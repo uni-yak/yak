@@ -11,40 +11,81 @@ permissions:
   contents: read
 
 jobs:
-  bootstrap:
+  bootstrap-win64:
+    name: Win64 原生冷启动与自举
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 180
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      MSYSTEM: UCRT64
+      CHERE_INVOKING: '1'
+      MSYS2_PATH_TYPE: inherit
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
-      - name: 安装 MinGW 交叉工具链与 Wine
-        shell: bash
+      - name: 准备 MSYS2 UCRT64 工具链
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 wine
-          x86_64-w64-mingw32-gcc --version | head -n 1
-          x86_64-w64-mingw32-ld --version | head -n 1
-          wine --version
-      - name: 执行冷启动门禁和自举
-        shell: bash
+          pacman --noconfirm -Sy --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang
+          command -v gcc clang as ld python gh
+          gcc --version | head -n 1
+          clang --version | head -n 1
+          ld --version | head -n 1
+      - name: 执行 Win64 原生冷启动、三遍自举与 ELF 对象发射
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
         env:
           SOURCE_COMMIT: ${{ inputs.commit || github.sha }}
           GH_TOKEN: ${{ github.token }}
           SEED_URL: ${{ vars.YAK_SEED_URL }}
-          YAK_CI_WINE: ${{ vars.YAK_CI_WINE }}
-          WINEPREFIX: ${{ runner.temp }}/yak-wine-bootstrap
+        run: bash test/gate/ci_bootstrap_win64.sh "$SOURCE_COMMIT" "$GITHUB_RUN_ID"
+      - name: 上传 Win64 交接产物
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: bootstrap-win64-stage
+          path: test/gate/tmp/ci-bootstrap-win64/
+          if-no-files-found: error
+          overwrite: true
+      - name: 归档 Win64 自举原始产物
+        if: "!cancelled()"
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
         run: |
-          mkdir -p "$WINEPREFIX"
-          # Debian/Ubuntu 的 wineserver 位于 /usr/lib/wine/wineserver；启用常驻消除 3 秒空闲回收竞态。
-          wineserver_bin=$(command -v wineserver || echo /usr/lib/wine/wineserver)
-          if [[ -x $wineserver_bin ]]; then
-            WINEDEBUG=-all "$wineserver_bin" -p
-            trap 'WINEDEBUG=-all "$wineserver_bin" -k >/dev/null 2>&1 || true' EXIT
+          work=.cold-start/test/gate/tmp/ci-bootstrap-candidate
+          if [[ -d "$work" ]]; then
+            tar -czf test/gate/tmp/ci-bootstrap-win64-evidence/selfhost-win64-originals.tar.gz -C "$work" .
           fi
-          bash test/gate/ci_bootstrap.sh "$SOURCE_COMMIT" "$GITHUB_RUN_ID"
+      - name: 上传 Win64 冷启动和自举回执
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: compiler-bootstrap-win64-evidence
+          path: test/gate/tmp/ci-bootstrap-win64-evidence/
+          compression-level: 0
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 90
+
+  bootstrap-linux:
+    name: Linux 原生 ELF 固定点自举
+    needs: bootstrap-win64
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: bootstrap-win64-stage
+          path: test/gate/tmp/ci-bootstrap-win64
+      - name: 执行纯净 Linux 原生 ELF 三遍自举并封存共享候选
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.commit || github.sha }}
+        run: bash test/gate/ci_bootstrap_linux.sh "$SOURCE_COMMIT" "$GITHUB_RUN_ID"
       - name: 上传共享候选
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -52,20 +93,20 @@ jobs:
           path: test/gate/tmp/ci-candidate/
           if-no-files-found: error
           overwrite: true
-      - name: 归档自举的原始产物
+      - name: 归档 Linux 原生自举原始产物
         if: "!cancelled()"
         shell: bash
         run: |
-          work=.cold-start/test/gate/tmp/ci-bootstrap-candidate
+          work=test/gate/tmp/ci-bootstrap-linux-work/linux-selfhost
           if [[ -d "$work" ]]; then
-            tar -czf test/gate/tmp/ci-bootstrap-evidence/selfhost-originals.tar.gz -C "$work" .
+            tar -czf test/gate/tmp/ci-bootstrap-linux-evidence/selfhost-linux-originals.tar.gz -C "$work" .
           fi
-      - name: 上传冷启动和自举回执
+      - name: 上传 Linux 原生自举回执
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: compiler-bootstrap-evidence
-          path: test/gate/tmp/ci-bootstrap-evidence/
+          name: compiler-bootstrap-linux-evidence
+          path: test/gate/tmp/ci-bootstrap-linux-evidence/
           compression-level: 0
           if-no-files-found: warn
           overwrite: true

@@ -8,8 +8,10 @@ import diag;
 import ast;
 import types;
 
+const BUILTIN_U8: u16 = 4097;
 const BUILTIN_U64: u16 = 4100;
 const BUILTIN_BOOL: u16 = 4105;
+const BUILTIN_VOID: u16 = 4107;
 const BUILTIN_ALLOC_ERROR: u16 = 4108;
 const TK_BUILTIN: u8 = 1;
 const TK_LOCAL: u8 = 2;
@@ -84,6 +86,26 @@ function infer_primitive(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite,
         if result == 0 { result = right; }
         if result != 0 && !typecheck::is_integer_type(tt, result) { typecheck::emit(diags, types::error_code(5001), span)?; }
         return result;
+    }
+    if builtin == 20496 {
+        // @assert(cond: bool): void（base.md 6.7）。
+        if count != 1 { typecheck::emit(diags, types::error_code(5001), span)?; return 0; }
+        let bool_ty: u32 = typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_BOOL as u32, 0)?;
+        let actual: u32 = infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, pool.calls[call].args[0].value, bool_ty)?;
+        if actual != 0 && bool_ty != 0 && !typecheck::same_type(actual, bool_ty) {
+            typecheck::emit(diags, types::error_code(5001), pool.calls[call].args[0].span)?;
+        }
+        return typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_VOID as u32, 0)?;
+    }
+    if builtin == 20497 {
+        // @exit(code: u8): void（base.md 6.7）。
+        if count != 1 { typecheck::emit(diags, types::error_code(5001), span)?; return 0; }
+        let u8_ty: u32 = typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_U8 as u32, 0)?;
+        let actual: u32 = infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, pool.calls[call].args[0].value, u8_ty)?;
+        if actual != 0 && u8_ty != 0 && !typecheck::same_type(actual, u8_ty) {
+            typecheck::emit(diags, types::error_code(5001), pool.calls[call].args[0].span)?;
+        }
+        return typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_VOID as u32, 0)?;
     }
     // 尚无完整固有签名的形态仍遍历实参；未知结果保持未定型供后端明确拒绝。
     var i: u32 = 0;

@@ -243,9 +243,9 @@ opcode 为 u8；操作数按 `symbol.md` 九节的域宽度编码。结果列为
 
 checked 算术、索引与切片指令在产生结果前发生失败，跳到本函数的专属清理块，没有清理任务时可跳到共享空 `trap_target`。专属块只含 `drop`，随后以 `trap` 终结。`reason=0` 开始回传算术或访问陷阱，`reason=1` 开始回传服务失败，`reason=2` 回传来自被调函数的失败状态。`reason=2` 只允许作为一个 `invoke_*` 私有清理块的终结指令。`invoke_*` 的失败边无待清理值时直接回传失败。宿主入口完成最后一帧回传后执行进程终止。
 
-标准外部服务 `exit`（退出）降级为 `exit` 终结指令。先求值并保存 `code`，清理当前帧仍拥有的值，然后沿调用链清理外层帧并以该状态码终止进程。该终结指令没有正常后继，也不向调用者提交已写入的输出槽。
+语言级控制流原语 `@exit(code)`（及 T1 兼容的外部服务 `foreign exit`）降级为 `exit` 终结指令（`0xC5`）。先求值并保存 `code`，清理当前帧仍拥有的值，然后沿调用链清理外层帧并以该状态码终止进程。该终结指令没有正常后继，也不向调用者提交已写入的输出槽。
 
-`call_service` 仅用于已认证的 `read` / `write` / `assert`。调用失败时，清理当前帧并回传服务失败；没有待清理值时直接回传。`unreachable` 用于穷尽 `enum_dispatch` / `carrier_dispatch` 后排除的路径。
+语言级控制流原语 `@assert(cond)` 降级为条件分支 `branch`（`0xC1`）：条件为真进入后继块继续执行，条件为假进入以 `trap(reason=0)`（`0xC3`）终结的失败块并执行本帧与调用链清理。`call_service` 仅用于已认证的 `read` / `write` 以及 T1 兼容的 `foreign assert`。调用失败时，清理当前帧并回传服务失败；没有待清理值时直接回传。`unreachable` 用于穷尽 `enum_dispatch` / `carrier_dispatch` 后排除的路径。
 
 ### 4.14 动态数组追加
 
@@ -289,6 +289,7 @@ checked 算术、索引与切片指令在产生结果前发生失败，跳到本
 | `call_builtin(@len)` | 中性（读取切片胖指针的 len 字段，不分配） |
 | `const_aggregate` | 中性（只读静态池到本地聚合槽的字节复制，不分配） |
 | `call_builtin(@wrap_add)` / `@wrap_sub` / `@wrap_mul` | 中性（回绕算术，映射到 `wrap_add`/`wrap_sub`/`wrap_mul` opcode，不分配） |
+| `@assert` / `@exit` 控制流原语 | 中性（分别降级为 `branch`+`trap` 与 `exit` 终结指令，不分配） |
 | `array_construct` 的类型为 `T[]` 且元素数大于 0 | 增，结果 false |
 | `array_construct` 的类型为 `T[]` 且元素数为 0；或类型为 `[T; N]` | 中性 |
 | `call_foreign` → 堆分配服务 | 增，结果 false |

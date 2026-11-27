@@ -1,0 +1,7 @@
+// expected_code: E5001
+// spec: spec/lang/base.md 6.7
+// 触发：语言级控制流原语 @assert 要求 bool 条件，传入 u8 必须按类型不匹配拒绝。
+function main(): void {
+    @assert(1u8);
+    return;
+}

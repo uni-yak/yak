@@ -263,6 +263,8 @@ class ContractGates(unittest.TestCase):
         self.assertNotIn('"string"', name_table)
         active = actual.split("export function builtin_is_base", 1)[1]
         self.assertIn("id == 20495", active)
+        self.assertIn("id == 20496", active)
+        self.assertIn("id == 20497", active)
         self.assertNotIn("id == 20487", active)
 
     def test_generator_rejects_duplicate_slot(self):

@@ -43,6 +43,8 @@ semantic_fixtures=(
     test/gate/fixtures/owner/E6004/block_exclusive_write.yak
     test/gate/fixtures/owner/E6004/nested_exclusive_parent.yak
     test/gate/fixtures/owner/E6004/copied_exclusive_parent.yak
+    test/gate/fixtures/flow/E5001/assert_non_bool.yak
+    test/gate/fixtures/flow/E5001/exit_non_u8.yak
 )
 
 usage() {

@@ -118,6 +118,34 @@ function lower_builtin(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Bu
         if build.rejection.kind != 0 { return 0; }
         return mir_lower_ops::emit_push_checked(ctx, build, pool, tc, expr, value_type_id, arr_type, arr_value, elem)?;
     }
+    if bid == 20496 {
+        // @assert(cond: bool): void：条件为假时执行当前帧清理并以语言陷阱（reason=0）终结。
+        if count != 1 { mir_builder::reject(build, 7, build.span); return 0; }
+        if pool.calls[call].args[0].kind != 0 { mir_builder::reject(build, 1, pool.calls[call].args[0].span); return 0; }
+        let cond: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.calls[call].args[0].value)?;
+        if build.rejection.kind != 0 { return 0; }
+        let ok_block: u16 = mir_builder::new_block(ctx, build)?;
+        let fail_block: u16 = mir_builder::new_block(ctx, build)?;
+        if build.rejection.kind != 0 { return 0; }
+        mir_builder::term(ctx, build, 193, cond, ok_block as u32, fail_block as u32);
+        build.current = fail_block;
+        mir_builder::keep_expression_views(ctx, &*build:Read, 0)?;
+        mir_builder::end_bound_views(ctx, &*build:Read, 0)?;
+        mir_builder::term(ctx, build, 195, 0, 0, 0);
+        build.current = ok_block;
+        return 0;
+    }
+    if bid == 20497 {
+        // @exit(code: u8): void：求值退出码后执行本帧与调用链清理并直接发射 0xC5 退出终结指令。
+        if count != 1 { mir_builder::reject(build, 7, build.span); return 0; }
+        if pool.calls[call].args[0].kind != 0 { mir_builder::reject(build, 1, pool.calls[call].args[0].span); return 0; }
+        let code: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.calls[call].args[0].value)?;
+        if build.rejection.kind != 0 { return 0; }
+        mir_builder::keep_expression_views(ctx, &*build:Read, 0)?;
+        mir_builder::end_bound_views(ctx, &*build:Read, 0)?;
+        mir_builder::term(ctx, build, 197, code, 0, 0);
+        return 0;
+    }
     if bid != 20481 && bid != 20482 && bid != 20486 && bid != 20493 && bid != 20494 && bid != 20495 { mir_builder::reject(build, 1, pool.exprs[expr].span); return 0; }
     var needed: u32 = 1;
     if bid >= 20493 { needed = 2; }

@@ -11,7 +11,6 @@
 1. 将与 [seed/frozen.txt](../seed/frozen.txt) 末条 SHA-256 一致的 `seed/out/yak-seed.exe` 发布为同仓库 Release 附件（标签 `seed-<完整 SHA-256>`，附件名 `yak-seed.exe`）。
 2. 可选 Actions 仓库变量（**Settings → Secrets and variables → Actions → Variables**，默认可不配）：
    - `YAK_SEED_URL`：冻结 Seed 的额外 HTTPS 镜像地址（未配置时自动从同仓库 Release 读取）
-   - `YAK_CI_WINE`：仅在 Linux 冷启动审计作业中运行 Win64 PE 工具的命令（默认 `wine`；Linux 原生平台验收与分发已彻底脱离 Wine）
    - `YAK_LINUX_CASE_JOBS` / `YAK_WINDOWS_CASE_JOBS`：单平台语料并发数（默认 `3`，范围 `1`–`8`）
    - `YAK_LINUX_CODE`、`YAK_LINUX_NVIM`、`YAK_WINDOWS_CODE`、`YAK_WINDOWS_NVIM`：仅在覆盖编辑器默认安装路径时填写
 

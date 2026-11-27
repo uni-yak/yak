@@ -1,8 +1,8 @@
 // 由 tools/symgen/lex_tables.py 生成；请勿手改。
-// 源摘要：40f096eb50026341498049e2407832b54c5603e4830d7d1273093d8bb949fb71
+// 源摘要：dbcbb7ea8abb53e770fc304f6e2b18487802de13607d35dc9ff9ac5d0be64371
 
 // 生成源和链接产物共用同一份只读摘要。
-const SOURCE_SHA256: &[u8] = "YAK-SYMBOL-SHA256-V1:40f096eb50026341498049e2407832b54c5603e4830d7d1273093d8bb949fb71:END-YAK-SYMBOL";
+const SOURCE_SHA256: &[u8] = "YAK-SYMBOL-SHA256-V1:dbcbb7ea8abb53e770fc304f6e2b18487802de13607d35dc9ff9ac5d0be64371:END-YAK-SYMBOL";
 
 export function symbol_source_sha256_at(at: u32): u8 {
     if at >= 64u32 { return 0u8; }
@@ -89,6 +89,8 @@ export function builtin(src: &[u8], off: u32, len: u32): u16 {
     if len == 8 && matches(src, off, "wrap_add") { return 20493; }
     if len == 8 && matches(src, off, "wrap_sub") { return 20494; }
     if len == 8 && matches(src, off, "wrap_mul") { return 20495; }
+    if len == 6 && matches(src, off, "assert") { return 20496; }
+    if len == 4 && matches(src, off, "exit") { return 20497; }
     if len == 6 && matches(src, off, "inline") { return 24577; }
     if len == 5 && matches(src, off, "align") { return 24578; }
     return 0;
@@ -104,6 +106,8 @@ export function builtin_is_base(id: u16): bool {
     if id == 20493 { return true; }
     if id == 20494 { return true; }
     if id == 20495 { return true; }
+    if id == 20496 { return true; }
+    if id == 20497 { return true; }
     return false;
 }
 

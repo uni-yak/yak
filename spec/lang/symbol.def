@@ -88,7 +88,9 @@ entry functions slot 0x00C stage full kind primitive name "@breakpoint"
 entry functions slot 0x00D stage base kind primitive name "@wrap_add"
 entry functions slot 0x00E stage base kind primitive name "@wrap_sub"
 entry functions slot 0x00F stage base kind primitive name "@wrap_mul"
-reserve functions from 0x010 to 0xFFF
+entry functions slot 0x010 stage base kind primitive name "@assert"
+entry functions slot 0x011 stage base kind primitive name "@exit"
+reserve functions from 0x012 to 0xFFF
 
 # ── 0x6 annotations：编译器可识别注解 ──
 entry annotations slot 0x001 stage full kind annotation name "@inline"

@@ -1,0 +1,24 @@
+// expected_exit: 19
+// spec: spec/lang/base.md 6.7
+// 语言级控制流原语 @assert 与 @exit：无需 foreign 声明，在 # 无分配函数中合法，并支持跨帧清理后按指定 u8 状态码退出。
+function #verify_and_exit(code: u8): void {
+    @assert(code > 0u8);
+    @assert(code == 19u8);
+    @exit(code);
+    return;
+}
+
+function run_with_owned(): void!AllocError {
+    var owned: u8[] = [];
+    @push(&owned:ReadWrite, 7u8)?;
+    @assert(@len(&owned[0..owned.len]:Read) == 1u64);
+    verify_and_exit(19u8);
+    return;
+}
+
+function main(): void {
+    let unused: void!AllocError = run_with_owned();
+    @drop(unused);
+    @exit(0);
+    return;
+}

@@ -1,0 +1,7 @@
+// expected_code: E5001
+// spec: spec/lang/base.md 6.7
+// 触发：语言级控制流原语 @exit 要求 u8 退出码，传入 bool 必须按类型不匹配拒绝。
+function main(): void {
+    @exit(true);
+    return;
+}

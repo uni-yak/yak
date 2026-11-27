@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import ci_artifacts as artifacts
+import ci_bootstrap_stage as bootstrap_stage
 import ci_release as release
 
 
@@ -39,6 +40,25 @@ class CIArtifactsTest(unittest.TestCase):
         (candidate / artifacts.CANDIDATE_FILES[0]).write_bytes(b"changed")
         with self.assertRaisesRegex(ValueError, "工具摘要"):
             artifacts.verify_candidate(args)
+
+    def test_bootstrap_stage_round_trip_and_rejects_tampering(self):
+        source = self.root / "win64-src"
+        for name in bootstrap_stage.WIN64_FILES:
+            tool = source / name
+            tool.parent.mkdir(parents=True, exist_ok=True)
+            tool.write_text(name, encoding="ascii")
+        for root_name in bootstrap_stage.ELF_ROOTS:
+            obj_dir = source / "elf-c0-objects" / root_name
+            obj_dir.mkdir(parents=True, exist_ok=True)
+            (source / "elf-c0-objects" / f"{root_name}.order").write_text("a.o\nb.o\n", encoding="ascii")
+            (obj_dir / "a.o").write_bytes(b"obj-a")
+            (obj_dir / "b.o").write_bytes(b"obj-b")
+        sealed = self.root / "win64-stage"
+        bootstrap_stage.seal_stage(Namespace(root=source, output=sealed, commit=COMMIT, run=RUN))
+        bootstrap_stage.verify_stage(Namespace(root=sealed, commit=COMMIT, run=RUN))
+        (sealed / "elf-c0-objects" / "main" / "a.o").write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "文件摘要不一致"):
+            bootstrap_stage.verify_stage(Namespace(root=sealed, commit=COMMIT, run=RUN))
 
     def test_collect_uses_real_exit_and_stdout_bytes(self):
         logfile = self.root / "semantic.log"

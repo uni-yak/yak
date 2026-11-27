@@ -23,18 +23,18 @@
 
 2.4 base 期 foreign 声明不支持泛型参数、可变参数或 `@callconv` / `@export_c` 注解（推迟至第七节 full 层）。
 
-2.5 `foreign #name` 是零分配声明契约（`base.md` 5.11），只允许已登记的无增服务：`read`、`write`、`exit`、`assert` 以及 `../proc/host.md` 的受限宿主服务；堆分配服务不得标 `#`。堆释放为运行时内部服务，不由用户声明。full 层任意 external foreign 的 `#` 需要独立 effect / provider 证明，当前未激活。
+2.5 `foreign #name` 是零分配声明契约（`base.md` 5.11），允许已登记的无增 I/O 服务 `read`、`write`、T1 兼容保留的 `exit`、`assert` 以及 `../proc/host.md` 的受限宿主服务；堆分配服务不得标 `#`。堆释放为运行时内部服务，不由用户声明。full 层任意 external foreign 的 `#` 需要独立 effect / provider 证明，当前未激活。
 
 ## 三、base 期服务集
 
-3.1 用户可声明的 foreign 服务（签名固定，`base.md` 9.2）：
+3.1 用户可声明的 foreign 服务（签名固定，`base.md` 9.2）：`read` 与 `write` 长期保留在 `foreign` ABI 层；进程退出与断言首选语言级控制流原语 `@exit`／`@assert`（`base.md` 6.7），下表中 `exit`／`assert` 的 `foreign` 签名仅作 T1 冻结 Seed 与存量夹具兼容保留。
 
 | 服务 | 签名 | `no_alloc` | 失败 |
 |:---|:---|:---:|:---|
 | `read`（输入） | `foreign read(buf: &[u8]:ReadWrite): u32` | true | 读错误 → 陷阱（不正常完成路径） |
 | `write`（输出） | `foreign write(data: &[u8]): void` | true | 写错误 → 陷阱 |
-| `exit`（退出） | `foreign exit(code: u8): void` | true | 不返回；`code` 为 0–255，与宿主进程退出码真值一致 |
-| `assert`（断言） | `foreign assert(cond: bool): void` | true | `cond` 为假 → 陷阱（不正常完成路径） |
+| `exit`（退出，T1 兼容；首选 `@exit`） | `foreign exit(code: u8): void` | true | 不返回；`code` 为 0–255，与宿主进程退出码真值一致 |
+| `assert`（断言，T1 兼容；首选 `@assert`） | `foreign assert(cond: bool): void` | true | `cond` 为假 → 陷阱（不正常完成路径） |
 
 3.2 运行时内部服务（不由用户声明，`T[]` 与 `@push` 内部使用）：
 
@@ -52,7 +52,7 @@
 
 3.4 新增用户 foreign 服务必须先登记入本文，并按 [`error.def`](../proc/error.def) 登记关联诊断。未登记服务按 F-1 拒绝。服务的 `LinkId` 绑定到登记的运行时库符号，见 `symbol.md` 2.5 和第六节。
 
-3.5 `assert`（断言）是 base 期登记的诊断服务：`cond` 为真时正常返回；为假即进入不正常完成路径，不得静默返回。其失败登记 `E9205`（`../proc/error.def`）。`assert` 无分配，可按 2.5 标 `#`。
+3.5 断言语义的首选形态为语言级控制流原语 `@assert(cond: bool): void`（`base.md` 6.7），T1 兼容 `foreign assert` 保持同一语义：`cond` 为真时正常继续；为假即进入不正常完成路径，不得静默返回。`foreign assert` 的服务失败登记 `E9205`（`../proc/error.def`）；两者均无分配，可用于 `#` 函数。
 
 ## 四、调用约定
 

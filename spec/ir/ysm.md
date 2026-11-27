@@ -141,7 +141,7 @@ padding      : [u8; 8]    // 16..24，0
 
 **可选 payload**（`enum_construct` 的 `payload:Local?`、`ret` 的 `v:Local?`）编码为 `has:u8`；`has=0` 无后续，`has=1` 后随 `LocalId:u32`。`has` 取其他值为 Y-4。
 
-**进程退出**（`exit`，0xC5）：`code:u32`，指向当前函数中类型为 `u8` 的局部。该终结指令没有结果和后继块。
+**进程退出**（`exit`，0xC5，由 `@exit` 原语或 T1 兼容 `foreign exit` 降级而来）：`code:u32`，指向当前函数中类型为 `u8` 的局部。该终结指令没有结果和后继块。
 
 **dispatch 终结指令**的臂表编码：
 

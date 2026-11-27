@@ -54,7 +54,7 @@
 - `|` 三用：`T!(E1 | E2)` 括号内为错误集，full 类型位为普通联合，表达式位为按位或。
 - `..` 仅用于索引位 `[a..b]`。
 - `&` 在函数名位产出函数静态引用（类型 `&function(P): R`），与借用视图的 `&` 同形但语义不同（静态、Copy、无能力、可入聚合）。`function` 为保留字，声明位后随函数名、类型位后随 `(` 由位置区分。
-- `@` 为原语前缀记号；原语调用统一形为 `@name '(' args ')'`，如 `@move(e)`、`@copy(e)`、`@clone(e)`、`@drop(e)`、`@push(x, e)`、`@len(s)`、`@wrap_mul(a, b)`；无前缀运算符形。`@` 不得用于用户标识符；裸 `move` / `copy` / `clone` / `drop` / `push` / `len` / `wrap_add` / `wrap_sub` / `wrap_mul` 为普通标识符。
+- `@` 为原语前缀记号；原语调用统一形为 `@name '(' args ')'`，如 `@move(e)`、`@copy(e)`、`@clone(e)`、`@drop(e)`、`@push(x, e)`、`@len(s)`、`@wrap_mul(a, b)`、`@assert(cond)`、`@exit(code)`；无前缀运算符形。`@` 不得用于用户标识符；裸 `move` / `copy` / `clone` / `drop` / `push` / `len` / `wrap_add` / `wrap_sub` / `wrap_mul` / `assert` / `exit` 为普通标识符。
 
 ## 四、类型
 
@@ -129,11 +129,11 @@
 
 5.9 多值返回：用 `struct` 返回值、`T!E` 或 `out` 槽位表达。
 
-5.10 根模块程序入口为 `function main(): void`，正常完成以退出码 0 结束。`main` 必须显式处理 `T!E`，不能使用传播 error 的后缀 `?`。显式退出调用 9.2 的 `exit` 服务，退出码为 `u8`。构建中的入口选择见 [构建规格](../proc/build.md) 3.1，目标入口与完成状态见 [Win64 ABI](../target/abi-win.md) 和 [Linux ABI](../target/abi-linux.md)。
+5.10 根模块程序入口为 `function main(): void`，正常完成以退出码 0 结束。`main` 必须显式处理 `T!E`，不能使用传播 error 的后缀 `?`。显式退出调用语言级控制流原语 `@exit(code)`（退出码为 `u8`；原 9.2 的 `foreign exit` 仅作 T1 兼容保留）。构建中的入口选择见 [构建规格](../proc/build.md) 3.1，目标入口与完成状态见 [Win64 ABI](../target/abi-win.md) 和 [Linux ABI](../target/abi-linux.md)。
 
 5.11 无增契约 `#`：`function #名(参数): 类型 { 块 }` 或 `foreign #名(...)` 声明该 callable 及其可达 Yak 调用图不增加 Yak 运行时堆分配。`#` 是声明修饰符（非独立 callable 身份），`#foo` 与 `foo` 不可共存；声明后的调用、取地址和导入只写 `foo`。编译器对全部函数计算 `no_alloc`（`mir.md`），导出结果写入 `.iface`（`symbol.md`）；`#` 声明要求 `no_alloc == true`，否则按 R-29 拒绝。
 
-增（禁止）：`@push`、`@clone`、非空 `T[]` 构造、运行时内部堆分配服务、不可验证的 `&function` 间接调用。减（允许）：无增析构和运行时内部堆释放服务。中性（允许）：`@move`、`@copy`（Copy 类型位拷贝不分配）、`@len`（读胖指针）、`@wrap_add`/`@wrap_sub`/`@wrap_mul`（回绕算术不分配）、算术/位/比较/控制流/借用/切片/字段/enum/carrier、经 `no_alloc` 验证的 `call_local` / `call_far`。base 生成的析构路径无增；full 自定义 `Drop` 激活后，只有其析构路径同样证明 `no_alloc` 才可视为减。`#` 不进修饰名，不分配 `BuiltinId`。`#` 只用于具名 callable；匿名函数（S-21）仅自动计算 `no_alloc`，被 `#` 直接调用时递归验证。源级 `foreign #` 仅允许 `read` / `write` / `exit` / `assert`；堆分配 / 堆释放是运行时内部服务，不可由用户声明。
+增（禁止）：`@push`、`@clone`、非空 `T[]` 构造、运行时内部堆分配服务、不可验证的 `&function` 间接调用。减（允许）：无增析构和运行时内部堆释放服务。中性（允许）：`@move`、`@copy`（Copy 类型位拷贝不分配）、`@len`（读胖指针）、`@wrap_add`/`@wrap_sub`/`@wrap_mul`（回绕算术不分配）、`@assert`/`@exit`（控制流原语不分配）、算术/位/比较/控制流/借用/切片/字段/enum/carrier、经 `no_alloc` 验证的 `call_local` / `call_far`。base 生成的析构路径无增；full 自定义 `Drop` 激活后，只有其析构路径同样证明 `no_alloc` 才可视为减。`#` 不进修饰名，不分配 `BuiltinId`。`#` 只用于具名 callable；匿名函数（S-21）仅自动计算 `no_alloc`，被 `#` 直接调用时递归验证。源级 `foreign #` 的核心 I/O 服务为 `read` / `write`（`exit` / `assert` 的 `foreign` 形态仅作 T1 兼容保留）；堆分配 / 堆释放是运行时内部服务，不可由用户声明。
 
 ## 六、控制流与求值
 
@@ -155,6 +155,11 @@
 
 - `+ - * / %` 与一元 `-` 的整数溢出、`MIN / -1`、移位 ≥ 类型宽度进入不正常完成路径；需要回绕语义时使用 base `@wrap_add` / `@wrap_sub` / `@wrap_mul` 原语（`symbol.def` 0x00D–0x00F）。
 - `as` 为显式承诺：窄化转换按位截断，行为固定；编译期可证明发生截断时产生诊断。
+
+6.7 控制流原语（无需 `foreign` 声明，零分配、中性）：
+
+- `@assert(cond: bool): void`（`symbol.def` `0x010`）：`cond` 为真时正常继续；为假时进入不正常完成路径，清理当前帧及调用链上的活跃拥有值并触发陷阱。
+- `@exit(code: u8): void`（`symbol.def` `0x011`）：求值并保存 `code`（0–255），清理当前帧及调用链上的活跃拥有值并以该状态码终止进程，不返回。
 
 ## 七、所有权与能力
 
@@ -245,7 +250,7 @@
 
 9.1 外部函数以 `foreign` 声明，调用约定见 `../target/abi-win.md` / `abi-linux.md`。
 
-9.2 base 期用户可声明的目标服务为 `read`、`write`、`exit` 和 `assert`。`exit` 的 `u8` 退出码原样交给目标进程，`assert` 条件为假时进入不正常完成路径。堆分配和释放属于运行时内部服务。签名、失败行为与种子宿主的单独登记见 [外部接口规格](foreign.md) 第三节。
+9.2 base 期用户可声明的 `foreign` I/O 服务为 `read` 与 `write`（保留在外部 ABI 层，不进入 `@` 原语闭集）。进程退出与断言已上移为语言级控制流原语 `@exit(code: u8): void` 与 `@assert(cond: bool): void`（见 6.7）；原 `foreign exit` 与 `foreign assert` 仅作 T1 冻结 Seed 与存量夹具兼容保留。堆分配和释放属于运行时内部服务。签名、失败行为与种子宿主的单独登记见 [外部接口规格](foreign.md) 第三节。
 
 9.3 `Write` 不得传给外部边界；外部输出指针必须由独立的 `unsafe.md` / `foreign.md` 契约登记。
 
