@@ -118,6 +118,71 @@ class ErrorCodes(unittest.TestCase):
                 with self.assertRaisesRegex(module.ConfigError, error):
                     module.check_pe_digest(artifact, digest)
 
+    def test_elf_digest_requires_unique_loaded_read_only_record(self):
+        """静态 x86-64 ELF 最小样本覆盖 .rodata 摘要位置、权限、静态约束与漂移。"""
+        module = self.generator
+        digest = hashlib.sha256(self.base.encode("utf-8")).hexdigest()
+        prefix, suffix = module.ARTIFACT_DIGEST_PREFIX, module.ARTIFACT_DIGEST_SUFFIX
+        record = prefix + digest.encode("ascii") + suffix
+
+        def elf_image(payload, sec_flags=2, load_flags=5, interp=False, tail=b"", rodata_size=None):
+            shstr = b"\0.rodata\0.shstrtab\0"
+            phnum = 2 if interp else 1
+            phoff = 64
+            text_off = 0x100
+            rodata_off = 0x200
+            rodata_bytes = payload if rodata_size is None else payload[:rodata_size]
+            rodata_len = len(payload) if rodata_size is None else rodata_size
+            shstr_off = rodata_off + max(len(payload), 0x100)
+            shoff = (shstr_off + len(shstr) + 7) & ~7
+            total = shoff + 3 * 64
+            raw = bytearray(total)
+            ident = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+            struct.pack_into(
+                "<16sHHIQQQIHHHHHH", raw, 0,
+                ident, 2, 62, 1, 0x401000, phoff, shoff, 0, 64, 56, phnum, 64, 3, 2,
+            )
+            load_end = rodata_off + len(payload)
+            struct.pack_into(
+                "<IIQQQQQQ", raw, phoff,
+                1, load_flags, 0, 0x400f00, 0x400f00, load_end, load_end, 0x1000,
+            )
+            if interp:
+                struct.pack_into(
+                    "<IIQQQQQQ", raw, phoff + 56,
+                    3, 4, text_off, 0x401000, 0x401000, 8, 8, 1,
+                )
+            raw[rodata_off:rodata_off + len(payload)] = payload
+            raw[shstr_off:shstr_off + len(shstr)] = shstr
+            struct.pack_into(
+                "<IIQQQQIIQQ", raw, shoff + 64,
+                1, 1, sec_flags, 0x400f00 + rodata_off, rodata_off, rodata_len, 0, 0, 8, 0,
+            )
+            struct.pack_into(
+                "<IIQQQQIIQQ", raw, shoff + 128,
+                9, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+            )
+            return bytes(raw) + tail
+
+        artifact = self.root / "main.elf"
+        artifact.write_bytes(elf_image(b"prefix" + record))
+        module.check_pe_digest(artifact, digest)
+        for label, payload, error in (
+            ("裸摘要", elf_image(digest.encode("ascii")), "缺失或重复"),
+            ("体外摘要", elf_image(b"pad", tail=record), "缺失或重复"),
+            ("重复", elf_image(record, tail=record), "缺失或重复"),
+            ("过期", elf_image(prefix + b"0" * 64 + suffix), "与配置源不一致"),
+            ("可写节", elf_image(record, sec_flags=3), "不是保留的只读"),
+            ("可写段", elf_image(record, load_flags=7), "不在只读加载段"),
+            ("动态解释器", elf_image(record, interp=True), "解释器入口"),
+            ("截断边界", elf_image(record, rodata_size=len(record) - 1), "截断或无效"),
+            ("非法魔数", b"not-a-binary" * 8, "缺少有效 PE 或 ELF 文件头"),
+        ):
+            with self.subTest(label=label):
+                artifact.write_bytes(payload)
+                with self.assertRaisesRegex(module.ConfigError, error):
+                    module.check_pe_digest(artifact, digest)
+
     def test_crlf_source_matches_lf_digest(self):
         """CRLF 检出物与 LF 存储物必须生成同一张表（拒绝形态 ER-2）。"""
         lf = self.generator.generate(self.source, self.generator.OUTPUT, history=False)

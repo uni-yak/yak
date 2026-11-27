@@ -9,12 +9,15 @@ cd -P -- "${script%/*}/../.."
 
 fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
 [[ ${OSTYPE:-} == linux* && ${HOSTTYPE:-} == x86_64 ]] || fail '此构建门禁只在 Linux x86-64 上运行'
-if (( $# != 3 )); then
-    printf '%s\n' '用法：YAK_PE_RUNNER=wine bash test/gate/test_base_linux_build.sh 编译器.EXE 扫描器.EXE COFF运行时.OBJ' >&2
+if (( $# != 2 && $# != 3 )); then
+    printf '%s\n' '用法：bash test/gate/test_base_linux_build.sh <编译器> <扫描器> [COFF运行时.OBJ]' >&2
     exit 2
 fi
-main=$1 scanner=$2 runtime=$3
-[[ -f $main && -f $scanner && ! $main -ef $scanner && -f $runtime ]] || fail '需要两枚不同的 Win64 工具和一个 COFF 运行时'
+main=$1 scanner=$2 runtime=${3:-}
+[[ -f $main && -f $scanner && ! $main -ef $scanner ]] || fail '需要两枚不同的原生编译器与扫描器'
+if [[ -n $runtime ]]; then
+    [[ -f $runtime ]] || fail "缺少 COFF 运行时：$runtime"
+fi
 mkdir -p -- test/gate/tmp
 work=$(mktemp -d test/gate/tmp/base-linux-build.XXXXXXXX)
 printf 'Linux base 证据：%s\n' "$work"
@@ -67,13 +70,13 @@ verify_mirror() (
     done
 )
 
-record inputs -- sha256sum -- "$main" "$scanner" "$runtime"
+if [[ -n $runtime ]]; then
+    record inputs -- sha256sum -- "$main" "$scanner" "$runtime"
+else
+    record inputs -- sha256sum -- "$main" "$scanner"
+fi
 reject pair-required 2 '须同时指定原生编译器和扫描器' "${entry[@]}" "$root" --target linux-x64 --out-dir "$missing_out"
-for name in main imports; do
-    reject "bootstrap-$name" 2 '自举编译器和扫描器只接受 Windows x64 目标' "${entry[@]}" "compiler/min/src/$name.yak" \
-        --target linux-x64 "${pair[@]}" --out-dir "$missing_out" --audit-dir "$missing_audit"
-done
-reject runtime-forbidden 2 '不接受 YAK_RUNTIME_OBJ' env YAK_RUNTIME_OBJ="$runtime" "${entry[@]}" "$root" \
+reject runtime-forbidden 2 '不接受 YAK_RUNTIME_OBJ' env YAK_RUNTIME_OBJ="$main" "${entry[@]}" "$root" \
     --target linux-x64 "${pair[@]}" --out-dir "$missing_out" --audit-dir "$missing_audit"
 
 reject missing-imports 1 '模块图验证失败' "${entry[@]}" test/bad/E4002/missing_imports.yak \
@@ -87,35 +90,55 @@ reject bad-carrier 1 '错误 E6007 @ off=' "${entry[@]}" test/bad/E6007/question
     --target linux-x64 "${pair[@]}" --out-dir "$missing_out" --audit-dir "$missing_audit"
 
 printf 'sysv_root\n%s\n' "$root" > "$work/owner.expected"
-record build-win-default -- timeout -k 5s 180s env YAK_RUNTIME_OBJ="$runtime" "${entry[@]}" "$root" "${pair[@]}" --out-dir "$out" --audit-dir "$audit"
-record coff-format -- python -X utf8 -B tools/coff_sections.py --runtime-pe -- "$out/sysv_root.exe"
-verify_mirror "$coff" obj
-record snapshot-win -- sha256sum -- "$out/sysv_root.exe" "$owner" "$coff/"* "$coff/.yak-audit"
-# Wine 只提供兼容层回归，不作为 Win64 原生执行证据。
-run_expected pe-compat 0 sysv-ok "$YAK_PE_RUNNER" "$out/sysv_root.exe"
+if [[ -n $runtime ]]; then
+    record build-win-default -- timeout -k 5s 180s env YAK_RUNTIME_OBJ="$runtime" "${entry[@]}" "$root" "${pair[@]}" --out-dir "$out" --audit-dir "$audit"
+    record coff-format -- python -X utf8 -B tools/coff_sections.py --runtime-pe -- "$out/sysv_root.exe"
+    verify_mirror "$coff" obj
+    record snapshot-win -- sha256sum -- "$out/sysv_root.exe" "$owner" "$coff/"* "$coff/.yak-audit"
+    # Wine 只提供兼容层回归，不作为 Win64 原生执行证据。
+    run_expected pe-compat 0 sysv-ok "$YAK_PE_RUNNER" "$out/sysv_root.exe"
+fi
 record build-linux -- timeout -k 5s 180s "${entry[@]}" "$root" --target linux-x64 "${pair[@]}" --out-dir "$out" --audit-dir "$audit"
 record owner -- cmp -- "$work/owner.expected" "$owner"
 verify_mirror "$elf" o
 record elf-format -- python -X utf8 -B tools/elf_headers.py executable -- "$out/sysv_root.elf"
 record objects-format -- python -X utf8 -B tools/elf_headers.py object -- "$elf/sysv_leaf.o" "$elf/sysv_root.o"
-record win-unchanged -- sha256sum -c --strict -- "$receipts/snapshot-win.log"
+if [[ -n $runtime ]]; then
+    record win-unchanged -- sha256sum -c --strict -- "$receipts/snapshot-win.log"
+fi
 run_expected elf-native 0 sysv-ok "$out/sysv_root.elf"
 record build-values -- timeout -k 5s 180s "${entry[@]}" "$fixture/sysv_values.yak" --target linux-x64 "${pair[@]}" --out-dir "$out"
 run_expected values-native 0 sysv-values-ok "$out/sysv_values.elf"
 record build-exit -- timeout -k 5s 180s "${entry[@]}" test/ok/type/array_properties.yak --target linux-x64 "${pair[@]}" --out-dir "$out"
 run_expected exit-native 42 '' "$out/array_properties.elf"
+
+# 核验正式自举扫描器根可在 Linux x86-64 下构建、校验内嵌符号表并产出独立 ELF 审计镜像。
+imports_roots=()
+for dir in host/stream lib src src/check src/desugar src/diag src/emit src/lex src/link src/mir src/parse src/ysm; do
+    imports_roots+=(--module-root "compiler/min/$dir")
+done
+record build-imports-elf -- timeout -k 5s 300s "${entry[@]}" compiler/min/src/imports.yak \
+    "${imports_roots[@]}" --target linux-x64 "${pair[@]}" --out-dir "$work/selfhost-out" --audit-dir "$work/selfhost-audit"
+record imports-elf-format -- python -X utf8 -B tools/elf_headers.py executable -- "$work/selfhost-out/imports.elf"
+record imports-elf-symbols -- python -X utf8 -B tools/symgen/lex_tables.py --check-artifact "$work/selfhost-out/imports.elf"
+[[ -f $work/selfhost-audit/imports.elf/.yak-audit ]] || fail '自举扫描器 ELF 审计标记缺失'
 absent compiler/min/tmp/build && absent compiler/min/tmp/lock.dir || fail '成功后保留了临时目录或锁'
 
 # 同根不同格式共用标记，不能给未登记的另一格式产物补登记。
 mkdir -- "$work/unowned"
-cp -- "$out/sysv_root.exe" "$work/unowned/"
+if [[ -n $runtime ]]; then
+    cp -- "$out/sysv_root.exe" "$work/unowned/"
+else
+    printf '无主另一格式占位文件\n' > "$work/unowned/sysv_root.exe"
+fi
+cp -- "$work/unowned/sysv_root.exe" "$work/unowned-expected.exe"
 rc=0
 record unowned-opposite -- timeout -k 5s 180s "${entry[@]}" "$root" --target linux-x64 "${pair[@]}" \
     --out-dir "$work/unowned" --audit-dir "$missing_audit" || rc=$?
 [[ $rc == 1 && $(<"$receipts/unowned-opposite.log") == *'可执行文件不属于当前根模块'* ]] || fail '由另一格式接管了未登记产物'
 absent "$work/unowned/sysv_root.elf" && absent "$work/unowned/.sysv_root.yak-root" && absent "$missing_audit" ||
     fail '未登记拒绝留下发布产物'
-record unowned-kept -- cmp -- "$out/sysv_root.exe" "$work/unowned/sysv_root.exe"
+record unowned-kept -- cmp -- "$work/unowned-expected.exe" "$work/unowned/sysv_root.exe"
 
 # 增加不同的旧 ELF 字节和旧审计标识，避免用重新生成的同字节产物伪装恢复。
 cp -- "$out/sysv_root.elf" "$work/current.elf"
@@ -145,7 +168,9 @@ record rollback-owner -- cmp -- "$work/owner.expected" "$owner"
 record rollback-audit -- diff -r -- "$work/previous-audit" "$elf"
 [[ $(stat -c %a -- "$out/sysv_root.elf") == 751 && -d compiler/min/tmp/build && ! -e compiler/min/tmp/lock.dir ]] ||
     fail '回滚后旧权限、诊断保留或锁释放错误'
-record win-unaffected -- sha256sum -c --strict -- "$receipts/snapshot-win.log"
+if [[ -n $runtime ]]; then
+    record win-unaffected -- sha256sum -c --strict -- "$receipts/snapshot-win.log"
+fi
 record inputs-end -- sha256sum -c --strict -- "$receipts/inputs.log"
 absent "$YAK_SEED_BIN" || fail '不应登记 Seed'
-printf '%s\n' 'Linux base：新入口、两种审计、Linux 原生用例和事务回滚通过'
+printf '%s\n' 'Linux base：新入口、自举扫描器 ELF、Linux 原生用例和事务回滚通过'

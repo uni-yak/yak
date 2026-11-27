@@ -7,7 +7,7 @@ script=${BASH_SOURCE[0]}
 cd -P -- "${script%/*}/../.."
 usage() {
     printf '%s\n' '用法：bash compiler/lsp/build.sh <仓库内输出目录>' >&2
-    printf '%s\n' '      bash compiler/lsp/build.sh --target win-x64|linux-x64 --native-compiler EXE --native-scanner EXE <仓库内输出目录>' >&2
+    printf '%s\n' '      bash compiler/lsp/build.sh --target win-x64|linux-x64 --native-compiler TOOL --native-scanner TOOL <仓库内输出目录>' >&2
     exit 2
 }
 options=()

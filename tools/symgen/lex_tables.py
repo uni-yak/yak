@@ -16,7 +16,7 @@ PARTITION_CODES = {
 
 # 从子目录直接执行时也复用产物摘要校验。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from pe_digest import PETimestampError, check_pe_digest
+from pe_digest import PETimestampError, check_artifact_digest
 
 # 这些配置行不生成 min 分派项，但必须保留声明式语法和显式编号。
 DECLARATIONS = re.compile(
@@ -198,7 +198,7 @@ def main(argv=None):
     """运行生成或只读校验，非法配置在写出前拒绝。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
-    parser.add_argument("--check-artifact", type=Path, metavar="PE", help="校验生成表与 AMD64 PE 内嵌摘要")
+    parser.add_argument("--check-artifact", type=Path, metavar="ARTIFACT", help="校验生成表与 AMD64 PE / 静态 ELF 内嵌摘要")
     args = parser.parse_args(argv)
     try:
         text, digest = build_table()
@@ -211,7 +211,7 @@ def main(argv=None):
             return 1
         if args.check_artifact is not None:
             try:
-                check_pe_digest(args.check_artifact, digest, ARTIFACT_DIGEST_PREFIX, ARTIFACT_DIGEST_SUFFIX, "符号表")
+                check_artifact_digest(args.check_artifact, digest, ARTIFACT_DIGEST_PREFIX, ARTIFACT_DIGEST_SUFFIX, "符号表")
             except PETimestampError as error:
                 print(error, file=sys.stderr)
                 return 1

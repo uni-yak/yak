@@ -62,7 +62,7 @@
 - **双级门禁与可移植 Shell**：开发跑快速门禁，提交/升级跑完整门禁（见 `spec/proc/gate.md`）；全部构建与门禁脚本遵守 `spec/proc/shell.md` 白名单并通过 `python tools/shell_contract.py --strict`。
 - **跨平台目标边界**：
   - T1 的 Windows x64 PE 构建在 MSYS2 UCRT64 或配置了 MinGW-w64 的 Linux 宿主运行；Linux 上使用冻结 PE Seed 或运行 Win64 PE 时必须显式设置 `YAK_PE_RUNNER`（`--no-run` 只跳过目标 EXE，不跳过 PE Seed）。
-  - 通用 base 与独立 LSP 的 Linux x86_64 静态 ELF 构建需显式 `--target linux-x64` 并成对提供 `--native-compiler` 与 `--native-scanner`，仅从源码构建 Linux 运行时（不接受 `YAK_RUNTIME_OBJ` 或冻结 Seed）。
+  - 通用 base、正式自举根（`main.yak` / `imports.yak`）与独立 LSP 的 Linux x86_64 静态 ELF 构建需显式 `--target linux-x64` 并成对提供 `--native-compiler` 与 `--native-scanner`（支持静态 Linux ELF 直接原生执行且无需 `YAK_PE_RUNNER`，亦兼容 Win64 PE 交叉接力），仅从源码构建 Linux 运行时（不接受 `YAK_RUNTIME_OBJ` 或冻结 Seed）。
 - **可信 CI 与 Seed 退役红线**：按 `spec/proc/fixpoint.md` 2.6 与 `spec/proc/seed.md` 3.1，本地 Windows、WSL 或局域网 SSH 隔离复验不替代可信 `main` 远端 Linux CI 发布归档；取得正式 CI 归档前不得晋升产物、冻结规格或退役 `seed/out/yak-seed.exe`。
 
 ## 七、常用命令

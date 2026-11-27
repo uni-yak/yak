@@ -100,6 +100,55 @@ yak_run_pe() {
     if [[ -n ${YAK_PE_RUNNER:-} ]]; then "$YAK_PE_RUNNER" "$@"; else "$@"; fi
 }
 
+# 按前 4 字节魔数识别可执行文件格式（pe / elf / unknown）。
+yak_binary_kind() {
+    local magic
+    magic=$(od -An -v -tx1 -N4 -- "$1" | tr -d '[:space:]') || {
+        printf '错误：无法读取可执行文件头：%s\n' "$1" >&2
+        return 1
+    }
+    case $magic in
+        4d5a*) printf 'pe\n' ;;
+        7f454c46) printf 'elf\n' ;;
+        *) printf 'unknown\n' ;;
+    esac
+}
+
+# 按二进制格式构造原生编译器/扫描器执行命令；Linux 上静态 ELF 直接执行，无需 YAK_PE_RUNNER。
+yak_native_command() {
+    local kind
+    local -n command_out=$2
+    kind=$(yak_binary_kind "$1") || return 1
+    case $kind in
+        elf)
+            if [[ ${OSTYPE:-} != linux* ]]; then
+                printf '错误：当前宿主不能直接运行 ELF 原生工具：%s\n' "$1" >&2
+                return 1
+            fi
+            command_out=("$1")
+            ;;
+        pe)
+            if [[ ${OSTYPE:-} == linux* ]]; then
+                yak_pe_runner || return 1
+                command_out=("$YAK_PE_RUNNER" "$1")
+            else
+                command_out=("$1")
+            fi
+            ;;
+        *)
+            printf '错误：原生工具不是有效的 Win64 PE 或静态 Linux ELF 产物：%s\n' "$1" >&2
+            return 1
+            ;;
+    esac
+}
+
+yak_run_native() {
+    local -a cmd=()
+    yak_native_command "$1" cmd || return 1
+    shift
+    "${cmd[@]}" "$@"
+}
+
 # 按数字分段比较版本：actual >= minimum 返回 0，其余（含非数字或空串）返回 1。
 yak_version_ge() {
     local actual=${1%$'\r'} minimum=${2%$'\r'}

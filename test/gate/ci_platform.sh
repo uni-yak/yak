@@ -24,9 +24,9 @@ source tools/target.sh
 unset YAK_RUNTIME_OBJ
 export YAK_SEED_BIN="$evidence/absent-seed.exe"
 [[ ! -e $YAK_SEED_BIN && ! -L $YAK_SEED_BIN ]] || fail 'Seed 禁用路径已被占用'
-main="$candidate/c2/out/main.exe"
-scanner="$candidate/c2/out/imports.exe"
-pair=(--native-compiler "$main" --native-scanner "$scanner")
+main=""
+scanner=""
+pair=()
 server="$evidence/server"
 source test/gate/ci_runner_env.sh
 YAK_CI_NVIM=$(yak_ci_find_editor "$target" nvim "${YAK_CI_NVIM:-}") ||
@@ -54,6 +54,9 @@ case $target in
     win-x64)
         [[ ${MSYSTEM:-} == UCRT64 ]] || fail 'Windows 作业须在 MSYS2 UCRT64 中运行'
         unset YAK_PE_RUNNER
+        main="$candidate/c2/out/main.exe"
+        scanner="$candidate/c2/out/imports.exe"
+        pair=(--native-compiler "$main" --native-scanner "$scanner")
         label=win64
         extension=exe
         cc=$(yak_target_cc)
@@ -69,25 +72,23 @@ case $target in
         ;;
     linux-x64)
         [[ $OSTYPE == linux* && $HOSTTYPE == x86_64 ]] || fail 'Linux 作业须在 Linux x86-64 上运行'
-        export YAK_PE_RUNNER=${YAK_CI_WINE:-wine}
-        export WINEPREFIX="${RUNNER_TEMP:-$(pwd -P)/test/gate/tmp}/yak-wine-platform" WINEDEBUG=-all
-        mkdir -p -- "$WINEPREFIX"
+        unset YAK_PE_RUNNER
+        main="$candidate/elf-c2/out/main.elf"
+        scanner="$candidate/elf-c2/out/imports.elf"
+        chmod +x -- "$main" "$scanner" "$candidate/elf-c3/out/main.elf" "$candidate/elf-c3/out/imports.elf"
+        pair=(--native-compiler "$main" --native-scanner "$scanner")
         label=linux-x64
         extension=elf
         record elf-gcc -- "${YAK_ELF_CC:-gcc}" -v
         record elf-as -- "${YAK_ELF_AS:-as}" --version
         record elf-ld -- "${YAK_ELF_LD:-ld}" --version
-        record pe-runner -- "$YAK_PE_RUNNER" --version
-        "$YAK_PE_RUNNER" reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Auto /t REG_SZ /d 1 /f >/dev/null 2>&1 || true
-        "$YAK_PE_RUNNER" reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Debugger /t REG_SZ /d __yak_no_debugger__ /f >/dev/null 2>&1 || true
-        "$YAK_PE_RUNNER" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1 || true
         record linux-runtime -- bash test/gate/test_linux_runtime.sh
         record syscall -- bash test/gate/test_sysv_syscall_rejection.sh
         ;;
     *) fail "未知目标：$target" ;;
 esac
 
-# 在正负例之前先通过正式入口构建一次语言服务，同时完成 Wine 前缀的串行预热。
+# 通过正式入口构建语言服务；Linux 端全程使用原生静态 ELF 编译器与扫描器。
 record lsp-build -- bash compiler/lsp/build.sh --target "$target" "${pair[@]}" "$server"
 exe="$server/yak_lsp.$extension"
 if [[ $target == linux-x64 ]]; then
@@ -98,7 +99,7 @@ if [[ $target == linux-x64 ]]; then
     record lsp-owner-match -- cmp -- "$server/.yak_lsp.yak-root" "$second/.yak_lsp.yak-root"
     # 紧接两次 LSP 构建之后复验其临时目录清理，避免被 base-linux 末尾故障回滚测试留下的诊断目录干扰。
     record lsp-linux-boundary -- bash test/gate/test_lsp_linux_build.sh "$main" "$scanner" --verified-output "$server"
-    record base-linux -- bash test/gate/test_base_linux_build.sh "$main" "$scanner" "$candidate/runtime.obj"
+    record base-linux -- bash test/gate/test_base_linux_build.sh "$main" "$scanner"
 fi
 record corpus -- bash test/gate/test_base_selfhost_candidate.sh --verify-run "$candidate" --platform "$target"
 record lsp-protocol -- python test/gate/lsp_p4_check.py "$exe"
@@ -120,8 +121,11 @@ if [[ $target == win-x64 ]]; then
         "$evidence/windows-package/main.exe" "$evidence/windows-package/imports.exe" \
         "$evidence/windows-package/yak_lsp.exe" "$evidence/windows-package/runtime.obj"
 else
-    record package -- tar -czf "$delivery/yak-lsp-linux-x86-64.tar.gz" \
-        -C "$server" -- yak_lsp.elf .yak_lsp.yak-root
+    mkdir -- "$evidence/linux-package"
+    cp --preserve=mode -- "$main" "$scanner" "$exe" "$evidence/linux-package/"
+    cp -- "$server/.yak_lsp.yak-root" "$evidence/linux-package/"
+    record package -- tar -czf "$delivery/yak-linux-x86-64.tar.gz" \
+        -C "$evidence/linux-package" -- main.elf imports.elf yak_lsp.elf .yak_lsp.yak-root
 fi
 record platform -- python test/gate/ci_artifacts.py platform "$candidate" "$commit" "$run" \
     --target "$target" --output "$delivery"

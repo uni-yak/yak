@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -12,10 +13,12 @@ from pathlib import Path
 from test_diag_contract import Failure, parse_jsonl
 
 TARGETS = ("win-x64", "linux-x64")
-CANDIDATE_FILES = tuple(
-    f"{stage}/out/{tool}.exe" for stage in ("c2", "c3") for tool in ("main", "imports")
-) + ("runtime.obj",)
-PACKAGES = {"win-x64": "yak-windows-x64.zip", "linux-x64": "yak-lsp-linux-x86-64.tar.gz"}
+CANDIDATE_FILES = (
+    tuple(f"{stage}/out/{tool}.exe" for stage in ("c2", "c3") for tool in ("main", "imports"))
+    + tuple(f"elf-{stage}/out/{tool}.elf" for stage in ("c2", "c3") for tool in ("main", "imports"))
+    + ("runtime.obj",)
+)
+PACKAGES = {"win-x64": "yak-windows-x64.zip", "linux-x64": "yak-linux-x86-64.tar.gz"}
 CASE_RESULT = re.compile(r"^\[通过\] (positive|negative|graph) (test/[^：]+)：")
 
 
@@ -45,6 +48,8 @@ def publish_candidate(args):
         target = args.output / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+        if name.endswith(".elf"):
+            os.chmod(target, 0o755)
     write_json(args.output / "candidate.json", {"commit": args.commit, "run": args.run, "files": hashes})
 
 

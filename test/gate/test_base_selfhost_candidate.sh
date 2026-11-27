@@ -19,6 +19,8 @@ verify_arg=""
 defer_semantics=0
 semantic_target=win-x64
 platform_check=0
+platform_stage_prefix=""
+platform_tool_suffix="exe"
 selected_cases=()
 self_test=0
 run_root=""
@@ -724,8 +726,8 @@ run_graph_case() {
         roots+=(--module-root "$case_root/other-root")
     fi
     for side in c2 c3; do
-        args=("$work/${src##*/}" "${roots[@]}" --native-compiler "$run_root/$side/out/main.exe"
-              --native-scanner "$run_root/$side/out/imports.exe" --out-dir "$case_root/$side-publish"
+        args=("$work/${src##*/}" "${roots[@]}" --native-compiler "$run_root/${platform_stage_prefix}${side}/out/main.${platform_tool_suffix}"
+              --native-scanner "$run_root/${platform_stage_prefix}${side}/out/imports.${platform_tool_suffix}" --out-dir "$case_root/$side-publish"
               --audit-dir "$case_root/$side-audit")
         if [[ $semantic_target == linux-x64 ]]; then args+=(--target linux-x64); fi
         {
@@ -766,13 +768,13 @@ run_semantic_case() {
         run_graph_case "$src" "$case_root"
         return
     fi
-    run_semantic_side "$kind" "$src" "$case_root" c2 "$run_root/c2/out/main.exe" || return 1
-    run_semantic_side "$kind" "$src" "$case_root" c3 "$run_root/c3/out/main.exe" || return 1
+    run_semantic_side "$kind" "$src" "$case_root" c2 "$run_root/${platform_stage_prefix}c2/out/main.${platform_tool_suffix}" || return 1
+    run_semantic_side "$kind" "$src" "$case_root" c3 "$run_root/${platform_stage_prefix}c3/out/main.${platform_tool_suffix}" || return 1
     compare_semantic_case "$kind" "$src" "$case_root" "$root_name" || return 1
     if (( platform_check )) && [[ $kind == negative ]]; then
         # 固定点已逐遍对拍终端诊断；这里再对同一候选采集一次目标 JSONL。
         diagnostic="$case_root/jsonl/$root_name/$root_name.diag.jsonl"
-        if ! run_semantic_side "$kind" "$src" "$case_root" jsonl "$run_root/c2/out/main.exe" jsonl ||
+        if ! run_semantic_side "$kind" "$src" "$case_root" jsonl "$run_root/${platform_stage_prefix}c2/out/main.${platform_tool_suffix}" jsonl ||
             [[ $(<"$case_root/jsonl.rc") != 1 || -s $case_root/jsonl-link.stdout ]] ||
             ! check_negative_artifacts "$case_root/jsonl" "${diagnostic%/*}" "${diagnostic##*/}" ||
             ! python -X utf8 -B test/gate/ci_artifacts.py jsonl "$diagnostic" "$root_name" "${semantic_diagnostics[@]}" \
@@ -947,13 +949,23 @@ run_platform_cases() {
 # 平台作业只使用封存的两遍构建工具。每个原生结果保留实际命令和原始回执。
 verify_platform() {
     local pass tool
-    case "$semantic_target:$OSTYPE:${YAK_PE_RUNNER:-}" in
-        win-x64:msys*:|win-x64:cygwin*:|linux-x64:linux*:?*) ;;
-        *) unavailable "目标与原生验证宿主不符：$semantic_target / $OSTYPE" ;;
-    esac
+    platform_stage_prefix=""
+    platform_tool_suffix="exe"
+    if [[ $semantic_target == linux-x64 && $OSTYPE == linux* ]] &&
+       [[ -s $run_root/elf-c2/out/main.elf && -s $run_root/elf-c2/out/imports.elf &&
+          -s $run_root/elf-c3/out/main.elf && -s $run_root/elf-c3/out/imports.elf ]]; then
+        platform_stage_prefix="elf-"
+        platform_tool_suffix="elf"
+    else
+        case "$semantic_target:$OSTYPE:${YAK_PE_RUNNER:-}" in
+            win-x64:msys*:|win-x64:cygwin*:|linux-x64:linux*:?*) ;;
+            *) unavailable "目标与原生验证宿主不符：$semantic_target / $OSTYPE" ;;
+        esac
+    fi
     for pass in c2 c3; do
         for tool in main imports; do
-            [[ -s $run_root/$pass/out/$tool.exe ]] || unavailable "缺少 $pass/$tool.exe"
+            [[ -s $run_root/${platform_stage_prefix}${pass}/out/${tool}.${platform_tool_suffix} ]] ||
+                unavailable "缺少 ${platform_stage_prefix}${pass}/${tool}.${platform_tool_suffix}"
         done
     done
     logdir=$(new_temp_dir "$run_root/platform-$semantic_target") || die '无法创建平台证据目录'

@@ -4,10 +4,10 @@ set -euo pipefail
 export LC_ALL=C TZ=UTC
 
 usage() {
-    printf '%s\n' '用法：bash compiler/min/build.sh ROOT [--target win-x64|linux-x64] [--module-root DIR]... [--out-dir DIR] [--audit-dir DIR] [--require-frozen-seed | --native-compiler EXE --native-scanner EXE]'
-    printf '%s\n' 'Linux x86-64：显式使用 --target linux-x64 并指定原生编译器与扫描器；自举根仍只构建 Win64，独立 LSP 不启用审计。'
+    printf '%s\n' '用法：bash compiler/min/build.sh ROOT [--target win-x64|linux-x64] [--module-root DIR]... [--out-dir DIR] [--audit-dir DIR] [--require-frozen-seed | --native-compiler TOOL --native-scanner TOOL]'
+    printf '%s\n' 'Linux x86-64：显式使用 --target linux-x64 并指定原生编译器与扫描器（静态 Linux ELF 直接执行，亦兼容 Win64 PE 交叉接力）；独立 LSP 不启用审计。'
     printf '%s\n' '目录相对仓库根。默认源根为 ROOT 的父目录，默认发布到 compiler/min/out。根级产物目录限 tmp 或 out。'
-    printf '%s\n' '环境变量：YAK_SEED_BIN（宿主可运行的 Seed）、YAK_TARGET_CC（Windows x64 GCC）、YAK_RUNTIME_OBJ（目标运行时）、YAK_PE_RUNNER（Linux 运行 PE 工具）。'
+    printf '%s\n' '环境变量：YAK_SEED_BIN（宿主可运行的 Seed）、YAK_TARGET_CC（Windows x64 GCC）、YAK_RUNTIME_OBJ（目标运行时）、YAK_PE_RUNNER（仅 Linux 运行 PE 工具时使用）。'
 }
 
 fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -44,7 +44,7 @@ while (( $# )); do
             target=$2; shift 2 ;;
         --require-frozen-seed) require_frozen_seed=1; shift ;;
         --native-compiler|--native-scanner)
-            (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] || usage_error "$1 缺少 EXE 路径"
+            (( $# >= 2 )) && [[ -n $2 && $2 != -* ]] || usage_error "$1 缺少工具路径"
             case $1 in
                 --native-compiler) [[ -z $native_compiler ]] || usage_error "$1 重复"; native_compiler=$2 ;;
                 --native-scanner) [[ -z $native_scanner ]] || usage_error "$1 重复"; native_scanner=$2 ;;
@@ -98,7 +98,6 @@ if [[ -n $native_compiler || -n $native_scanner ]]; then
     [[ $native_compiler == */* ]] || native_compiler="./$native_compiler"
     [[ $native_scanner == */* ]] || native_scanner="./$native_scanner"
     [[ -f $native_compiler && -f $native_scanner ]] || fail '缺少原生编译器或扫描器'
-    yak_pe_runner || exit 1
 fi
 
 # 参数是仓库相对路径；将物理路径转换回仓库内的规范相对路径。
@@ -122,11 +121,8 @@ esac
 source_dir=$(relative "${source_dir:-/}") || usage_error '根模块必须位于仓库内'
 source_file="$source_dir/${source_file##*/}"
 source_file=${source_file#./}
-if [[ $target == linux-x64 ]]; then
-    case $source_file in
-        compiler/min/src/main.yak|compiler/min/src/imports.yak) usage_error '自举编译器和扫描器只接受 Windows x64 目标' ;;
-        compiler/lsp/yak_lsp.yak) [[ -z $audit ]] || usage_error 'Linux LSP 不启用审计镜像' ;;
-    esac
+if [[ $target == linux-x64 && $source_file == compiler/lsp/yak_lsp.yak && -n $audit ]]; then
+    usage_error 'Linux LSP 不启用审计镜像'
 fi
 [[ -f $source_file && ! -L $source_file ]] || fail "根模块不存在或不是普通文件：$source_file"
 if (( ${#roots[@]} == 0 )); then roots=("$source_dir"); fi
@@ -236,8 +232,6 @@ if [[ $target == linux-x64 ]]; then
     binutils_pin "$YAK_ELF_LD" elf_binutils 'GNU ld'
     python_version=$(python -c 'import sys; print(".".join(map(str, sys.version_info[:3])))') || fail '无法读取 Python 版本'
     pin python "$python_version"
-    python -X utf8 -B tools/coff_sections.py --runtime-pe -- "$native_compiler" || fail 'ELF 构建的原生编译器不是有效的 Win64 产物'
-    python -X utf8 -B tools/coff_sections.py --runtime-pe -- "$native_scanner" || fail 'ELF 构建的原生扫描器不是有效的 Win64 产物'
 else
     cc=$(yak_target_cc) || exit 1
     export YAK_TARGET_CC="$cc"
@@ -246,7 +240,32 @@ else
     linker=$("$cc" -print-prog-name=ld) || fail '无法定位目标 GCC 链接器'
     binutils_pin "${linker%$'\r'}" binutils
 fi
-if [[ -z $native_compiler ]]; then
+native_compiler_cmd=()
+native_scanner_cmd=()
+check_native_tool() {
+    local label=$1 path=$2 out_ref=$3 kind
+    kind=$(yak_binary_kind "$path") || fail "无法读取原生${label}文件头：$path"
+    if [[ $target == linux-x64 ]]; then
+        case $kind in
+            elf)
+                python -X utf8 -B tools/elf_headers.py executable -- "$path" ||
+                    fail "ELF 构建的原生${label}不是有效的 Win64 PE 或静态 Linux ELF 产物"
+                ;;
+            pe)
+                python -X utf8 -B tools/coff_sections.py --runtime-pe -- "$path" ||
+                    fail "ELF 构建的原生${label}不是有效的 Win64 PE 或静态 Linux ELF 产物"
+                ;;
+            *)
+                fail "ELF 构建的原生${label}不是有效的 Win64 PE 或静态 Linux ELF 产物"
+                ;;
+        esac
+    fi
+    yak_native_command "$path" "$out_ref" || exit 1
+}
+if [[ -n $native_compiler ]]; then
+    check_native_tool 编译器 "$native_compiler" native_compiler_cmd
+    check_native_tool 扫描器 "$native_scanner" native_scanner_cmd
+else
     bin=$(yak_seed_path)
     [[ -f $bin ]] || fail "缺少种子解释器：$bin"
     # 显式路径也可能指向已安装的冻结件；其他宿主产物由调用方核验。
@@ -362,7 +381,7 @@ scanner=(
 run_scanner() {
     if [[ -n $native_scanner ]]; then
         yak_stream_request "$work/scan.request" "$1" "$2" || return 1
-        yak_run_pe "$native_scanner" < "$work/scan.request"
+        "${native_scanner_cmd[@]}" < "$work/scan.request"
     else
         local -n scanner_pos=$1 scanner_inputs=$2
         local -a registry=()
@@ -445,10 +464,10 @@ fi
 linked="$work/link/$root_name"
 # 在归属标记、旧产物和发布目录尚未改动时核对内嵌摘要。
 if [[ -n $error_table ]]; then
-    python tools/error_codes.py --check-artifact "$linked/$root_name.exe" --output "$error_table" || fail '错误码表产物校验失败'
+    python tools/error_codes.py --check-artifact "$linked/$root_name.$exe_suffix" --output "$error_table" || fail '错误码表产物校验失败'
 fi
 if (( symbol_table )); then
-    python tools/symgen/lex_tables.py --check-artifact "$linked/$root_name.exe" || fail '符号表产物校验失败'
+    python tools/symgen/lex_tables.py --check-artifact "$linked/$root_name.$exe_suffix" || fail '符号表产物校验失败'
 fi
 
 [[ ! -L $exe && ( ! -e $exe || -f $exe ) ]] || fail "发布目标不是普通文件：$exe"

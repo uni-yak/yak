@@ -29,16 +29,14 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
-      - name: 安装交叉工具链、Wine、Xvfb、Neovim 与 VS Code
+      - name: 安装原生验收用 Xvfb、Neovim 与 VS Code
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 wine xvfb dbus-x11 neovim
+          sudo apt-get install -y --no-install-recommends xvfb dbus-x11 neovim
           curl -fsSL 'https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64' -o /tmp/vscode.deb
           sudo apt-get install -y /tmp/vscode.deb
           rm -f /tmp/vscode.deb
-          x86_64-w64-mingw32-gcc --version | head -n 1
-          wine --version
           nvim --version | head -n 1
           test -x /usr/share/code/code
       - name: 核对候选运行的来源
@@ -62,17 +60,8 @@ jobs:
           CANDIDATE_RUN: ${{ inputs.candidate_run }}
           YAK_CI_NVIM: ${{ vars.YAK_LINUX_NVIM }}
           YAK_CI_CODE: ${{ vars.YAK_LINUX_CODE }}
-          YAK_CI_WINE: ${{ vars.YAK_CI_WINE }}
           YAK_CI_CASE_JOBS: ${{ vars.YAK_LINUX_CASE_JOBS }}
-          WINEPREFIX: ${{ runner.temp }}/yak-wine-platform
-        run: |
-          mkdir -p "$WINEPREFIX"
-          wineserver_bin=$(command -v wineserver || echo /usr/lib/wine/wineserver)
-          if [[ -x $wineserver_bin ]]; then
-            WINEDEBUG=-all "$wineserver_bin" -p
-            trap 'WINEDEBUG=-all "$wineserver_bin" -k >/dev/null 2>&1 || true' EXIT
-          fi
-          bash test/gate/ci_platform.sh linux-x64 "$SOURCE_COMMIT" "$CANDIDATE_RUN"
+        run: bash test/gate/ci_platform.sh linux-x64 "$SOURCE_COMMIT" "$CANDIDATE_RUN"
       - name: 上传已验收的分发包
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

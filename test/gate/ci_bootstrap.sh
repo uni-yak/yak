@@ -51,6 +51,13 @@ record sysv-abi -- bash test/gate/test_sysv_target_rejections.sh
 candidate=test/gate/tmp/ci-bootstrap-candidate
 record selfhost -- bash test/gate/test_base_selfhost_candidate.sh --out-dir "$candidate" --defer-semantics
 record native-commands -- python test/gate/t2_stage_fixpoint_gate.py --commands "$candidate/logs/commands.txt"
+record linux-selfhost -- bash test/gate/test_linux_selfhost_fixpoint.sh \
+    "$candidate/c2/out/main.exe" "$candidate/c2/out/imports.exe" --out-dir "$candidate/linux-selfhost"
+mkdir -p -- "$candidate/elf-c2/out" "$candidate/elf-c3/out"
+cp --preserve=mode -- "$candidate/linux-selfhost/elf-c2/out/main.elf" "$candidate/linux-selfhost/elf-c2/out/imports.elf" \
+    "$candidate/elf-c2/out/"
+cp --preserve=mode -- "$candidate/linux-selfhost/elf-c3/out/main.elf" "$candidate/linux-selfhost/elf-c3/out/imports.elf" \
+    "$candidate/elf-c3/out/"
 cp -- runtime/out/win_x64/runtime.obj "$candidate/runtime.obj"
 record seal -- python test/gate/ci_artifacts.py candidate "$candidate" "$commit" "$run" \
     --output "$root/test/gate/tmp/ci-candidate"

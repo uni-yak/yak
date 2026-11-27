@@ -26,7 +26,7 @@ usage() {
     echo "  --expect-stdout <文本>  断言标准输出（精确字节，不含隐式换行）"
     echo "  --module-name <身份>    按源顺序指定模块身份（默认取基名）；身份段用 :: 分隔"
     echo "  --dependency-closure <列表>  每源单元的前序依赖闭包（空格分隔，允许空列表）"
-    echo "  --native-compiler <EXE>  用原生流式驱动替代 Seed"
+    echo "  --native-compiler <工具> 用原生流式驱动（PE 或静态 ELF）替代 Seed"
     echo "  --emit-ysm              每单元额外发射 .ysm（驱动需识别位置参数 --emit-ysm）"
     echo "  --diag=jsonl            诊断改走逐行 JSONL 帧，写到失败现场 <产物>.diag.jsonl"
     echo "  链接产物校验使用 Python 3。"
@@ -143,7 +143,7 @@ if [[ $target == linux-x64 ]]; then
 elif (( !objects_only )); then
     cc=$(yak_target_cc) || exit 2
 fi
-if [[ -n $native_compiler ]] || { (( do_run )) && [[ $target == win-x64 ]]; }; then yak_pe_runner || exit 2; fi
+if (( do_run )) && [[ $target == win-x64 ]]; then yak_pe_runner || exit 2; fi
 
 # 身份默认取源文件基名（去 .yak）；新入口传入相对源根的 a::b 形态。
 # 只校验身份的分段语法，不把 :: 改成下划线：.iface 与修饰名必须保留源身份。
@@ -213,9 +213,11 @@ if (( !objects_only )) && [[ -n $runtime && ! -f $runtime ]]; then
     echo "错误：缺少运行时对象 $runtime，请先执行 (cd runtime && bash build.sh)" >&2
     exit 1
 fi
+native_compiler_cmd=()
 if [[ -n $native_compiler ]]; then
     [[ $native_compiler == */* ]] || native_compiler="./$native_compiler"
     [[ -f $native_compiler ]] || { echo "错误：缺少原生编译器 $native_compiler" >&2; exit 1; }
+    yak_native_command "$native_compiler" native_compiler_cmd || exit 2
 else
     bin=$(yak_seed_path)
     [[ -f $bin ]] || { echo "错误：缺少种子解释器 $bin，请先构建 seed 或用 YAK_SEED_BIN 指定" >&2; exit 1; }
@@ -335,7 +337,7 @@ modules=(
 compile_native_unit() {
     local request="$dir/driver.request" response="$dir/driver.response" rc
     yak_stream_request "$request" pos native_inputs || return 1
-    if yak_run_pe "$native_compiler" < "$request" > "$response"; then
+    if "${native_compiler_cmd[@]}" < "$request" > "$response"; then
         if ! yak_stream_extract "$response" native_outputs; then
             printf '%s\n' '错误：原生编译器产物帧无效' >&2
             return 1

@@ -6,13 +6,23 @@ script=${BASH_SOURCE[0]}
 [[ $script == */* ]] || script=./$script
 cd -P -- "${script%/*}/../.."
 if (( $# == 1 )) && [[ $1 == --help || $1 == -h ]]; then
-    printf '%s\n' '用法：bash compiler/min/selfhost.sh [--out-dir DIR] [--audit-dir DIR] [--native-compiler EXE --native-scanner EXE]'
+    printf '%s\n' '用法：bash compiler/min/selfhost.sh [--target win-x64|linux-x64] [--out-dir DIR] [--audit-dir DIR] [--native-compiler TOOL --native-scanner TOOL]'
     exit 0
 fi
 args=()
 native=0
+target=win-x64
 while (( $# )); do
     case $1 in
+        --target)
+            if (( $# < 2 )) || [[ $2 != win-x64 && $2 != linux-x64 ]]; then
+                printf '错误：%s 缺少或无效目标\n' "$1" >&2
+                exit 2
+            fi
+            target=$2
+            args+=("$1" "$2")
+            shift 2
+            ;;
         --out-dir|--audit-dir|--native-compiler|--native-scanner)
             if (( $# < 2 )) || [[ -z $2 || $2 == -* ]]; then
                 printf '错误：%s 缺少目录\n' "$1" >&2
@@ -25,7 +35,7 @@ while (( $# )); do
         *) printf '错误：未知自举选项 %s\n' "$1" >&2; exit 2 ;;
     esac
 done
-if (( native == 0 )); then args+=(--require-frozen-seed); fi
+if (( native == 0 )) && [[ $target == win-x64 ]]; then args+=(--require-frozen-seed); fi
 
 source tools/target.sh
 # 预检在构建编译器和扫描器之前拒绝陈旧或缺失的错误码表。

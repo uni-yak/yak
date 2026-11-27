@@ -10,11 +10,13 @@ cd -P -- "${script%/*}/../.."
 fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
 [[ ${OSTYPE:-} == linux* && ${HOSTTYPE:-} == x86_64 ]] || fail '此构建门禁只在 Linux x86-64 上运行'
 if (( $# != 2 )) && { (( $# != 4 )) || [[ $3 != --verified-output || -z $4 ]]; }; then
-    printf '%s\n' '用法：YAK_PE_RUNNER=wine bash test/gate/test_lsp_linux_build.sh 编译器.EXE 扫描器.EXE [--verified-output DIR]' >&2
+    printf '%s\n' '用法：bash test/gate/test_lsp_linux_build.sh <编译器> <扫描器> [--verified-output DIR]' >&2
     exit 2
 fi
 main=$1 scanner=$2
-[[ -f $main && -f $scanner && ! $main -ef $scanner ]] || fail '需要两个不同的原生 Win64 工具'
+[[ -f $main && -f $scanner && ! $main -ef $scanner ]] || fail '需要两个不同的原生构建工具（静态 ELF 或 Win64 PE）'
+source tools/target.sh
+tool_kind=$(yak_binary_kind "$main") || fail '无法识别编译器文件格式'
 mkdir -p -- test/gate/tmp
 work=$(mktemp -d test/gate/tmp/lsp-linux-build.XXXXXXXX)
 printf 'Linux LSP evidence: %s\n' "$work"
@@ -43,10 +45,10 @@ reject wrapper-usage 2 '用法：' "${entry[@]}" "$absent"
 reject pair-required 2 '须同时指定原生编译器和扫描器' "${direct[@]}" --out-dir "$absent"
 reject audit-forbidden 2 '不启用审计镜像' "${direct[@]}" "${pair[@]}" --out-dir "$absent" --audit-dir "$absent/audit"
 reject seed-forbidden 2 '原生模式不能要求冻结 Seed' "${direct[@]}" "${pair[@]}" --out-dir "$absent" --require-frozen-seed
-reject root-forbidden 2 '自举编译器和扫描器只接受 Windows x64 目标' bash compiler/min/build.sh compiler/min/src/imports.yak \
-    --target linux-x64 "${pair[@]}" --out-dir "$absent"
 reject runtime-forbidden 2 '不接受 YAK_RUNTIME_OBJ' env YAK_RUNTIME_OBJ="$main" "${entry[@]}" "${pair[@]}" "$absent"
-reject runner-required 1 '须设置 YAK_PE_RUNNER' env -u YAK_PE_RUNNER "${entry[@]}" "${pair[@]}" "$absent"
+if [[ $tool_kind == pe ]]; then
+    reject runner-required 1 '须设置 YAK_PE_RUNNER' env -u YAK_PE_RUNNER "${entry[@]}" "${pair[@]}" "$absent"
+fi
 [[ ! -e "$absent/audit" ]] || fail '拒绝用例留下审计镜像'
 
 # 只伪造版本响应以触发拒绝；不让替身参与编译或链接。
@@ -57,11 +59,14 @@ printf '%s\n' '#!/usr/bin/env bash' '[[ $# == 1 && $1 == --version ]] || exit 97
 chmod +x -- "$work/drift-gcc" "$work/drift-ld"
 reject gcc-drift 1 'elf_gcc 版本漂移' env YAK_ELF_CC="$work/drift-gcc" "${entry[@]}" "${pair[@]}" "$absent"
 reject ld-drift 1 'elf_binutils 版本漂移' env YAK_ELF_LD="$work/drift-ld" "${entry[@]}" "${pair[@]}" "$absent"
-printf '不是 Win64 PE\n' > "$work/not-pe"
-reject compiler-format 1 '原生编译器不是有效的 Win64 产物' "${entry[@]}" \
-    --native-compiler "$work/not-pe" --native-scanner "$scanner" "$absent"
-reject scanner-format 1 '原生扫描器不是有效的 Win64 产物' "${entry[@]}" \
-    --native-compiler "$main" --native-scanner "$work/not-pe" "$absent"
+printf '不是有效可执行文件\n' > "$work/not-bin"
+printf '\177ELF损坏头\n' > "$work/bad-elf"
+reject compiler-format 1 '原生编译器不是有效的 Win64 PE 或静态 Linux ELF 产物' "${entry[@]}" \
+    --native-compiler "$work/not-bin" --native-scanner "$scanner" "$absent"
+reject scanner-format 1 '原生扫描器不是有效的 Win64 PE 或静态 Linux ELF 产物' "${entry[@]}" \
+    --native-compiler "$main" --native-scanner "$work/not-bin" "$absent"
+reject compiler-bad-elf 1 '原生编译器不是有效的 Win64 PE 或静态 Linux ELF 产物' "${entry[@]}" \
+    --native-compiler "$work/bad-elf" --native-scanner "$scanner" "$absent"
 
 if (( $# == 2 )); then
     record build -- timeout -k 15s 2700s "${entry[@]}" "${pair[@]}" "$out"

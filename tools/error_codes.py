@@ -8,7 +8,7 @@ import sys
 
 # 固定版本的嵌入式 Python 也能加载同目录的产物校验。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pe_digest import check_pe_digest as check_artifact_digest
+from pe_digest import check_artifact_digest
 
 # 仓库根由脚本位置推出，生成结果不受当前工作目录影响。
 ROOT = Path(__file__).resolve().parents[1]
@@ -572,7 +572,7 @@ def check_pe_digest(artifact, expected):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="只校验生成文件是否与配置源一致")
-    parser.add_argument("--check-artifact", type=Path, metavar="PE", help="校验生成表及 AMD64 PE 内嵌摘要")
+    parser.add_argument("--check-artifact", type=Path, metavar="ARTIFACT", help="校验生成表及 AMD64 PE / 静态 ELF 内嵌摘要")
     parser.add_argument("--output", type=Path, default=OUTPUT, help="生成文件写入位置")
     parser.add_argument("--source", type=Path, default=SOURCE, help="配置源位置（测试可用）")
     parser.add_argument("--history-file", type=Path, help="ER-3 独立历史基线（默认在配置源旁）")

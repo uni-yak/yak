@@ -217,7 +217,7 @@
 
 ### 独立 Linux x86-64 构建与交付
 
-- Linux x86-64 宿主上，用 `bash compiler/lsp/build.sh --target linux-x64 --native-compiler EXE --native-scanner EXE <仓库内输出目录>` 构建 `yak_lsp.elf`。该包装入口固定使用 `compiler/lsp/yak_lsp.yak` 为根，不启用审计镜像，也不执行 Seed 或接收预制 `YAK_RUNTIME_OBJ`。调用方须事先核验 Win64 编译器和扫描器的来源及摘要，设置能接收 EXE 路径并完整传递标准流和退出码的 `YAK_PE_RUNNER`；此运行器只用于构建器，语言服务本身由 Linux 直接执行。
+- Linux x86-64 宿主上，用 `bash compiler/lsp/build.sh --target linux-x64 --native-compiler TOOL --native-scanner TOOL <仓库内输出目录>` 构建 `yak_lsp.elf`。该包装入口固定使用 `compiler/lsp/yak_lsp.yak` 为根，不启用审计镜像，也不执行 Seed 或接收预制 `YAK_RUNTIME_OBJ`。调用方须事先核验编译器和扫描器的来源及摘要：优先传入原生静态 Linux x86-64 ELF 工具由宿主直接执行（无需 `YAK_PE_RUNNER`）；若使用 Win64 PE 交叉构建工具，则须设置能接收 EXE 路径并完整传递标准流和退出码的 `YAK_PE_RUNNER`，此运行器只用于构建器，语言服务本身由 Linux 直接执行。
 - Bash、GNU coreutils 和 Python 使用 `versions.lock` 的共用条目；GNU GCC 目标须为 `x86_64-linux-gnu`，GCC、独立 GNU `as`、GCC 实际选择的 GNU `as` 和 GNU `ld` 须通过该文件的 ELF 版本锁。可用 `YAK_ELF_CC`、`YAK_ELF_AS`、`YAK_ELF_LD` 指定命令（默认 `gcc`、`as`、`ld`）。共享正式入口使用相同模块图和归属检查，从运行时源码链接静态 x86-64 ELF，入口须在可执行加载段内且无解释器。仅发布 `yak_lsp.elf` 与两行 `.yak_lsp.yak-root`；失败保留原产物或回滚，不提交部分产物。
 - Linux 交付证据须记录源码、两枚构建工具、宿主工具和产物的身份，独立清冷构建比对 ELF 与归属标记的原始字节。用同一份发布入口产物直启开放管道、真实 Neovim 与 VS Code 客户端及 Linux 资源探针，保存原始命令、退出、日志及资源口径；Windows 私有提交量不能用 Linux RSS 替代。通过该边界不等于 T1 Linux CI、双目标自举或 Seed 退役。
 
