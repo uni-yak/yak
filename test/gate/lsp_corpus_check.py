@@ -10,7 +10,7 @@ import sys
 import tempfile
 from time import perf_counter_ns
 
-from lsp_frame_check import open_pipe, require
+from lsp_frame_check import candidate_capabilities, open_pipe, require
 from lsp_stress_check import Memory, PEAK_WORKING_SET_LIMIT, encoded, notice, percentile
 
 
@@ -95,7 +95,7 @@ def make_workspace(gate, work, report):
 
 def initialize_frames():
     caps = {"textDocument": {"publishDiagnostics": {"versionSupport": True}}}
-    result = {"capabilities": {"textDocumentSync": {"openClose": True, "change": 1}, "definitionProvider": True, "hoverProvider": True, "completionProvider": {}, "semanticTokensProvider": {"legend": {"tokenTypes": ["keyword", "string", "number", "operator"], "tokenModifiers": []}, "full": True}, "documentSymbolProvider": True, "foldingRangeProvider": True}}
+    result = {"capabilities": candidate_capabilities()}
     return encoded(id=1, method="initialize", params={"capabilities": caps}), encoded(id=1, result=result)
 
 
@@ -151,7 +151,8 @@ class Experiment:
 
         def barrier():
             self.identifier += 1
-            send(encoded(id=self.identifier, method="workspace/symbol", params={"query": ""}))
+            send(encoded(id=self.identifier, method="textDocument/references",
+                         params={"textDocument": {"uri": self.uri}, "position": {"line": 0, "character": 0}}))
             receive(encoded(id=self.identifier, error={"code": -32601, "message": "Method not found"}), "通知处理完成")
 
         def close(uri, group, label):
