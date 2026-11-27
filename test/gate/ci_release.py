@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from ci_artifacts import PACKAGES, digest, read_json
@@ -120,7 +121,14 @@ def draft(tag, run, directory):
             flags = ["--prerelease"] if "-rc." in tag else []
             print(gh("release", "create", tag, "--verify-tag", "--draft", "--title", tag,
                      "--notes-file", str(notes), *flags).strip())
-        release = next(value for value in releases() if value["tag_name"] == tag)
+        for attempt in range(5):
+            release = next((value for value in releases() if value["tag_name"] == tag), None)
+            if release is not None:
+                break
+            if attempt < 4:
+                time.sleep(2)
+        if release is None:
+            raise ValueError(f"草稿 Release 创建后未能从列表读回：{tag}")
     if not release["draft"]:
         raise ValueError("标签已发布")
     for entry in release["assets"]:
