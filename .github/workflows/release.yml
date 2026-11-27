@@ -51,7 +51,7 @@ jobs:
       CI_CODE: ${{ matrix.code }}
       CI_NVIM: ${{ matrix.nvim }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: 盘点 Linux runner
@@ -62,7 +62,7 @@ jobs:
         if: matrix.target == 'win-x64'
         shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
         run: bash test/gate/ci_runner_env.sh "$TARGET"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: runner-environment-${{ matrix.target }}
           path: ${{ runner.temp }}/yak-runner-environment.txt
@@ -76,7 +76,7 @@ jobs:
     outputs:
       commit: ${{ steps.source.outputs.commit }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -149,15 +149,15 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: delivery-win-x64
           path: test/gate/tmp/ci-verified/win-x64
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: delivery-linux-x64
           path: test/gate/tmp/ci-verified/linux-x64
@@ -168,7 +168,7 @@ jobs:
           python3 test/gate/ci_artifacts.py assemble test/gate/tmp/ci-verified "$SOURCE_COMMIT" "$GITHUB_RUN_ID" --output test/gate/tmp/ci-release-ready
           cat test/gate/tmp/ci-release-ready/build-manifest.json >> "$GITHUB_STEP_SUMMARY"
       - name: 上传完整验收资产
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: release-ready
           path: test/gate/tmp/ci-release-ready/
@@ -187,11 +187,11 @@ jobs:
       actions: read
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: release-ready
           path: test/gate/tmp/ci-release-ready

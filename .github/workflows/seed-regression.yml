@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   regression:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.YAK_WINDOWS_RUNNER != '')
     runs-on: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
     timeout-minutes: 75
     env:
@@ -33,7 +33,7 @@ jobs:
           if ($env:RUNNER_ENVIRONMENT -ne 'self-hosted') {
             throw '请配置 YAK_WINDOWS_RUNNER 指向预置锁定 UCRT64 工具链的 Windows runner'
           }
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: 在隔离源码中双编译器重建并回归
@@ -48,7 +48,7 @@ jobs:
           sha256sum -- seed/out/yak-seed.exe seed/frozen.txt > "$evidence/SHA256SUMS"
       - name: 上传 Seed 解释器回执
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: seed-regression-evidence
           path: |
