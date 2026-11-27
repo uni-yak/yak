@@ -8,9 +8,8 @@
 
 ## P2 — T2 退役 Seed 后的工具链原生化与基座治理（T2 → T3 过渡）
 
-> 说明：T2 三遍固定点（`C2 == C3`）、双目标 131/131 原生验收归档（Run `45997051559`）、`v0.1.0-rc.1` 预发布草稿（Run `46004766496`）、正式固定点收据（[t2_fixpoint_receipt.json](test/gate/t2_fixpoint_receipt.json)）、`STAGE` 升至 `T2` 及 `yak-seed` 退役登记均已完成（详见[验收证据](test/gate/EVIDENCE.md#全-github-托管-ci-迁移与-releaseyml-modeverify-全链路验收归档2026-11-27)）。
+> 说明：T2 三遍固定点（`C2 == C3`）、双目标 131/131 原生验收归档（Run `45997051559`）、`v0.1.0-rc.1` 预发布草稿（Run `46004766496`）、正式固定点收据（[t2_fixpoint_receipt.json](test/gate/t2_fixpoint_receipt.json)）、`STAGE` 升至 `T2`、`yak-seed` 退役登记，以及 Linux 原生自举固定点（`ELF C2 == ELF C3`）与 Linux 平台去 Wine / 去 MinGW 验收归档（Run `46021257317`，产出完整工具链 `yak-linux-x86-64.tar.gz`）均已完成（详见[验收证据](test/gate/EVIDENCE.md#linux-原生自举固定点elf-c2--elf-c3与去-wine--去-mingw-验收归档2026-11-27)）。
 
-⬜  Linux 原生自举编译器与去 Wine / 去 MinGW 化：T2 退役冻结 Seed 后，放开 `compiler/min/build.sh` 对 `main.yak` 与 `imports.yak` 的 `--target linux-x64` 限制（`compiler/min/host/stream/host.yak` 已仅依赖平台无关的 `read`／`write`／`exit`），复用已归档 `C2` 交叉产出原生静态 `main.elf` 与 `imports.elf`，在 Linux 原生完成 `ELF C2 == ELF C3` 固定点接力，使 Linux 构建、自举与分发彻底脱离 Wine 与 MinGW。
 ⬜  控制流原语与 `foreign` I/O 边界整理：评估并将 `assert` 与 `exit` 从用户 `foreign` 服务集上移为语言级控制流原语 `@assert`／`@exit`（同步更新 `spec/lang/symbol.def`、`spec/lang/foreign.md`、`spec/lang/base.md`、`spec/ir/mir.md`、`spec/ir/ysm.md` 与 `no_alloc` 判定）；`read`／`write` 保留在 `foreign` ABI 层，不进入 `@` 语言原语闭集。
 ⬜  大模块演进治理：T2 解除冻结 Seed 100M 步约束后，随 `yakc-full` 演进按需拆分 `compiler/min/src/emit/pe.yak`（分离纯 x86 编码原语与分支布局／ABI 帧辅助）及 `compiler/min/src/check/owner_state.yak`；若在 Seed 退役前需继续扩展 YSM 格式，优先拆离 `compiler/min/src/ysm/ysm_write.yak`（当前 C0 实测 97.0M 步）的编码段。
 

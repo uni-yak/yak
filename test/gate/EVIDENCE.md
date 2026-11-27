@@ -1854,6 +1854,25 @@ Win64 重定位夹具以真实 PE 中的 VA、RVA 与独立保留的语义加数
   - **受保护标签与预发布草稿**：推送受 `protect-semver-tags` 保护的附注标签 `v0.1.0-rc.1`（指向 `62220d64e4d43d48f1905c87e39585e6dc478f69`），执行 `release.yml (mode=draft)`（Run `46004766496`）成功生成待审核草稿 Release（ID `460617032`，4 份资产 SHA-256 逐项校验通过），并在 [ci_release.py](ci_release.py) 中增加新建草稿后的短重试读取以容忍 GitHub API 最终一致性（`eee2924`）。
   - **T2 阶段收口与 Seed 退役**：落盘正式固定点收据 [t2_fixpoint_receipt.json](t2_fixpoint_receipt.json)（记录 `c2_main_sha256` `a789a4411c385419d7c57aaa1dcd90ccd8096953b0bad0fbaea8f82b0393abee`、`c2_imports_sha256` `92119fef957722da28a137701d9bfe9981c3c18c0eb172b77e64629dfeee75cd` 等），在 [t2_stage_fixpoint_gate.py](t2_stage_fixpoint_gate.py) 默认启用仓库内收据严格校验；将 [STAGE](../../compiler/min/STAGE) 推进至 `T2`，按 [seed.md](../../spec/proc/seed.md) 3.1 在 [seed/README.md](../../seed/README.md) 登记 `yak-seed` 退役为归档审计证据（不再更新语义），并将已由完整门禁验证的流程规格（`seed`、`host`、`build`、`fixpoint`、`diag`、`lsp`、`shell`、`error`）升标为 `确认` 后刷新 [audit.json](../../spec/audit.json)。
 
+### Linux 原生自举固定点（`ELF C2 == ELF C3`）与去 Wine / 去 MinGW 验收归档（2026-11-27）
+
+- **工具链原生化落地（提交 `e554a552a8ae040a5b8ec85acd57ac760eef3a05`）**：
+  - 同步更新 [spec/proc/build.md](../../spec/proc/build.md)、[spec/proc/fixpoint.md](../../spec/proc/fixpoint.md)、[spec/proc/lsp.md](../../spec/proc/lsp.md) 与 [AGENTS.md](../../AGENTS.md)，解除 `compiler/min/build.sh` 对 `main.yak`／`imports.yak` 的 `--target linux-x64` 限制，并在 `compiler/min/selfhost.sh` 增加 `--target win-x64|linux-x64`。
+  - 在 [tools/pe_digest.py](../../tools/pe_digest.py) 中扩展静态 x86-64 ELF `.rodata` 只读加载段唯一摘要校验（`tools/error_codes.py`、`tools/symgen/lex_tables.py` 与 `tools/test_error_codes.py` 31/31 全通）；在 [tools/target.sh](../../tools/target.sh)、[tools/link.sh](../../tools/link.sh) 与 [compiler/min/build.sh](../../compiler/min/build.sh) 中按魔数自动区分静态 Linux ELF 与 Win64 PE，Linux 上原生静态 ELF 工具直接执行，彻底无需 `YAK_PE_RUNNER`。
+  - 新增纯原生 Linux 三遍固定点门禁 [test_linux_selfhost_fixpoint.sh](test_linux_selfhost_fixpoint.sh)（自 `elf-c1` 起显式 `unset YAK_PE_RUNNER` 与禁用 Seed，核对 `elf-c2 == elf-c3` 全部单元 `.iface`/`.ysm`/`.o`、FP-3 依赖摘要映射与根 ELF 逐字节一致）；彻底移除 [build-linux-x64.yml](../../.github/workflows/build-linux-x64.yml) 与 [ci_platform.sh](ci_platform.sh) `linux-x64` 中的 `wine`、`wineserver`、`WINEPREFIX` 与 `gcc-mingw-w64-x86-64`／`binutils-mingw-w64-x86-64`。
+- **云端 GitHub Actions 全链路验收（Run `46021257317`，提交 `e554a552a8ae040a5b8ec85acd57ac760eef3a05`）**：
+  - 全作业一次通过：`plan` 3s → `checks` 23s → `bootstrap` 17m25s（Win64 `C2 == C3` + 纯原生 Linux `ELF C2 == ELF C3`）→ 并行 `linux` **2m27s**（零 Wine / 零 MinGW，较此前 4m16s 提速约 43%）/ `windows` 7m18s → `assemble` 18s。
+  - 共享双目标固定点候选摘要：`1b77077d78ebd6b25a45a2c14d19a29076f56d10139dfb76ccaeac99a6f68cb9`
+  - 原生静态 Linux ELF 固定点产物（`ELF C2 == ELF C3`，均通过 `elf_headers.py`、符号表与错误码表摘要校验）：
+    - `main.elf`（5,645,416 字节，`0755`）SHA-256：`ab0cf322dcb0f80bba41b37d5a3bd83d47f7e8bc2e16cef1b1d347d2ccfdfa56`
+    - `imports.elf`（813,168 字节，`0755`）SHA-256：`00301c74fda4d82e14444e3bb3f00e99c5d1432137d071a704a2cfc81de5b7ef`
+    - `yak_lsp.elf`（3,289,368 字节，`0755`）SHA-256：`663e90c1417e208be81aa1217f55a5f2948726e601ea21c0c96a4669246916c8`
+  - 双平台原生逐例对拍：`131 / 131` 通过（Win64 PE 由 `main.exe` 构建运行，Linux ELF 由 `main.elf` 零 Wine 原生构建运行，退出码、stdout、stderr 与 JSONL 诊断逐字节完全一致）。
+  - 正式交付资产摘要：
+    - `yak-linux-x86-64.tar.gz`（含 `main.elf`、`imports.elf`、`yak_lsp.elf`、`.yak_lsp.yak-root`）SHA-256：`d6970e7ca972b1da14cdda077cb6c17ed81047375fac4c50766b0a64c2e43ac1`
+    - `yak-windows-x64.zip`（`main.exe`、`imports.exe` 与 `v0.1.0-rc.1` 逐字节一致）SHA-256：`db8a756a7ed20b3e19c53cba70c235353d16ed9f7c0ae753a4f77341b3803fda`
+    - `build-manifest.json` SHA-256：`e67161ad5c1898e2cff1f8b6b9ed8d22553dea81f437ce515b007b632048949f`
+
 ## 归档模板
 
 提交或在评审中粘贴证据时，用下列字段，缺项即视为证据不完整：
