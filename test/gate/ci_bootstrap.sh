@@ -12,13 +12,18 @@ run=$2
 }
 root=$(pwd -P)
 evidence="$root/test/gate/tmp/ci-bootstrap-evidence"
-export WINEPREFIX="$evidence/wine"
+# 将 Wine 前缀放在证据目录之外，避免归档扫描 dosdevices/z: 符号链接。
+export WINEPREFIX="${RUNNER_TEMP:-$root/test/gate/tmp}/yak-wine-bootstrap"
 export YAK_PE_RUNNER=${YAK_CI_WINE:-wine}
 unset YAK_RUNTIME_OBJ YAK_SEED_BIN
-mkdir -p -- "$evidence/logs"
+mkdir -p -- "$evidence/logs" "$WINEPREFIX"
 record() { bash test/gate/ci_record.sh "$evidence/logs" "$@"; }
 record host -- uname -srvmo
 record pe-runner -- "$YAK_PE_RUNNER" --version
+# 禁用 Wine 事后调试器，避免 int3 陷阱把堆栈转储写入被测程序的 stdout。
+"$YAK_PE_RUNNER" reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Auto /t REG_SZ /d 1 /f >/dev/null 2>&1 || true
+"$YAK_PE_RUNNER" reg add 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Debugger /t REG_SZ /d __yak_no_debugger__ /f >/dev/null 2>&1 || true
+"$YAK_PE_RUNNER" reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null 2>&1 || true
 record source-snapshot -- bash test/gate/ci_linux_snapshot.sh "$commit" .cold-start
 cd .cold-start
 record host-preflight -- bash test/gate/t1_linux_preflight.sh --host-only
