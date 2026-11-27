@@ -64,7 +64,12 @@ jobs:
           YAK_CI_CODE: ${{ vars.YAK_LINUX_CODE }}
           YAK_CI_WINE: ${{ vars.YAK_CI_WINE }}
           YAK_CI_CASE_JOBS: ${{ vars.YAK_LINUX_CASE_JOBS }}
-        run: bash test/gate/ci_platform.sh linux-x64 "$SOURCE_COMMIT" "$CANDIDATE_RUN"
+          WINEPREFIX: ${{ runner.temp }}/yak-wine-platform
+        run: |
+          mkdir -p "$WINEPREFIX"
+          WINEDEBUG=-all wineserver -p
+          trap 'WINEDEBUG=-all wineserver -k >/dev/null 2>&1 || true' EXIT
+          bash test/gate/ci_platform.sh linux-x64 "$SOURCE_COMMIT" "$CANDIDATE_RUN"
       - name: 上传已验收的分发包
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

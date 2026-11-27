@@ -35,7 +35,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SEED_URL: ${{ vars.YAK_SEED_URL }}
           YAK_CI_WINE: ${{ vars.YAK_CI_WINE }}
-        run: bash test/gate/ci_bootstrap.sh "$SOURCE_COMMIT" "$GITHUB_RUN_ID"
+          WINEPREFIX: ${{ runner.temp }}/yak-wine-bootstrap
+        run: |
+          mkdir -p "$WINEPREFIX"
+          # 保持常驻 wineserver，消除 3 秒空闲回收与短进程重连之间的 recvmsg 竞态。
+          WINEDEBUG=-all wineserver -p
+          trap 'WINEDEBUG=-all wineserver -k >/dev/null 2>&1 || true' EXIT
+          bash test/gate/ci_bootstrap.sh "$SOURCE_COMMIT" "$GITHUB_RUN_ID"
       - name: 上传共享候选
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
