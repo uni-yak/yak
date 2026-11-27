@@ -34,9 +34,15 @@ YAK_CI_NVIM=$(yak_ci_find_editor "$target" nvim "${YAK_CI_NVIM:-}") ||
 YAK_CI_CODE=$(yak_ci_find_editor "$target" code "${YAK_CI_CODE:-}") ||
     fail "在 $target runner 上找不到 VS Code 可执行文件"
 record nvim-version -- "$YAK_CI_NVIM" --version
-# 通过 Electron Node 模式调用 VS Code CLI，避免无头 Linux 缺少 DISPLAY 或 Windows 启动 GUI 窗口挂起。
-code_cli="${YAK_CI_CODE%/*}/resources/app/out/cli.js"
-if [[ -f $code_cli ]]; then
+# 通过 Electron Node 模式调用 VS Code CLI，兼容扁平与含提交哈希子目录两种安装布局。
+code_cli=""
+for candidate_cli in "${YAK_CI_CODE%/*}/resources/app/out/cli.js" "${YAK_CI_CODE%/*}"/*/resources/app/out/cli.js; do
+    if [[ -f $candidate_cli ]]; then
+        code_cli=$candidate_cli
+        break
+    fi
+done
+if [[ -n $code_cli ]]; then
     record code-version -- env ELECTRON_RUN_AS_NODE=1 "$YAK_CI_CODE" "$code_cli" --version
 else
     record code-version -- timeout -k 5s 15s "$YAK_CI_CODE" --version
@@ -90,8 +96,9 @@ if [[ $target == linux-x64 ]]; then
     record lsp-repeat -- bash compiler/lsp/build.sh --target "$target" "${pair[@]}" "$second"
     record lsp-binary-match -- cmp -- "$exe" "$second/yak_lsp.elf"
     record lsp-owner-match -- cmp -- "$server/.yak_lsp.yak-root" "$second/.yak_lsp.yak-root"
-    record base-linux -- bash test/gate/test_base_linux_build.sh "$main" "$scanner" "$candidate/runtime.obj"
+    # 紧接两次 LSP 构建之后复验其临时目录清理，避免被 base-linux 末尾故障回滚测试留下的诊断目录干扰。
     record lsp-linux-boundary -- bash test/gate/test_lsp_linux_build.sh "$main" "$scanner" --verified-output "$server"
+    record base-linux -- bash test/gate/test_base_linux_build.sh "$main" "$scanner" "$candidate/runtime.obj"
 fi
 record corpus -- bash test/gate/test_base_selfhost_candidate.sh --verify-run "$candidate" --platform "$target"
 record lsp-protocol -- python test/gate/lsp_p4_check.py "$exe"
