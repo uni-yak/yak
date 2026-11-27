@@ -235,8 +235,9 @@ class Experiment:
         samples = self.report["samples"]
         peak = max(s["peak_working_set_bytes"] for s in samples)
         self.report["peak_working_set_bytes"] = peak
-        closed = [s["private_commit_bytes"] for s in samples if s["phase"].startswith("workspace_closed_")]
-        self.report["workspace_closed_private_spread_bytes"] = max(closed) - min(closed)
+        closed = [s[self.memory.retained_key] for s in samples if s["phase"].startswith("workspace_closed_")]
+        spread_key = "workspace_closed_anonymous_spread_bytes" if sys.platform == "linux" else "workspace_closed_private_spread_bytes"
+        self.report[spread_key] = max(closed) - min(closed)
         summary = {}
         for group, rows in self.report["measurements"].items():
             durations = [r["ns"] for r in rows]
