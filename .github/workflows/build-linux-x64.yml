@@ -29,14 +29,15 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
-      - name: 安装 Wine、Xvfb、Neovim 与 VS Code
+      - name: 安装交叉工具链、Wine、Xvfb、Neovim 与 VS Code
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wine xvfb dbus-x11 neovim
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 wine xvfb dbus-x11 neovim
           curl -fsSL 'https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64' -o /tmp/vscode.deb
           sudo apt-get install -y /tmp/vscode.deb
           rm -f /tmp/vscode.deb
+          x86_64-w64-mingw32-gcc --version | head -n 1
           wine --version
           nvim --version | head -n 1
           test -x /usr/share/code/code

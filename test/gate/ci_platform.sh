@@ -34,7 +34,13 @@ YAK_CI_NVIM=$(yak_ci_find_editor "$target" nvim "${YAK_CI_NVIM:-}") ||
 YAK_CI_CODE=$(yak_ci_find_editor "$target" code "${YAK_CI_CODE:-}") ||
     fail "在 $target runner 上找不到 VS Code 可执行文件"
 record nvim-version -- "$YAK_CI_NVIM" --version
-record code-version -- "$YAK_CI_CODE" --version
+# 通过 Electron Node 模式调用 VS Code CLI，避免无头 Linux 缺少 DISPLAY 或 Windows 启动 GUI 窗口挂起。
+code_cli="${YAK_CI_CODE%/*}/resources/app/out/cli.js"
+if [[ -f $code_cli ]]; then
+    record code-version -- env ELECTRON_RUN_AS_NODE=1 "$YAK_CI_CODE" "$code_cli" --version
+else
+    record code-version -- timeout -k 5s 15s "$YAK_CI_CODE" --version
+fi
 record node-version -- node --version
 record npm-version -- npm --version
 

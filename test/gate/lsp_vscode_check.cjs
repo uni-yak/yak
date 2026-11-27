@@ -44,6 +44,7 @@ const install = spawnSync(windows ? process.env.ComSpec || 'cmd.exe' : 'npm',
 if (install.error) throw install.error;
 assert.equal(install.status, 0, '安装固定客户端失败');
 const args = [
+    ...(process.env.GITHUB_ACTIONS === 'true' ? ['--disable-gpu'] : []),
     ...(process.platform === 'linux' && process.env.GITHUB_ACTIONS === 'true' ? ['--no-sandbox'] : []),
     '--user-data-dir', userData, '--extensions-dir', extDir, '--new-window', '--disable-extensions',
     '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--extensionDevelopmentPath=' + ext,
