@@ -30,7 +30,7 @@
 - `lib/` —— 手写容器（无泛型：字节缓冲、句柄表、哈希表）
 - `build.sh` —— 构建（按 `../../spec/proc/build.md`，shell 白名单 `shell.md`）
 - `verify.sh` —— 验证（快速门禁 `../../spec/proc/gate.md` 2.1）
-- `STAGE` —— 阶段元数据（当前 `T1`；T2 收敛后改标）
+- `STAGE` —— 阶段元数据（当前 `T2`；已完成固定点收敛与双目标正式 CI 验收）
 
 ## 边界
 

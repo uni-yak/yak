@@ -1,0 +1,17 @@
+{
+  "stage": "T2",
+  "commit": "62220d64e4d43d48f1905c87e39585e6dc478f69",
+  "tag": "v0.1.0-rc.1",
+  "run_id": "45997051559",
+  "draft_run_id": "46004766496",
+  "candidate_sha256": "8f7d8b43c7679463a4b52014ce00d2eab07a7659b4913a43218d3e4d39d209fc",
+  "c2_main_sha256": "a789a4411c385419d7c57aaa1dcd90ccd8096953b0bad0fbaea8f82b0393abee",
+  "c2_imports_sha256": "92119fef957722da28a137701d9bfe9981c3c18c0eb172b77e64629dfeee75cd",
+  "runtime_obj_sha256": "7e1c0430590d3dedfff6296422de4eef59d719f2fc4b4f01dae186dc571a97d5",
+  "compared_cases": 131,
+  "c2_eq_c3": true,
+  "fp3_ok": true,
+  "win64_matrix_ok": true,
+  "linux_elf_matrix_ok": true,
+  "ci_trusted": true
+}

@@ -5,7 +5,7 @@
 - 名称：fixpoint（固定点收敛）
 - 级别：流程
 - 拒绝形态类别：门禁断言
-- 状态：草案
+- 状态：确认
 - 依赖：`build.md`、`gate.md`、`status.md`、`../ir/ysm.md`、`../lang/symbol.md`
 
 ## 一、范围

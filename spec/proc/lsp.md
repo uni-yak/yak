@@ -4,7 +4,7 @@
 
 - 名称：lsp（独立 Yak 语言服务）
 - 级别：流程
-- 状态：草案
+- 状态：确认
 - 依赖：`../lang/base.md`、`../lang/foreign.md`、`diag.md`、`gate.md`
 
 ## 一、边界

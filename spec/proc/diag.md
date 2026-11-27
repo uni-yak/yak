@@ -5,7 +5,7 @@
 - 名称：diag（诊断协议）
 - 级别：流程
 - 拒绝形态类别：门禁断言
-- 状态：草案
+- 状态：确认
 - 依赖：`error.md`、`../lang/symbol.md`、`../lang/name.md`、`../ir/ysm.md`
 
 ## 一、范围

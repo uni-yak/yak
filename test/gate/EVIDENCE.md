@@ -1851,6 +1851,8 @@ Win64 重定位夹具以真实 PE 中的 VA、RVA 与独立保留的语义加数
     - `yak-windows-x64.zip` SHA-256：`f7ec79b36e0ca0cb974e52efe09605ed54c7df8db8037c4297f48a60e5ce40ee`
     - `yak-lsp-linux-x86-64.tar.gz` SHA-256：`73a64f9a0c7e2688cd788116073deb98cef7f91cf1fee4ba33e2f2fa050821e7`
     - `build-manifest.json` SHA-256：`bf3eb4edc2ba361f5e91c4e98092e3c3c033300830836a3ec46e2fa5c4403d48`
+  - **受保护标签与预发布草稿**：推送受 `protect-semver-tags` 保护的附注标签 `v0.1.0-rc.1`（指向 `62220d64e4d43d48f1905c87e39585e6dc478f69`），执行 `release.yml (mode=draft)`（Run `46004766496`）成功生成待审核草稿 Release（ID `460617032`，4 份资产 SHA-256 逐项校验通过），并在 [ci_release.py](ci_release.py) 中增加新建草稿后的短重试读取以容忍 GitHub API 最终一致性（`eee2924`）。
+  - **T2 阶段收口与 Seed 退役**：落盘正式固定点收据 [t2_fixpoint_receipt.json](t2_fixpoint_receipt.json)（记录 `c2_main_sha256` `a789a4411c385419d7c57aaa1dcd90ccd8096953b0bad0fbaea8f82b0393abee`、`c2_imports_sha256` `92119fef957722da28a137701d9bfe9981c3c18c0eb172b77e64629dfeee75cd` 等），在 [t2_stage_fixpoint_gate.py](t2_stage_fixpoint_gate.py) 默认启用仓库内收据严格校验；将 [STAGE](../../compiler/min/STAGE) 推进至 `T2`，按 [seed.md](../../spec/proc/seed.md) 3.1 在 [seed/README.md](../../seed/README.md) 登记 `yak-seed` 退役为归档审计证据（不再更新语义），并将已由完整门禁验证的流程规格（`seed`、`host`、`build`、`fixpoint`、`diag`、`lsp`、`shell`、`error`）升标为 `确认` 后刷新 [audit.json](../../spec/audit.json)。
 
 ## 归档模板
 

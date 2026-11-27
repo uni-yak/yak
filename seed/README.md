@@ -2,9 +2,9 @@
 
 ## 职责与阶段
 
-`yak-seed` 是 C 编写的树遍历解释器，用于解释执行 `compiler/min` 的 Yak 源码。它不生成 `.ysm`、`.iface` 或 `.obj`；目标代码由 min 编译器负责。
+`yak-seed` 是 C 编写的树遍历解释器，用于 T1 点火阶段解释执行 `compiler/min` 的 Yak 源码。它不生成 `.ysm`、`.iface` 或 `.obj`；目标代码由 min 编译器负责。
 
-当前已验证 min 的 buf、hash、hashmap、lex、diag、host 模块以及入口、parse、check、MIR 与 emit 的完整编译管线。完整 base 严格矩阵与正式 Linux CI 仍有缺口，因此当前不是 T1 点火成功，也不是 T2 固定点。未完成事项见 [TODO](../TODO.md)，阶段和退役条件见 [seed 规格](../spec/proc/seed.md)。
+**退役状态（依据 [seed 规格](../spec/proc/seed.md) 3.1）**：T2 三遍固定点（`C2 == C3`）与双目标（Win64 PE + Linux x86-64 ELF，131/131 原生对拍）已在可信 GitHub CI 完整归档（Run `45997051559`，固定点收据见 [t2_fixpoint_receipt.json](../test/gate/t2_fixpoint_receipt.json)，预发布草稿标签 `v0.1.0-rc.1`）。`yak-seed` 现已退役：**不再更新语言语义，仅作为 T0/T1 历史点火与冷启动归档审计证据保留**；冻结二进制 `yak-seed.exe` 不入库，仅存留于仓库 Release `seed-9abd162e2713748ffb62d471e39c5703abb733b607bb6431dccef1e7b9fe30ec` 供冷启动审计复现。后续待办见 [TODO](../TODO.md)。
 
 ## 构建与验证
 

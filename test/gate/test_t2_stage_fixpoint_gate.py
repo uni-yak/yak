@@ -144,6 +144,38 @@ class StageFixpointGateTest(unittest.TestCase):
         res = self._run("--fixpoint-receipt", str(receipt), "--commands", str(cmds))
         self.assertEqual(res.returncode, 0, res.stderr)
 
+    def test_default_receipt_auto_discovery_validates_strictly(self) -> None:
+        self._write("compiler/min/STAGE", "stage: T2\nignition: 已完成 T2 固定点收敛\n")
+        self._write("spec/proc/fixpoint.md", "# fixpoint\n\n- 状态：确认\n")
+        self._write("spec/proc/seed.md", "# seed\n\n- 状态：确认\n")
+        self._write(
+            "test/gate/t2_fixpoint_receipt.json",
+            json.dumps({
+                "c2_eq_c3": True,
+                "fp3_ok": True,
+                "win64_matrix_ok": True,
+                "linux_elf_matrix_ok": True,
+                "ci_trusted": False,
+                "c2_main_sha256": "a" * 64,
+            }),
+        )
+        bad = self._run()
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("FP-4", bad.stderr)
+        self._write(
+            "test/gate/t2_fixpoint_receipt.json",
+            json.dumps({
+                "c2_eq_c3": True,
+                "fp3_ok": True,
+                "win64_matrix_ok": True,
+                "linux_elf_matrix_ok": True,
+                "ci_trusted": True,
+                "c2_main_sha256": "a" * 64,
+            }),
+        )
+        good = self._run()
+        self.assertEqual(good.returncode, 0, good.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

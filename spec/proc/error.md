@@ -5,7 +5,7 @@
 - 名称：error（错误码体系）
 - 级别：流程
 - 拒绝形态类别：门禁断言
-- 状态：草案
+- 状态：确认
 - 依赖：`../lang/symbol.md`、`../lang/base.md`、`../lang/lex.md`、`../lang/parse.md`、`../lang/name.md`、`../lang/sugar.md`、`../lang/layout.md`、`../lang/const.md`、`../lang/type/enum.md`、`../lang/type/union.md`、`../lang/type/option.md`、`../lang/type/result.md`、`../lang/owner.md`、`../target/emitter.md`、`error.def`
 
 ## 一、范围

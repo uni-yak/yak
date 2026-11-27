@@ -147,11 +147,6 @@
     },
     {
       "spec": "ir/ysm.md",
-      "dependency": "proc/fixpoint.md",
-      "status": "草案"
-    },
-    {
-      "spec": "ir/ysm.md",
       "dependency": "target/emitter.md",
       "status": "草案"
     },
@@ -436,11 +431,6 @@
       "status": "草案"
     },
     {
-      "spec": "lang/const.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
-    },
-    {
       "spec": "lang/effect.md",
       "dependency": "lang/base.md",
       "status": "草案"
@@ -498,11 +488,6 @@
     {
       "spec": "lang/foreign.md",
       "dependency": "target/abi-linux.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/foreign.md",
-      "dependency": "proc/error.md",
       "status": "草案"
     },
     {
@@ -681,16 +666,6 @@
       "status": "草案-可实施"
     },
     {
-      "spec": "lang/module.md",
-      "dependency": "proc/build.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/module.md",
-      "dependency": "proc/fixpoint.md",
-      "status": "草案"
-    },
-    {
       "spec": "lang/name.md",
       "dependency": "lang/lex.md",
       "status": "草案"
@@ -768,11 +743,6 @@
     {
       "spec": "lang/owner.md",
       "dependency": "lang/foreign.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/owner.md",
-      "dependency": "proc/error.md",
       "status": "草案"
     },
     {
@@ -893,21 +863,6 @@
     {
       "spec": "lang/symbol.md",
       "dependency": "ir/mir.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/symbol.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/symbol.md",
-      "dependency": "proc/build.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/symbol.md",
-      "dependency": "proc/fixpoint.md",
       "status": "草案"
     },
     {
@@ -1076,11 +1031,6 @@
       "status": "草案"
     },
     {
-      "spec": "lang/type/enum.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
-    },
-    {
       "spec": "lang/type/function.md",
       "dependency": "lang/base.md",
       "status": "草案"
@@ -1241,11 +1191,6 @@
       "status": "草案"
     },
     {
-      "spec": "lang/type/option.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
-    },
-    {
       "spec": "lang/type/ptr.md",
       "dependency": "lang/unsafe.md",
       "status": "草案"
@@ -1348,11 +1293,6 @@
     {
       "spec": "lang/type/result.md",
       "dependency": "lang/type/union.md",
-      "status": "草案"
-    },
-    {
-      "spec": "lang/type/result.md",
-      "dependency": "proc/error.md",
       "status": "草案"
     },
     {
@@ -1611,11 +1551,6 @@
       "status": "草案"
     },
     {
-      "spec": "lang/type/union.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
-    },
-    {
       "spec": "lang/type/void.md",
       "dependency": "lang/base.md",
       "status": "草案"
@@ -1667,16 +1602,6 @@
     },
     {
       "spec": "proc/build.md",
-      "dependency": "proc/shell.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/build.md",
-      "dependency": "proc/fixpoint.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/build.md",
       "dependency": "proc/gate.md",
       "status": "草案"
     },
@@ -1689,11 +1614,6 @@
       "spec": "proc/build.md",
       "dependency": "lang/symbol.md",
       "status": "草案-可实施"
-    },
-    {
-      "spec": "proc/diag.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
     },
     {
       "spec": "proc/diag.md",
@@ -1782,11 +1702,6 @@
     },
     {
       "spec": "proc/fixpoint.md",
-      "dependency": "proc/build.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/fixpoint.md",
       "dependency": "proc/gate.md",
       "status": "草案"
     },
@@ -1799,21 +1714,6 @@
       "spec": "proc/fixpoint.md",
       "dependency": "lang/symbol.md",
       "status": "草案-可实施"
-    },
-    {
-      "spec": "proc/gate.md",
-      "dependency": "proc/build.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/gate.md",
-      "dependency": "proc/fixpoint.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/gate.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
     },
     {
       "spec": "proc/gate.md",
@@ -1846,16 +1746,6 @@
       "status": "草案"
     },
     {
-      "spec": "proc/host.md",
-      "dependency": "proc/seed.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/host.md",
-      "dependency": "proc/error.md",
-      "status": "草案"
-    },
-    {
       "spec": "proc/lsp.md",
       "dependency": "lang/base.md",
       "status": "草案"
@@ -1867,22 +1757,7 @@
     },
     {
       "spec": "proc/lsp.md",
-      "dependency": "proc/diag.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/lsp.md",
       "dependency": "proc/gate.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/seed.md",
-      "dependency": "proc/build.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/seed.md",
-      "dependency": "proc/fixpoint.md",
       "status": "草案"
     },
     {
@@ -1901,18 +1776,8 @@
       "status": "草案-可实施"
     },
     {
-      "spec": "proc/shell.md",
-      "dependency": "proc/build.md",
-      "status": "草案"
-    },
-    {
       "spec": "proc/status.md",
       "dependency": "proc/gate.md",
-      "status": "草案"
-    },
-    {
-      "spec": "proc/status.md",
-      "dependency": "proc/error.md",
       "status": "草案"
     },
     {
@@ -2043,11 +1908,6 @@
     {
       "spec": "target/optimize.md",
       "dependency": "lang/atomic.md",
-      "status": "草案"
-    },
-    {
-      "spec": "target/optimize.md",
-      "dependency": "proc/fixpoint.md",
       "status": "草案"
     },
     {

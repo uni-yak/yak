@@ -1,13 +1,13 @@
 # STAGE —— yakc-min 阶段元数据
 # 格式：键: 值（UTF-8、LF）
 
-stage: T1
-status: 本地 Win64 C0 点火已验证，T1 整体未验收
+stage: T2
+status: T2 三遍固定点（C2 == C3）与双目标（Win64 PE + Linux ELF）正式 GitHub CI 验收已归档（Run 45997051559，v0.1.0-rc.1）
 base_spec: ../../spec/lang/base.md
-target_profile: yak64-v1 + abi-win
-products: out/<root>.exe；可选审计目录保留各单元 .ysm、.iface、.obj
+target_profile: yak64-v1 + abi-win / abi-linux
+products: out/<root>.exe / out/<root>.elf；可选审计目录保留各单元 .ysm、.iface、.obj/.o
 entry: build.sh
 verify: verify.sh
 driver: src/main.yak
-ignition: 由 yak-seed 解释执行（../../seed/）
-next: 关闭 T1 发布门禁后再启动 T2（../../spec/proc/fixpoint.md）
+ignition: 已完成 T2 固定点收敛（../../test/gate/t2_fixpoint_receipt.json）；yak-seed 已退役为归档审计证据（../../seed/）
+next: 推进 P2（Linux 原生自举编译器去 Wine/MinGW）与 T3 能力生长（../../TODO.md）

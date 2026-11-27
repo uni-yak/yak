@@ -5,7 +5,7 @@
 - 名称：build（确定性构建）
 - 级别：流程
 - 拒绝形态类别：门禁断言
-- 状态：草案
+- 状态：确认
 - 依赖：`shell.md`、`fixpoint.md`、`gate.md`、`../lang/module.md`、`../lang/symbol.md`、`../../versions.lock`
 
 ## 一、范围

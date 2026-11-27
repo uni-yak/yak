@@ -6,13 +6,9 @@
 
 截至 2026-11-27：静态语料覆盖 214／214，完整性错误 0。已登记 106 个源码负例、4 组 Seed 宿主夹具、2 组运行期夹具、1 组原生接口夹具和 76 组工具夹具。运行回执与相应源码范围见 [证据](test/gate/EVIDENCE.md)。
 
-## P1 — 完成 T2 收口、Seed 退役与首个草稿发布
-
-> 说明：全 GitHub 托管 CI（`ubuntu-26.04` + `windows-2025`）与 `release.yml (mode=verify)` 全链路验收归档已全绿通过（Run `45997051559`，提交 `62220d6`，双平台 131/131 原生对拍一致，详见[验收证据](test/gate/EVIDENCE.md#全-github-托管-ci-迁移与-releaseyml-modeverify-全链路验收归档2026-11-27)）：
-
-⬜  完成 T2 收口与 Seed 退役：基于已通过的正式 CI 归档（Run `45997051559`），审核并完成 `spec/audit.json` 冻结收口、退役 `seed/out/yak-seed.exe`（`spec/proc/seed.md` 3.1），并通过 [发布与验收归档](.github/workflows/release.yml) 的 `draft` 模式产出首个预发布/正式版本草稿。
-
 ## P2 — T2 退役 Seed 后的工具链原生化与基座治理（T2 → T3 过渡）
+
+> 说明：T2 三遍固定点（`C2 == C3`）、双目标 131/131 原生验收归档（Run `45997051559`）、`v0.1.0-rc.1` 预发布草稿（Run `46004766496`）、正式固定点收据（[t2_fixpoint_receipt.json](test/gate/t2_fixpoint_receipt.json)）、`STAGE` 升至 `T2` 及 `yak-seed` 退役登记均已完成（详见[验收证据](test/gate/EVIDENCE.md#全-github-托管-ci-迁移与-releaseyml-modeverify-全链路验收归档2026-11-27)）。
 
 ⬜  Linux 原生自举编译器与去 Wine / 去 MinGW 化：T2 退役冻结 Seed 后，放开 `compiler/min/build.sh` 对 `main.yak` 与 `imports.yak` 的 `--target linux-x64` 限制（`compiler/min/host/stream/host.yak` 已仅依赖平台无关的 `read`／`write`／`exit`），复用已归档 `C2` 交叉产出原生静态 `main.elf` 与 `imports.elf`，在 Linux 原生完成 `ELF C2 == ELF C3` 固定点接力，使 Linux 构建、自举与分发彻底脱离 Wine 与 MinGW。
 ⬜  控制流原语与 `foreign` I/O 边界整理：评估并将 `assert` 与 `exit` 从用户 `foreign` 服务集上移为语言级控制流原语 `@assert`／`@exit`（同步更新 `spec/lang/symbol.def`、`spec/lang/foreign.md`、`spec/lang/base.md`、`spec/ir/mir.md`、`spec/ir/ysm.md` 与 `no_alloc` 判定）；`read`／`write` 保留在 `foreign` ABI 层，不进入 `@` 语言原语闭集。

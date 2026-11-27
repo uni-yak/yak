@@ -142,13 +142,21 @@ def check_sd3(root: Path, stage_meta: dict[str, str], converged: bool) -> list[s
     return violations
 
 
+DEFAULT_RECEIPT_REL = "test/gate/t2_fixpoint_receipt.json"
+
+
 def run_gate(root: Path, receipt_path: Path | None, commands_path: Path | None) -> tuple[int, list[str]]:
     """执行 FP-4 / SD-2 / SD-3 联合校验。"""
     stage_file = root / "compiler/min/STAGE"
     if not stage_file.is_file():
         return 2, [f"错误：缺少阶段元数据文件：{stage_file}"]
     stage_meta = parse_stage_file(stage_file)
-    converged = is_valid_fixpoint_receipt(receipt_path)
+    effective_receipt = receipt_path
+    if effective_receipt is None:
+        candidate = root / DEFAULT_RECEIPT_REL
+        if candidate.is_file():
+            effective_receipt = candidate
+    converged = is_valid_fixpoint_receipt(effective_receipt)
     violations: list[str] = []
     violations.extend(check_fp4(root, converged))
     violations.extend(check_sd2_stage(stage_meta))
