@@ -1873,6 +1873,23 @@ Win64 重定位夹具以真实 PE 中的 VA、RVA 与独立保留的语义加数
     - `yak-windows-x64.zip`（`main.exe`、`imports.exe` 与 `v0.1.0-rc.1` 逐字节一致）SHA-256：`db8a756a7ed20b3e19c53cba70c235353d16ed9f7c0ae753a4f77341b3803fda`
     - `build-manifest.json` SHA-256：`e67161ad5c1898e2cff1f8b6b9ed8d22553dea81f437ce515b007b632048949f`
 
+### 控制流原语 `@assert`／`@exit` 与全仓库零 Wine / 零 MinGW 双平台原生自举 CI（2026-11-28）
+
+- **控制流原语与 `foreign` I/O 边界整理（提交 `c3de5b7`）**：
+  - 在 [spec/lang/symbol.def](../../spec/lang/symbol.def) `0x5 functions` 分区追加 `0x010 @assert`（`BuiltinId 20496`）与 `0x011 @exit`（`BuiltinId 20497`）并重新生成 [compiler/min/src/lex/lextables.yak](../../compiler/min/src/lex/lextables.yak)；同步更新 [spec/lang/base.md](../../spec/lang/base.md)（3.8、5.10、5.11、6.7、9.2）、[spec/lang/foreign.md](../../spec/lang/foreign.md)（2.5、3.1、3.5）、[spec/ir/mir.md](../../spec/ir/mir.md)（4.11、6.5）与 [spec/ir/ysm.md](../../spec/ir/ysm.md)，明确 `read`／`write` 保留在 `foreign` ABI 层，`@assert`／`@exit` 升格为语言级无分配控制流原语（原 `foreign assert`／`foreign exit` 仅作 T1 过渡兼容保留）。
+  - 在 [compiler/min/src/check/typecheck_body.yak](../../compiler/min/src/check/typecheck_body.yak) 与 [compiler/min/src/mir/mir_lower_expr.yak](../../compiler/min/src/mir/mir_lower_expr.yak) 中落地 `@assert(cond: bool): void`（`branch` + `trap(reason=0)` 跨帧清理）与 `@exit(code: u8): void`（直接发射 `0xC5` 退出终结指令）；配套正例 [test/ok/flow/control_primitives.yak](../ok/flow/control_primitives.yak)（`#` 无分配函数 + 拥有型跨帧清理 + 退出码 `19`）及负例 [assert_non_bool.yak](fixtures/flow/E5001/assert_non_bool.yak)／[exit_non_u8.yak](fixtures/flow/E5001/exit_non_u8.yak)。
+- **全仓库零 Wine / 零 MinGW 双平台原生自举 CI（提交 `c3de5b7`、`2d32048`、`8b8bf90`）**：
+  - 将 [.github/workflows/compiler-bootstrap.yml](../../.github/workflows/compiler-bootstrap.yml) 拆分为 `bootstrap-win64`（`windows-2025` MSYS2 UCRT64 原生冷启动 + Win64 `C2 == C3` + [ci_emit_elf_objects.sh](ci_emit_elf_objects.sh) 发射 ELF64 `.o` + [ci_bootstrap_stage.py](ci_bootstrap_stage.py) 摘要封存）与 `bootstrap-linux`（`ubuntu-26.04` 零额外安装包、零 Wine、零 MinGW 原生链接 `elf-c0`、复验 `elf-object`／`elf-call` 与 `ELF C2 == ELF C3`）。
+  - 修复 MSYS2 Windows 下 [evidence.sh](evidence.sh)／[evidence_matrix.sh](evidence_matrix.sh)／[evidence_preflight.sh](evidence_preflight.sh) 7 处 `cmp` 进程替换兼容性（改用标准管道）；将 [test_elf_object.sh](test_elf_object.sh) 与 [test_elf_call.sh](test_elf_call.sh) 拆分为 `--emit-only` 与 `--verify-dir` 跨宿主无缝接力。
+- **云端 GitHub Actions 全链路验收（Run `46042555495`，提交 `8b8bf90bd9807cf321de088763b0ce3e1bfba6ab`）**：
+  - 全作业通过：`plan` 4s → `checks` 28s → `bootstrap-win64` 28m38s → `bootstrap-linux` **2m15s**（零 apt / 零 Wine / 零 MinGW）→ 并行 `linux` **2m29s**（零 Wine / 零 MinGW）/ `windows` 9m11s → `assemble` 12s。
+  - 双平台原生逐例对拍：**`134 / 134`** 通过（含 `@assert`／`@exit` 正例及 2 项 `E5001` 终端/JSONL 负例，退出码、stdout、stderr 与 JSONL 逐字节一致）。
+  - 共享双目标候选摘要：`f3bd2000bf94a21fb92912579e1bb233d8678c783bc760f43ad0119a649617b3`
+  - 交付资产 SHA-256：
+    - `yak-linux-x86-64.tar.gz`：`5cd32e48e6d14c899e738effd687abbb7921de54e998eaf5f21bc5736fe2d4a6`（`main.elf` `473dcc0e29da71363e6ebfba0a88397b81844f7e4c12743b35fe314bd59777ca`、`imports.elf` `281e58f340f4da1f6bbc3d883208964057867687dea07f231791618b4486a37b`、`yak_lsp.elf` `73e07bc1d275305ccdc1d223d52d2c6f1ae0f45c41439d585f22b20c21e3e55c`）
+    - `yak-windows-x64.zip`：`c39345b4a2c3374f6f4027fe35bedc8bf417e805b6f59a5dda7ec0baad3c23c5`（`main.exe` `5b5aef00716910c7dd2ffc5af14e79cb0b32eae20333779b6272ec60ac0861c3`、`imports.exe` `4e76a933d8f4ac4b8ad035faa28e409eca0691635df564185389f91e247baf16`、`yak_lsp.exe` `5a7963596a8e9ccd8ac60e22753bec9b3bdf8ddedf01da191ab169abb27febbe`）
+    - `build-manifest.json`：`3e35d4457d9217f668c3854347b9677abda72946eb926704e74716c0488c0316`
+
 ## 归档模板
 
 提交或在评审中粘贴证据时，用下列字段，缺项即视为证据不完整：
