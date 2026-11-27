@@ -52,7 +52,7 @@ reject '非法 CI 冷启动目录' "$commit" test/gate/tmp/other
 
 for out in .cold-start test/gate/tmp/t2-ci-source; do
     "${entry[@]}" "$commit" "$out" > "$work/snapshot.log"
-    cmp -s -- "$work/snapshot.log" <(printf '通过：从提交 %s 制备隔离源码 %s\n' "$commit" "$out") || fail '未登记实际提交'
+    printf '通过：从提交 %s 制备隔离源码 %s\n' "$commit" "$out" | cmp -s -- "$work/snapshot.log" - || fail '未登记实际提交'
     git show "$commit:compiler/min/src/input.yak" | cmp -s -- - "$out/compiler/min/src/input.yak" || fail '快照使用了工作树修改'
     git show "$commit:test/gate/.tracked" | cmp -s -- - "$out/test/gate/.tracked" || fail '快照漏掉已提交的隐藏文件'
     [[ -x $out/test/gate/executable.sh && ! -e $out/compiler/min/src/untracked.yak ]] || fail '快照的可执行位或未登记输入不符'

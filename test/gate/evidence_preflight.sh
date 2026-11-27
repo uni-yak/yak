@@ -56,7 +56,7 @@ verify_linux_preflight_record() {
             done='Linux T1 前置条件满足：12 项全部通过' ;;
         *) return 1 ;;
     esac
-    cmp -s -- "$cmd_file" <(printf '%s\n' "$cmd") || return 1
+    printf '%s\n' "$cmd" | cmp -s -- "$cmd_file" - || return 1
     mapfile -t log < "$log_file" || return 1
 
     # 路径与高版本允许随宿主变化；固定位置、门限值和实际版本比较保证无缺项、伪造或冲突结果。

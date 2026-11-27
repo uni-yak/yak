@@ -16,7 +16,7 @@ verify_base_matrix_record() {
         strict) expected+=' --require-complete' ;;
         *) return 1 ;;
     esac
-    cmp -s -- "$cmd" <(printf '%s\n' "$expected") || return 1
+    printf '%s\n' "$expected" | cmp -s -- "$cmd" - || return 1
 
     while IFS= read -r line || [[ -n $line ]]; do
         case $state in

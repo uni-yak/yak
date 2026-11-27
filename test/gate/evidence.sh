@@ -251,8 +251,8 @@ if [[ $release -eq 1 && $failed -eq 0 && -z $missing_records ]]; then
     fi
     # 下载归档只允许固定命令和一行与冷启动输入相符的摘要。
     if [[ ! $seed_digest =~ ^[0-9a-f]{64}$ ]] ||
-        ! cmp -s -- "$from_logs/seed-fetch.cmd" <(printf '%s\n' 'bash test/gate/t1_seed_fetch.sh') ||
-        ! cmp -s -- "$from_logs/seed-fetch.log" <(printf '通过：HTTPS 下载的冻结 Seed SHA-256 为 %s\n' "$seed_digest"); then
+        ! printf '%s\n' 'bash test/gate/t1_seed_fetch.sh' | cmp -s -- "$from_logs/seed-fetch.cmd" - ||
+        ! printf '通过：HTTPS 下载的冻结 Seed SHA-256 为 %s\n' "$seed_digest" | cmp -s -- "$from_logs/seed-fetch.log" -; then
         release_issues+=("Seed 下载未记录指定 HTTPS 获取命令及与归档输入一致的唯一摘要")
     fi
     if [[ ! $runtime_digest =~ ^[0-9a-f]{64}$ ]]; then
@@ -265,8 +265,8 @@ if [[ $release -eq 1 && $failed -eq 0 && -z $missing_records ]]; then
         runtime_bytes=${runtime_bytes//[[:space:]]/}
     fi
     if [[ ! $runtime_bytes =~ ^[1-9][0-9]*$ ]] ||
-        ! cmp -s -- "$from_logs/build-runtime.cmd" <(printf '%s\n' 'bash runtime/build.sh') ||
-        ! cmp -s -- "$from_logs/build-runtime.log" <(printf 'build: OK (out/win_x64/runtime.obj, %s 字节)\n' "$runtime_bytes"); then
+        ! printf '%s\n' 'bash runtime/build.sh' | cmp -s -- "$from_logs/build-runtime.cmd" - ||
+        ! printf 'build: OK (out/win_x64/runtime.obj, %s 字节)\n' "$runtime_bytes" | cmp -s -- "$from_logs/build-runtime.log" -; then
         release_issues+=("运行时构建未记录指定命令及与归档对象大小一致的唯一安装结论")
     fi
     source test/gate/evidence_preflight.sh
@@ -351,7 +351,7 @@ if [[ $release -eq 1 && $failed -eq 0 && -z $missing_records ]]; then
     done < "$from_logs/verify.log"; then
         verify_ok=0
     fi
-    if ! cmp -s -- "$from_logs/verify.cmd" <(printf '%s\n' 'bash compiler/min/verify.sh') ||
+    if ! printf '%s\n' 'bash compiler/min/verify.sh' | cmp -s -- "$from_logs/verify.cmd" - ||
         [[ $verify_ok -ne 1 || $verify_py_seen -ne 1 || $verify_next -ne ${#verify_marks[@]} ]]; then
         release_issues+=("快速门禁未记录指定命令及按序完整且唯一的成功结论")
     fi
