@@ -1,0 +1,107 @@
+// 可选的可信宿主适配器，不由默认候选入口导入。
+import diag;
+import diagnostic_service;
+import documents;
+import iface;
+import json_string;
+import session;
+import workspace_snapshot;
+foreign exit(code: u8): void;
+
+function publish_refresh(state: &session::State:Read, update: &workspace_snapshot::Refresh:Read): bool!AllocError {
+    if update.status == 1u8 { return diagnostic_service::emit_analysis(state, update.ticket, &update.analysis:Read)?; }
+    if update.status == 3u8 {
+        let blank: diag::DiagBuffer = diag::diagbuf_new();
+        var reason: u8 = 49u8;
+        if documents::is_current(&state.store:Read, update.ticket) &&
+            !documents::analysis_size_allowed(@len(state.store.slots[update.ticket.slot].snapshot.text.data)) { reason = 3u8; }
+        return diagnostic_service::emit_current(state, update.ticket, &blank:Read, reason)?;
+    }
+    return true;
+}
+
+function registration_exists(registrations: &[workspace_snapshot::Registration]:Read, uri: &json_string::Decoded:Read): bool {
+    return workspace_snapshot::registration_for_uri(registrations, &uri.data[0..@len(uri.data)]:Read) < @len(registrations) as u32;
+}
+
+function registered_ticket(state: &session::State:Read, registrations: &[workspace_snapshot::Registration]:Read, ticket: documents::Ticket): bool {
+    return registration_exists(registrations, &state.store.slots[ticket.slot].uri:Read);
+}
+
+function valid_targets(registrations: &[workspace_snapshot::Registration]:Read, targets: &[documents::DefinitionTarget]:Read): bool {
+    if @len(targets) > 32u64 { return false; }
+    var i: u32 = 0;
+    while i < @len(targets) as u32 {
+        let target: &documents::DefinitionTarget:Read = &targets[i]:Read;
+        if target.status == 0u8 {
+            let at: u32 = workspace_snapshot::registration_for_uri(registrations, &target.uri[0..@len(target.uri)]:Read);
+            if at >= @len(registrations) as u32 { return false; }
+            let row: &workspace_snapshot::Registration:Read = &registrations[at]:Read;
+            if iface::bytes_order(&target.module[0..@len(target.module)]:Read, &row.module[0..@len(row.module)]:Read) != 0 { return false; }
+        }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+// 独占的文档存储借用在返回批结果前结束，发布再读取完整会话。
+function refresh_batch(state: &session::State:ReadWrite, registrations: &[workspace_snapshot::Registration]:Read,
+    profile: &[u8], frontend: u64): workspace_snapshot::Batch!AllocError {
+    return workspace_snapshot::refresh_registered(&state.store:ReadWrite, registrations, profile, frontend)?;
+}
+
+// 一帧的文档状态已提交，先清空关闭项，再按 URI 发布受影响快照。
+function publish_configured(state: &session::State:ReadWrite, event: &documents::Event:Read,
+    registrations: &[workspace_snapshot::Registration]:Read, profile: &[u8], frontend: u64): bool!AllocError {
+    if event.status == 2u8 {
+        if !diagnostic_service::publish(state, event)? { return false; }
+        if !registration_exists(registrations, &event.closed_uri:Read) { return true; }
+    } elseif event.status == 1u8 {
+        let ticket: documents::Ticket = event.ticket;
+        if !documents::is_current(&state.store:Read, ticket) { return true; }
+        if !registered_ticket(&*state:Read, registrations, ticket) { return diagnostic_service::snapshot(state, ticket)?; }
+    } else { return diagnostic_service::publish(state, event)?; }
+    let batch: workspace_snapshot::Batch = refresh_batch(state, registrations, profile, frontend)?;
+    if batch.status != 0u8 { return false; }
+    var i: u32 = 0;
+    while i < @len(batch.updates) as u32 {
+        if !publish_refresh(&*state:Read, &batch.updates[i]:Read)? { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function configured_step(state: &session::State:ReadWrite, registrations: &[workspace_snapshot::Registration]:Read, profile: &[u8], frontend: u64,
+    targets: &[documents::DefinitionTarget]:Read, workspace_symbols: bool): u8!AllocError {
+    let step: session::Step = session::advance_workspace(state, targets, workspace_symbols)?;
+    if step.status != 3u8 { return step.status; }
+    if !publish_configured(state, &step.event:Read, registrations, profile, frontend)? { return 2u8; }
+    return 3u8;
+}
+
+function serve_configured(registrations: &[workspace_snapshot::Registration]:Read, profile: &[u8], frontend: u64,
+    targets: &[documents::DefinitionTarget]:Read, workspace_symbols: bool): u8!AllocError {
+    if !workspace_snapshot::valid_registrations(registrations) || !valid_targets(registrations, targets) { return 1u8; }
+    let symbols_ready: bool = workspace_symbols && documents::complete_symbol_scope(targets);
+    var state: session::State = session::create_configured(16777216u32, true);
+    while true {
+        let status: u8 = configured_step(&state:ReadWrite, registrations, profile, frontend, targets, symbols_ready)?;
+        if status != 3u8 { exit(status); }
+    }
+    return 1u8;
+}
+
+// 嵌入宿主提供预授权登记和已验证目标；不从协议初始化参数接收这些数据。
+export function run_configured(registrations: &[workspace_snapshot::Registration]:Read, profile: &[u8], frontend: u64,
+    targets: &[documents::DefinitionTarget]:Read): void {
+    run_with_symbols(registrations, profile, frontend, targets, false);
+    return;
+}
+
+// 仅当宿主确认目标集合是它授权的完整符号搜索范围时才启用。
+export function run_with_symbols(registrations: &[workspace_snapshot::Registration]:Read, profile: &[u8], frontend: u64,
+    targets: &[documents::DefinitionTarget]:Read, workspace_symbols: bool): void {
+    let failed: u8!AllocError = serve_configured(registrations, profile, frontend, targets, workspace_symbols);
+    @drop(failed);
+    exit(1u8);
+}

@@ -1,0 +1,93 @@
+name: Windows x64 构建与验收
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run:
+        description: 同一提交的编译器冷启动与自举运行编号
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        required: true
+      candidate_run:
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
+    timeout-minutes: 90
+    env:
+      MSYSTEM: UCRT64
+      CHERE_INVOKING: '1'
+      MSYS2_PATH_TYPE: inherit
+    steps:
+      - name: 核对运行器
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'self-hosted') {
+            throw '请配置 YAK_WINDOWS_RUNNER 指向预置锁定 UCRT64 工具链的 Windows runner'
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          persist-credentials: false
+      - name: 核对候选运行的来源
+        if: inputs.commit == ''
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run }}
+        run: |
+          python test/gate/ci_release.py check-run "$CANDIDATE_RUN" "$GITHUB_SHA" .github/workflows/compiler-bootstrap.yml
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: bootstrap-candidate
+          path: test/gate/tmp/ci-candidate
+          run-id: ${{ inputs.candidate_run }}
+          github-token: ${{ github.token }}
+      - name: 执行目标原生验收和打包
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        env:
+          SOURCE_COMMIT: ${{ inputs.commit || github.sha }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run }}
+          YAK_CI_NVIM: ${{ vars.YAK_WINDOWS_NVIM }}
+          YAK_CI_CODE: ${{ vars.YAK_WINDOWS_CODE }}
+          YAK_CI_CASE_JOBS: ${{ vars.YAK_WINDOWS_CASE_JOBS }}
+        run: bash test/gate/ci_platform.sh win-x64 "$SOURCE_COMMIT" "$CANDIDATE_RUN"
+      - name: 上传已验收的分发包
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: delivery-win-x64
+          path: test/gate/tmp/ci-delivery/
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: true
+      - name: 封存原始回执
+        if: "!cancelled()"
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        run: |
+          [[ -d test/gate/tmp ]] || exit 0
+          cd test/gate/tmp
+          shopt -s nullglob
+          paths=(ci-platform-evidence/logs ci-platform-evidence/stress-*.json ci-candidate/platform-win-x64.* lsp-neovim.*/{run.json,launcher.log,workspace} lsp-vscode.*/{run.json,editor.json,launcher.log,trace.log} lsp-corpus.*/run.json)
+          if [[ -d ci-platform-evidence/logs ]]; then
+            tar -czf platform-originals.tar.gz -- "${paths[@]}"
+          fi
+      - name: 上传原生证据
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: evidence-win-x64
+          path: test/gate/tmp/platform-originals.tar.gz
+          compression-level: 0
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 90

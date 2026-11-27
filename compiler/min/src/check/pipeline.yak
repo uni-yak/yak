@@ -1,0 +1,306 @@
+// T1 前端聚合管线：lex → parse → desugar → resolve → typecheck → layout → owner。
+// 只做诊断与语义事实构建；不产生 MIR / .iface / .obj。
+import lex;
+import types;
+import parse;
+import ast;
+import parse_core;
+import diag;
+import resolve_refs;
+import layout;
+import desugar;
+import pipeline_index;
+import pipeline_stages;
+
+function emit_lex(diags: &diag::DiagBuffer:ReadWrite, errors: &[lex::LexDiagnostic]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+function emit_parse(diags: &diag::DiagBuffer:ReadWrite, errors: &[parse_core::ParseDiagnostic]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+const DOCUMENT_TOKENS: u32 = 2048;
+const DOCUMENT_NAME_BYTES: u32 = 1024;
+const DOCUMENT_LEX_INTERN: u64 = 12288;
+const DOCUMENT_DIAGNOSTICS: u32 = 64;
+const DOCUMENT_PARSE_DEPTH: u32 = 64;
+const DOCUMENT_EXPRESSION_DEPTH: u32 = 64;
+const DOCUMENT_MATCH_PATH_STEPS: u32 = 1024;
+const DOCUMENT_PARSE_RECOVERY_TOKENS: u32 = 1024;
+// 全管线统一总工作量上限（跨词法、解析、符号、类型、布局、所有权与索引累加）。
+const DOCUMENT_TOTAL_WORK: u64 = 131072;
+
+// 贯通全阶段的总工作量预算；零上限表示批处理模式不启用文档总预算。
+export struct WorkBudget { limit: u64, used: u64, exhausted: bool }
+
+export function work_budget(limit: u64): WorkBudget {
+    return WorkBudget { limit: limit, used: 0, exhausted: false };
+}
+
+function charge_work(work: &WorkBudget:ReadWrite, cost: u64): bool {
+    if work.limit == 0u64 { return true; }
+    if work.exhausted { return false; }
+    if cost > work.limit - work.used {
+        work.used = work.limit;
+        work.exhausted = true;
+        return false;
+    }
+    work.used = work.used + cost;
+    return true;
+}
+
+// 文档分析的状态不混入编译错误码。
+export struct DocumentAnalysis { status: u8, diagnostics: diag::DiagBuffer }
+
+// 只保留区间和展示文本，不把定义或类型编号留到请求阶段。
+export struct DocumentWithDefinitions { analysis: DocumentAnalysis, definitions: types::DocumentDefinitions }
+
+export struct PublicDeclaration { name: types::Span, kind: u8 }
+export struct PublicDeclarations { valid: bool, items: PublicDeclaration[] }
+
+export function analysis_checked(status: u8): bool { return status == 0u8; }
+export function analysis_rejected(status: u8): bool { return status == 1u8; }
+export function analysis_needs_dependencies(status: u8): bool { return status == 2u8; }
+export function analysis_diagnostics_truncated(status: u8): bool { return status == 3u8; }
+export function analysis_parse_depth_exceeded(status: u8): bool { return status == 4u8; }
+export function analysis_expression_depth_exceeded(status: u8): bool { return status == 5u8; }
+export function analysis_value_depth_exceeded(status: u8): bool { return status == 6u8; }
+export function analysis_token_limit_exceeded(status: u8): bool { return status == 7u8; }
+export function analysis_name_limit_exceeded(status: u8): bool { return status == 8u8; }
+export function analysis_copy_walk_exceeded(status: u8): bool { return status == 9u8; }
+export function analysis_write_visits_exceeded(status: u8): bool { return status == 10u8; }
+export function analysis_owner_replays_exceeded(status: u8): bool { return status == 11u8; }
+export function analysis_place_copy_exceeded(status: u8): bool { return status == 12u8; }
+export function analysis_slice_merge_exceeded(status: u8): bool { return status == 13u8; }
+export function analysis_slice_copy_exceeded(status: u8): bool { return status == 14u8; }
+export function analysis_slice_scope_exceeded(status: u8): bool { return status == 15u8; }
+export function analysis_slice_assignment_exceeded(status: u8): bool { return status == 16u8; }
+export function analysis_borrow_conflict_exceeded(status: u8): bool { return status == 17u8; }
+export function analysis_place_merge_exceeded(status: u8): bool { return status == 18u8; }
+export function analysis_place_lookup_exceeded(status: u8): bool { return status == 19u8; }
+export function analysis_place_exit_exceeded(status: u8): bool { return status == 20u8; }
+export function analysis_slot_jump_exceeded(status: u8): bool { return status == 21u8; }
+export function analysis_slice_jump_exceeded(status: u8): bool { return status == 22u8; }
+export function analysis_name_lookup_exceeded(status: u8): bool { return status == 23u8; }
+export function analysis_reservation_exceeded(status: u8): bool { return status == 24u8; }
+export function analysis_enum_lookup_exceeded(status: u8): bool { return status == 25u8; }
+export function analysis_reference_output_exceeded(status: u8): bool { return status == 26u8; }
+export function analysis_value_graph_exceeded(status: u8): bool { return status == 27u8; }
+export function analysis_layout_exceeded(status: u8): bool { return status == 28u8; }
+export function analysis_decl_intern_exceeded(status: u8): bool { return status == 29u8; }
+export function analysis_const_init_exceeded(status: u8): bool { return status == 30u8; }
+export function analysis_const_material_exceeded(status: u8): bool { return status == 31u8; }
+export function analysis_const_fold_exceeded(status: u8): bool { return status == 32u8; }
+export function analysis_integer_probe_exceeded(status: u8): bool { return status == 33u8; }
+export function analysis_integer_scan_exceeded(status: u8): bool { return status == 34u8; }
+export function analysis_integer_shape_exceeded(status: u8): bool { return status == 35u8; }
+export function analysis_array_inference_exceeded(status: u8): bool { return status == 36u8; }
+export function analysis_ctor_fields_exceeded(status: u8): bool { return status == 37u8; }
+export function analysis_match_scan_exceeded(status: u8): bool { return status == 38u8; }
+export function analysis_match_path_exceeded(status: u8): bool { return status == 39u8; }
+export function analysis_parse_recovery_exceeded(status: u8): bool { return status == 40u8; }
+export function analysis_out_ref_exceeded(status: u8): bool { return status == 41u8; }
+export function analysis_projection_exceeded(status: u8): bool { return status == 42u8; }
+export function analysis_equality_exceeded(status: u8): bool { return status == 43u8; }
+export function analysis_const_snapshot_exceeded(status: u8): bool { return status == 44u8; }
+export function analysis_body_intern_exceeded(status: u8): bool { return status == 45u8; }
+export function analysis_lex_intern_exceeded(status: u8): bool { return status == 46u8; }
+export function analysis_total_work_exceeded(status: u8): bool { return status == 47u8; }
+
+export function public_declarations(source: &[u8], file: u16): PublicDeclarations!AllocError {
+    if file == 0u16 || @len(source) > 16384u64 { return PublicDeclarations { valid: false, items: [] }; }
+    let lexed: lex::LexResult = lex::lex_scan_budgeted(source, file, DOCUMENT_TOKENS, DOCUMENT_NAME_BYTES, DOCUMENT_LEX_INTERN)?;
+    if lexed.resource_status != 0u8 || @len(lexed.diagnostics) != 0u64 { return PublicDeclarations { valid: false, items: [] }; }
+    let parsed: parse::ParseResult = parse::parse_lexed_limited(&lexed:Read, file, DOCUMENT_DIAGNOSTICS, DOCUMENT_PARSE_DEPTH, DOCUMENT_MATCH_PATH_STEPS, DOCUMENT_PARSE_RECOVERY_TOKENS)?;
+    if parsed.depth_exceeded || parsed.match_path_exceeded || parsed.recovery_exceeded || parsed.diagnostics_truncated || @len(parsed.diagnostics) != 0u64 {
+        return PublicDeclarations { valid: false, items: [] };
+    }
+    let collected: pipeline_index::PublicDeclarations = pipeline_index::collect_public_declarations(&lexed.tokens[0..@len(lexed.tokens)]:Read, &parsed.file:Read, &parsed.pool:Read, file)?;
+    if !collected.valid { return PublicDeclarations { valid: false, items: [] }; }
+    var items: PublicDeclaration[] = [];
+    var i: u32 = 0;
+    while i < @len(collected.items) as u32 {
+        @push(items, PublicDeclaration { name: collected.items[i].name, kind: collected.items[i].kind })?;
+        i = i + 1u32;
+    }
+    return PublicDeclarations { valid: true, items: @move(items) };
+}
+
+// 只接收已验证的内存上下文；配额检查整个传入表，包括传递名义类型后缀。
+function document_dependencies_fit(deps: &resolve_refs::DependencySet:Read, direct_count: u32, imported: &layout::ImportedLayoutTable:Read): bool {
+    let count: u32 = @len(deps.ifaces) as u32;
+    if count > 32u32 || direct_count > count { return false; }
+    var bytes: u64 = 0;
+    var rows: u64 = @len(imported.items) as u64;
+    var i: u32 = 0;
+    while i < count {
+        let item: &resolve_refs::Iface:Read = &deps.ifaces[i]:Read;
+        bytes = bytes + @len(item.module) as u64 + @len(item.names) as u64 + @len(item.sigs) as u64 + @len(item.digest) as u64;
+        let edges: u32 = @len(item.dependencies) as u32;
+        rows = rows + @len(item.exports) as u64 + @len(item.enum_members) as u64 + @len(item.struct_fields) as u64 + edges as u64;
+        if bytes > 32768u64 || rows > 512u64 { return false; }
+        var j: u32 = 0;
+        while j < edges {
+            bytes = bytes + @len(item.dependencies[j].module) as u64 + @len(item.dependencies[j].digest) as u64;
+            if bytes > 32768u64 { return false; }
+            j = j + 1u32;
+        }
+        i = i + 1u32;
+    }
+    return rows <= 512u64;
+}
+
+function document_imports_bound(pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, direct_count: u32, module_name: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(pool.imports) as u32 {
+        // 自导入由共享解析器给出本文件的真实诊断，而不是报材料缺失。
+        if !resolve_refs::module_path_matches(names, pool, i, module_name) {
+            var d: u32 = 0;
+            while d < direct_count && !resolve_refs::iface_module_matches(names, pool, i, &deps.ifaces[d]:Read) { d = d + 1u32; }
+            if d == direct_count { return false; }
+        }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+// 阶段 1：词法、解析与 base 脱糖门禁。
+function analyze(source: &[u8], file: u16, document: bool, diags: &diag::DiagBuffer:ReadWrite, index_definitions: bool, definitions: &types::DocumentDefinitions:ReadWrite, module_name: &[u8], deps: &resolve_refs::DependencySet:Read, direct_count: u32, imported_layouts: &layout::ImportedLayoutTable:Read, work: &WorkBudget:ReadWrite): u8!AllocError {
+    var token_limit: u32 = 0;
+    var name_limit: u32 = 0;
+    var intern_limit: u64 = 0;
+    if document { token_limit = DOCUMENT_TOKENS; name_limit = DOCUMENT_NAME_BYTES; intern_limit = DOCUMENT_LEX_INTERN; }
+    let lexed: lex::LexResult = lex::lex_scan_budgeted(source, file, token_limit, name_limit, intern_limit)?;
+    if lex::lex_intern_limit_exceeded(lexed.resource_status) { return 46u8; }
+    if lexed.resource_status != 0u8 { return lexed.resource_status + 6u8; }
+    if !charge_work(work, @len(source) + @len(lexed.tokens) * 2u64 + @len(lexed.names.entries)) { return 47u8; }
+    emit_lex(diags, &lexed.diagnostics[0..@len(lexed.diagnostics)]:Read)?;
+    if @len(lexed.diagnostics) > 0 {
+        diag::diagbuf_sort(diags);
+        return 1u8;
+    }
+    if document && index_definitions { pipeline_index::collect_semantic(&lexed.tokens[0..@len(lexed.tokens)]:Read, definitions)?; }
+    // 走 parse_lexed 而非 parse_file：字符串字面量的静态字节必须随 AST 一起进入后续阶段。
+    var limit: u32 = 0;
+    var depth_limit: u32 = 0;
+    var match_path_limit: u32 = 0;
+    var recovery_limit: u32 = 0;
+    if document {
+        limit = DOCUMENT_DIAGNOSTICS;
+        depth_limit = DOCUMENT_PARSE_DEPTH;
+        match_path_limit = DOCUMENT_MATCH_PATH_STEPS;
+        recovery_limit = DOCUMENT_PARSE_RECOVERY_TOKENS;
+    }
+    let parsed: parse::ParseResult = parse::parse_lexed_limited(&lexed:Read, file, limit, depth_limit, match_path_limit, recovery_limit)?;
+    var pstop: u8 = 0u8;
+    if parsed.depth_exceeded { pstop = 4u8; }
+    elseif parsed.match_path_exceeded { pstop = 39u8; }
+    elseif parsed.recovery_exceeded { pstop = 40u8; }
+    if pstop != 0u8 { return pstop; }
+    let ast_cost: u64 = @len(parsed.pool.exprs) + @len(parsed.pool.stmts) + @len(parsed.pool.types) + @len(parsed.pool.blocks) + @len(parsed.file.items);
+    if !charge_work(work, ast_cost * 2u64) { return 47u8; }
+    emit_parse(diags, &parsed.diagnostics[0..@len(parsed.diagnostics)]:Read)?;
+    if parsed.diagnostics_truncated || @len(parsed.diagnostics) > 0 {
+        diag::diagbuf_sort(diags);
+        if parsed.diagnostics_truncated { return 3u8; }
+        return 1u8;
+    }
+    if document {
+        let bounded: bool = ast::expression_depth_within(&parsed.pool:Read, DOCUMENT_EXPRESSION_DEPTH)?;
+        if !bounded { return 5u8; }
+    }
+    if document && index_definitions { pipeline_index::collect_structure(&lexed.tokens[0..@len(lexed.tokens)]:Read, &parsed.file:Read, &parsed.pool:Read, definitions)?; }
+    let base_ok: bool = desugar::verify_base(&parsed.file:Read, &parsed.pool:Read, diags)?;
+    if !base_ok {
+        diag::diagbuf_sort(diags);
+        return 1u8;
+    }
+    // 只在前三个阶段通过后按实际 AST 决定是否能继续。
+    let pool: &ast::AstPool:Read = &parsed.pool:Read;
+    if document {
+        if !document_dependencies_fit(deps, direct_count, imported_layouts) { return 2u8; }
+        if @len(pool.imports) > 0 && (@len(module_name) == 0 || !document_imports_bound(pool, &lexed.names:Read, deps, direct_count, module_name)) {
+            diag::diagbuf_sort(diags);
+            return 2u8;
+        }
+    }
+    var stage_work: pipeline_stages::StageBudget = pipeline_stages::StageBudget { limit: work.limit, used: work.used, exhausted: work.exhausted };
+    let status: u8 = pipeline_stages::analyze_resolve(source, file, document, diags, index_definitions, definitions, module_name, deps, direct_count, imported_layouts, &stage_work:ReadWrite, &lexed:Read, &parsed:Read, ast_cost)?;
+    work.used = stage_work.used;
+    work.exhausted = stage_work.exhausted;
+    return status;
+}
+
+export function run_frontend(source: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    var unused: types::DocumentDefinitions = types::empty_definitions();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let imported: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    var work: WorkBudget = work_budget(0u64);
+    let status: u8 = analyze(source, file, false, diags, false, &unused:ReadWrite, "", &deps:Read, 0u32, &imported:Read, &work:ReadWrite)?;
+    return analysis_checked(status);
+}
+
+// 每次持有新的诊断缓冲；文档不会借用前一次分析或宿主路径。
+function analyze_document(source: &[u8], file: u16, index_definitions: bool, definitions: &types::DocumentDefinitions:ReadWrite, work_limit: u64): DocumentAnalysis!AllocError {
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let imported: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    return analyze_document_context(source, file, index_definitions, definitions, "", &deps:Read, 0u32, &imported:Read, work_limit)?;
+}
+
+function analyze_document_context(source: &[u8], file: u16, index_definitions: bool, definitions: &types::DocumentDefinitions:ReadWrite, module_name: &[u8], deps: &resolve_refs::DependencySet:Read, direct_count: u32, imported_layouts: &layout::ImportedLayoutTable:Read, work_limit: u64): DocumentAnalysis!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_limited(DOCUMENT_DIAGNOSTICS);
+    var work: WorkBudget = work_budget(work_limit);
+    var status: u8 = analyze(source, file, true, &diags:ReadWrite, index_definitions, definitions, module_name, deps, direct_count, imported_layouts, &work:ReadWrite)?;
+    // 工作量中止不发布局部诊断；39、40 属于独立的解析降级路径。
+    if (status >= 10u8 && status <= 38u8) || (status >= 41u8 && status <= 47u8) { return DocumentAnalysis { status: status, diagnostics: diag::diagbuf_new() }; }
+    if diags.truncated { status = 3u8; }
+    return DocumentAnalysis { status: status, diagnostics: @move(diags) };
+}
+
+export function run_document_frontend(source: &[u8], file: u16): DocumentAnalysis!AllocError {
+    var unused: types::DocumentDefinitions = types::empty_definitions();
+    return analyze_document(source, file, false, &unused:ReadWrite, DOCUMENT_TOTAL_WORK)?;
+}
+
+// 显式指定总工作量预算的文档入口，用于边界测试与收紧配额。
+export function run_document_budgeted(source: &[u8], file: u16, total_work: u64): DocumentAnalysis!AllocError {
+    var unused: types::DocumentDefinitions = types::empty_definitions();
+    var limit: u64 = total_work;
+    if limit == 0u64 || limit > DOCUMENT_TOTAL_WORK { limit = DOCUMENT_TOTAL_WORK; }
+    return analyze_document(source, file, false, &unused:ReadWrite, limit)?;
+}
+
+export function run_document_with_definitions(source: &[u8], file: u16): DocumentWithDefinitions!AllocError {
+    var definitions: types::DocumentDefinitions = types::empty_definitions();
+    let analysis: DocumentAnalysis = analyze_document(source, file, true, &definitions:ReadWrite, DOCUMENT_TOTAL_WORK)?;
+    return DocumentWithDefinitions { analysis: analysis, definitions: definitions };
+}
+
+// 分析与索引一起产出；即使失败也不会保留上一次的链接。
+export function run_document_indexed(source: &[u8], file: u16, enabled: bool, definitions: &types::DocumentDefinitions:ReadWrite): DocumentAnalysis!AllocError {
+    *definitions = types::empty_definitions();
+    return analyze_document(source, file, enabled, definitions, DOCUMENT_TOTAL_WORK)?;
+}
+
+// 调用方保证模块名来自授权登记、依赖由身份校验和装配得到、布局来自同一依赖顺序。
+// 接口材料不产生跨文件位置，也不替换当前源码或绕过文档预算。
+export function run_document_with_dependencies(source: &[u8], file: u16, module_name: &[u8], deps: &resolve_refs::DependencySet:Read, direct_count: u32, imported_layouts: &layout::ImportedLayoutTable:Read): DocumentWithDefinitions!AllocError {
+    var definitions: types::DocumentDefinitions = types::empty_definitions();
+    let analysis: DocumentAnalysis = run_document_dependency_indexed(source, file, module_name, deps, direct_count, imported_layouts, &definitions:ReadWrite)?;
+    return DocumentWithDefinitions { analysis: analysis, definitions: definitions };
+}
+
+export function run_document_dependency_indexed(source: &[u8], file: u16, module_name: &[u8], deps: &resolve_refs::DependencySet:Read, direct_count: u32,
+    imported_layouts: &layout::ImportedLayoutTable:Read, definitions: &types::DocumentDefinitions:ReadWrite): DocumentAnalysis!AllocError {
+    *definitions = types::empty_definitions();
+    return analyze_document_context(source, file, true, definitions, module_name, deps, direct_count, imported_layouts, DOCUMENT_TOTAL_WORK)?;
+}

@@ -1,0 +1,11 @@
+// t68: 有符号算术assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let a: i32 = -10;
+    let b: i32 = -20;
+    assert(a + b == -30);
+    assert(a * b == 200);
+    assert(a - b == 10);
+    return;
+}

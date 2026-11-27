@@ -1,0 +1,6 @@
+// t367 的依赖单元：导出无载荷枚举与构造函数。
+export enum E { A, B }
+
+export function make(): E {
+    return E::A;
+}

@@ -1,0 +1,29 @@
+// expected_exit: 42
+// spec: spec/lang/base.md 7.16
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+struct Stats { len: u64, cap: u64 }
+struct Buffer { bytes: u8[] }
+
+function #read_length(values: &u8[]): u64 {
+    return values.len;
+}
+
+function samples(): u8[] { return [3u8, 4u8, 5u8]; }
+
+function main(): void {
+    let empty: u8[] = [];
+    assert(empty.len == 0u64 && empty.cap == 0u64);
+    let buffer: Buffer = Buffer { bytes: samples() };
+    assert(buffer.bytes.len == 3u64 && buffer.bytes.cap >= 3u64);
+    assert(read_length(&buffer.bytes) == 3u64);
+    let view: &[u8] = buffer.bytes[1u64..3u64];
+    assert(view.len == 2u64);
+    assert("abc".len == 3u64);
+    assert(samples().len == 3u64);
+    var native: Stats = Stats { len: 9u64, cap: 8u64 };
+    native.cap = native.len;
+    assert(native.cap == 9u64);
+    exit(42u8);
+}

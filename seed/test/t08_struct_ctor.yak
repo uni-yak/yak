@@ -1,0 +1,10 @@
+// t08: struct 定义 + 结构体字面量构造
+struct Point {
+    x: u32,
+    y: u32,
+}
+
+function main(): void {
+    let p: Point = Point { x: 1, y: 2 };
+    return;
+}

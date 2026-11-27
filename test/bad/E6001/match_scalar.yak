@@ -1,0 +1,10 @@
+// expected_code: E6001
+// spec: spec/lang/base.md R-2
+// 触发：以 owning 标量而不是 owning 枚举作为 match 判别值。
+function main(): void {
+    let value: u32 = 1u32;
+    match value {
+        _ => { return; }
+    }
+    return;
+}

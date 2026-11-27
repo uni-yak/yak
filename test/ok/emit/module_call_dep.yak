@@ -1,0 +1,4 @@
+// 依赖单元：导出被根单元调用的加法函数（自身无入口）。
+export function add(a: u32, b: u32): u32 {
+    return a + b;
+}

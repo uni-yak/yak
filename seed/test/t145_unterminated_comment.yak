@@ -1,0 +1,3 @@
+// expected_trap: unterminated comment
+function main(): void {  }
+/* unfinished

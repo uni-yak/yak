@@ -1,0 +1,8 @@
+foreign assert(cond: bool): void;
+function main(): void {
+    let source: [u8[]; 1] = [[1]];
+    var copy: [u8[]; 1] = @clone(source)?;
+    @push(copy[0], 2)?;
+    assert(@len(source[0]) == 1);
+    assert(@len(copy[0]) == 2);
+}

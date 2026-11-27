@@ -1,0 +1,46 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function main(): void {
+    // 低 4 GiB 的上半区需要零扩展地址，数据宽度仍由原操作数决定。
+    let required: [u8; 51] = [0x67, 0x4c, 0x8b, 0x04, 0x25, 0, 0, 0, 0x80,
+        0x66, 0x67, 0x44, 0x89, 0x0c, 0x25, 0xff, 0xff, 0xff, 0xff,
+        0x67, 0x44, 0x0f, 0xb6, 0x04, 0x25, 0, 0, 0, 0x90,
+        0x67, 0x48, 0x81, 0x3c, 0x25, 0, 0, 0, 0x90, 0x80, 0, 0, 0,
+        0x67, 0x4c, 0x8d, 0x04, 0x25, 0, 0, 0, 0x80];
+    encoding(&required[0..42]:Read, 0)?;
+    // LEA 无访存，32 位目的可直接把相同地址零扩展。
+    encoding(&required[42..51]:Read, 7103)?;
+    encoding(&required[19..28]:Read, 7101)?;
+    encoding(&required[29..41]:Read, 7101)?;
+
+    let low: [u8; 23] = [0x67, 0x4c, 0x8b, 0x04, 0x25, 0xff, 0xff, 0xff, 0x7f,
+        0x67, 0x48, 0x81, 0x3c, 0x25, 0, 0, 0, 0x40, 0x80, 0, 0, 0, 0xc3];
+    encoding(&low[0..9]:Read, 7103)?;
+    encoding(&low[9..22]:Read, 7103)?;
+    // 无前缀的同一位移按符号扩展，表示高端地址。
+    let sign_extended: [u8; 8] = [0x4c, 0x8b, 0x04, 0x25, 0, 0, 0, 0x80];
+    encoding(&sign_extended[0..8]:Read, 0)?;
+
+    let aliases: [u8; 19] = [0x67, 0x66, 0x44, 0x89, 0x0c, 0x25, 0xff, 0xff, 0xff, 0xff,
+        0x67, 0x4c, 0x8b, 0x04, 0x65, 0, 0, 0, 0x80];
+    encoding(&aliases[0..10]:Read, 7102)?;
+    encoding(&aliases[10..19]:Read, 7102)?;
+
+    // REX.X 选出真实索引，rm=5 表示指令指针相对，这两种都不是绝对地址。
+    let other: [u8; 17] = [0x67, 0x4e, 0x8b, 0x04, 0x25, 0, 0, 0, 0x80,
+        0x67, 0x4c, 0x8b, 0x05, 0, 0, 0, 0x80];
+    encoding(&other[0..9]:Read, 7101)?;
+    encoding(&other[9..17]:Read, 7101)?;
+    return;
+}

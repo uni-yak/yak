@@ -1,0 +1,42 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+
+function number(ok: bool): i32!Failure {
+    if !ok { return Failure::Bad; }
+    return 5;
+}
+function flag(ok: bool): bool!Failure {
+    if !ok { return Failure::Bad; }
+    return true;
+}
+function forbidden(): i32 { assert(false); return 1; }
+function left(ok: bool): i32!Failure { return number(ok)? + forbidden(); }
+function right(ok: bool): i32!Failure { return 2 + number(ok)?; }
+function negate(ok: bool): i32!Failure { return -number(ok)?; }
+function invert(ok: bool): bool!Failure { return !flag(ok)?; }
+function both(ok: bool): bool!Failure { return flag(ok)? && flag(true)?; }
+function both_right(ok: bool): bool!Failure { return true && flag(ok)?; }
+function either(ok: bool): bool!Failure { return false || flag(ok)?; }
+function either_left(ok: bool): bool!Failure { return flag(ok)? || false; }
+function skip_and(): bool!Failure { return false && flag(false)?; }
+function skip_or(): bool!Failure { return true || flag(false)?; }
+function recover_number(e: &Failure): i32 { return 99; }
+function recover_flag(e: &Failure): bool { return true; }
+
+function main(): void {
+    assert(left(false).catch(&recover_number) == 99);
+    assert(right(false).catch(&recover_number) == 99);
+    assert(right(true).catch(&recover_number) == 7);
+    assert(negate(false).catch(&recover_number) == 99);
+    assert(negate(true).catch(&recover_number) == -5);
+    assert(invert(false).catch(&recover_flag) == true);
+    assert(invert(true).catch(&recover_flag) == false);
+    assert(both(false).catch(&recover_flag) == true);
+    assert(both(true).catch(&recover_flag) == true);
+    assert(both_right(false).catch(&recover_flag) == true);
+    assert(either(false).catch(&recover_flag) == true);
+    assert(either(true).catch(&recover_flag) == true);
+    assert(either_left(false).catch(&recover_flag) == true);
+    assert(skip_and().catch(&recover_flag) == false);
+    assert(skip_or().catch(&recover_flag) == true);
+}

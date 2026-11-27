@@ -1,0 +1,2 @@
+// expected_trap: moved/dropped
+function main(): void { let x: u8[] = [1]; @drop(x); @len(x); }

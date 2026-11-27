@@ -1,0 +1,39 @@
+// t257: ? 错误传播在子表达式中的短路语义
+// 覆盖：普通函数实参、foreign 实参、数组字面量元素；
+// 错误传播后不得继续求值后续子表达式或调用被调函数。
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+
+function number(ok: bool): i32!Failure {
+    if !ok { return Failure::Bad; }
+    return 5;
+}
+function recover(e: &Failure): i32 { return 99; }
+
+// 普通函数实参：? 传播后不得调用 use()（use 内 assert(false)，若被调用会 trap）
+function use(x: i32): i32 { assert(false); return x; }
+function call_arg(ok: bool): i32!Failure { return use(number(ok)?); }
+
+// foreign 实参：? 传播后不得对空值应用参数类型（否则 OP-1 trap）
+function foreign_arg(ok: bool): i32!Failure {
+    assert(number(ok)? == 5);
+    return 0;
+}
+
+// 数组字面量：元素 ? 传播后不得求值 forbidden()（forbidden 内 assert(false)）
+function forbidden(): i32 { assert(false); return 1; }
+function array_lit(ok: bool): i32!Failure {
+    let xs: i32[] = [number(ok)?, forbidden()];
+    return xs[0];
+}
+
+// as 转换：操作数 ? 传播后不得对空值做类型检查
+function conv(ok: bool): i32!Failure { return (number(ok)? as u8) as i32; }
+
+function main(): void {
+    assert(call_arg(false).catch(&recover) == 99);
+    assert(foreign_arg(false).catch(&recover) == 99);
+    assert(array_lit(false).catch(&recover) == 99);
+    assert(conv(false).catch(&recover) == 99);
+    return;
+}

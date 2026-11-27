@@ -1,0 +1,20 @@
+// 聚合按值 ABI 样例：12 字节 struct 与 6 字节定长数组跨函数按值传参与返回。
+// 12 字节 struct 与 6 字节定长数组都不属于 1/2/4/8 字节分类：
+// 返回走隐藏返回缓冲区（rcx 传入、rax 返回指针），实参走调用方副本指针。
+// 验收方式：链接后运行，退出码必须是 25（7 + 8 + 9 + 1）。
+foreign exit(code: u8): void;
+
+struct Pair { a: u32, b: u32, c: u32 }
+
+function make(x: u32): Pair { return Pair { a: x, b: x + 1u32, c: x + 2u32 }; }
+function sum(p: Pair): u32 { return p.a + p.b + p.c; }
+function small(): [u16; 3] { return [1u16, 2u16, 3u16]; }
+function use_small(x: [u16; 3]): u32 { return x[0u32] as u32; }
+
+function main(): void {
+    let p: Pair = make(7u32);
+    let s: [u16; 3] = small();
+    let total: u32 = sum(p) + use_small(s);
+    exit(total as u8);
+    return;
+}

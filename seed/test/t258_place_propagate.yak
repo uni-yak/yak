@@ -1,0 +1,47 @@
+// t258: ? 错误传播在 place（位置表达式）内的短路语义
+// 覆盖：索引读取、赋值目标索引、@push 目标索引、借用目标索引；
+// 错误传播后不得求值索引后续部分、被借用的place或 RHS。
+foreign assert(cond: bool): void;
+enum E { Bad, }
+
+function get(ok: bool): i32!E {
+    if !ok { return E::Bad; }
+    return 0;
+}
+function recover(e: &E): i32 { return 99; }
+
+// 索引读取：索引中 ? 传播后不得当作越界访问
+function index_read(ok: bool): i32!E {
+    let xs: i32[] = [10, 20];
+    return xs[get(ok)?];
+}
+
+// 赋值 LHS 索引：RHS 有副作用，错误后不应求值
+function side(): i32 { assert(false); return 7; }
+function index_assign(ok: bool): i32!E {
+    var xs: i32[] = [10, 20];
+    xs[get(ok)?] = side();
+    return 0;
+}
+
+// @push 目标索引：错误后不得调用 push 或触发嵌套 ? 误判
+function index_push(ok: bool): i32!E {
+    var xs: i32[] = [];
+    @push(xs[get(ok)?], 5)?;
+    return 0;
+}
+
+// 借用目标索引：错误后不得形成借用
+function borrow_idx(x: &i32): i32 { return *x; }
+function index_borrow(ok: bool): i32!E {
+    var xs: i32[] = [10, 20];
+    return borrow_idx(&xs[get(ok)?]);
+}
+
+function main(): void {
+    assert(index_read(false).catch(&recover) == 99);
+    assert(index_assign(false).catch(&recover) == 99);
+    assert(index_push(false).catch(&recover) == 99);
+    assert(index_borrow(false).catch(&recover) == 99);
+    return;
+}

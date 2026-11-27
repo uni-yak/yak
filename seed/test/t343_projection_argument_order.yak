@@ -1,0 +1,7 @@
+// expected_trap: eval: exclusively borrowed place (OW-2)
+struct Pair { first: u32, second: u32 }
+function inspect(first: &u32:ReadWrite, second: u32): void {}
+function main(): void {
+    var pair: Pair = Pair { first: 1u32, second: 2u32 };
+    inspect(pair.first, pair.second);
+}

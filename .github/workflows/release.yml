@@ -1,0 +1,205 @@
+name: 发布与验收归档
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 调查 runner、完整验收或从已有回执创建草稿
+        type: choice
+        options: [probe, verify, draft]
+        default: verify
+      review_ref:
+        description: 仅验收模式可选，填写维护者保护的 ci/verify/ 分支
+        type: string
+      tag:
+        description: 草稿模式需要已存在的受保护版本标签
+        type: string
+      verified_run:
+        description: 草稿模式需要指定成功的验收运行编号
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: yak-release-${{ inputs.mode }}-${{ inputs.tag || inputs.review_ref || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: 采集 runner 环境（${{ matrix.target }}）
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'probe'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            image: ${{ vars.YAK_LINUX_RUNNER || 'ubuntu-26.04' }}
+            code: ${{ vars.YAK_LINUX_CODE }}
+            nvim: ${{ vars.YAK_LINUX_NVIM }}
+          - target: win-x64
+            image: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
+            code: ${{ vars.YAK_WINDOWS_CODE }}
+            nvim: ${{ vars.YAK_WINDOWS_NVIM }}
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 8
+    env:
+      TARGET: ${{ matrix.target }}
+      MSYSTEM: ${{ matrix.target == 'win-x64' && 'UCRT64' || '' }}
+      CHERE_INVOKING: '1'
+      MSYS2_PATH_TYPE: inherit
+      CI_CODE: ${{ matrix.code }}
+      CI_NVIM: ${{ matrix.nvim }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: 盘点 Linux runner
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: bash test/gate/ci_runner_env.sh "$TARGET"
+      - name: 盘点 Windows UCRT64 runner
+        if: matrix.target == 'win-x64'
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        run: bash test/gate/ci_runner_env.sh "$TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runner-environment-${{ matrix.target }}
+          path: ${{ runner.temp }}/yak-runner-environment.txt
+          if-no-files-found: error
+
+  plan:
+    name: 核对验收或发布输入
+    if: github.ref == 'refs/heads/main' && inputs.mode != 'probe'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 核对触发模式和源码身份
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          REVIEW_REF: ${{ inputs.review_ref }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERIFIED_RUN: ${{ inputs.verified_run }}
+          LINUX_RUNNER: ${{ vars.YAK_LINUX_RUNNER }}
+          WINDOWS_RUNNER: ${{ vars.YAK_WINDOWS_RUNNER }}
+        run: |
+          if [[ $MODE == verify ]]; then
+            test -z "$RELEASE_TAG$VERIFIED_RUN" || { echo '错误：验收模式不接收发布标签或运行编号' >&2; exit 2; }
+            for name in LINUX_RUNNER WINDOWS_RUNNER; do
+              [[ -n ${!name} ]] || { echo "错误：缺少验收环境设置 $name" >&2; exit 2; }
+            done
+            sha=$GITHUB_SHA
+            if [[ -n $REVIEW_REF ]]; then
+              [[ $REVIEW_REF =~ ^ci/verify/[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { echo '错误：审核分支名无效' >&2; exit 2; }
+              commit=$(git rev-parse --verify "refs/remotes/origin/$REVIEW_REF^{commit}" 2>/dev/null) || { echo "错误：远端不存在审核分支 $REVIEW_REF" >&2; exit 2; }
+              encoded_ref=${REVIEW_REF//\//%2F}
+              remote=$(gh api "repos/$GITHUB_REPOSITORY/branches/$encoded_ref" --jq 'select(.protected == true) | .commit.sha')
+              [[ $commit == "$remote" ]] || { echo '错误：审核分支未受保护或提交身份不同' >&2; exit 2; }
+              sha=$commit
+            fi
+          else
+            test -z "$REVIEW_REF" || { echo '错误：草稿只接收 main 上验收的版本' >&2; exit 2; }
+            sha=$(python3 test/gate/ci_release.py plan "$RELEASE_TAG" "$VERIFIED_RUN")
+          fi
+          printf 'commit=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+
+  checks:
+    if: inputs.mode == 'verify'
+    needs: plan
+    uses: ./.github/workflows/repository-checks.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+
+  bootstrap:
+    if: inputs.mode == 'verify'
+    needs: [plan, checks]
+    uses: ./.github/workflows/compiler-bootstrap.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+
+  windows:
+    if: inputs.mode == 'verify'
+    needs: [plan, bootstrap]
+    uses: ./.github/workflows/build-windows-x64.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+      candidate_run: ${{ github.run_id }}
+
+  linux:
+    if: inputs.mode == 'verify'
+    needs: [plan, bootstrap]
+    uses: ./.github/workflows/build-linux-x64.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+      candidate_run: ${{ github.run_id }}
+
+  assemble:
+    name: 对拍并归档双平台交付件
+    if: inputs.mode == 'verify'
+    needs: [plan, windows, linux]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: delivery-win-x64
+          path: test/gate/tmp/ci-verified/win-x64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: delivery-linux-x64
+          path: test/gate/tmp/ci-verified/linux-x64
+      - name: 校验同一候选、包摘要和逐例结果
+        env:
+          SOURCE_COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          python3 test/gate/ci_artifacts.py assemble test/gate/tmp/ci-verified "$SOURCE_COMMIT" "$GITHUB_RUN_ID" --output test/gate/tmp/ci-release-ready
+          cat test/gate/tmp/ci-release-ready/build-manifest.json >> "$GITHUB_STEP_SUMMARY"
+      - name: 上传完整验收资产
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-ready
+          path: test/gate/tmp/ci-release-ready/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 90
+
+  draft:
+    name: 创建或续传草稿 Release
+    if: inputs.mode == 'draft'
+    needs: plan
+    runs-on: ubuntu-26.04
+    timeout-minutes: 12
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-ready
+          path: test/gate/tmp/ci-release-ready
+          run-id: ${{ inputs.verified_run }}
+          github-token: ${{ github.token }}
+      - name: 核对标签和验收记录后上传草稿资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERIFIED_RUN: ${{ inputs.verified_run }}
+        run: python3 test/gate/ci_release.py draft "$RELEASE_TAG" "$VERIFIED_RUN" test/gate/tmp/ci-release-ready

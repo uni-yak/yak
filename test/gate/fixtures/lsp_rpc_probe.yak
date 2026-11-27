@@ -1,0 +1,18 @@
+// 在相同数据流上验证 stdio 会话，不提供编辑器能力。
+import session;
+foreign exit(code: u8): void;
+
+function serve(): u8!AllocError {
+    var state: session::State = session::create(16777216u32);
+    while true {
+        let step: session::Step = session::advance(&state:ReadWrite)?;
+        if step.status != 3u8 { exit(step.status); }
+    }
+    return 1;
+}
+
+function main(): void {
+    let failed: u8!AllocError = serve();
+    @drop(failed);
+    exit(1);
+}

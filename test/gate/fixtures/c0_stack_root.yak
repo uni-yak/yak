@@ -1,0 +1,16 @@
+// 从独立单元调用，避免把对 ABI 的断言退化成本地调用。
+import c0_stack_leaf;
+
+foreign assert(ok: bool): void;
+
+function main(): void {
+    assert(c0_stack_leaf::six(1, 2, 3, 4, 5, 6) == 91);
+    let data: [u8; 3] = [11u8, 13u8, 17u8];
+    assert(c0_stack_leaf::slice_end(1, 2, 3, &data[0..3], 5) == 77);
+    let src: c0_stack_leaf::Triple = c0_stack_leaf::Triple { x: 11, y: 13, z: 17 };
+    let result: c0_stack_leaf::Triple = c0_stack_leaf::aggregate(1, 2, 3, 4, src);
+    assert(result.x == 12 && result.y == 15 && result.z == 35);
+    assert(src.x == 11 && src.y == 13 && src.z == 17);
+    assert(c0_stack_leaf::large_frame(1, 2, 3, 4, 5, 6) == 21);
+    assert(c0_stack_leaf::six(6, 5, 4, 3, 2, 1) == 56);
+}

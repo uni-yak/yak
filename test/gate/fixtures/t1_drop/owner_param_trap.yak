@@ -1,0 +1,35 @@
+// 按值 owning 形参在先前调用中显式析构，随后当前帧触发边界陷阱；
+// 已转移的所有权不得在陷阱清理中再次释放。
+struct Payload { first: u32[], second: u32[] }
+
+function consume(v: u32[]): void {
+    @drop(v);
+    return;
+}
+
+function trigger(p: &Payload:Write, hi: u32): void!AllocError {
+    var e: u32[] = [];
+    @push(e, 81u32)?;
+    consume(@move(e));
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, 82u32)?;
+    @push(b, 83u32)?;
+    *p = Payload { first: @move(a), second: @move(b) };
+    var c: u32[] = [];
+    @push(c, 84u32)?;
+    var d: u32[] = [];
+    @push(d, 85u32)?;
+    if @len(d[0u32..hi]) == 0u64 { return; }
+    @drop(d);
+    @drop(c);
+    return;
+}
+
+function outer(): void!AllocError {
+    out p: Payload;
+    trigger(out p, 9u32)?;
+    return;
+}
+
+function main(): void { outer(); return; }

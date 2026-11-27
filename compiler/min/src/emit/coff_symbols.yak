@@ -1,0 +1,466 @@
+// COFF 链接符号核验、符号表与长名字符串表。
+import coff_code;
+import coff_state;
+import iface;
+
+export function e_em1(): u16 { return 8002; }
+export function e_em2(): u16 { return 8003; }
+
+// 两种目标共用修饰名语法，各自报告对应 ABI 的诊断。
+export function decorated_name_error(sysv: bool): u16 {
+    if sysv { return 8017; }
+    return 8009;
+}
+
+function digit(byte: u8): bool { return byte >= 48 && byte <= 57; }
+
+// 十进制编号必须使用唯一的 u32 书写；变体编号可以从零开始。
+function number_end(name: &[u8], start: u32, zero_allowed: bool): u32 {
+    let size: u32 = @len(name) as u32;
+    if start >= size || !digit(name[start]) { return 0; }
+    if name[start] == 48 {
+        if !zero_allowed || (start + 1 < size && digit(name[start + 1])) { return 0; }
+        return start + 1;
+    }
+    var at: u32 = start;
+    var value: u64 = 0;
+    while at < size && digit(name[at]) {
+        value = value * 10u64 + ((name[at] - 48u8) as u64);
+        if value > 4294967295u64 { return 0; }
+        at = at + 1;
+    }
+    return at;
+}
+
+function valid_link_name(name: &[u8]): bool {
+    let size: u32 = @len(name) as u32;
+    // 运行时与对象内部的其它低层名字不使用这个保留前缀。
+    if size < 4 || name[0] != 121 || name[1] != 97 || name[2] != 107 || name[3] != 36 { return true; }
+    if names_equal(name, "yak$entry") { return true; }
+    var marker: u32 = 4;
+    while marker < size && name[marker] != 36 { marker = marker + 1; }
+    if size - marker < 3 || !iface::valid_module_name(&name[4..marker]:Read) { return false; }
+    let id_end: u32 = number_end(name, marker + 2, false);
+    if id_end == 0 { return false; }
+    let kind: u8 = name[marker + 1];
+    // 函数实例后缀必须由单态化的签名证据生成；base 链接表无该证据。
+    if kind == 102 || kind == 108 { return id_end == size; }
+    if kind != 101 || size - id_end < 3 || name[id_end] != 36 || name[id_end + 1] != 118 { return false; }
+    return number_end(name, id_end + 2, true) == size;
+}
+
+// 符号表条目：名字、值、所属节、类型、存储类。节号 -1 表示未定义（外链输入）。
+export struct OutSymbol {
+    def: u64, name: u8[], value: u32, section: i16, kind: u16, storage: u8,
+}
+
+// COFF 符号表字段值的访问器：类型与存储类（pe.md 3.2、3.3）。
+export function sym_type_function(): u16 { return 32; }
+export function sym_type_not_function(): u16 { return 0; }
+export function sym_class_external(): u8 { return 2; }
+export function sym_class_static(): u8 { return 3; }
+
+// 仅外部链接条目可携带由 DependencyId 与 ExportId 构成的键。
+function link_symbol_error(sym: &coff_state::LinkSymbol:Read, sysv: bool): u16 {
+    if sym.def == 0 || @len(sym.name) == 0 { return e_em1(); }
+    let dependency: u64 = sym.def >> 32u64;
+    if dependency != 0 {
+        if sym.kind != 1 || (sym.def & 4294967295u64) == 0 { return 7001; }
+        if dependency > 65535u64 { return 7009; }
+    }
+    if !valid_link_name(&sym.name[0..@len(sym.name)]:Read) { return decorated_name_error(sysv); }
+    return 0;
+}
+
+// ── 符号解析与拒绝 ──
+// 校验链接输入：EM-1 = 未定义（键为 0 或名字为空），EM-2 = 同一键重复定义。
+// 返回 0 表示通过；否则返回 spec/proc/error.def 中的错误码。
+export function validate_links(table: &coff_state::LinkTable:Read): u16 {
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        let sym: &coff_state::LinkSymbol:Read = &table.symbols[i]:Read;
+        let code: u16 = link_symbol_error(sym, false);
+        if code != 0 { return code; }
+        var j: u32 = 0;
+        while j < i {
+            if table.symbols[j].def == sym.def { return e_em2(); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 只索引非零链接键；符号原表仍决定输出顺序和下标。
+export struct SymbolKeys { slots: u64[], count: u32 }
+export function symbol_keys_new(): SymbolKeys { return SymbolKeys { slots: [], count: 0 }; }
+function symbol_key_slot(slots: &u64[]:Read, key: u64): u32 {
+    let mask: u64 = @len(*slots) as u64 - 1u64;
+    let lo: u64 = key & 4294967295u64;
+    let hi: u64 = key >> 32u64;
+    let hash: u64 = (lo * 2654435761u64) ^ (hi * 2246822519u64);
+    var i: u64 = (hash ^ (hash >> 16u64)) & mask;
+    while (*slots)[i] != 0 && (*slots)[i] != key { i = (i + 1u64) & mask; }
+    return i as u32;
+}
+export function symbol_key_present(keys: &SymbolKeys:Read, key: u64): bool {
+    if key == 0 || @len(keys.slots) == 0 { return false; }
+    let i: u32 = symbol_key_slot(&keys.slots:Read, key);
+    return keys.slots[i] == key;
+}
+// 返回是否首次登记；扩容时重新探测，不改原符号表。
+export function symbol_key_add(keys: &SymbolKeys:ReadWrite, key: u64): bool!AllocError {
+    if key == 0 { return false; }
+    let count: u32 = @len(keys.slots) as u32;
+    var at: u32 = 0;
+    if count != 0 {
+        at = symbol_key_slot(&keys.slots:Read, key);
+        if keys.slots[at] == key { return false; }
+    }
+    if keys.count >= count / 2 {
+        var cap: u32 = 16;
+        if count != 0 { cap = count * 2; }
+        var next: u64[] = [];
+        var i: u32 = 0;
+        while i < cap { @push(next, 0u64)?; i = i + 1; }
+        i = 0;
+        while i < count {
+            let old: u64 = keys.slots[i];
+            if old != 0 {
+                let slot: u32 = symbol_key_slot(&next:Read, old);
+                next[slot] = old;
+            }
+            i = i + 1;
+        }
+        let size: u32 = keys.count;
+        *keys = SymbolKeys { slots: @move(next), count: size };
+        at = symbol_key_slot(&keys.slots:Read, key);
+    }
+    keys.slots[at] = key;
+    keys.count = keys.count + 1;
+    return true;
+}
+// 与公开校验逐项同序：无效条目先于该条目的重复键诊断。
+export function validate_indexed_links(table: &coff_state::LinkTable:Read): u16!AllocError {
+    return validate_target_links(table, false)?;
+}
+
+export function validate_target_links(table: &coff_state::LinkTable:Read, sysv: bool): u16!AllocError {
+    var keys: SymbolKeys = symbol_keys_new();
+    let count: u32 = @len(table.symbols) as u32;
+    var i: u32 = 0;
+    while i < count {
+        let sym: &coff_state::LinkSymbol:Read = &table.symbols[i]:Read;
+        let code: u16 = link_symbol_error(sym, sysv);
+        if code != 0 { return code; }
+        if !symbol_key_add(&keys:ReadWrite, sym.def)? { return e_em2(); }
+        i = i + 1;
+    }
+    return 0;
+}
+// 按内部符号键查 LinkTable 下标（1 基，0 表示未登记）。
+export function def_index(table: &coff_state::LinkTable:Read, def: u64): u32 {
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        if table.symbols[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 生成符号表条目：kind 0/2/3 为已定义（节号 1 = .text），kind 1 为外部（节号 -1）。
+// kind 0 是对象内部函数（STATIC），kind 3 是导出函数或 yak$entry（EXTERNAL，pe.md 3.3/3.4）。
+// 已定义符号的 value 必须回填该函数在 .text 内的入口偏移；留 0 会让所有函数都指向节首。
+// 可装配性由 validate_symbols 在装配前保证，此处不再兜底判断。
+export function build_symbols(table: &coff_state::LinkTable:Read, layout: &coff_state::ObjectLayout:Read): OutSymbol[]!AllocError {
+    return build_target_symbols(table, layout, true)?;
+}
+
+export function build_target_symbols(table: &coff_state::LinkTable:Read, layout: &coff_state::ObjectLayout:Read,
+    static_symbols: bool): OutSymbol[]!AllocError {
+    var dst: OutSymbol[] = [];
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        let sym: &coff_state::LinkSymbol:Read = &table.symbols[i]:Read;
+        var section: i16 = 1;
+        var kind: u16 = sym_type_function();
+        var value: u32 = 0;
+        // 未定义符号的节号为 0（无节引用），存储类 EXTERNAL（pe.md 3.5）；
+        // 数值 -1 在 COFF 中表示绝对符号，不能用来表达未定义。
+        if sym.kind == 1 { section = 0; }
+        if sym.kind == 2 { kind = sym_type_not_function(); }
+        if section == 1 {
+            let at: u32 = function_index(layout, sym.def);
+            if at < @len(layout.functions) as u32 { value = layout.functions[at].text_offset; }
+        }
+        let sym_name: u8[] = coff_state::copy_u8s(&sym.name[0..@len(sym.name)]:Read)?;
+        // 本对象内部函数（kind 0）只在本对象内可见，存储类取 STATIC；
+        // 导出函数、入口别名与外部引用（kind 1、2、3）取 EXTERNAL（pe.md 3.3、3.4）。
+        var storage: u8 = sym_class_external();
+        if sym.kind == 0 { storage = sym_class_static(); }
+        @push(dst, OutSymbol { def: sym.def, name: sym_name, value: value, section: section,
+            kind: kind, storage: storage })?;
+        i = i + 1;
+    }
+    if !static_symbols { return dst; }
+    // 每个静态条目追加一条对象内数据符号：节号 2（.rdata）、值取静态字节偏移、
+    // 存储类取 STATIC（对象内部可见，避免多对象链接时同名数据符号冲突）。
+    var s: u32 = 0;
+    while s < @len(layout.static_offsets) as u32 {
+        let data_name: u8[] = static_symbol_name(s)?;
+        @push(dst, OutSymbol { def: 0u64, name: data_name, value: layout.static_offsets[s],
+            section: 2i16, kind: sym_type_not_function(), storage: sym_class_static() })?;
+        s = s + 1;
+    }
+    return dst;
+}
+// 自动数据符号名：`$s<十进制索引>`。短名内联进 8 字节名字段，且以 `$` 开头，
+// 不会与链接表里由语言层生成的 `yak$...` 名字冲突；索引次序保证确定性。
+export function static_symbol_name(index: u32): u8[]!AllocError {
+    var name: u8[] = [];
+    @push(name, 36u8)?;
+    @push(name, 115u8)?;
+    if index == 0 {
+        @push(name, 48u8)?;
+        return name;
+    }
+    var digits: u8[] = [];
+    var rest: u32 = index;
+    while rest > 0 {
+        @push(digits, (48 + rest % 10) as u8)?;
+        rest = rest / 10;
+    }
+    var i: u32 = @len(digits) as u32;
+    while i > 0 {
+        i = i - 1;
+        @push(name, digits[i])?;
+    }
+    return name;
+}
+// 装配前的符号可装配性校验，返回 0 表示通过：
+//   - 已定义符号的 DefId 不在本对象布局里：链接输入与 MIR 不一致，属 EM-1（未定义链接符号）；
+//   - 长名（超过 8 字节）由字符串表承载，属于本对象支持的格式，不再据此拒绝。
+export function validate_symbols(table: &coff_state::LinkTable:Read, layout: &coff_state::ObjectLayout:Read): u16!AllocError {
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        let sym: &coff_state::LinkSymbol:Read = &table.symbols[i]:Read;
+        if sym.kind != 1 && function_index(layout, sym.def) == @len(layout.functions) as u32 { return e_em1(); }
+        i = i + 1;
+    }
+    return 0;
+}
+// 符号校验和装配只需要函数索引，不复制机器码与重定位。
+export function function_index(layout: &coff_state::ObjectLayout:Read, def: u64): u32 {
+    let count: u32 = @len(layout.functions) as u32;
+    if def == 0 { return count; }
+    var i: u32 = 0;
+    while i < count {
+        if layout.functions[i].def as u64 == def { return i; }
+        i = i + 1;
+    }
+    return count;
+}
+// 按 DefId 在布局里查函数；找不到时返回 def 为 0 的空项表示未定义。
+export function find_function(layout: &coff_state::ObjectLayout:Read, def: u64): coff_state::FunctionLayout!AllocError {
+    let i: u32 = function_index(layout, def);
+    if i < @len(layout.functions) as u32 { return copy_function(&layout.functions[i]:Read)?; }
+    return coff_state::FunctionLayout { def: 0, symbol: 0, text_offset: 0, code_size: 0,
+        frame_size: 0, slots: [], widths: [], code: [], calls: [], data_refs: [],
+        rejected: 0, reject_kind: 0 };
+}
+// 深拷贝一个函数布局，避免跨结构共享引用。
+export function copy_function(src: &coff_state::FunctionLayout:Read): coff_state::FunctionLayout!AllocError {
+    let slots: u32[] = coff_state::copy_u32s(&src.slots[0..@len(src.slots)]:Read)?;
+    let widths: u8[] = coff_state::copy_u8s(&src.widths[0..@len(src.widths)]:Read)?;
+    let code: u8[] = coff_state::copy_u8s(&src.code[0..@len(src.code)]:Read)?;
+    var calls: coff_state::CallSite[] = [];
+    var k: u32 = 0;
+    while k < @len(src.calls) as u32 {
+        @push(calls, coff_state::CallSite { at: src.calls[k].at, symbol: src.calls[k].symbol,
+            kind: src.calls[k].kind })?;
+        k = k + 1;
+    }
+    var data_refs: coff_state::DataRef[] = [];
+    var d: u32 = 0;
+    while d < @len(src.data_refs) as u32 {
+        @push(data_refs, coff_state::DataRef { at: src.data_refs[d].at, index: src.data_refs[d].index })?;
+        d = d + 1;
+    }
+    return coff_state::FunctionLayout { def: src.def, symbol: src.symbol, text_offset: src.text_offset,
+        code_size: src.code_size, frame_size: src.frame_size, slots: slots,
+        widths: widths, code: code, calls: calls, data_refs: data_refs,
+        rejected: src.rejected, reject_kind: src.reject_kind };
+}
+
+// 字符串表总长（含首 4 字节长度字段）必须能装进 u32；超限时由装配阶段整体拒绝。
+// 用 u64 累加，避免先发生 u32 回绕或宿主溢出陷阱。
+export function string_table_size(symbols: &[OutSymbol]:Read): u64 {
+    var total: u64 = 4;
+    let count: u32 = @len(symbols) as u32;
+    let inline_limit: u32 = coff_code::name_inline_limit();
+    var i: u32 = 0;
+    while i < count {
+        let size: u64 = @len(symbols[i].name);
+        if size > inline_limit as u64 { total = total + size + 1u64; }
+        i = i + 1;
+    }
+    return total;
+}
+// COFF 字符串表：按符号次序拼接全部长名（超过 8 字节）并以 0 结尾。
+// 首 4 字节长度字段不计入本函数返回值，由装配阶段在写出前补上。
+export function string_table(symbols: &[OutSymbol]:Read): u8[]!AllocError {
+    var tab: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(symbols) as u32 {
+        let name: &[u8]:Read = &symbols[i].name[0..@len(symbols[i].name)]:Read;
+        if @len(name) as u32 > coff_code::name_inline_limit() {
+            var k: u32 = 0;
+            while k < @len(name) as u32 { @push(tab, name[k])?; k = k + 1; }
+            @push(tab, 0)?;
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+// 每个符号名在字符串表内的偏移（相对字符串表起点，故首项为 4）；短名记 0。
+// 偏移必须与 string_table 使用同一遍历次序，保证同一输入得到同一布局（fixpoint.md）。
+export function string_offsets(symbols: &[OutSymbol]:Read): u32[]!AllocError {
+    var offsets: u32[] = [];
+    var at: u32 = 4;
+    var i: u32 = 0;
+    while i < @len(symbols) as u32 {
+        let name: &[u8]:Read = &symbols[i].name[0..@len(symbols[i].name)]:Read;
+        if @len(name) as u32 > coff_code::name_inline_limit() {
+            @push(offsets, at)?;
+            at = at + @len(name) as u32 + 1;
+        } else {
+            @push(offsets, 0)?;
+        }
+        i = i + 1;
+    }
+    return offsets;
+}
+
+export function symbol_index(symbols: &[OutSymbol]:Read, def: u64): u32 {
+    var i: u32 = 0;
+    while i < @len(symbols) as u32 {
+        if symbols[i].def == def { return i; }
+        i = i + 1;
+    }
+    return 4294967295u32;
+}
+
+// 同名时只记首个链接表位置；探测命中必须完整比较名字节。
+function symbol_name_slot(table: &coff_state::LinkTable:Read, slots: &u32[]:Read, name: &[u8]:Read): u64 {
+    let mask: u64 = @len(*slots) - 1u64;
+    let count: u32 = @len(name) as u32;
+    var hash: u64 = 14695981039346656037u64;
+    var k: u32 = 0;
+    while k < count {
+        hash = @wrap_mul(hash ^ name[k] as u64, 1099511628211u64);
+        k = k + 1;
+    }
+    var i: u64 = hash & mask;
+    while (*slots)[i] != 0 {
+        let at: u32 = (*slots)[i] - 1;
+        let entry: &[u8]:Read = &table.symbols[at].name[0..@len(table.symbols[at].name)]:Read;
+        if names_equal(entry, name) { return i; }
+        i = (i + 1u64) & mask;
+    }
+    return i;
+}
+// 合并时同键先取左列，未登记的名字继续使用最大键。
+function merge_symbol_order(keys: &u64[]:Read, from: &u32[]:Read, to: &u32[]:ReadWrite, n: u64, width: u64): void {
+    var lo: u64 = 0;
+    while lo < n {
+        var mid: u64 = lo + width;
+        if mid > n { mid = n; }
+        var hi: u64 = mid + width;
+        if hi > n { hi = n; }
+        var i: u64 = lo;
+        var j: u64 = mid;
+        var dest: u64 = lo;
+        while dest < hi {
+            if j == hi || (i < mid && (*keys)[(*from)[i]] <= (*keys)[(*from)[j]]) {
+                (*to)[dest] = (*from)[i];
+                i = i + 1;
+            } else {
+                (*to)[dest] = (*from)[j];
+                j = j + 1;
+            }
+            dest = dest + 1;
+        }
+        lo = hi;
+    }
+    return;
+}
+// 符号表按内部链接键稳定升序排列；同键条目保留原次序（pe.md 6.1）。
+export function sorted_symbols(symbols: &[OutSymbol]:Read, table: &coff_state::LinkTable:Read): OutSymbol[]!AllocError {
+    let n: u32 = @len(symbols) as u32;
+    var ordered: OutSymbol[] = [];
+    if n == 0 { return ordered; }
+    let table_count: u32 = @len(table.symbols) as u32;
+    var cap: u64 = 1;
+    while cap < (table_count as u64) * 2u64 { cap = cap * 2u64; }
+    var slots: u32[] = [];
+    var w: u64 = 0;
+    while w < cap { @push(slots, 0u32)?; w = w + 1; }
+    var i: u32 = 0;
+    while i < table_count {
+        let name: &[u8]:Read = &table.symbols[i].name[0..@len(table.symbols[i].name)]:Read;
+        let slot: u64 = symbol_name_slot(table, &slots:Read, name);
+        if slots[slot] == 0 { slots[slot] = i + 1; }
+        i = i + 1;
+    }
+    var keys: u64[] = [];
+    var left: u32[] = [];
+    var right: u32[] = [];
+    i = 0;
+    while i < n {
+        let name: &[u8]:Read = &symbols[i].name[0..@len(symbols[i].name)]:Read;
+        let slot: u64 = symbol_name_slot(table, &slots:Read, name);
+        let pos: u32 = slots[slot];
+        var key: u64 = 18446744073709551615u64;
+        if pos != 0 { key = table.symbols[pos - 1].def; }
+        @push(keys, key)?;
+        @push(left, i)?;
+        @push(right, 0u32)?;
+        i = i + 1;
+    }
+    var width: u64 = 1;
+    var read_left: bool = true;
+    while width < n as u64 {
+        if read_left { merge_symbol_order(&keys:Read, &left:Read, &right:ReadWrite, n as u64, width); }
+        else { merge_symbol_order(&keys:Read, &right:Read, &left:ReadWrite, n as u64, width); }
+        read_left = !read_left;
+        width = width * 2;
+    }
+    i = 0;
+    while i < n {
+        var entry: u32 = left[i];
+        if !read_left { entry = right[i]; }
+        let name: u8[] = coff_state::copy_u8s(&symbols[entry].name[0..@len(symbols[entry].name)]:Read)?;
+        @push(ordered, OutSymbol { def: symbols[entry].def, name: name,
+            value: symbols[entry].value, section: symbols[entry].section,
+            kind: symbols[entry].kind, storage: symbols[entry].storage })?;
+        i = i + 1;
+    }
+    return ordered;
+}
+// 按符号名字节反查内部链接键；不在表中的符号排在最后。
+export function def_of_name(table: &coff_state::LinkTable:Read, name: &[u8]:Read): u64 {
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        if names_equal(&table.symbols[i].name[0..@len(table.symbols[i].name)]:Read, name) { return table.symbols[i].def; }
+        i = i + 1;
+    }
+    return 18446744073709551615u64;
+}
+// 字节序列相等比较：长度相同且逐字节一致。
+export function names_equal(a: &[u8]:Read, b: &[u8]:Read): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}

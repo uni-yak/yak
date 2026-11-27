@@ -1,0 +1,537 @@
+// 共享游标上的表达式与受限 const 表达式解析。
+import lex;
+import types;
+import ast;
+import parse_core;
+import type_parser;
+
+function make_expr(pool: &ast::AstPool:ReadWrite, kind: u8, span: types::Span, data: u64): u32!AllocError {
+    let id: u32 = @len(pool.exprs) as u32;
+    @push(pool.exprs, ast::Expr { kind: kind, span: span, data: data, integer_suffix: 0 })?;
+    return id;
+}
+function make_literal_expr(pool: &ast::AstPool:ReadWrite, token: lex::Token): u32!AllocError {
+    let id: u32 = @len(pool.exprs) as u32;
+    @push(pool.exprs, ast::Expr { kind: token.kind, span: token.span, data: token.payload, integer_suffix: token.integer_suffix })?;
+    return id;
+}
+// 表达式 kind 0..5 复用词法 TokenKind（标识符、哈希名、整数、布尔、字符、字符串）。
+// 13=问号传播，20=二元，21=一元，22=调用，23=成员，24=索引，
+// 25=路径，26=数组，27=切片，28=类型转换，29=原语，30=结构体构造，
+// 255=错误占位。
+function is_literal_expr(pool: &ast::AstPool:Read, expr: u32): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    let kind: u8 = pool.exprs[expr].kind;
+    return kind >= 2 && kind <= 5;
+}
+// parse.md 8.1.1：QualifiedPath '{' FieldInit ... '}' 归约为 StructConstruct。
+// '{' 后紧随 '}'（空字面量）或 Ident ':'（首个字段）时与 Block 区分。
+function is_struct_ctor_start(p: &parse_core::Parser:Read): bool {
+    if !parse_core::is_op(p, 28) { return false; }
+    if parse_core::is_op_at(p, p.pos + 1, 29) { return true; }
+    if !parse_core::is_kind_at(p, p.pos + 1, 0) { return false; }
+    return parse_core::is_op_at(p, p.pos + 2, 24);
+}
+function path_segments_of(pool: &ast::AstPool:ReadWrite, expr: u32): u32[]!AllocError {
+    var segments: u32[] = [];
+    if expr >= @len(pool.exprs) as u32 { return segments; }
+    let kind: u8 = pool.exprs[expr].kind;
+    if kind == 0 {
+        @push(segments, pool.exprs[expr].data as u32)?;
+    } elseif kind == 25 {
+        let path_id: u32 = pool.exprs[expr].data as u32;
+        if path_id < @len(pool.paths) as u32 {
+            var i: u32 = 0;
+            while i < @len(pool.paths[path_id].segments) as u32 {
+                @push(segments, pool.paths[path_id].segments[i])?;
+                i = i + 1;
+            }
+        }
+    }
+    return segments;
+}
+export function is_place_expr(pool: &ast::AstPool:Read, expr: u32): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    let kind: u8 = pool.exprs[expr].kind;
+    if kind == 0 || kind == 23 || kind == 24 { return true; }
+    if kind == 21 {
+        let unary_id: u32 = pool.exprs[expr].data as u32;
+        if unary_id < @len(pool.unaries) as u32 { return pool.unaries[unary_id].op == 13; }
+    }
+    return false;
+}
+function binary_precedence(op: u8): u8 {
+    if op == 6 { return 1; }
+    if op == 5 { return 2; }
+    if op == 20 { return 3; }
+    if op == 21 { return 4; }
+    if op == 19 { return 5; }
+    if op == 1 || op == 2 { return 6; }
+    if op == 16 || op == 17 || op == 3 || op == 4 { return 7; }
+    if op == 7 || op == 8 { return 8; }
+    if op == 11 || op == 12 { return 9; }
+    if op == 13 || op == 14 || op == 15 { return 10; }
+    return 0;
+}
+
+// ── const 表达式（const.md 2.1；仅字面量、路径、enum / 定长数组常量）──
+function const_precedence(op: u8): u8 {
+    if op == 20 { return 1; }
+    if op == 21 { return 2; }
+    if op == 19 { return 3; }
+    if op == 7 || op == 8 { return 4; }
+    if op == 11 || op == 12 { return 5; }
+    if op == 13 || op == 14 || op == 15 { return 6; }
+    return 0;
+}
+function is_const_compare(op: u8): bool {
+    return op == 1 || op == 2 || op == 3 || op == 4 || op == 5 || op == 6 || op == 16 || op == 17;
+}
+function const_placeholder(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    return make_expr(pool, 255, parse_core::span_at(p, p.pos), 0)?;
+}
+function parse_const_atom(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    if parse_core::is_kind(p, 2) || parse_core::is_kind(p, 3) || parse_core::is_kind(p, 4) || parse_core::is_kind(p, 5) {
+        let token: lex::Token = p.tokens[p.pos];
+        parse_core::advance(p);
+        return make_literal_expr(pool, token)?;
+    }
+    if parse_core::is_op(p, 12) {
+        parse_core::advance(p);
+        let operand: u32 = parse_const_expr(p, pool, 7)?;
+        let unary_id: u32 = @len(pool.unaries) as u32;
+        @push(pool.unaries, ast::UnaryExpr { operand: operand, op: 12, capability: 0, has_capability: false, span: parse_core::span_at(p, start) })?;
+        return make_expr(pool, 21, parse_core::span_at(p, start), unary_id as u64)?;
+    }
+    if parse_core::is_op(p, 30) {
+        parse_core::advance(p);
+        var elements: u32[] = [];
+        if parse_core::is_op(p, 31) {
+            parse_core::fail_code(p, p.pos, types::error_code(5007))?;
+        } else {
+            while true {
+                @push(elements, parse_const_expr(p, pool, 1)?)?;
+                if parse_core::is_op(p, 32) {
+                    parse_core::advance(p);
+                    if parse_core::is_op(p, 31) { parse_core::fail(p, p.pos)?; }
+                    else { continue; }
+                }
+                break;
+            }
+        }
+        parse_core::expect_op(p, 31)?;
+        let array_id: u32 = @len(pool.arrays) as u32;
+        @push(pool.arrays, ast::ArrayExpr { elements: elements, span: parse_core::span_at(p, start) })?;
+        return make_expr(pool, 26, parse_core::span_at(p, start), array_id as u64)?;
+    }
+    if parse_core::is_kind(p, 0) || parse_core::is_kind(p, 1) {
+        let first: u32 = parse_core::take_ident(p)?;
+        var value: u32 = 0;
+        if parse_core::is_op(p, 0) {
+            var segments: u32[] = [];
+            @push(segments, first)?;
+            while parse_core::is_op(p, 0) {
+                parse_core::advance(p);
+                @push(segments, parse_core::take_ident(p)?)?;
+            }
+            let path_id: u32 = @len(pool.paths) as u32;
+            @push(pool.paths, ast::PathExpr { segments: segments, span: parse_core::span_at(p, start) })?;
+            value = make_expr(pool, 25, parse_core::span_at(p, start), path_id as u64)?;
+        } else {
+            value = make_expr(pool, 0, parse_core::span_at(p, start), first as u64)?;
+        }
+        if parse_core::is_op(p, 26) {
+            parse_core::advance(p);
+            var args: ast::CallArg[] = [];
+            // 先保留参数列表，名称解析后才能区分枚举构造和未启用的函数调用。
+            if !parse_core::is_op(p, 27) {
+                let arg_start: u32 = p.pos;
+                @push(args, ast::CallArg { kind: 0, value: parse_const_expr(p, pool, 1)?, span: parse_core::span_at(p, arg_start) })?;
+                while parse_core::is_op(p, 32) {
+                    parse_core::advance(p);
+                    let next_start: u32 = p.pos;
+                    @push(args, ast::CallArg { kind: 0, value: parse_const_expr(p, pool, 1)?, span: parse_core::span_at(p, next_start) })?;
+                }
+            }
+            parse_core::expect_op(p, 27)?;
+            let call_id: u32 = @len(pool.calls) as u32;
+            let span: types::Span = parse_core::span_range(p, start, p.pos);
+            @push(pool.calls, ast::CallExpr { callee: value, args: args, span: span, in_const: true })?;
+            value = make_expr(pool, 22, span, call_id as u64)?;
+        }
+        while true {
+            if parse_core::is_op(p, 23) {
+                parse_core::fail_code(p, p.pos, types::error_code(5006))?;
+                parse_core::advance(p);
+                parse_core::take_ident(p)?;
+            } elseif parse_core::is_op(p, 30) {
+                parse_core::fail_code(p, p.pos, types::error_code(5006))?;
+                parse_core::advance(p);
+                // 常量语法不接受下标，但恢复时仍应识别切片分隔符。
+                parse_expr_bounded(p, pool, 1, true, true)?;
+                if parse_core::is_op(p, 10) || parse_core::is_op(p, 34) {
+                    parse_core::advance(p);
+                    parse_expr(p, pool, 1, true)?;
+                }
+                parse_core::expect_op(p, 31)?;
+            } elseif parse_core::is_op(p, 25) {
+                parse_core::fail_code(p, p.pos, types::error_code(5006))?;
+                parse_core::advance(p);
+            } else { break; }
+        }
+        return value;
+    }
+    if parse_core::is_op(p, 10) || parse_core::is_op(p, 34) { parse_core::fail(p, p.pos)?; }
+    else { parse_core::fail_code(p, p.pos, types::error_code(5006))?; }
+    return const_placeholder(p, pool)?;
+}
+export function parse_const_expr(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, min_prec: u8): u32!AllocError {
+    if p.depth_limit == 0u32 {
+        return parse_const_expr_inner(p, pool, min_prec)?;
+    }
+    if !parse_core::enter_depth(p) { return 0u32; }
+    let value: u32 = parse_const_expr_inner(p, pool, min_prec)?;
+    parse_core::leave_depth(p);
+    return value;
+}
+function parse_const_expr_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, min_prec: u8): u32!AllocError {
+    var left: u32 = parse_const_atom(p, pool)?;
+    while parse_core::is_kind(p, 7) {
+        let op: u8 = p.tokens[p.pos].payload as u8;
+        if (op == 10 || op == 34) && min_prec == 1 {
+            parse_core::fail_code(p, p.pos, types::error_code(1010))?;
+            parse_core::recover_advance(p);
+            if p.recovery_exceeded { return left; }
+            parse_const_expr(p, pool, 2)?;
+            continue;
+        }
+        let prec: u8 = const_precedence(op);
+        if prec == 0 {
+            if is_const_compare(op) {
+                parse_core::fail_code(p, p.pos, types::error_code(5006))?;
+                let start: u32 = p.pos;
+                parse_core::advance(p);
+                let right: u32 = parse_const_expr(p, pool, 1)?;
+                let id: u32 = @len(pool.binaries) as u32;
+                @push(pool.binaries, ast::BinaryExpr { left: left, right: right, op: op, span: parse_core::span_at(p, start) })?;
+                left = make_expr(pool, 20, parse_core::span_at(p, start), id as u64)?;
+                continue;
+            }
+            break;
+        }
+        if prec < min_prec { break; }
+        let start: u32 = p.pos;
+        parse_core::advance(p);
+        let right: u32 = parse_const_expr(p, pool, prec + 1)?;
+        let id: u32 = @len(pool.binaries) as u32;
+        @push(pool.binaries, ast::BinaryExpr { left: left, right: right, op: op, span: parse_core::span_at(p, start) })?;
+        left = make_expr(pool, 20, parse_core::span_at(p, start), id as u64)?;
+    }
+    if parse_core::is_keyword(p, 20) {
+        parse_core::fail_code(p, p.pos, types::error_code(5006))?;
+        parse_core::advance(p);
+        type_parser::parse_type(p, pool)?;
+    }
+    return left;
+}
+
+// ── 表达式 ──
+function parse_atom(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, allow_ctor: bool): u32!AllocError {
+    if parse_core::is_kind(p, 15) {
+        let at: types::Span = parse_core::span_at(p, p.pos);
+        parse_core::advance(p);
+        return make_expr(pool, 31, at, 0)?;
+    }
+    if parse_core::is_op(p, 30) {
+        let start: u32 = p.pos;
+        parse_core::advance(p);
+        var elements: u32[] = [];
+        if !parse_core::is_op(p, 31) {
+            while true {
+                @push(elements, parse_expr(p, pool, 1, true)?)?;
+                if parse_core::is_op(p, 32) {
+                    parse_core::advance(p);
+                    if parse_core::is_op(p, 31) { parse_core::fail(p, p.pos)?; }
+                    else { continue; }
+                }
+                break;
+            }
+        }
+        parse_core::expect_op(p, 31)?;
+        let array_id: u32 = @len(pool.arrays) as u32;
+        @push(pool.arrays, ast::ArrayExpr { elements: elements, span: parse_core::span_at(p, start) })?;
+        return make_expr(pool, 26, parse_core::span_at(p, start), array_id as u64)?;
+    }
+    if parse_core::is_op(p, 26) {
+        parse_core::advance(p);
+        let nested: u32 = parse_expr(p, pool, 1, true)?;
+        parse_core::expect_op(p, 27)?;
+        return nested;
+    }
+    if parse_core::is_op(p, 5) {
+        // lex.md 9.2：前缀位的 '&&' 拆分为两个借用 token。
+        let start: u32 = p.pos;
+        parse_core::advance(p);
+        let operand: u32 = parse_postfix(p, pool, allow_ctor)?;
+        let inner_id: u32 = @len(pool.unaries) as u32;
+        @push(pool.unaries, ast::UnaryExpr { operand: operand, op: 19, capability: 0, has_capability: false, span: parse_core::span_at(p, start) })?;
+        let inner: u32 = make_expr(pool, 21, parse_core::span_at(p, start), inner_id as u64)?;
+        let outer_id: u32 = @len(pool.unaries) as u32;
+        @push(pool.unaries, ast::UnaryExpr { operand: inner, op: 19, capability: 0, has_capability: false, span: parse_core::span_at(p, start) })?;
+        return make_expr(pool, 21, parse_core::span_at(p, start), outer_id as u64)?;
+    }
+    if parse_core::is_op(p, 18) || parse_core::is_op(p, 12) || parse_core::is_op(p, 19) || parse_core::is_op(p, 13) {
+        let op: u8 = p.tokens[p.pos].payload as u8;
+        let start: u32 = p.pos;
+        parse_core::advance(p);
+        let operand: u32 = parse_postfix(p, pool, allow_ctor)?;
+        var capability: u32 = 0;
+        let has_capability: bool = op == 19 && parse_core::is_op(p, 24);
+        if has_capability {
+            parse_core::advance(p);
+            if parse_core::is_kind(p, 1) {
+                parse_core::fail_code(p, p.pos, types::error_code(2015))?;
+                capability = 4294967295u32;
+                parse_core::advance(p);
+            } elseif parse_core::is_kind(p, 0) {
+                let capability_id: u32 = p.tokens[p.pos].payload as u32;
+                if !parse_core::is_capability(p, capability_id) { parse_core::fail(p, p.pos)?; }
+                capability = parse_core::capability_code(p, capability_id);
+                parse_core::advance(p);
+            } else { parse_core::fail(p, p.pos)?; }
+        }
+        let unary_id: u32 = @len(pool.unaries) as u32;
+        @push(pool.unaries, ast::UnaryExpr { operand: operand, op: op, capability: capability, has_capability: has_capability, span: parse_core::span_at(p, start) })?;
+        return make_expr(pool, 21, parse_core::span_at(p, start), unary_id as u64)?;
+    }
+    if parse_core::is_kind(p, 8) {
+        let token: lex::Token = p.tokens[p.pos];
+        if token.payload == 20484 { parse_core::fail(p, p.pos)?; }
+        parse_core::advance(p);
+        return make_expr(pool, 29, token.span, token.payload)?;
+    }
+    if !parse_core::is_kind(p, 0) && !parse_core::is_kind(p, 1) && !parse_core::is_kind(p, 2) && !parse_core::is_kind(p, 3) && !parse_core::is_kind(p, 4) && !parse_core::is_kind(p, 5) {
+        parse_core::fail(p, p.pos)?;
+        return 0;
+    }
+    let token: lex::Token = p.tokens[p.pos];
+    let first: u32 = token.payload as u32;
+    let start: u32 = p.pos;
+    var expr_kind: u8 = token.kind;
+    if parse_core::is_kind(p, 1) {
+        parse_core::fail_code(p, p.pos, types::error_code(2015))?;
+        expr_kind = 0;
+    }
+    var id: u32 = 0;
+    if expr_kind == 0 { id = make_expr(pool, expr_kind, token.span, token.payload)?; } else { id = make_literal_expr(pool, token)?; }
+    parse_core::advance(p);
+    if parse_core::is_op(p, 0) {
+        var segments: u32[] = [];
+        @push(segments, first)?;
+        while parse_core::is_op(p, 0) {
+            parse_core::advance(p);
+            @push(segments, parse_core::take_ident(p)?)?;
+        }
+        let path_id: u32 = @len(pool.paths) as u32;
+        @push(pool.paths, ast::PathExpr { segments: segments, span: parse_core::span_at(p, start) })?;
+        return make_expr(pool, 25, parse_core::span_at(p, start), path_id as u64)?;
+    }
+    return id;
+}
+// Arg ::= 'out' Ident | MoveArg | Expr（parse.md 八）
+// CallArg.kind：0=表达式，1=out 槽位（value=NameId），2=@move(e)（value=ExprRef）。
+function parse_call_args(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): ast::CallArg[]!AllocError {
+    var args: ast::CallArg[] = [];
+    if parse_core::is_op(p, 27) { return args; }
+    while true {
+        let arg_start: u32 = p.pos;
+        if parse_core::is_keyword(p, 19) {
+            parse_core::advance(p);
+            let slot: u32 = parse_core::take_ident(p)?;
+            @push(args, ast::CallArg { kind: 1, value: slot, span: parse_core::span_at(p, arg_start) })?;
+        } elseif parse_core::is_builtin(p, 20481) && parse_core::is_op_at(p, p.pos + 1, 26) {
+            parse_core::advance(p);
+            parse_core::advance(p);
+            let moved: u32 = parse_expr(p, pool, 1, true)?;
+            parse_core::expect_op(p, 27)?;
+            @push(args, ast::CallArg { kind: 2, value: moved, span: parse_core::span_at(p, arg_start) })?;
+        } else {
+            let value: u32 = parse_expr(p, pool, 1, true)?;
+            @push(args, ast::CallArg { kind: 0, value: value, span: parse_core::span_at(p, arg_start) })?;
+        }
+        if parse_core::is_op(p, 32) {
+            parse_core::advance(p);
+            if parse_core::is_op(p, 27) { parse_core::fail(p, p.pos)?; break; }
+            continue;
+        }
+        break;
+    }
+    return args;
+}
+function parse_postfix(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, allow_ctor: bool): u32!AllocError {
+    if p.depth_limit == 0u32 {
+        return parse_postfix_inner(p, pool, allow_ctor)?;
+    }
+    if !parse_core::enter_depth(p) { return 0u32; }
+    let value: u32 = parse_postfix_inner(p, pool, allow_ctor)?;
+    parse_core::leave_depth(p);
+    return value;
+}
+function parse_postfix_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, allow_ctor: bool): u32!AllocError {
+    var value: u32 = parse_atom(p, pool, allow_ctor)?;
+    while true {
+        if parse_core::is_op(p, 26) {
+            if is_literal_expr(pool, value) { parse_core::fail(p, p.pos)?; }
+            parse_core::advance(p);
+            let args: ast::CallArg[] = parse_call_args(p, pool)?;
+            let start: u32 = p.pos;
+            parse_core::expect_op(p, 27)?;
+            let call_id: u32 = @len(pool.calls) as u32;
+            @push(pool.calls, ast::CallExpr { callee: value, args: args, span: parse_core::span_at(p, start), in_const: false })?;
+            value = make_expr(pool, 22, parse_core::span_at(p, start), call_id as u64)?;
+        } elseif parse_core::is_op(p, 23) || parse_core::is_op(p, 35) {
+            let start: u32 = p.pos;
+            let optional: bool = parse_core::is_op(p, 35);
+            parse_core::advance(p);
+            let union_else: bool = parse_core::option_syntax(p) && parse_core::is_keyword(p, 5);
+            var name: u32 = 0;
+            if union_else { parse_core::advance(p); }
+            else { name = parse_core::take_ident(p)?; }
+            var property: u8 = 0;
+            if name != 0 && name == p.len_name { property = 1; }
+            elseif name != 0 && name == p.cap_name { property = 2; }
+            // 保留拼写供类型阶段区分 carrier 恢复与同名的普通字段。
+            let recovery: bool = name != 0 && (name == p.carrier_methods[0] || name == p.carrier_methods[1] ||
+                name == p.carrier_methods[2] || name == p.carrier_methods[3]);
+            let nullable_dispatch: bool = union_else || (name != 0 && (name == p.carrier_methods[1] || name == p.carrier_methods[2] || name == p.union_on_name));
+            let member_id: u32 = @len(pool.members) as u32;
+            @push(pool.members, ast::MemberExpr { object: value, name: name, property: property, recovery_name: recovery, optional: optional,
+                nullable_dispatch: nullable_dispatch, tag_name: name != 0 && name == p.tag_name,
+                payload_name: name != 0 && name == p.payload_name, span: parse_core::span_at(p, start) })?;
+            value = make_expr(pool, 23, parse_core::span_at(p, start), member_id as u64)?;
+        } elseif parse_core::is_op(p, 30) {
+            let start: u32 = p.pos;
+            parse_core::advance(p);
+            let low: u32 = parse_expr_bounded(p, pool, 1, true, true)?;
+            if parse_core::is_op(p, 10) || parse_core::is_op(p, 34) {
+                let closed: bool = parse_core::is_op(p, 34);
+                let divider: types::Span = parse_core::span_at(p, p.pos);
+                parse_core::advance(p);
+                var high: u32 = parse_expr(p, pool, 1, true)?;
+                parse_core::expect_op(p, 31)?;
+                var inclusive_upper: u32 = 4294967295u32;
+                if closed {
+                    inclusive_upper = high;
+                    let one: u32 = make_expr(pool, 2, divider, 1)?;
+                    let sum: u32 = @len(pool.binaries) as u32;
+                    @push(pool.binaries, ast::BinaryExpr { left: high, right: one, op: 11, span: divider })?;
+                    high = make_expr(pool, 20, divider, sum as u64)?;
+                }
+                let slice_id: u32 = @len(pool.slices) as u32;
+                @push(pool.slices, ast::SliceExpr { object: value, low: low, high: high, span: parse_core::span_at(p, start), inclusive_upper: inclusive_upper })?;
+                value = make_expr(pool, 27, parse_core::span_at(p, start), slice_id as u64)?;
+            } else {
+                parse_core::expect_op(p, 31)?;
+                let index_id: u32 = @len(pool.indices) as u32;
+                @push(pool.indices, ast::IndexExpr { object: value, index: low, span: parse_core::span_at(p, start) })?;
+                value = make_expr(pool, 24, parse_core::span_at(p, start), index_id as u64)?;
+            }
+        } elseif parse_core::is_op(p, 25) {
+            let start: u32 = p.pos;
+            parse_core::advance(p);
+            value = make_expr(pool, 13, parse_core::span_at(p, start), value as u64)?;
+        } elseif parse_core::is_keyword(p, 20) {
+            let start: u32 = p.pos;
+            parse_core::advance(p);
+            let target_type: u32 = type_parser::parse_type(p, pool)?;
+            let cast_id: u32 = @len(pool.casts) as u32;
+            @push(pool.casts, ast::CastExpr { operand: value, target_type: target_type, span: parse_core::span_at(p, start) })?;
+            value = make_expr(pool, 28, parse_core::span_at(p, start), cast_id as u64)?;
+        } elseif parse_core::is_op(p, 28) {
+            if !allow_ctor || !is_struct_ctor_start(p) { break; }
+            let value_kind: u8 = pool.exprs[value].kind;
+            if value_kind != 0 && value_kind != 25 { parse_core::fail(p, p.pos)?; break; }
+            let start: u32 = p.pos;
+            parse_core::advance(p);
+            var fields: ast::StructFieldInit[] = [];
+            if !parse_core::is_op(p, 29) {
+                while true {
+                    let field_start: u32 = p.pos;
+                    let field_name: u32 = parse_core::take_ident(p)?;
+                    parse_core::expect_op(p, 24)?;
+                    let field_value: u32 = parse_expr(p, pool, 1, true)?;
+                    @push(fields, ast::StructFieldInit { name: field_name, value: field_value, span: parse_core::span_at(p, field_start) })?;
+                    if parse_core::is_op(p, 32) {
+                        parse_core::advance(p);
+                        if parse_core::is_op(p, 29) { break; }
+                        continue;
+                    }
+                    break;
+                }
+            }
+            parse_core::expect_op(p, 29)?;
+            let path: u32[] = path_segments_of(pool, value)?;
+            let ctor_id: u32 = @len(pool.ctors) as u32;
+            @push(pool.ctors, ast::StructCtorExpr { path: path, fields: fields, span: parse_core::span_at(p, start) })?;
+            value = make_expr(pool, 30, parse_core::span_at(p, start), ctor_id as u64)?;
+        } else { break; }
+    }
+    return value;
+}
+export function parse_expr(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, min_prec: u8, allow_ctor: bool): u32!AllocError {
+    return parse_expr_bounded(p, pool, min_prec, allow_ctor, false)?;
+}
+// 只有下标下界的当前表达式可在切片分隔符前结束；分组、实参等另起表达式。
+function parse_expr_bounded(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, min_prec: u8, allow_ctor: bool, slice_low: bool): u32!AllocError {
+    if p.depth_limit == 0u32 {
+        return parse_expr_inner(p, pool, min_prec, allow_ctor, slice_low)?;
+    }
+    if !parse_core::enter_depth(p) { return 0u32; }
+    let value: u32 = parse_expr_inner(p, pool, min_prec, allow_ctor, slice_low)?;
+    parse_core::leave_depth(p);
+    return value;
+}
+function parse_expr_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, min_prec: u8, allow_ctor: bool, slice_low: bool): u32!AllocError {
+    var left: u32 = parse_postfix(p, pool, allow_ctor)?;
+    var tested: bool = false;
+    while parse_core::is_kind(p, 7) {
+        let op: u8 = p.tokens[p.pos].payload as u8;
+        if op == 10 || op == 34 {
+            if slice_low || min_prec > 1 { break; }
+            parse_core::fail_code(p, p.pos, types::error_code(1010))?;
+            parse_core::recover_advance(p);
+            if p.recovery_exceeded { return left; }
+            parse_expr_bounded(p, pool, 2, allow_ctor, false)?;
+            continue;
+        }
+        var prec: u8 = binary_precedence(op);
+        if parse_core::option_syntax(p) {
+            if op == 36 { prec = 1; }
+            elseif prec != 0 { prec = prec + 1; }
+        }
+        if parse_core::union_syntax(p) {
+            if op == 37 { prec = 8; }
+            elseif prec >= 8 { prec = prec + 1; }
+        }
+        if prec < min_prec || prec == 0 { break; }
+        let start: u32 = p.pos;
+        parse_core::advance(p);
+        if op == 37 {
+            if tested { parse_core::fail(p, start)?; }
+            tested = true;
+            let target: u32 = type_parser::parse_type(p, pool)?;
+            let id: u32 = @len(pool.casts) as u32;
+            let span: types::Span = parse_core::span_at(p, start);
+            @push(pool.casts, ast::CastExpr { operand: left, target_type: target, span: span })?;
+            left = make_expr(pool, 32, span, id as u64)?;
+            continue;
+        }
+        let right: u32 = parse_expr_bounded(p, pool, prec + 1, allow_ctor, slice_low)?;
+        let id: u32 = @len(pool.binaries) as u32;
+        @push(pool.binaries, ast::BinaryExpr { left: left, right: right, op: op, span: parse_core::span_at(p, start) })?;
+        left = @len(pool.exprs) as u32;
+        @push(pool.exprs, ast::Expr { kind: 20, span: parse_core::span_at(p, start), data: id as u64, integer_suffix: 0 })?;
+    }
+    return left;
+}

@@ -1,0 +1,10 @@
+// expected_code: E6002
+// spec: spec/lang/base.md R-3
+// 触发：切片上界是常量，且越过定长数组末尾。
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let values: [u8; 2] = [1u8, 2u8];
+    assert(@len(values[0..3]) == 0u64);
+    return;
+}

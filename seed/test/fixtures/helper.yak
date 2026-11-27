@@ -1,0 +1,3 @@
+const K: i64 = 41;
+function secret(): i64 { return 0; }
+export function answer(): i64 { return K + 1; }

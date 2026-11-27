@@ -1,0 +1,48 @@
+import diag;
+import types;
+import typecheck;
+import layout;
+
+const TK_LOCAL: u8 = 2;
+const TK_ERROR_SET: u8 = 11;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+// 两个相邻输入共用按定义号递增的不同枚举；只改变进入布局的规范成员数。
+function check_error_set_member_limit(): void!AllocError {
+    let upper: u32 = 65536u32;
+    let over: u32 = upper + 1u32;
+    var tt: typecheck::TypeTable = typecheck::TypeTable { entries: [], members: [] };
+    var enums: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    let fields: typecheck::FieldTable = typecheck::FieldTable { items: [] };
+    var id: u32 = 1u32;
+    while id <= over {
+        @push(tt.entries, typecheck::TypeEntry { kind: TK_LOCAL, builtin: 0, def: id, dep: 0, export_id: 0, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+        @push(enums.items, typecheck::EnumType { def: id, payloads: [0u32] })?;
+        @push(tt.members, id)?;
+        id = id + 1u32;
+    }
+    @push(tt.entries, typecheck::TypeEntry { kind: TK_ERROR_SET, builtin: 0, def: 0, dep: 0, export_id: 0, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: upper })?;
+    var work: layout::ValueGraphBudget = layout::document_value_graph_budget(0u32);
+    var accepted: diag::DiagBuffer = diag::diagbuf_new();
+    let at_limit: layout::LayoutResult = layout::layout_unit_limited(&tt:Read, &fields:Read, &enums:Read, &accepted:ReadWrite, &work:ReadWrite)?;
+    let info: layout::LayoutInfo = at_limit.table.items[over];
+    assert(diag::diagbuf_count(&accepted:Read) == 0);
+    assert(info.known && info.size == 4u64 && info.align == 2u8 && info.tag_size == 2u8 && info.payload_off == 2u64);
+    tt.entries[over].members_count = over;
+    var rejected: diag::DiagBuffer = diag::diagbuf_new();
+    let above_limit: layout::LayoutResult = layout::layout_unit_limited(&tt:Read, &fields:Read, &enums:Read, &rejected:ReadWrite, &work:ReadWrite)?;
+    assert(!work.exhausted && !above_limit.table.items[over].known);
+    assert(diag::diagbuf_count(&rejected:Read) == 1);
+    let diagnostic: diag::Diag = rejected.diags[0];
+    let code: types::ErrorCode = diagnostic.code;
+    assert(code.raw == 5503u16 && diagnostic.severity == 0u8);
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = check_error_set_member_limit();
+    @drop(failed);
+    exit(1);
+}

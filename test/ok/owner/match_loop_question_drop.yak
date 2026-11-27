@@ -1,0 +1,49 @@
+// expected_exit: 42
+// expected_stdout: ok
+// spec: spec/lang/owner.md 6.1-6.2
+// 同一个 match 臂分别正常结束和由循环内的问号提前返回。
+foreign exit(code: u8): void;
+foreign write(data: &[u8]): void;
+
+enum Choice { Empty, Run(u8) }
+
+function check(fail: bool): void!AllocError {
+    if fail { return AllocError::OutOfMemory; }
+    return;
+}
+
+function run(fail: bool): u8!AllocError {
+    var outer: u64[] = [];
+    @push(outer, 42u64)?;
+    let choice: Choice = Choice::Run(7u8);
+    match choice {
+        Empty => { return 1u8; },
+        Run(n) => {
+            var arm: u32[] = [];
+            @push(arm, n as u32)?;
+            var i: u32 = 0u32;
+            while i == 0u32 {
+                var inner: u16[] = [];
+                @push(inner, arm[0u64] as u16)?;
+                check(fail)?;
+                i = 1u32;
+            }
+        }
+    }
+    return outer[0u64] as u8;
+}
+
+function observe(fail: bool): void!AllocError {
+    let code: u8 = run(fail)?;
+    if fail { exit(91u8); }
+    if code != 42u8 { exit(90u8); }
+    write("ok");
+    return;
+}
+
+function main(): void {
+    observe(false);
+    observe(true);
+    exit(42u8);
+    return;
+}

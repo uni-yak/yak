@@ -1,0 +1,4 @@
+// YSM 驱动依赖链的叶子单元：只导出常量取值函数，供中间单元跨模块调用。
+export function base_value(): u32 {
+    return 7u32;
+}

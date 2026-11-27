@@ -1,0 +1,8 @@
+// expected_code: E6007
+// spec: spec/lang/base.md R-10；spec/lang/type/result.md RE-4
+// 触发：普通标量没有可传播的错误分支。
+function main(): void {
+    let value: u8 = 1u8;
+    value?;
+    return;
+}

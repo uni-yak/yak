@@ -1,0 +1,184 @@
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: json_string=../../compiler/lsp/json_string.yak
+// module: json=../../compiler/lsp/json.yak
+// module: positions=../../compiler/lsp/positions.yak
+// module: documents=../../compiler/lsp/documents.yak
+// module: types=../../compiler/min/lib/types.yak
+import json;
+import json_string;
+import positions;
+import documents;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function apply(store: &documents::Store:ReadWrite, src: &[u8], method: u8): documents::Event!AllocError {
+    let doc: json::Document = json::parse(src)?;
+    return documents::apply(store, &doc:Read, src, 0u32, method)?;
+}
+
+function apply_incremental(store: &documents::Store:ReadWrite, src: &[u8]): documents::Event!AllocError {
+    let doc: json::Document = json::parse(src)?;
+    return documents::apply_with_sync_mode(store, &doc:Read, src, 0u32, 2u8, true)?;
+}
+
+function expect(store: &documents::Store:ReadWrite, src: &[u8], method: u8, status: u8): void!AllocError {
+    let event: documents::Event = apply(store, src, method)?;
+    assert(event.status == status);
+    if status >= 3u8 { assert(!event.closed_uri.ok && event.ticket.generation == 0u64); }
+    return;
+}
+
+function lifecycle(): void!AllocError {
+    var store: documents::Store = documents::create(13u32);
+    let opened: documents::Event = apply(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":-2147483648,\"text\":\"A😀\\r\\n\",\"languageId\":\"yak\"}}", 1u8)?;
+    let first: documents::Ticket = opened.ticket;
+    assert(opened.status == 1u8 && first.version == -2147483648i32 && documents::is_current(&store:Read, first));
+    assert(store.used == 7u32 && store.active == 1u32);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0,\"text\":\"duplicate\",\"languageId\":\"yak\"}}", 1u8, 4u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"untitled:2\",\"version\":7,\"text\":\"123456\",\"languageId\":\"yak\"}}", 1u8, 1u8)?;
+    assert(store.used == 13u32 && store.active == 2u32);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[{\"text\":\"12345678\"}]}", 2u8, 5u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":-2147483648},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 4u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":2147483648},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":-2147483649},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":1e0},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":1.0},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[{\"text\":\"\",\"range\":null}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[{\"text\":\"\",\"rangeLength\":null}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[{\"text\":\"\"},{\"text\":\"\"}]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[]}", 2u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":3}},\"text\":\"中\"}]}", 2u8, 3u8)?;
+    assert(store.used == 13u32 && documents::is_current(&store:Read, first));
+    let before: positions::PositionResult = positions::to_position(&store.slots[first.slot].snapshot.index:Read,
+        &store.slots[first.slot].snapshot.text.data[0..7]:Read, 5u32);
+    assert(before.valid && before.position.line == 0u32 && before.position.character == 3u32);
+
+    // JSON 转义可改变拼写；URI 的百分号拼写仍按原值比较。
+    let edited: documents::Event = apply(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/\\u4e2d.yak\",\"version\":2147483647},\"contentChanges\":[{\"text\":\"中\\n\"}]}", 2u8)?;
+    let current: documents::Ticket = edited.ticket;
+    assert(edited.status == 1u8 && current.slot == first.slot && current.generation == first.generation);
+    assert(current.version == 2147483647i32 && !documents::is_current(&store:Read, first));
+    assert(documents::is_current(&store:Read, current) && store.used == 10u32);
+    let after: positions::PositionResult = positions::to_position(&store.slots[current.slot].snapshot.index:Read,
+        &store.slots[current.slot].snapshot.text.data[0..4]:Read, 4u32);
+    assert(after.valid && after.position.line == 1u32 && after.position.character == 0u32);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":0},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 4u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak Work/中.yak\"}}", 3u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%2520Work/中.yak\"}}", 3u8, 4u8)?;
+    let closed: documents::Event = apply(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\"}}", 3u8)?;
+    let closed_uri: &json_string::Decoded:Read = &closed.closed_uri:Read;
+    assert(closed.status == 2u8 && closed_uri.ok && @len(closed_uri.data) == @len("file:///C:/Yak%20Work/中.yak"));
+    assert(!documents::is_current(&store:Read, current) && store.used == 6u32 && store.active == 1u32);
+    assert(@len(store.slots[first.slot].snapshot.index.lines) == 0u64);
+    assert(@len(store.slots[first.slot].snapshot.text.data) == 0u64 && @len(store.slots[first.slot].uri.data) == 0u64);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\"}}", 3u8, 4u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":1},\"contentChanges\":[{\"text\":\"\"}]}", 2u8, 4u8)?;
+    let reopened: documents::Event = apply(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///C:/Yak%20Work/中.yak\",\"version\":-2147483648,\"text\":\"1234567\",\"languageId\":\"yak\"}}", 1u8)?;
+    assert(reopened.status == 1u8 && reopened.ticket.slot == first.slot && reopened.ticket.version == first.version);
+    assert(reopened.ticket.generation > first.generation && !documents::is_current(&store:Read, first));
+    assert(documents::is_current(&store:Read, reopened.ticket) && store.used == 13u32);
+    return;
+}
+
+function invalid_shapes(): void!AllocError {
+    var store: documents::Store = documents::create(2u32);
+    expect(&store:ReadWrite, "[]", 1u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"untitled:1\",\"uri\":\"untitled:2\"}}", 3u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"untitled:1\",\"version\":1,\"text\":\"\",\"languageId\":\"other\"}}", 1u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:///a%\",\"version\":0,\"text\":\"\",\"languageId\":\"yak\"}}", 1u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:/\\u0000x\",\"version\":0,\"text\":\"\",\"languageId\":\"yak\"}}", 1u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"1file:/x\",\"version\":0,\"text\":\"\",\"languageId\":\"yak\"}}", 1u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:\",\"version\":0,\"text\":\"\",\"languageId\":\"yak\"}}", 1u8, 3u8)?;
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:/x\",\"version\":0,\"text\":\"汉\",\"languageId\":\"yak\"}}", 1u8, 5u8)?;
+    assert(store.active == 0u32 && store.used == 0u32 && store.generation == 0u64);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"file:/x\",\"version\":0,\"text\":\"\",\"languageId\":\"yak\"}}", 1u8, 1u8)?;
+    assert(store.active == 1u32 && store.used == 0u32 && store.slots[0].snapshot.index.bytes == 0u32);
+    return;
+}
+
+function capacities(): void!AllocError {
+    var store: documents::Store = documents::create(4294967295u32);
+    assert(store.cap == 16777216u32);
+    let letters: &[u8] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg";
+    let form: &[u8] = "{\"textDocument\":{\"uri\":\"x:X\",\"version\":0,\"text\":\"\",\"languageId\":\"yak\"}}";
+    var body: u8[] = [];
+    var n: u32 = 0;
+    var letter_at: u32 = 0;
+    while (n as u64) < @len(form) {
+        if form[n] == 88u8 { letter_at = n; }
+        @push(body, form[n])?;
+        n = n + 1u32;
+    }
+    var i: u32 = 0;
+    while i < 33u32 {
+        body[letter_at] = letters[i];
+        var status: u8 = 1;
+        if i == 32u32 { status = 5u8; }
+        expect(&store:ReadWrite, &body[0..n]:Read, 1u8, status)?;
+        i = i + 1u32;
+    }
+    assert(store.active == 32u32 && @len(store.slots) == 32u64 && store.generation == 32u64);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:A\"}}", 3u8, 2u8)?;
+    expect(&store:ReadWrite, &body[0..n]:Read, 1u8, 1u8)?;
+    assert(store.active == 32u32 && @len(store.slots) == 32u64 && store.slots[0].generation == 33u64);
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:g\"}}", 3u8, 2u8)?;
+    store.generation = 18446744073709551615u64;
+    expect(&store:ReadWrite, &body[0..n]:Read, 1u8, 5u8)?;
+    assert(store.active == 31u32 && store.slots[0].generation == 0u64);
+    return;
+}
+
+// 增量通知按前项应用后的坐标解释；坏的后项不能提交本版。
+function incremental(): void!AllocError {
+    var store: documents::Store = documents::create(13u32);
+    let opened: documents::Event = apply(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":0,\"text\":\"A😀\\r\\n\",\"languageId\":\"yak\"}}", 1u8)?;
+    let prior: documents::Ticket = opened.ticket;
+    assert(opened.status == 1u8 && store.used == 7u32);
+    let empty: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":1},\"contentChanges\":[]}")?;
+    assert(empty.status == 3u8 && documents::is_current(&store:Read, prior));
+    let bad: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":1},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":3}},\"text\":\"中\"},{\"range\":{\"start\":{\"line\":9,\"character\":0},\"end\":{\"line\":9,\"character\":0}},\"text\":\"!\"}]}")?;
+    assert(bad.status == 3u8 && store.used == 7u32 && documents::is_current(&store:Read, prior));
+    {
+        let initial: &documents::Snapshot:Read = &store.slots[prior.slot].snapshot:Read;
+        assert(initial.text.data[1] == 240u8 && initial.index.bytes == 7u32);
+    }
+    let good: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":1},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":3}},\"text\":\"中\"},{\"range\":{\"start\":{\"line\":0,\"character\":2},\"end\":{\"line\":0,\"character\":2}},\"text\":\"😀\"}]}")?;
+    let current: documents::Ticket = good.ticket;
+    assert(good.status == 1u8 && current.version == 1i32 && current.generation == prior.generation);
+    assert(store.used == 10u32 && documents::is_current(&store:Read, current) && !documents::is_current(&store:Read, prior));
+    {
+        let saved: &documents::Snapshot:Read = &store.slots[current.slot].snapshot:Read;
+        let offset: positions::OffsetResult = positions::to_offset(&saved.index:Read, &saved.text.data[0..10]:Read, 0u32, 4u32);
+        assert(saved.text.data[1] == 228u8 && saved.text.data[4] == 240u8 && offset.valid && offset.offset == 8u32);
+    }
+    let full: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":2},\"contentChanges\":[{\"text\":\"ok\\n\"}]}")?;
+    assert(full.status == 1u8 && full.ticket.version == 2i32 && store.used == 3u32 && documents::is_current(&store:Read, full.ticket));
+    // 第二份文档压缩可用额度；后项超额时，已暂存的首项也不能提交。
+    expect(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:other\",\"version\":0,\"text\":\"123456789\",\"languageId\":\"yak\"}}", 1u8, 1u8)?;
+    let too_big: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":3},\"contentChanges\":[{\"text\":\"abc\"},{\"range\":{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":3}},\"text\":\"!!\"}]}")?;
+    assert(too_big.status == 5u8 && store.used == 12u32 && documents::is_current(&store:Read, full.ticket));
+    assert(store.slots[full.ticket.slot].snapshot.text.data[0] == 111u8);
+    let retry: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":3},\"contentChanges\":[{\"text\":\"A\"},{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":1}},\"rangeLength\":0,\"text\":\"\\n\"}]}")?;
+    assert(retry.status == 1u8 && store.used == 11u32 && documents::is_current(&store:Read, retry.ticket));
+    assert(store.slots[retry.ticket.slot].snapshot.text.data[0] == 65u8 && store.slots[retry.ticket.slot].snapshot.text.data[1] == 10u8);
+    // 同一活动额度下，正好四字节仍可提交。
+    let exact: documents::Event = apply_incremental(&store:ReadWrite, "{\"textDocument\":{\"uri\":\"x:inc\",\"version\":4},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":1}},\"text\":\"!!\"}]}")?;
+    assert(exact.status == 1u8 && store.used == 13u32 && documents::is_current(&store:Read, exact.ticket));
+    assert(store.slots[exact.ticket.slot].snapshot.text.data[3] == 10u8);
+    return;
+}
+
+function run(): void!AllocError {
+    lifecycle()?;
+    invalid_shapes()?;
+    capacities()?;
+    incremental()?;
+    exit(0u8);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run();
+    @drop(failed);
+    exit(1u8);
+}

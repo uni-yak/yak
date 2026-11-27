@@ -1,0 +1,21 @@
+// t43: 短路求值 — 通过write验证副作用是否被跳过
+// 期望: f && side_effect 不调用；t || side_effect 不调用 → 仅write "short-circuit ok"
+foreign write(data: &[u8]): void;
+// expected_stdout: short-circuit ok
+
+function side_effect_1(): bool {
+    write("called\n");
+    return true;
+}
+
+function main(): void {
+    let f: bool = false;
+    if f && side_effect_1() {
+        write("unreachable\n");
+    }
+    let t: bool = true;
+    if t || side_effect_1() {
+        write("short-circuit ok\n");
+    }
+    return;
+}

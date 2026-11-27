@@ -1,0 +1,144 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import layout;
+import iface;
+import iface_write;
+import iface_load;
+foreign assert(cond: bool): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    return Loaded { parsed: p, lexed: r };
+}
+function has_code(diags: &diag::DiagBuffer:Read, code: u16): bool {
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(diags) {
+        if diags.diags[i].code.raw == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function reject_record_flag(original: &[u8], offset: u32, value: u8): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    bytes[offset] = value;
+    i = 24;
+    while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0;
+    while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    assert(has_code(&diags:Read, 7012) && @len(rejected.exports) == 0);
+    return;
+}
+function section_offset(bytes: &[u8], section: u32): u32 {
+    let p: u32 = 60 + section * 16;
+    return bytes[p] as u32 | (bytes[p + 1] as u32 << 8) | (bytes[p + 2] as u32 << 16) | (bytes[p + 3] as u32 << 24);
+}
+// 重签名真实接口，隔离请求对齐与标签自然对齐的组合。
+function reject_narrow_enum_align(original: &[u8]): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    bytes[section_offset(original, 6) + 10] = 1;
+    let summary: u32 = section_offset(original, 5);
+    bytes[summary + 4] = 1;
+    bytes[summary + 12] = 1;
+    i = 24; while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0; while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    assert(has_code(&diags:Read, 7012) && @len(loaded.exports) == 0);
+    return;
+}
+// 由前端和接口写出器生成跨越标签宽度边界的真实枚举。
+function check_enum_width(count: u32): void!AllocError {
+    var source: u8[] = [];
+    let prefix: &[u8]:Read = "export enum E { ";
+    var i: u32 = 0;
+    while i < @len(prefix) as u32 { @push(source, prefix[i])?; i = i + 1; }
+    i = 0;
+    while i < count {
+        @push(source, 86u8)?;
+        @push(source, (65 + (i / 676) % 26) as u8)?;
+        @push(source, (65 + (i / 26) % 26) as u8)?;
+        @push(source, (65 + i % 26) as u8)?;
+        @push(source, 44u8)?;
+        i = i + 1;
+    }
+    @push(source, 125u8)?; @push(source, 10u8)?;
+    let input: Loaded = load(&source[0..@len(source)]:Read, 1001)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&input.parsed.file:Read, &input.parsed.pool:Read, &input.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&input.parsed.file:Read, &input.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let ly: layout::LayoutResult = layout::layout_unit(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, &diags:ReadWrite)?;
+    var sizes: u64[] = []; var aligns: u8[] = []; var known: bool[] = [];
+    i = 0;
+    while i < @len(tc.types.entries) as u32 {
+        @push(sizes, ly.table.items[i].size)?; @push(aligns, ly.table.items[i].align)?; @push(known, ly.table.items[i].known)?;
+        i = i + 1;
+    }
+    let layouts: iface::LayoutData = iface::LayoutData { sizes: sizes, aligns: aligns, known: known };
+    let output: iface::InterfaceResult = iface_write::write_interface(&input.parsed.file:Read, &input.parsed.pool:Read, &resolution:Read, &input.lexed.names:Read, &tc:Read, &layouts:Read, "width", &diags:ReadWrite)?;
+    assert(!diags.has_error);
+    let original: &[u8]:Read = &output.data.bytes[0..@len(output.data.bytes)]:Read;
+    let loaded: iface::LoadedInterface = iface_load::load_interface(original, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(loaded.summaries) == 1 && @len(loaded.enum_members) as u32 == count);
+    var expected: u8 = 1; if count > 256 { expected = 2; }
+    assert(loaded.summaries[0].size == expected as u64 && loaded.summaries[0].align == expected);
+    let summary: u32 = section_offset(original, 5);
+    reject_record_flag(original, summary + 4, expected * 2)?;
+    if count > 256 { reject_narrow_enum_align(original)?; }
+    return;
+}
+function main(): void {
+    check_enum_width(256)?;
+    check_enum_width(257)?;
+    return;
+}

@@ -1,0 +1,17 @@
+// 正常合流：一侧显式析构，另一侧由函数出口清理；两条路径各释放一次。
+function join(c: bool, value: u32): void!AllocError {
+    var a: u32[] = [];
+    @push(a, value)?;
+    if c {
+        @drop(a);
+    }
+    return;
+}
+
+function outer(): void!AllocError {
+    join(true, 111u32)?;
+    join(false, 112u32)?;
+    return;
+}
+
+function main(): void { outer(); return; }

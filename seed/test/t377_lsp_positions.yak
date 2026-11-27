@@ -1,0 +1,125 @@
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: positions=../../compiler/lsp/positions.yak
+import positions;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function check(index: &positions::Index:Read, src: &[u8], at: u32, row: u32, col: u32): void {
+    let pos: positions::PositionResult = positions::to_position(index, src, at);
+    assert(pos.valid && pos.position.line == row && pos.position.character == col);
+    let back: positions::OffsetResult = positions::to_offset(index, src, row, col);
+    assert(back.valid && back.offset == at);
+}
+
+function boundaries(): void!AllocError {
+    // 第零行：A + 汉 + 代理对；第二个换行是裸 CR，最后一行为空。
+    let src: &[u8] = "A汉😀\r\né\rX\n";
+    let index: positions::Index = positions::build(src)?;
+    assert(index.status == 0u8 && index.bytes == 15u32);
+    check(&index:Read, src, 0, 0, 0);
+    check(&index:Read, src, 1, 0, 1);
+    check(&index:Read, src, 4, 0, 2);
+    check(&index:Read, src, 8, 0, 4);
+    check(&index:Read, src, 10, 1, 0);
+    check(&index:Read, src, 12, 1, 1);
+    check(&index:Read, src, 13, 2, 0);
+    check(&index:Read, src, 14, 2, 1);
+    check(&index:Read, src, 15, 3, 0);
+    assert(!positions::to_position(&index:Read, src, 2).valid);
+    assert(!positions::to_position(&index:Read, src, 5).valid);
+    assert(!positions::to_position(&index:Read, src, 9).valid);
+    assert(!positions::to_position(&index:Read, src, 16).valid);
+    assert(!positions::to_position(&index:Read, "A", 0).valid);
+    assert(!positions::to_offset(&index:Read, src, 0, 3).valid);
+    assert(!positions::to_offset(&index:Read, src, 4, 0).valid);
+    let clamped: positions::OffsetResult = positions::to_offset(&index:Read, src, 0, 4294967295u32);
+    assert(clamped.valid && clamped.offset == 8u32);
+
+    let across: positions::RangeResult = positions::span_range(&index:Read, src, 1, 1, 4, 9);
+    assert(across.valid && across.range.start.line == 0u32 && across.range.start.character == 2u32);
+    assert(across.range.end.line == 2u32 && across.range.end.character == 0u32);
+    let eof: positions::RangeResult = positions::span_range(&index:Read, src, 1, 1, 15, 0);
+    assert(eof.valid && eof.range.start.line == 3u32 && eof.range.end.line == 3u32);
+    let first: positions::RangeResult = positions::span_range(&index:Read, src, 1, 1, 0, 0);
+    assert(first.valid && first.range.start.line == 0u32 && first.range.start.character == 0u32);
+    assert(!positions::span_range(&index:Read, src, 0, 0, 0, 0).valid);
+    assert(!positions::span_range(&index:Read, src, 2, 1, 0, 0).valid);
+    assert(!positions::span_range(&index:Read, src, 1, 1, 4, 1).valid);
+    assert(!positions::span_range(&index:Read, src, 1, 1, 8, 1).valid);
+    assert(!positions::span_range(&index:Read, src, 1, 1, 1, 4294967295u32).valid);
+    assert(!positions::span_range(&index:Read, src, 1, 1, 4294967295u32, 0).valid);
+    return;
+}
+
+function edge_texts(): void!AllocError {
+    let empty: positions::Index = positions::build("")?;
+    check(&empty:Read, "", 0, 0, 0);
+    assert(!positions::to_offset(&empty:Read, "", 1, 0).valid);
+    let eof: positions::Index = positions::build("\n😀")?;
+    check(&eof:Read, "\n😀", 0, 0, 0);
+    check(&eof:Read, "\n😀", 1, 1, 0);
+    check(&eof:Read, "\n😀", 5, 1, 2);
+    let first_bad: [u8; 4] = [10u8, 240u8, 159u8, 10u8];
+    let src: &[u8] = &first_bad[0..4]:Read;
+    let bad: positions::Index = positions::build(src)?;
+    assert(bad.status == 1u8);
+    assert(!positions::to_position(&bad:Read, src, 0).valid);
+    assert(!positions::to_offset(&bad:Read, src, 0, 0).valid);
+    return;
+}
+
+function long_line(): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < 255u32 { @push(bytes, 65u8)?; i = i + 1u32; }
+    @push(bytes, 240u8)?;
+    @push(bytes, 159u8)?;
+    @push(bytes, 152u8)?;
+    @push(bytes, 128u8)?;
+    while i < 1000u32 { @push(bytes, 66u8)?; i = i + 1u32; }
+    @push(bytes, 10u8)?;
+    @push(bytes, 67u8)?;
+    let src: &[u8] = &bytes[0..@len(bytes)]:Read;
+    let index: positions::Index = positions::build(src)?;
+    check(&index:Read, src, 254, 0, 254);
+    check(&index:Read, src, 255, 0, 255);
+    assert(!positions::to_position(&index:Read, src, 258).valid);
+    assert(!positions::to_offset(&index:Read, src, 0, 256).valid);
+    check(&index:Read, src, 259, 0, 257);
+    check(&index:Read, src, 515, 0, 513);
+    check(&index:Read, src, 772, 0, 770);
+    check(&index:Read, src, 1004, 0, 1002);
+    check(&index:Read, src, 1005, 1, 0);
+    check(&index:Read, src, 1006, 1, 1);
+    return;
+}
+
+function line_budget(): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < 65536u32 { @push(bytes, 10u8)?; i = i + 1u32; }
+    let allowed: &[u8] = &bytes[0..65535]:Read;
+    let full: positions::Index = positions::build(allowed)?;
+    assert(full.status == 0u8);
+    check(&full:Read, allowed, 65535, 65535, 0);
+    let extra: &[u8] = &bytes[0..65536]:Read;
+    let limited: positions::Index = positions::build(extra)?;
+    assert(limited.status == 2u8);
+    assert(!positions::to_position(&limited:Read, extra, 0).valid);
+    return;
+}
+
+function run(): void!AllocError {
+    boundaries()?;
+    edge_texts()?;
+    long_line()?;
+    line_budget()?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run();
+    @drop(failed);
+    exit(1);
+}

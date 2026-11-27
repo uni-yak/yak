@@ -1,0 +1,243 @@
+// 解码接口布局摘要、枚举变体和结构体字段；目录和摘要已由接口入口核验。
+import iface;
+import hash;
+
+export function read_u16_at(bytes: &[u8], offset: u32): u16 {
+    return (bytes[offset] as u16) | ((bytes[offset + 1] as u16) << 8);
+}
+export function read_u32_at(bytes: &[u8], offset: u32): u32 {
+    return (bytes[offset] as u32) | ((bytes[offset + 1] as u32) << 8) | ((bytes[offset + 2] as u32) << 16) | ((bytes[offset + 3] as u32) << 24);
+}
+export function read_u64_at(bytes: &[u8], offset: u32): u64 {
+    return (read_u32_at(bytes, offset) as u64) | ((read_u32_at(bytes, offset + 4) as u64) << 32);
+}
+function valid_descriptor(bytes: &[u8], record: u32, export_id: u32, total: u32, summaries: &[iface::LoadedSummary]:Read): bool {
+    let start: u32 = read_u32_at(bytes, record);
+    let count: u32 = read_u32_at(bytes, record + 4);
+    let arity: u16 = read_u16_at(bytes, record + 8);
+    let align: u8 = bytes[record + 10];
+    let index: u32 = read_u32_at(bytes, record + 12);
+    if export_id == 0 || count == 0 || count > 65536 || start > total || count > total - start { return false; }
+    if (align != 0 && align != 1 && align != 2 && align != 4 && align != 8) || bytes[record + 11] != 0 { return false; }
+    if arity != 0 { return index == 4294967295u32; }
+    if index >= @len(summaries) as u32 { return false; }
+    // 请求对齐不可高于实际布局摘要的对齐。
+    return summaries[index].type_export_id == export_id && summaries[index].align >= align;
+}
+// 描述符顺序不固定，以导出偏移关联成员表并逐组验证完整区间。
+function valid_member_ranges(bytes: &[u8], export_offset: u32, export_count: u32, desc_offset: u32, desc_count: u32, member_offset: u32, member_count: u32, kind: u8): bool {
+    var i: u32 = 0;
+    var previous: u32 = 0;
+    var start: u32 = 0;
+    var end: u32 = 0;
+    var groups: u32 = 0;
+    while i < member_count {
+        let record: u32 = member_offset + i * 32;
+        let host: u32 = read_u32_at(bytes, record);
+        if host != previous {
+            if host == 0 || host > export_count || host < previous { return false; }
+            let exported: u32 = export_offset + (host - 1) * 32;
+            if bytes[exported + 6] != kind { return false; }
+            let desc: u32 = desc_offset + read_u32_at(bytes, exported + 28);
+            start = read_u32_at(bytes, desc);
+            let count: u32 = read_u32_at(bytes, desc + 4);
+            if i != end || start != i { return false; }
+            end = start + count;
+            groups = groups + 1;
+            previous = host;
+        }
+        if i >= end || read_u16_at(bytes, record + 10) as u32 != i - start { return false; }
+        i = i + 1;
+    }
+    return end == member_count && groups == desc_count;
+}
+// 成员区间及名称范围已验证，严格排序与等量记录共同保证索引完整且无重复。
+function valid_member_index(bytes: &[u8], export_offset: u32, export_count: u32, desc_offset: u32, member_offset: u32, member_count: u32, index_offset: u32, index_count: u32, name_offset: u32, kind: u8): bool {
+    if index_count != member_count { return false; }
+    var i: u32 = 0;
+    var previous_host: u32 = 0;
+    var previous_record: u32 = 0;
+    while i < index_count {
+        let entry: u32 = index_offset + i * 8;
+        let host: u32 = read_u32_at(bytes, entry);
+        if host == 0 || host > export_count || host < previous_host || read_u16_at(bytes, entry + 6) != 0 { return false; }
+        let exported: u32 = export_offset + (host - 1) * 32;
+        if bytes[exported + 6] != kind { return false; }
+        let desc: u32 = desc_offset + read_u32_at(bytes, exported + 28);
+        let member_id: u32 = read_u16_at(bytes, entry + 4) as u32;
+        if member_id >= read_u32_at(bytes, desc + 4) { return false; }
+        let record: u32 = member_offset + (read_u32_at(bytes, desc) + member_id) * 32;
+        if host == previous_host {
+            let left: u32 = name_offset + read_u32_at(bytes, previous_record + 4);
+            let right: u32 = name_offset + read_u32_at(bytes, record + 4);
+            let left_len: u32 = read_u16_at(bytes, previous_record + 8) as u32;
+            let right_len: u32 = read_u16_at(bytes, record + 8) as u32;
+            if !iface::export_key_less(read_u64_at(bytes, previous_record + 24), &bytes[left..left + left_len]:Read, 0, read_u64_at(bytes, record + 24), &bytes[right..right + right_len]:Read, 0) { return false; }
+        }
+        previous_host = host;
+        previous_record = record;
+        i = i + 1;
+    }
+    return true;
+}
+
+export function decode_members(bytes: &[u8], loaded: &iface::LoadedInterface:ReadWrite): bool!AllocError {
+    let name_offset: u32 = read_u32_at(bytes, 56 + 0 * 16 + 4);
+    let name_length: u32 = read_u32_at(bytes, 56 + 0 * 16 + 8);
+    let export_offset: u32 = read_u32_at(bytes, 56 + 3 * 16 + 4);
+    let export_count: u32 = read_u32_at(bytes, 56 + 3 * 16 + 12);
+    let sig_length: u32 = read_u32_at(bytes, 56 + 4 * 16 + 8);
+    var i: u32 = 0;
+    // 描述符可按任意顺序排列，按节内偏移建立一一对应关系。
+    var enum_ids: u32[] = [];
+    var struct_ids: u32[] = [];
+    let enum_count: u32 = read_u32_at(bytes, 56 + 6 * 16 + 12);
+    let struct_count: u32 = read_u32_at(bytes, 56 + 11 * 16 + 12);
+    i = 0;
+    while i < enum_count { @push(enum_ids, 0)?; i = i + 1; }
+    i = 0;
+    while i < struct_count { @push(struct_ids, 0)?; i = i + 1; }
+    i = 0;
+    while i < @len(loaded.exports) as u32 {
+        let item: iface::LoadedExport = loaded.exports[i];
+        if item.kind != 1 {
+            if item.aux_off % 16 != 0 { return false; }
+            let slot: u32 = item.aux_off / 16;
+            if item.kind == 2 {
+                if slot >= enum_count || enum_ids[slot] != 0 { return false; }
+                enum_ids[slot] = item.export_id;
+            } else {
+                if slot >= struct_count || struct_ids[slot] != 0 { return false; }
+                struct_ids[slot] = item.export_id;
+            }
+        }
+        i = i + 1;
+    }
+    var linked_summaries: u32 = 0;
+    var summaries: iface::LoadedSummary[] = [];
+    let summary_offset: u32 = read_u32_at(bytes, 56 + 5 * 16 + 4);
+    let summary_length: u32 = read_u32_at(bytes, 56 + 5 * 16 + 8);
+    let summary_count: u32 = read_u32_at(bytes, 56 + 5 * 16 + 12);
+    if summary_length != summary_count * 16 { return false; }
+    i = 0;
+    while i < summary_count {
+        let record: u32 = summary_offset + i * 16;
+        if bytes[record + 13] != 0 || read_u16_at(bytes, record + 14) != 0 { return false; }
+        let type_id: u32 = read_u32_at(bytes, record);
+        let size: u64 = read_u64_at(bytes, record + 4);
+        let align: u8 = bytes[record + 12];
+        if type_id == 0 || type_id > @len(loaded.exports) as u32 { return false; }
+        if loaded.exports[type_id - 1].kind == 1 || (i > 0 && type_id <= summaries[i - 1].type_export_id) { return false; }
+        if (align != 1 && align != 2 && align != 4 && align != 8) || size == 0 { return false; }
+        if size % (align as u64) != 0 { return false; }
+        @push(summaries, iface::LoadedSummary { type_export_id: type_id, size: size, align: align })?;
+        i = i + 1;
+    }
+    var enum_descriptors: iface::LoadedEnumDescriptor[] = [];
+    var enum_members: iface::LoadedEnumMember[] = [];
+    var enum_name_index: iface::NameIndexRecord[] = [];
+    let enum_desc_offset: u32 = read_u32_at(bytes, 56 + 6 * 16 + 4);
+    let enum_desc_length: u32 = read_u32_at(bytes, 56 + 6 * 16 + 8);
+    let enum_desc_count: u32 = read_u32_at(bytes, 56 + 6 * 16 + 12);
+    if enum_desc_length != enum_desc_count * 16 { return false; }
+    let enum_member_offset: u32 = read_u32_at(bytes, 56 + 7 * 16 + 4);
+    let enum_member_length: u32 = read_u32_at(bytes, 56 + 7 * 16 + 8);
+    let enum_member_count: u32 = read_u32_at(bytes, 56 + 7 * 16 + 12);
+    if enum_member_length != enum_member_count * 32 { return false; }
+    let enum_index_offset: u32 = read_u32_at(bytes, 56 + 8 * 16 + 4);
+    let enum_index_length: u32 = read_u32_at(bytes, 56 + 8 * 16 + 8);
+    let enum_index_count: u32 = read_u32_at(bytes, 56 + 8 * 16 + 12);
+    if enum_index_length != enum_index_count * 8 { return false; }
+    i = 0;
+    while i < enum_desc_count {
+        let record: u32 = enum_desc_offset + i * 16;
+        if !valid_descriptor(bytes, record, enum_ids[i], enum_member_count, &summaries[0..@len(summaries)]:Read) { return false; }
+        // 泛型成员签名尚无类型参数上下文，不能声称已完成验证。
+        if read_u16_at(bytes, record + 8) != 0 { return false; }
+        linked_summaries = linked_summaries + 1;
+        @push(enum_descriptors, iface::LoadedEnumDescriptor { export_id: enum_ids[i], member_start: read_u32_at(bytes, record), member_count: read_u32_at(bytes, record + 4), summary_index: read_u32_at(bytes, record + 12), request_align: bytes[record + 10] })?;
+        i = i + 1;
+    }
+    if !valid_member_ranges(bytes, export_offset, export_count, enum_desc_offset, enum_desc_count, enum_member_offset, enum_member_count, 2) { return false; }
+    i = 0;
+    while i < enum_member_count {
+        let record: u32 = enum_member_offset + i * 32;
+        if read_u16_at(bytes, record + 12) > 1 || read_u16_at(bytes, record + 14) != 0 { return false; }
+        let member_name: u32 = read_u32_at(bytes, record + 4);
+        let member_name_len: u32 = read_u16_at(bytes, record + 8) as u32;
+        let payload: u32 = read_u32_at(bytes, record + 16);
+        let payload_len: u32 = read_u32_at(bytes, record + 20);
+        if member_name > name_length || member_name_len > name_length - member_name || payload > sig_length || payload_len > sig_length - payload { return false; }
+        if read_u16_at(bytes, record + 12) == 0 && (payload != 0 || payload_len != 0) { return false; }
+        if read_u16_at(bytes, record + 12) == 1 && payload_len == 0 { return false; }
+        let name: &[u8]:Read = &bytes[name_offset + member_name..name_offset + member_name + member_name_len]:Read;
+        if !iface::valid_identifier(name) || hash::fnv1a(name) != read_u64_at(bytes, record + 24) { return false; }
+        @push(enum_members, iface::LoadedEnumMember { enum_export_id: read_u32_at(bytes, record), name_off: read_u32_at(bytes, record + 4), name_len: read_u16_at(bytes, record + 8), variant_id: read_u16_at(bytes, record + 10), flags: read_u16_at(bytes, record + 12), payload_sig_off: read_u32_at(bytes, record + 16), payload_sig_len: read_u32_at(bytes, record + 20), name_hash: read_u64_at(bytes, record + 24) })?;
+        i = i + 1;
+    }
+    if !valid_member_index(bytes, export_offset, export_count, enum_desc_offset, enum_member_offset, enum_member_count, enum_index_offset, enum_index_count, name_offset, 2) { return false; }
+    i = 0;
+    while i < enum_index_count {
+        let record: u32 = enum_index_offset + i * 8;
+        if read_u16_at(bytes, record + 6) != 0 { return false; }
+        @push(enum_name_index, iface::NameIndexRecord { export_id: read_u32_at(bytes, record), member_id: read_u16_at(bytes, record + 4) })?;
+        i = i + 1;
+    }
+    var struct_descriptors: iface::LoadedStructDescriptor[] = [];
+    var struct_fields: iface::LoadedStructField[] = [];
+    var struct_field_name_index: iface::NameIndexRecord[] = [];
+    let struct_desc_offset: u32 = read_u32_at(bytes, 56 + 11 * 16 + 4);
+    let struct_desc_length: u32 = read_u32_at(bytes, 56 + 11 * 16 + 8);
+    let struct_desc_count: u32 = read_u32_at(bytes, 56 + 11 * 16 + 12);
+    if struct_desc_length != struct_desc_count * 16 { return false; }
+    let struct_field_offset: u32 = read_u32_at(bytes, 56 + 12 * 16 + 4);
+    let struct_field_length: u32 = read_u32_at(bytes, 56 + 12 * 16 + 8);
+    let struct_field_count: u32 = read_u32_at(bytes, 56 + 12 * 16 + 12);
+    if struct_field_length != struct_field_count * 32 { return false; }
+    let struct_index_offset: u32 = read_u32_at(bytes, 56 + 13 * 16 + 4);
+    let struct_index_length: u32 = read_u32_at(bytes, 56 + 13 * 16 + 8);
+    let struct_index_count: u32 = read_u32_at(bytes, 56 + 13 * 16 + 12);
+    if struct_index_length != struct_index_count * 8 { return false; }
+    i = 0;
+    while i < struct_desc_count {
+        let record: u32 = struct_desc_offset + i * 16;
+        if !valid_descriptor(bytes, record, struct_ids[i], struct_field_count, &summaries[0..@len(summaries)]:Read) { return false; }
+        // 泛型成员签名尚无类型参数上下文，不能声称已完成验证。
+        if read_u16_at(bytes, record + 8) != 0 { return false; }
+        linked_summaries = linked_summaries + 1;
+        @push(struct_descriptors, iface::LoadedStructDescriptor { export_id: struct_ids[i], member_start: read_u32_at(bytes, record), member_count: read_u32_at(bytes, record + 4), summary_index: read_u32_at(bytes, record + 12), request_align: bytes[record + 10] })?;
+        i = i + 1;
+    }
+    if !valid_member_ranges(bytes, export_offset, export_count, struct_desc_offset, struct_desc_count, struct_field_offset, struct_field_count, 3) { return false; }
+    i = 0;
+    while i < struct_field_count {
+        let record: u32 = struct_field_offset + i * 32;
+        if read_u16_at(bytes, record + 12) != 0 || read_u16_at(bytes, record + 14) != 0 { return false; }
+        let field_name: u32 = read_u32_at(bytes, record + 4);
+        let field_name_len: u32 = read_u16_at(bytes, record + 8) as u32;
+        let field_sig: u32 = read_u32_at(bytes, record + 16);
+        let field_sig_len: u32 = read_u32_at(bytes, record + 20);
+        if field_name > name_length || field_name_len > name_length - field_name || field_sig_len == 0 || field_sig > sig_length || field_sig_len > sig_length - field_sig { return false; }
+        let name: &[u8]:Read = &bytes[name_offset + field_name..name_offset + field_name + field_name_len]:Read;
+        if !iface::valid_identifier(name) || hash::fnv1a(name) != read_u64_at(bytes, record + 24) { return false; }
+        @push(struct_fields, iface::LoadedStructField { struct_export_id: read_u32_at(bytes, record), name_off: read_u32_at(bytes, record + 4), name_len: read_u16_at(bytes, record + 8), field_id: read_u16_at(bytes, record + 10), type_sig_off: read_u32_at(bytes, record + 16), type_sig_len: read_u32_at(bytes, record + 20), name_hash: read_u64_at(bytes, record + 24) })?;
+        i = i + 1;
+    }
+    if !valid_member_index(bytes, export_offset, export_count, struct_desc_offset, struct_field_offset, struct_field_count, struct_index_offset, struct_index_count, name_offset, 3) { return false; }
+    i = 0;
+    while i < struct_index_count {
+        let record: u32 = struct_index_offset + i * 8;
+        if read_u16_at(bytes, record + 6) != 0 { return false; }
+        @push(struct_field_name_index, iface::NameIndexRecord { export_id: read_u32_at(bytes, record), member_id: read_u16_at(bytes, record + 4) })?;
+        i = i + 1;
+    }
+    if linked_summaries != @len(summaries) as u32 { return false; }
+    loaded.summaries = @move(summaries);
+    loaded.enum_descriptors = @move(enum_descriptors);
+    loaded.enum_members = @move(enum_members);
+    loaded.enum_name_index = @move(enum_name_index);
+    loaded.struct_descriptors = @move(struct_descriptors);
+    loaded.struct_fields = @move(struct_fields);
+    loaded.struct_field_name_index = @move(struct_field_name_index);
+    return true;
+}

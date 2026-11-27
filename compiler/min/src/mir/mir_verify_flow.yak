@@ -1,0 +1,572 @@
+// 验证已通过结构检查的控制流、操作数使用及槽位交接。
+import types;
+import typecheck;
+import layout;
+import mir;
+import mir_borrow_flow;
+import mir_place_flow;
+
+const NONE: u32 = 4294967295u32;
+
+function defined_local(ctx: &mir::MirFunction:Read, id: u32): bool { return id > 0 && id <= @len(ctx.locals) as u32; }
+
+// 原位确认定义和使用的顺序，不为每条指令分配操作数数组。
+function valid_use(ctx: &mir::MirFunction:Read, defs: &[u32], positions: &[u32], dominators: &[u32], local: u32, block: u32, inst: u32, slot_allowed: bool): bool {
+    if !defined_local(ctx, local) { return false; }
+    let owner: u32 = defs[local - 1];
+    if owner == NONE || (!slot_allowed && ctx.locals[local - 1].kind == 3) { return false; }
+    // 任意块都支配自身；同块只需验证定义先于使用。
+    if owner == block { return positions[local - 1] <= inst; }
+    return mir::dominates(dominators, owner, block);
+}
+
+// 对同一个槽，合流的所有前驱必须给出相同状态。
+function merge_slot_state(states: &u8[]:ReadWrite, queue: &u32[]:ReadWrite, target: u32, state: u8): bool!AllocError {
+    if target >= @len((*states)) as u32 { return false; }
+    if states[target] != 255 { return states[target] == state; }
+    states[target] = state;
+    @push(*queue, target)?;
+    return true;
+}
+
+function blocks_slot_rollback(op: u8): bool {
+    // 无失败边的调用不能携带尚未交接的聚合槽。
+    return (mir::is_slot_call(op) && !mir::is_checked_call(op)) || op == 147;
+}
+
+struct SlotRollback { block: u32, slot: u32 }
+
+// 只检查私有清理块；无私有目标时没有回滚动作。
+function trap_slot_drops(ctx: &mir::MirFunction:Read, target: u32, slot: u32): u32 {
+    if target == 0 { return 0; }
+    let block: mir::MirBlock = ctx.blocks[target - 1];
+    var count: u32 = 0;
+    var j: u32 = 0;
+    while j < block.inst_count {
+        let drop: mir::MirInst = ctx.insts[block.inst_start + j];
+        if drop.op == 115 && drop.b == slot { count = count + 1; }
+        j = j + 1;
+    }
+    return count;
+}
+
+// 错误返回和正常分流到的陷阱都回滚本帧；未知标签不能用于 Write 交接。
+function slot_return_form(ctx: &mir::MirFunction:Read, block: u32, fallible: bool): u8 {
+    let end: mir::MirTerminator = ctx.blocks[block].terminator;
+    if mir::terminates_process(end.op) { return 2; }
+    if end.op != 194 { return 0; }
+    if !fallible { return 1; }
+    var j: u32 = 0;
+    while j < ctx.blocks[block].inst_count {
+        let ins: mir::MirInst = ctx.insts[ctx.blocks[block].inst_start + j];
+        if ins.a == end.a && end.a != 0 {
+            if ins.op == 160 { return 1; }
+            if ins.op == 161 { return 2; }
+        }
+        j = j + 1;
+    }
+    return 3;
+}
+
+function slot_param_flow(ctx: &mir::MirFunction:Read, slot: u32, aggregate: bool, fallible: bool, generate: bool, required: &SlotRollback[]:ReadWrite): bool!AllocError {
+    let n: u32 = @len(ctx.blocks) as u32;
+    var states: u8[] = [];
+    var queue: u32[] = [];
+    while (@len(states) as u32) < n { @push(states, 255)?; }
+    states[ctx.entry] = 11;
+    @push(queue, ctx.entry as u32)?;
+    var i: u32 = 0;
+    while i < @len(queue) as u32 {
+        let block: u32 = queue[i];
+        let end: mir::MirTerminator = ctx.blocks[block].terminator;
+        let form: u8 = slot_return_form(ctx, block, fallible);
+        var state: u8 = states[block];
+        var j: u32 = 0;
+        while j < ctx.blocks[block].inst_count {
+            let ins: mir::MirInst = ctx.insts[ctx.blocks[block].inst_start + j];
+            if aggregate && state == 12 && blocks_slot_rollback(ins.op) { return false; }
+            if mir::has_trap_edge(ins.op) {
+                let full: bool = aggregate && state == 12;
+                if generate {
+                    if full {
+                        if ins.trap == 0 { return false; }
+                        @push(*required, SlotRollback { block: ins.trap - 1, slot: slot })?;
+                    }
+                } else {
+                    let drops: u32 = trap_slot_drops(ctx, ins.trap, slot);
+                    if (full && drops != 1) || (!full && drops != 0) { return false; }
+                }
+            }
+            if ins.op == 209 && ins.b == slot {
+                if state != 11 { return false; }
+                state = 12;
+            } elseif ins.op == 115 && ins.b == slot {
+                if generate || !aggregate || state != 12 || form != 2 { return false; }
+                state = 14;
+            }
+            j = j + 1;
+        }
+        if form == 1 && state != 12 { return false; }
+        if form == 3 { return false; }
+        if form == 2 && aggregate && state == 12 {
+            if !generate { return false; }
+            @push(*required, SlotRollback { block: block, slot: slot })?;
+        }
+        if aggregate && state == 12 && end.op == 196 { return false; }
+        if end.op == 192 || end.op == 193 || end.op == 162 {
+            if !merge_slot_state(&states:ReadWrite, &queue:ReadWrite, end.b, state)? { return false; }
+        }
+        if end.op == 193 || end.op == 162 {
+            if !merge_slot_state(&states:ReadWrite, &queue:ReadWrite, end.c, state)? { return false; }
+        }
+        if end.op == 177 {
+            var a: u32 = 0;
+            while a < end.c {
+                if !merge_slot_state(&states:ReadWrite, &queue:ReadWrite, ctx.arms[end.b + a].block as u32, state)? { return false; }
+                a = a + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function collect_slot_rollbacks(ctx: &mir::MirFunction:Read, types: &typecheck::TypeTable:Read, ret: u32, generate: bool, required: &SlotRollback[]:ReadWrite): bool!AllocError {
+    let fallible: bool = mir::valid_type(types, ret) && types.entries[ret - 1].kind == 9;
+    var p: u32 = @len(ctx.params) as u32;
+    while p != 0 {
+        p = p - 1;
+        let slot: u32 = ctx.params[p];
+        if ctx.locals[slot - 1].kind == 3 {
+            let aggregate: bool = !mir::is_scalar(types, ctx.locals[slot - 1].value_type_id);
+            if !slot_param_flow(ctx, slot, aggregate, fallible, generate, required)? { return false; }
+        }
+    }
+    return true;
+}
+
+function check_slot_params(ctx: &mir::MirFunction:Read, types: &typecheck::TypeTable:Read, ret: u32): bool!AllocError {
+    var required: SlotRollback[] = [];
+    if !collect_slot_rollbacks(ctx, types, ret, false, &required:ReadWrite)? { return false; }
+    var i: u32 = 0;
+    while i < @len(ctx.blocks) as u32 {
+        var p: u32 = @len(ctx.params) as u32;
+        var started: bool = false;
+        var j: u32 = 0;
+        while j < ctx.blocks[i].inst_count {
+            let ins: mir::MirInst = ctx.insts[ctx.blocks[i].inst_start + j];
+            if ins.op == 115 && ctx.locals[ins.b - 1].kind == 3 && ctx.locals[ins.b - 1].state == 11 {
+                while p != 0 && ctx.params[p - 1] != ins.b { p = p - 1; }
+                if p == 0 { return false; }
+                p = p - 1;
+                started = true;
+            } elseif started { return false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 局部值先按既有出口计划清理；仍由被调方拥有的已提交输出随后逆序回滚。
+export function insert_slot_rollbacks(ctx: &mir::MirFunction:ReadWrite, tt: &typecheck::TypeTable:Read, ret: u32, spans: &types::Span[]:ReadWrite, span: types::Span, track: bool): bool!AllocError {
+    var required: SlotRollback[] = [];
+    if !collect_slot_rollbacks(ctx, tt, ret, true, &required:ReadWrite)? { return false; }
+    if @len(required) == 0 { return true; }
+    var insts: mir::MirInst[] = [];
+    var updated: types::Span[] = [];
+    var i: u32 = 0;
+    while i < @len(ctx.blocks) as u32 {
+        let start: u32 = @len(insts) as u32;
+        let old: u32 = ctx.blocks[i].inst_start;
+        var j: u32 = 0;
+        while j < ctx.blocks[i].inst_count {
+            @push(insts, ctx.insts[old + j])?;
+            if track { @push(updated, (*spans)[old + j])?; }
+            j = j + 1;
+        }
+        var r: u32 = 0;
+        while r < @len(required) as u32 {
+            if required[r].block == i {
+                @push(insts, mir::MirInst { op: 115, a: 0, b: required[r].slot, c: 0, value_type_id: 0, value: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false })?;
+                if track { @push(updated, span)?; }
+            }
+            r = r + 1;
+        }
+        ctx.blocks[i].inst_start = start;
+        ctx.blocks[i].inst_count = @len(insts) as u32 - start;
+        i = i + 1;
+    }
+    ctx.insts = @move(insts);
+    *spans = @move(updated);
+    return true;
+}
+
+function add_dom_edge(heads: &u32[]:ReadWrite, predecessors: &mir::DomPredecessor[]:ReadWrite, origin: u32, target: u32): void!AllocError {
+    let edge: mir::DomPredecessor = mir::DomPredecessor { origin: origin, next: (*heads)[target] };
+    @push(*predecessors, edge)?;
+    (*heads)[target] = @len(*predecessors) as u32;
+    return;
+}
+
+// 声明支配范围外不保留局部槽状态；回到声明块时新建本次循环的槽。
+function join_slot_edge(states: &u8[]:ReadWrite, queue: &u32[]:ReadWrite, dominators: &[u32], origin: u32, target: u32, state: u8, aggregate: bool): bool!AllocError {
+    if target == origin || !mir::dominates(dominators, origin, target) { return !aggregate || state != 12; }
+    return merge_slot_state(states, queue, target, state)?;
+}
+
+function verify_slot_flow(ctx: &mir::MirFunction:Read, types: &typecheck::TypeTable:Read, defs: &[u32], dominators: &[u32]): bool!AllocError {
+    let n: u32 = @len(ctx.blocks) as u32;
+    var k: u32 = 0;
+    while k < @len(ctx.locals) as u32 {
+        if ctx.locals[k].kind != 3 || ctx.locals[k].state != 10 { k = k + 1; continue; }
+        let slot: u32 = k + 1;
+        let origin: u32 = defs[k];
+        if origin >= n || (ctx.has_trap_target && origin == ctx.trap_target as u32) { return false; }
+        let aggregate: bool = !mir::is_scalar(types, ctx.locals[k].value_type_id);
+        var states: u8[] = [];
+        var queue: u32[] = [];
+        var i: u32 = 0;
+        while i < n { @push(states, 255)?; i = i + 1; }
+        states[origin] = 0;
+        @push(queue, origin)?;
+        i = 0;
+        while i < @len(queue) as u32 {
+            let block: u32 = queue[i];
+            var state: u8 = states[block];
+            var pending: u32 = 0;
+            var j: u32 = 0;
+            while j < ctx.blocks[block].inst_count {
+                let ins: mir::MirInst = ctx.insts[ctx.blocks[block].inst_start + j];
+                // 借出的可错槽在调用后必须直接由同一载体分流，不能执行其他指令。
+                if pending != 0 { return false; }
+                if aggregate && state == 12 && blocks_slot_rollback(ins.op) { return false; }
+                if mir::has_trap_edge(ins.op) {
+                    let full: bool = aggregate && state == 12;
+                    let drops: u32 = trap_slot_drops(ctx, ins.trap, slot);
+                    if (full && drops != 1) || (!full && drops != 0) { return false; }
+                }
+                if ins.op == 208 && ins.a == slot {
+                    if state != 0 { return false; }
+                    state = 10;
+                } elseif ins.op == 210 && ins.b == slot {
+                    if state != 12 { return false; }
+                    state = 13;
+                } elseif ins.op == 115 && ins.b == slot {
+                    if state != 12 || !aggregate { return false; }
+                    state = 13;
+                } elseif mir::is_slot_call(ins.op) {
+                    var p: u32 = 0;
+                    while p < ins.args_count {
+                        if ctx.args[ins.args_start + p] == slot {
+                            if state != 10 || pending != 0 { return false; }
+                            if types.entries[ins.value_type_id - 1].kind == 9 { pending = ins.a; }
+                            else { state = 12; }
+                        }
+                        p = p + 1;
+                    }
+                }
+                j = j + 1;
+            }
+            let end: mir::MirTerminator = ctx.blocks[block].terminator;
+            if pending != 0 && (end.op != 162 || end.a != pending || end.b == end.c) { return false; }
+            if aggregate && state == 12 {
+                if mir::terminates_process(end.op) || end.op == 196 || end.op == 194 { return false; }
+            }
+            if end.op == 192 || end.op == 193 || end.op == 162 {
+                var success_state: u8 = state;
+                if pending != 0 { success_state = 12; }
+                if !join_slot_edge(&states:ReadWrite, &queue:ReadWrite, dominators, origin, end.b, success_state, aggregate)? { return false; }
+            }
+            if end.op == 193 || end.op == 162 {
+                if !join_slot_edge(&states:ReadWrite, &queue:ReadWrite, dominators, origin, end.c, state, aggregate)? { return false; }
+            }
+            if end.op == 177 {
+                var arm: u32 = 0;
+                while arm < end.c {
+                    if !join_slot_edge(&states:ReadWrite, &queue:ReadWrite, dominators, origin, ctx.arms[end.b + arm].block as u32, state, aggregate)? { return false; }
+                    arm = arm + 1;
+                }
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+function verify_arm_payloads(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, code: &u16:ReadWrite): bool!AllocError {
+    // 每条进入绑定臂的边都必须初始化载荷，函数和陷阱入口没有此定义。
+    if ctx.blocks[ctx.entry].payload != 0 || (ctx.has_trap_target && ctx.blocks[ctx.trap_target].payload != 0) { *code = 7035; return false; }
+    var claimed: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(ctx.blocks) as u32 { @push(claimed, 0)?; i = i + 1; }
+    i = 0;
+    while i < @len(ctx.blocks) as u32 {
+        let end: mir::MirTerminator = ctx.blocks[i].terminator;
+        if end.op == 192 || end.op == 193 {
+            if ctx.blocks[end.b].payload != 0 || (end.op == 193 && ctx.blocks[end.c].payload != 0) { *code = 7035; return false; }
+        } elseif end.op == 162 {
+            let carrier_type: u32 = mir::local_type(ctx, end.a);
+            if carrier_type == 0 || carrier_type > @len(module.types.entries) as u32 { return false; }
+            let carrier: typecheck::TypeEntry = module.types.entries[carrier_type - 1];
+            if carrier.kind != 9 { return false; }
+            let ok_payload: u32 = ctx.blocks[end.b].payload;
+            if mir::is_void(&module.types:Read, carrier.success) { if ok_payload != 0 { *code = 7035; return false; } }
+            else { if ok_payload == 0 || mir::local_type(ctx, ok_payload) != carrier.success { *code = 7035; return false; } }
+            let err_payload: u32 = ctx.blocks[end.c].payload;
+            if err_payload == 0 || mir::local_type(ctx, err_payload) != carrier.elem { *code = 7035; return false; }
+            claimed[end.b] = 1;
+            claimed[end.c] = 1;
+        } elseif end.op == 177 {
+            let scrutinee: u32 = mir::local_type(ctx, end.a);
+            if scrutinee == 0 || scrutinee > @len(module.types.entries) as u32 { return false; }
+            let se: typecheck::TypeEntry = module.types.entries[scrutinee - 1];
+            var ei: u32 = 0;
+            if se.kind == 2 {
+                var eidx: u32 = 0;
+                while eidx < @len(module.enums.items) as u32 {
+                    if module.enums.items[eidx].def == se.def { ei = eidx + 1; break; }
+                    eidx = eidx + 1;
+                }
+                if ei == 0 { return false; }
+            } elseif se.kind == 3 {
+                if !mir::imported_enum_known(&module.imported_enums:Read, se.dep, se.export_id) { return false; }
+            } elseif !(se.kind == 1 && se.builtin == 4108) { return false; }
+            var k: u32 = 0;
+            while k < end.c {
+                let arm: mir::MirArm = ctx.arms[end.b + k];
+                var expected: u32 = 0;
+                if se.kind == 2 { expected = module.enums.items[ei - 1].payloads[k]; }
+                elseif se.kind == 3 {
+                    expected = mir::imported_payload_of(&module.imported_enums:Read, se.dep, se.export_id, k);
+                    if expected == NONE { return false; }
+                } else { if end.c != 1 { return false; } }
+                let actual: u32 = ctx.blocks[arm.block].payload;
+                // 缺失的变体类型不是可忽略的载荷。
+                if expected != 0 && mir::storage_shape(&module.types:Read, &module.fields:Read, &module.enums:Read,
+                    &module.imported_fields:Read, &module.imported_enums:Read, expected, 0) == 0 { return false; }
+                if actual != 0 && (expected == 0 || mir::local_type(ctx, actual) != expected) { *code = 7035; return false; }
+                claimed[arm.block] = 1;
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.blocks) as u32 {
+        if ctx.blocks[i].payload != 0 && claimed[i] == 0 { *code = 7035; return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 迭代深搜记录前驱边和后序编号，检查可达性并按逆后序求直接支配点。
+function build_dominators(ctx: &mir::MirFunction:Read, trap_origins: &u32[]:Read, heads: &u32[]:ReadWrite, predecessors: &mir::DomPredecessor[]:ReadWrite, post: &u32[]:ReadWrite, parents: &u32[]:ReadWrite, code: &u16:ReadWrite): bool!AllocError {
+    let n: u32 = @len(ctx.blocks) as u32;
+    var stack: u32[] = [];
+    var edge_cursor: u32[] = [];
+    var rank: u32[] = [];
+    let entry: u32 = ctx.entry as u32;
+    var i: u32 = 0;
+    while i < n {
+        @push(*heads, 0)?; @push(stack, 0)?; @push(edge_cursor, 0)?;
+        @push(rank, NONE)?; @push(*parents, NONE)?;
+        i = i + 1;
+    }
+    var depth: u32 = 1;
+    stack[0] = entry;
+    rank[entry] = 0;
+    while depth != 0 {
+        let origin: u32 = stack[depth - 1];
+        let edge: u32 = edge_cursor[origin];
+        let term: mir::MirTerminator = ctx.blocks[origin].terminator;
+        var target: u32 = NONE;
+        if term.op == 177 {
+            if edge < term.c { target = ctx.arms[term.b + edge].block as u32; }
+        } elseif term.op == 192 || term.op == 193 || term.op == 162 {
+            if edge == 0 { target = term.b; }
+            elseif edge == 1 && term.op != 192 { target = term.c; }
+        }
+        if target == NONE {
+            rank[origin] = @len(*post) as u32;
+            @push(*post, origin)?;
+            depth = depth - 1;
+        } else {
+            edge_cursor[origin] = edge + 1;
+            add_dom_edge(heads, predecessors, origin, target)?;
+            if rank[target] == NONE {
+                rank[target] = 0;
+                stack[depth] = target;
+                depth = depth + 1;
+            }
+        }
+    }
+    let count: u32 = @len(*post) as u32;
+    i = 0;
+    while i < n {
+        let fallback: bool = ctx.has_trap_target && i == ctx.trap_target as u32;
+        let origin: u32 = (*trap_origins)[i];
+        if fallback || origin != NONE {
+            if rank[i] != NONE || (fallback && ctx.blocks[i].inst_count != 0) { return false; }
+            if origin != NONE && rank[origin] == NONE { *code = 7034; return false; }
+        } else {
+            if rank[i] == NONE { *code = 7034; return false; }
+            if ctx.blocks[i].terminator.op == 195 && ctx.blocks[i].terminator.a == 2 { return false; }
+        }
+        i = i + 1;
+    }
+    // 逆后序求直接支配点；前驱链沿后序编号递增，相交即共有支配点。
+    (*parents)[entry] = entry;
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        i = count - 1;
+        while i != 0 {
+            i = i - 1;
+            let target: u32 = (*post)[i];
+            var edge: u32 = (*heads)[target];
+            var common: u32 = NONE;
+            while edge != 0 {
+                let predecessor: mir::DomPredecessor = (*predecessors)[edge - 1];
+                let origin: u32 = predecessor.origin;
+                if origin != target && (*parents)[origin] != NONE {
+                    if common == NONE { common = origin; }
+                    else {
+                        var other: u32 = origin;
+                        while common != other {
+                            if rank[common] < rank[other] { common = (*parents)[common]; }
+                            else { other = (*parents)[other]; }
+                        }
+                    }
+                }
+                edge = predecessor.next;
+            }
+            if common == NONE { return false; }
+            if (*parents)[target] != common { (*parents)[target] = common; changed = true; }
+        }
+    }
+    return true;
+}
+
+function verify_block_terminator(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, signature: u32, def_view: &[u32], pos_view: &[u32], dom_view: &[u32], i: u32): bool {
+    let end: mir::MirTerminator = ctx.blocks[i].terminator;
+    if end.op == 193 && !mir::is_bool(&module.types:Read, mir::local_type(ctx, end.a)) { return false; }
+    if end.op == 197 {
+        let ty: u32 = mir::local_type(ctx, end.a);
+        if !mir::is_scalar(&module.types:Read, ty) || module.types.entries[ty - 1].builtin != 4097 { return false; }
+    }
+    if end.op == 194 {
+        let ret: u32 = module.signatures.items[signature].ret;
+        if mir::is_void(&module.types:Read, ret) { if end.a != 0 { return false; } }
+        elseif mir::local_type(ctx, end.a) != ret { return false; }
+    }
+    if end.op == 162 {
+        let value_type_id: u32 = mir::local_type(ctx, end.a);
+        if !mir::valid_type(&module.types:Read, value_type_id) || module.types.entries[value_type_id - 1].kind != 9 { return false; }
+        let carrier: typecheck::TypeEntry = module.types.entries[value_type_id - 1];
+        if mir::is_void(&module.types:Read, carrier.success) { if ctx.blocks[end.b].payload != 0 { return false; } }
+        elseif mir::local_type(ctx, ctx.blocks[end.b].payload) != carrier.success { return false; }
+        if mir::local_type(ctx, ctx.blocks[end.c].payload) != carrier.elem { return false; }
+    }
+    let inst_count: u32 = ctx.blocks[i].inst_count;
+    if end.op == 193 || end.op == 162 || end.op == 177 || end.op == 197 || (end.op == 194 && end.a != 0) {
+        if !valid_use(ctx, def_view, pos_view, dom_view, end.a, i, inst_count, false) { return false; }
+    }
+    return true;
+}
+
+function verify_block_insts(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, layouts: &layout::LayoutTable:Read, def_view: &[u32], pos_view: &[u32], dom_view: &[u32], pointees: &u32[]:Read, readonly_addrs: &bool[]:Read, trap_origins: &u32[]:Read, trap_positions: &u32[]:Read, trap_dropped: &u32[]:ReadWrite, i: u32, code: &u16:ReadWrite): bool {
+    let inst_count: u32 = ctx.blocks[i].inst_count;
+    var j: u32 = 0;
+    while j < inst_count {
+        let instruction: mir::MirInst = ctx.insts[ctx.blocks[i].inst_start + j];
+        let op: u8 = instruction.op;
+        if (*trap_origins)[i] != NONE {
+            // 异常边只能看到失败指令之前已经定义的值。
+            if op != 115 || instruction.b == 0 || !valid_use(ctx, def_view, pos_view, dom_view, instruction.b, (*trap_origins)[i], (*trap_positions)[i], true) { return false; }
+            if instruction.c != 0 && !valid_use(ctx, def_view, pos_view, dom_view, instruction.c, (*trap_origins)[i], (*trap_positions)[i], false) { return false; }
+            if (*trap_dropped)[instruction.b - 1] == i { *code = 7031; return false; }
+            (*trap_dropped)[instruction.b - 1] = i;
+            j = j + 1;
+            continue;
+        }
+        // 已知来源的地址必须按实际字段或元素类型读写。
+        if instruction.op == 80 || instruction.op == 81 {
+            if ctx.locals[instruction.b - 1].kind != 2 && (*pointees)[instruction.b - 1] != instruction.value_type_id { return false; }
+            if instruction.op == 81 && (*readonly_addrs)[instruction.b - 1] { return false; }
+        } elseif instruction.op == 82 || instruction.op == 83 {
+            if (*pointees)[instruction.b - 1] != mir::projection_base(instruction) { return false; }
+        } elseif instruction.op == 130 {
+            let indirect: u32 = mir::projection_base(instruction);
+            if indirect != 0 {
+                if (*pointees)[instruction.b - 1] != indirect { return false; }
+                if module.types.entries[instruction.value_type_id - 1].cap == 1 && (*readonly_addrs)[instruction.b - 1] { return false; }
+            }
+        } elseif instruction.op == 178 {
+            let source: mir::MirLocal = ctx.locals[instruction.b - 1];
+            var base: u32 = (*pointees)[instruction.b - 1];
+            if base == 0 {
+                if source.kind != 2 { return false; }
+                base = source.value_type_id;
+            } elseif (*readonly_addrs)[instruction.b - 1] { return false; }
+            if !mir::valid_type(&module.types:Read, base) || module.types.entries[base - 1].kind != 6 { return false; }
+            let element: u32 = module.types.entries[base - 1].elem;
+            if mir::local_type(ctx, instruction.c) != element { return false; }
+            let stride: u64 = mir::layout_size(layouts, element);
+            if stride != instruction.value { return false; }
+        } elseif instruction.op == 128 || instruction.op == 129 {
+            let target: u32 = module.types.entries[instruction.value_type_id - 1].elem;
+            let source: mir::MirLocal = ctx.locals[instruction.b - 1];
+            // 借用引用局部自身取槽地址；其指向的目标只用于显式解引用后的重借用。
+            let direct_ref: bool = source.value_type_id == target && module.types.entries[target - 1].kind == 4;
+            if !direct_ref && (*pointees)[instruction.b - 1] != 0 {
+                if (*pointees)[instruction.b - 1] != target || (instruction.op == 129 && (*readonly_addrs)[instruction.b - 1]) { return false; }
+            } elseif source.value_type_id != target || (instruction.op == 129 && source.kind != 2) { return false; }
+        }
+        if instruction.b != 0 && mir::reads_first(op) {
+            if !valid_use(ctx, def_view, pos_view, dom_view, instruction.b, i, j, op == 115 || op == 209 || op == 210) { return false; }
+        }
+        if mir::reads_second(op) && (op != 115 || instruction.c != 0)
+            && !valid_use(ctx, def_view, pos_view, dom_view, instruction.c, i, j, false) { return false; }
+        if (op == 130 || (op == 176 && instruction.value != 0)) && !valid_use(ctx, def_view, pos_view, dom_view, instruction.value as u32, i, j, false) { return false; }
+        var p: u32 = 0;
+        while p < instruction.args_count {
+            let allow_slot: bool = mir::is_slot_call(op) || ((op == 115 || op == 210) && instruction.b == 0 && p == 0);
+            if !valid_use(ctx, def_view, pos_view, dom_view, ctx.args[instruction.args_start + p], i, j, allow_slot) { return false; }
+            p = p + 1;
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+// 仅在指令结构和只读地址传播完成后检查控制流。
+export function verify_flow(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, layouts: &layout::LayoutTable:Read, signature: u32, def_view: &[u32], pos_view: &[u32], pointees: &u32[]:Read, readonly_addrs: &bool[]:Read, trap_origins: &u32[]:Read, trap_positions: &u32[]:Read, has_parameter_slots: bool, has_caller_slots: bool, copy_order: u8, copy_cache: &typecheck::CopyFacts:ReadWrite, code: &u16:ReadWrite): bool!AllocError {
+    if !verify_arm_payloads(module, ctx, code)? { return false; }
+    var heads: u32[] = [];
+    var predecessors: mir::DomPredecessor[] = [];
+    var post: u32[] = [];
+    var parents: u32[] = [];
+    if !build_dominators(ctx, trap_origins, &heads:ReadWrite, &predecessors:ReadWrite, &post:ReadWrite, &parents:ReadWrite, code)? { return false; }
+    let dom_view: &[u32] = &parents[0..@len(parents)]:Read;
+    var trap_dropped: u32[] = [];
+    var i: u32 = 0;
+    if ctx.has_trap_target {
+        while i < @len(ctx.locals) as u32 { @push(trap_dropped, NONE)?; i = i + 1; }
+    }
+    let n: u32 = @len(ctx.blocks) as u32;
+    i = 0;
+    while i < n {
+        if !verify_block_terminator(module, ctx, signature, def_view, pos_view, dom_view, i) { return false; }
+        if !verify_block_insts(module, ctx, layouts, def_view, pos_view, dom_view, pointees, readonly_addrs, trap_origins, trap_positions, &trap_dropped:ReadWrite, i, code) { return false; }
+        i = i + 1;
+    }
+    // 只跳过无相应槽位的专用数据流；普通操作数和支配性已逐条核验。
+    if has_parameter_slots && !check_slot_params(ctx, &module.types:Read, module.signatures.items[signature].ret)? { *code = 7036; return false; }
+    if has_caller_slots && !verify_slot_flow(ctx, &module.types:Read, def_view, dom_view)? { *code = 7036; return false; }
+    if !mir_place_flow::verify_place_liveness(ctx, module, copy_order, copy_cache, code)? { return false; }
+    if !mir_borrow_flow::verify_borrows(ctx, &module.types:Read, &post[0..@len(post)]:Read, def_view, dom_view, &heads[0..@len(heads)]:Read,
+        &predecessors:Read)? { *code = 7032; return false; }
+    return true;
+}

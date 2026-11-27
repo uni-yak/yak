@@ -1,0 +1,9 @@
+foreign assert(cond: bool): void;
+struct Leaf { value: u32 }
+function nested(): [[[[[[[[[[[[[[[[[Leaf; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1]; 1] {
+    return [[[[[[[[[[[[[[[[[Leaf { value: 42u32 }]]]]]]]]]]]]]]]]];
+}
+function main(): void {
+    let leaf: Leaf = nested()[0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32][0u32];
+    assert(leaf.value == 42u32);
+}

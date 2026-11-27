@@ -1,0 +1,668 @@
+// YSM 格式 4/5：共享记录、字节读回与结构校验。格式真源为 spec/ir/ysm.md。
+// 格式 5 在格式 4 之上追加每条可陷阱指令的私有清理块边，其余节布局不变。
+import types;
+import diag;
+import iface;
+import mir;
+
+// header 常量（ysm.md 三）
+const YSM_MAGIC_0: u8 = 89;
+const YSM_MAGIC_1: u8 = 75;
+const YSM_MAGIC_2: u8 = 77;
+const YSM_MAGIC_3: u8 = 73;
+const YSM_VERSION: u16 = 4;
+// 带私有陷阱边的格式版本：仅当模块存在非零 trap 边时写出，其余情况仍写格式 4。
+const YSM_VERSION_TRAP_EDGES: u16 = 5;
+// 带扩展 TypeSig 与 drop 守卫的格式版本：私有/传递名义或非零 drop 守卫时写出。
+const YSM_VERSION_TYPE_REFS: u16 = 6;
+const YSM_SECTION_SIZE: u32 = 16;
+const YSM_SECTION_COUNT: u16 = 7;
+const YSM_TABLE_OFFSET: u32 = 64;
+// 首个节的最小起点：header 与目录之后
+const YSM_FIRST_SECTION: u32 = 176;
+// header 内字段偏移
+const H_FLAGS: u32 = 6;
+const H_SECTION_COUNT: u32 = 8;
+const H_PROFILE: u32 = 10;
+const H_TABLE_OFFSET: u32 = 12;
+const H_FILE_SIZE: u32 = 16;
+const H_FUNCTION_COUNT: u32 = 20;
+const H_STATIC_COUNT: u32 = 24;
+const H_SHA256: u32 = 28;
+const H_RESERVED1: u32 = 60;
+// format 6 的 header flags bit0：表示存在扩展 TypeSig 或 drop 守卫。
+const YSM_FLAG_EXTENDED: u16 = 1;
+
+// 节 kind 取值（ysm.md 四）
+const SEC_TYPE_SIGS: u16 = 1;
+const SEC_STATICS: u16 = 2;
+const SEC_FUNCTIONS: u16 = 3;
+const SEC_LOCALS: u16 = 4;
+const SEC_BLOCKS: u16 = 5;
+const SEC_INSTS: u16 = 6;
+const SEC_DEPENDENCIES: u16 = 7;
+
+// 拒绝码（spec/proc/error.def 的 E70 分区）
+const E_Y1: u16 = 7023;
+const E_Y2: u16 = 7024;
+const E_Y3: u16 = 7025;
+const E_Y4: u16 = 7026;
+const E_Y5: u16 = 7027;
+const E_Y6: u16 = 7028;
+const E_Y7: u16 = 7029;
+const E_Y8: u16 = 7030;
+
+// 固定记录宽度（ysm.md 4.1–4.5）
+const DEPENDENCY_RECORD: u32 = 40;
+const DEPENDENCY_LIMIT: u32 = 65535;
+const STATIC_RECORD: u32 = 16;
+const FUNCTION_RECORD: u32 = 32;
+const LOCAL_RECORD: u32 = 16;
+const BLOCK_RECORD: u32 = 24;
+const DIGEST_SIZE: u32 = 32;
+
+// 终结指令 opcode（mir.md 4.13）
+const TERM_CARRIER_DISPATCH: u8 = 162;
+const TERM_ENUM_DISPATCH: u8 = 177;
+const TERM_BR: u8 = 192;
+const TERM_BRANCH: u8 = 193;
+const TERM_RET: u8 = 194;
+const TERM_TRAP: u8 = 195;
+const TERM_UNREACHABLE: u8 = 196;
+const TERM_EXIT: u8 = 197;
+
+
+// 输入结构：MIR 公开结构未携带的信息由调用方补齐。
+// 依赖表：直接依赖 id 与对应 YKIF format 2 的 content_digest（32 字节）。
+export struct YsmDependency { dependency_id: u16, interface_digest: u8[] }
+// 静态池条目：元素类型与字面量字节。
+export struct YsmStatic { type_sig: u32, bytes: u8[] }
+// 序列化时 MIR 公开结构未携带的信息：目标 profile、静态池、依赖摘要表与导出映射。
+// 视图类型不得作 struct 字段，故 MirModule 以独立引用参数传入。
+export struct YsmFacts {
+    target_profile: u16,
+    statics: YsmStatic[],
+    dependencies: YsmDependency[],
+    // 候选摘要串：按 direct order 与传递目标顺序拼接的 32 字节摘要，MIR 依赖编号从 1 起。
+    // 仅用于依赖摘要的交叉校验，不写入 format 4/5 的文件字节。
+    candidate_digests: u8[],
+    exports: iface::ExportMap,
+}
+
+export struct YsmSection { kind: u16, flags: u16, offset: u32, length: u32, count: u32 }
+export struct YsmHeader {
+    magic0: u8, magic1: u8, magic2: u8, magic3: u8,
+    version: u16, flags: u16, section_count: u16, target_profile: u16,
+    section_table_offset: u32, file_size: u32, function_count: u32, static_count: u32,
+    sha256: u8[], reserved1: u8[],
+}
+export struct YsmStaticRecord { static_index: u32, type_sig_off: u32, byte_off: u32, byte_len: u32 }
+export struct YsmFunctionRecord {
+    def_id: u32, sig_off: u32, local_start: u32, local_count: u32,
+    block_start: u32, block_count: u32, entry_block: u16, trap_target: u16, flags: u16,
+}
+export struct YsmLocalRecord { type_sig_off: u32, kind: u8, state: u8 }
+export struct YsmBlockRecord { block_id: u16, inst_count: u32, inst_off: u32, terminator: u8, payload: u32 }
+export struct YsmDependencyRecord { dependency_id: u16, interface_digest: u8[] }
+// 反序列化结果：既有原始节字节，也有已解析的定长记录。
+export struct YsmFile {
+    header: YsmHeader,
+    sections: YsmSection[],
+    type_sigs: u8[],
+    static_bytes: u8[],
+    statics: YsmStaticRecord[],
+    functions: YsmFunctionRecord[],
+    locals: YsmLocalRecord[],
+    blocks: YsmBlockRecord[],
+    insts: u8[],
+    dependencies: YsmDependencyRecord[],
+    inst_total: u32,
+}
+export struct YsmResult { accepted: bool, data: u8[], code: types::ErrorCode }
+export struct YsmLoadResult { accepted: bool, file: YsmFile, code: types::ErrorCode }
+
+// ── 字节读入 ──
+
+function read_u16(data: &[u8], offset: u32): u16 {
+    return (data[offset] as u16) | ((data[offset + 1] as u16) << 8);
+}
+function read_u32(data: &[u8], offset: u32): u32 {
+    return (data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24);
+}
+function bytes_equal(left: &[u8], right: &[u8]): bool {
+    if @len(left) != @len(right) { return false; }
+    var i: u32 = 0;
+    while i < @len(left) as u32 {
+        if left[i] != right[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function emit_code(diags: &diag::DiagBuffer:ReadWrite, code: types::ErrorCode): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: code, severity: 0, span: types::Span { file: 0, offset: 0, length: 0 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+
+// 低五位为操作数形态，高位为无语义检查的定宽操作数字节数。
+const OP_LOW: [u16; 64] = [
+    0, 449, 162, 259, 21, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    388, 388, 388, 388, 388, 261, 388, 388, 388, 0, 0, 0, 0, 0, 0, 0,
+    388, 388, 388, 388, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    388, 388, 388, 388, 388, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+];
+const OP_MEMORY: [u16; 64] = [
+    390, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    390, 263, 329, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    10, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    261, 261, 23, 136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+];
+const OP_CONTROL: [u16; 64] = [
+    261, 261, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    11, 11, 11, 11, 11, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    390, 390, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    13, 20, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+];
+const OP_HIGH: [u16; 32] = [
+    14, 15, 16, 17, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    390, 263, 261, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+];
+export function op_info(op: u8): u16 {
+    if op < 64 { return OP_LOW[op as u32]; }
+    if op < 128 { return OP_MEMORY[(op - 64) as u32]; }
+    if mir::is_checked_call(op) { return 11u16; }
+    if op < 192 { return OP_CONTROL[(op - 128) as u32]; }
+    if op < 224 { return OP_HIGH[(op - 192) as u32]; }
+    return 0;
+}
+// 终结 opcode 判定（mir.md 4.13 与 4.11 的 dispatch）。
+export function is_terminator(op: u8): bool {
+    if op == TERM_BR || op == TERM_BRANCH || op == TERM_RET { return true; }
+    if op == TERM_TRAP || op == TERM_UNREACHABLE || op == TERM_EXIT { return true; }
+    if op == TERM_CARRIER_DISPATCH || op == TERM_ENUM_DISPATCH { return true; }
+    return false;
+}
+
+// ── 反序列化与校验 ──
+
+// 以只读视图构造拒绝结果：结构按值复制，调用方仍可继续使用原值。
+function reject(file: &YsmFile:Read, code: u16): YsmLoadResult {
+    return YsmLoadResult { accepted: false, file: clone_file(file), code: types::error_code(code) };
+}
+// 深拷贝一份文件结构：各数组逐元素复制，避免与来源共享。
+function clone_file(src: &YsmFile:Read): YsmFile {
+    return YsmFile {
+        header: clone_header(&src.header:Read),
+        sections: copy_sections(&src.sections[0..@len(src.sections) as u32]:Read),
+        type_sigs: copy_bytes(&src.type_sigs[0..@len(src.type_sigs) as u32]:Read),
+        static_bytes: copy_bytes(&src.static_bytes[0..@len(src.static_bytes) as u32]:Read),
+        statics: [], functions: [], locals: [], blocks: [],
+        insts: copy_bytes(&src.insts[0..@len(src.insts) as u32]:Read),
+        dependencies: [], inst_total: 0,
+    };
+}
+// 复制目录项数组。
+function copy_sections(src: &[YsmSection]): YsmSection[] {
+    var copied: YsmSection[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(copied, src[i]); i = i + 1; }
+    return copied;
+}
+// 复制 header：值字段逐项搬运，两个定长数组重新分配。
+function clone_header(src: &YsmHeader:Read): YsmHeader {
+    return YsmHeader {
+        magic0: src.magic0, magic1: src.magic1, magic2: src.magic2, magic3: src.magic3,
+        version: src.version, flags: src.flags, section_count: src.section_count,
+        target_profile: src.target_profile, section_table_offset: src.section_table_offset,
+        file_size: src.file_size, function_count: src.function_count, static_count: src.static_count,
+        sha256: copy_bytes(&src.sha256[0..@len(src.sha256) as u32]:Read),
+        reserved1: copy_bytes(&src.reserved1[0..@len(src.reserved1) as u32]:Read),
+    };
+}
+// 复制一段字节到新数组。
+export function copy_bytes(data: &[u8]): u8[] {
+    var copied: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(data) as u32 { @push(copied, data[i]); i = i + 1; }
+    return copied;
+}
+// 读一条目录项；越界由调用方先保证。
+function read_section(bytes: &[u8], index: u32): YsmSection {
+    let base: u32 = YSM_TABLE_OFFSET + index * YSM_SECTION_SIZE;
+    return YsmSection {
+        kind: read_u16(bytes, base),
+        flags: read_u16(bytes, base + 2),
+        offset: read_u32(bytes, base + 4),
+        length: read_u32(bytes, base + 8),
+        count: read_u32(bytes, base + 12),
+    };
+}
+// 取某 kind 的节；目录已保证七种各一次，故按索引直接取。
+function section_of(sections: &[YsmSection], kind: u16): YsmSection {
+    var i: u32 = 0;
+    while i < @len(sections) as u32 {
+        if sections[i].kind == kind { return sections[i]; }
+        i = i + 1;
+    }
+    return YsmSection { kind: kind, flags: 0, offset: 0, length: 0, count: 0 };
+}
+// 节内子区间校验：offset+length 不得越过文件尾。
+function within(data: &[u8], offset: u32, length: u32): bool {
+    if offset > @len(data) as u32 { return false; }
+    if length > @len(data) as u32 - offset { return false; }
+    return true;
+}
+
+// Y-2/Y-3/Y-8：header 与目录的完整校验。返回拒绝码，0 表示通过。
+// expect_profile 非 0 时要求 header 的 target_profile 与之一致，见 Y-8。
+function is_symbol_section(kind: u16): bool {
+    // 符号审计的独立节组含有名称、定义和作用域编号，不能嵌入 MIR 镜像。
+    return kind >= 258u16 && kind <= 262u16;
+}
+
+function check_header(bytes: &[u8], header: &YsmHeader:Read, expect_profile: u16): u16 {
+    if (@len(bytes) as u32) < YSM_FIRST_SECTION { return E_Y2; }
+    if header.magic0 != YSM_MAGIC_0 || header.magic1 != YSM_MAGIC_1 { return E_Y2; }
+    if header.magic2 != YSM_MAGIC_2 || header.magic3 != YSM_MAGIC_3 { return E_Y2; }
+    // 接受格式 4、带私有陷阱边的格式 5，以及带扩展类型/守卫的格式 6；其他版本一律 Y-2。
+    if header.version != YSM_VERSION && header.version != YSM_VERSION_TRAP_EDGES && header.version != YSM_VERSION_TYPE_REFS { return E_Y2; }
+    if header.section_table_offset != YSM_TABLE_OFFSET { return E_Y2; }
+    if header.file_size != @len(bytes) as u32 { return E_Y2; }
+    if header.section_count != YSM_SECTION_COUNT {
+        let count: u32 = header.section_count as u32;
+        if within(bytes, YSM_TABLE_OFFSET, count * YSM_SECTION_SIZE) {
+            var i: u32 = 0;
+            while i < count {
+                if is_symbol_section(read_u16(bytes, YSM_TABLE_OFFSET + i * YSM_SECTION_SIZE)) { return E_Y1; }
+                i = i + 1;
+            }
+        }
+        return E_Y2;
+    }
+    // 格式 6 必须显式带扩展标记；只改版本号的字节流按 Y-2 拒绝。
+    if header.version == YSM_VERSION_TYPE_REFS {
+        if (header.flags & YSM_FLAG_EXTENDED) == 0 || (header.flags & 65534u16) != 0 { return E_Y2; }
+    }
+    // 格式 4/5 不允许任何 flag；格式 6 的其余位已在上面的分支拒绝。
+    if header.version != YSM_VERSION_TYPE_REFS && header.flags != 0 { return E_Y3; }
+    // Y-8：与本次编译的 layout/ABI profile 不一致
+    if expect_profile != 0 && header.target_profile != expect_profile { return E_Y8; }
+    // Y-3：保留字段必须为零
+    if header.reserved1[0] != 0 || header.reserved1[1] != 0 { return E_Y3; }
+    if header.reserved1[2] != 0 || header.reserved1[3] != 0 { return E_Y3; }
+    return 0;
+}
+// Y-2：目录项的 kind 升序、flags 为零、区间合法且互不重叠。
+function check_table(bytes: &[u8], sections: &[YsmSection]): u16 {
+    var i: u32 = 0;
+    var expected: u16 = 1;
+    while i < @len(sections) as u32 {
+        let s: YsmSection = sections[i];
+        if is_symbol_section(s.kind) { return E_Y1; }
+        if s.kind != expected { return E_Y2; }
+        if s.flags != 0 { return E_Y3; }
+        if !within(bytes, s.offset, s.length) { return E_Y2; }
+        if s.length > 0 && s.offset < YSM_FIRST_SECTION { return E_Y2; }
+        if i > 0 {
+            let prev: YsmSection = sections[i - 1];
+            if prev.offset + prev.length > s.offset { return E_Y2; }
+        }
+        expected = expected + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+// Y-3：摘要字段按零计算，其余文件字节必须全部参与重算。
+function check_sha(bytes: &[u8], header: &YsmHeader:Read): u16!AllocError {
+    let digest: u8[] = iface::sha256_zero_header_digest(bytes, H_SHA256)?;
+    if !bytes_equal(&digest[0..@len(digest) as u32]:Read, &header.sha256[0..@len(header.sha256) as u32]:Read) { return E_Y3; }
+    return 0;
+}
+
+// 解析定长记录表并校验 count 与 length 自洽。
+export function parse_functions(bytes: &[u8], s: YsmSection): YsmFunctionRecord[]!AllocError {
+    var records: YsmFunctionRecord[] = [];
+    if s.count as u32 * FUNCTION_RECORD != s.length { return records; }
+    var i: u32 = 0;
+    while i < s.count as u32 {
+        let base: u32 = s.offset + i * FUNCTION_RECORD;
+        @push(records, YsmFunctionRecord {
+            def_id: read_u32(bytes, base),
+            sig_off: read_u32(bytes, base + 4),
+            local_start: read_u32(bytes, base + 8),
+            local_count: read_u32(bytes, base + 12),
+            block_start: read_u32(bytes, base + 16),
+            block_count: read_u32(bytes, base + 20),
+            entry_block: read_u16(bytes, base + 24),
+            trap_target: read_u16(bytes, base + 26),
+            flags: read_u16(bytes, base + 28),
+        })?;
+        i = i + 1;
+    }
+    return records;
+}
+export function parse_locals(bytes: &[u8], s: YsmSection): YsmLocalRecord[]!AllocError {
+    var records: YsmLocalRecord[] = [];
+    if s.count as u32 * LOCAL_RECORD != s.length { return records; }
+    var i: u32 = 0;
+    while i < s.count as u32 {
+        let base: u32 = s.offset + i * LOCAL_RECORD;
+        @push(records, YsmLocalRecord {
+            type_sig_off: read_u32(bytes, base),
+            kind: bytes[base + 4],
+            state: bytes[base + 5],
+        })?;
+        i = i + 1;
+    }
+    return records;
+}
+export function parse_blocks(bytes: &[u8], s: YsmSection): YsmBlockRecord[]!AllocError {
+    var records: YsmBlockRecord[] = [];
+    if s.count as u32 * BLOCK_RECORD != s.length { return records; }
+    var i: u32 = 0;
+    while i < s.count as u32 {
+        let base: u32 = s.offset + i * BLOCK_RECORD;
+        @push(records, YsmBlockRecord {
+            block_id: read_u16(bytes, base),
+            inst_count: read_u32(bytes, base + 2),
+            inst_off: read_u32(bytes, base + 6),
+            terminator: bytes[base + 10],
+            payload: read_u32(bytes, base + 12),
+        })?;
+        i = i + 1;
+    }
+    return records;
+}
+export function parse_statics(bytes: &[u8], s: YsmSection): YsmStaticRecord[]!AllocError {
+    var records: YsmStaticRecord[] = [];
+    // 节内先记录表、后字节区；记录数由目录 count 给出。
+    var table_bytes: u32 = s.count * STATIC_RECORD;
+    if table_bytes > s.length { return records; }
+    var i: u32 = 0;
+    while i < s.count {
+        let base: u32 = s.offset + i * STATIC_RECORD;
+        @push(records, YsmStaticRecord {
+            static_index: read_u32(bytes, base),
+            type_sig_off: read_u32(bytes, base + 4),
+            byte_off: read_u32(bytes, base + 8),
+            byte_len: read_u32(bytes, base + 12),
+        })?;
+        i = i + 1;
+    }
+    return records;
+}
+export function parse_dependencies(bytes: &[u8], s: YsmSection): YsmDependencyRecord[]!AllocError {
+    var records: YsmDependencyRecord[] = [];
+    if s.count * DEPENDENCY_RECORD != s.length { return records; }
+    var i: u32 = 0;
+    while i < s.count {
+        let base: u32 = s.offset + i * DEPENDENCY_RECORD;
+        var digest: u8[] = [];
+        var d: u32 = 0;
+        while d < DIGEST_SIZE {
+            @push(digest, bytes[base + 4 + d])?;
+            d = d + 1;
+        }
+        @push(records, YsmDependencyRecord {
+            dependency_id: read_u16(bytes, base),
+            interface_digest: @move(digest),
+        })?;
+        i = i + 1;
+    }
+    return records;
+}
+// Y-7：依赖表必须从 1 起严格连续升序，保留字段为零。
+function check_dependencies(bytes: &[u8], s: YsmSection, deps: &[YsmDependencyRecord]): u16 {
+    var i: u32 = 0;
+    while i < @len(deps) as u32 {
+        let base: u32 = s.offset + i * DEPENDENCY_RECORD;
+        if deps[i].dependency_id as u32 != i + 1 { return E_Y7; }
+        if read_u16(bytes, base + 2) != 0 { return E_Y3; }
+        if read_u32(bytes, base + 36) != 0 { return E_Y3; }
+        i = i + 1;
+    }
+    return 0;
+}
+// Y-3：函数、局部、块记录的保留字段必须为零。
+function check_function_reserved(bytes: &[u8], s: YsmSection): u16 {
+    var i: u32 = 0;
+    while i < s.count as u32 {
+        // 函数记录 32 字节：flags 在 +28，reserved:u16 在 +30。
+        if read_u16(bytes, s.offset + i * FUNCTION_RECORD + 30) != 0 { return E_Y3; }
+        i = i + 1;
+    }
+    return 0;
+}
+function check_local_reserved(bytes: &[u8], s: YsmSection): u16 {
+    var i: u32 = 0;
+    while i < s.count as u32 {
+        // 局部记录 16 字节：reserved:[u8;2] 在 +6，padding:[u8;8] 在 +8。
+        let base: u32 = s.offset + i * LOCAL_RECORD;
+        var d: u32 = 6;
+        while d < LOCAL_RECORD {
+            if bytes[base + d] != 0 { return E_Y3; }
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+function check_block_reserved(bytes: &[u8], s: YsmSection): u16 {
+    var i: u32 = 0;
+    while i < s.count as u32 {
+        // 块记录 24 字节：terminator 在 +10，+11 保留 1 字节，+12..16 为 payload，
+        // +16..24 为零填充。payload 由 check_blocks 与扫描器校验，不在此按零处理。
+        let base: u32 = s.offset + i * BLOCK_RECORD;
+        if bytes[base + 11] != 0 { return E_Y3; }
+        var d: u32 = 16;
+        while d < BLOCK_RECORD {
+            if bytes[base + d] != 0 { return E_Y3; }
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Y-5：函数、局部、块记录按索引升序且区间自洽。
+function check_functions(functions: &[YsmFunctionRecord], locals_total: u32, blocks_total: u32): u16 {
+    var i: u32 = 0;
+    while i < @len(functions) as u32 {
+        let f: YsmFunctionRecord = functions[i];
+        if f.local_start > locals_total { return E_Y5; }
+        if f.local_count > locals_total - f.local_start { return E_Y5; }
+        if f.block_start > blocks_total { return E_Y5; }
+        if f.block_count > blocks_total - f.block_start { return E_Y5; }
+        // Y-6：flags 只允许 bit0/bit1，且 declared_no_alloc=1 必须 no_alloc=1
+        if (f.flags & 0xFFFC) != 0 { return E_Y6; }
+        let declared: u16 = f.flags & 1;
+        let effective: u16 = (f.flags >> 1) & 1;
+        if declared == 1 && effective == 0 { return E_Y6; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 块记录校验：块内指令区间自洽、终结 opcode 合法、臂载荷 LocalId 不越过函数局部数；
+// 按规格 5.1，块表按函数连续存放，BlockId 只在所属函数段内严格升序。
+function check_blocks(loaded: &YsmFile:Read, insts_len: u32): u16 {
+    let blocks_len: u32 = @len(loaded.blocks) as u32;
+    let funcs_len: u32 = @len(loaded.functions) as u32;
+    if blocks_len > 0 && funcs_len == 0 { return E_Y5; }
+    var f: u32 = 0;
+    while f < funcs_len {
+        let start: u32 = loaded.functions[f].block_start;
+        let count: u32 = loaded.functions[f].block_count;
+        if start > blocks_len { return E_Y5; }
+        if count > blocks_len - start { return E_Y5; }
+        var k: u32 = 0;
+        // entry_block 必须是本函数块之一；trap_target 为 0xFFFF 或本函数块之一。
+        var entry_found: bool = false;
+        var trap_found: bool = loaded.functions[f].trap_target == 65535u16;
+        while k < count {
+            let b: YsmBlockRecord = loaded.blocks[start + k];
+            if b.inst_off > insts_len { return E_Y5; }
+            if b.inst_count > insts_len - b.inst_off { return E_Y5; }
+            // payload 是函数内 LocalId；0 表示无载荷，非零不得越过本函数局部数。
+            if b.payload != 0 && b.payload > loaded.functions[f].local_count { return E_Y5; }
+            if b.terminator == 0 { return E_Y4; }
+            if !is_terminator(b.terminator) { return E_Y4; }
+            if b.block_id == loaded.functions[f].entry_block { entry_found = true; }
+            if b.block_id == loaded.functions[f].trap_target { trap_found = true; }
+            if k > 0 && loaded.blocks[start + k - 1].block_id as u32 >= b.block_id as u32 { return E_Y5; }
+            k = k + 1;
+        }
+        if !entry_found || !trap_found { return E_Y5; }
+        f = f + 1;
+    }
+    return 0;
+}
+
+// Y-4：静态记录侧校验。序号必须从 0 起连续升序，区间必须完整落在字节池内，
+// type_sig_off 必须落在 type_sigs 节内（存在性校验；TypeSig 的完整解码由写侧同源保证）。
+// 返回值是拒绝码，0 表示通过。
+function check_statics(records: &[YsmStaticRecord], pool_len: u32, sigs_len: u32): u16 {
+    var i: u32 = 0;
+    while i < @len(records) as u32 {
+        let rec: YsmStaticRecord = records[i];
+        if rec.static_index != i { return E_Y4; }
+        if rec.type_sig_off >= sigs_len { return E_Y4; }
+        if rec.byte_off > pool_len { return E_Y4; }
+        if rec.byte_len > pool_len - rec.byte_off { return E_Y4; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+
+// 反序列化入口：accepted=false 时 file 仅含已解析出的前缀，code 为拒绝码。
+export function read_module(bytes: &[u8], diags: &diag::DiagBuffer:ReadWrite): YsmLoadResult!AllocError {
+    return read_module_for(bytes, 0, diags)?;
+}
+
+// 带 profile 期望的反序列化入口。expect_profile 非 0 时校验 Y-8。
+export function read_module_for(bytes: &[u8], expect_profile: u16, diags: &diag::DiagBuffer:ReadWrite): YsmLoadResult!AllocError {
+    var empty: YsmFile = YsmFile {
+        header: YsmHeader {
+            magic0: 0, magic1: 0, magic2: 0, magic3: 0,
+            version: 0, flags: 0, section_count: 0, target_profile: 0,
+            section_table_offset: 0, file_size: 0, function_count: 0, static_count: 0,
+            sha256: [], reserved1: [],
+        },
+        sections: [], type_sigs: [], static_bytes: [], statics: [],
+        functions: [], locals: [], blocks: [], insts: [], dependencies: [], inst_total: 0,
+    };
+    if (@len(bytes) as u32) < YSM_FIRST_SECTION { emit_code(diags, types::error_code(E_Y2))?; return reject(&empty:Read, E_Y2); }
+    var sha: u8[] = [];
+    var reserved: u8[] = [];
+    var d: u32 = 0;
+    while d < DIGEST_SIZE {
+        @push(sha, bytes[H_SHA256 + d])?;
+        d = d + 1;
+    }
+    d = 0;
+    while d < 4 {
+        @push(reserved, bytes[H_RESERVED1 + d])?;
+        d = d + 1;
+    }
+    let header: YsmHeader = YsmHeader {
+        magic0: bytes[0], magic1: bytes[1], magic2: bytes[2], magic3: bytes[3],
+        version: read_u16(bytes, 4), flags: read_u16(bytes, H_FLAGS),
+        section_count: read_u16(bytes, H_SECTION_COUNT), target_profile: read_u16(bytes, H_PROFILE),
+        section_table_offset: read_u32(bytes, H_TABLE_OFFSET), file_size: read_u32(bytes, H_FILE_SIZE),
+        function_count: read_u32(bytes, H_FUNCTION_COUNT), static_count: read_u32(bytes, H_STATIC_COUNT),
+        sha256: @move(sha), reserved1: @move(reserved),
+    };
+    var file: YsmFile = YsmFile {
+        header: header, sections: [], type_sigs: [], static_bytes: [], statics: [],
+        functions: [], locals: [], blocks: [], insts: [], dependencies: [], inst_total: 0,
+    };
+    let hcode: u16 = check_header(bytes, &file.header:Read, expect_profile);
+    if hcode != 0 { emit_code(diags, types::error_code(hcode))?; return reject(&file:Read, hcode); }
+    var i: u32 = 0;
+    while i < YSM_SECTION_COUNT as u32 {
+        @push(file.sections, read_section(bytes, i))?;
+        i = i + 1;
+    }
+    let tcode: u16 = check_table(bytes, &file.sections[0..@len(file.sections) as u32]:Read);
+    if tcode != 0 { emit_code(diags, types::error_code(tcode))?; return reject(&file:Read, tcode); }
+    let scode: u16 = check_sha(bytes, &file.header:Read)?;
+    if scode != 0 { emit_code(diags, types::error_code(scode))?; return reject(&file:Read, scode); }
+    return load_sections(bytes, @move(file), diags)?;
+}
+
+// 逐段拷贝节字节，避免在主装载函数中反复展开清理块。
+function copy_section_bytes(bytes: &[u8], start: u32, end: u32): u8[]!AllocError {
+    var copied: u8[] = [];
+    var i: u32 = start;
+    while i < end {
+        @push(copied, bytes[i])?;
+        i = i + 1;
+    }
+    return copied;
+}
+
+// 统一校验已解析的各节记录；返回 0 表示通过，否则返回对应 YSM 拒绝码。
+function verify_section_records(bytes: &[u8], funcs: YsmSection, locs: YsmSection, blks: YsmSection, insts: YsmSection, deps: YsmSection, loaded: &YsmFile:Read): u16 {
+    let fcode: u16 = check_functions(&loaded.functions[0..@len(loaded.functions) as u32]:Read, locs.count, blks.count);
+    if fcode != 0 { return fcode; }
+    let rcode: u16 = check_function_reserved(bytes, funcs);
+    if rcode != 0 { return rcode; }
+    let lcode: u16 = check_local_reserved(bytes, locs);
+    if lcode != 0 { return lcode; }
+    let kcode: u16 = check_block_reserved(bytes, blks);
+    if kcode != 0 { return kcode; }
+    let bcode: u16 = check_blocks(loaded, insts.length);
+    if bcode != 0 { return bcode; }
+    return check_dependencies(bytes, deps, &loaded.dependencies[0..@len(loaded.dependencies) as u32]:Read);
+}
+
+// 装载并校验全部节体内容，返回 0 表示成功，否则返回拒绝码并保持原结构用于构造失败结果。
+function fill_sections(bytes: &[u8], loaded: &YsmFile:ReadWrite): u16!AllocError {
+    let sigs: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_TYPE_SIGS);
+    let stats: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_STATICS);
+    let funcs: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_FUNCTIONS);
+    let locs: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_LOCALS);
+    let blks: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_BLOCKS);
+    let insts: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_INSTS);
+    let deps: YsmSection = section_of(&loaded.sections[0..@len(loaded.sections) as u32]:Read, SEC_DEPENDENCIES);
+    if funcs.count != loaded.header.function_count || stats.count != loaded.header.static_count { return E_Y2; }
+    loaded.functions = parse_functions(bytes, funcs)?;
+    if @len(loaded.functions) as u32 != funcs.count { return E_Y5; }
+    loaded.locals = parse_locals(bytes, locs)?;
+    if @len(loaded.locals) as u32 != locs.count { return E_Y5; }
+    loaded.blocks = parse_blocks(bytes, blks)?;
+    if @len(loaded.blocks) as u32 != blks.count { return E_Y5; }
+    loaded.statics = parse_statics(bytes, stats)?;
+    if @len(loaded.statics) as u32 != stats.count { return E_Y5; }
+    // 记录编号的域宽限制也保证 count * DEPENDENCY_RECORD 不会回绕。
+    if deps.count > DEPENDENCY_LIMIT { return E_Y7; }
+    loaded.dependencies = parse_dependencies(bytes, deps)?;
+    if @len(loaded.dependencies) as u32 != deps.count { return E_Y5; }
+    let rcode: u16 = verify_section_records(bytes, funcs, locs, blks, insts, deps, loaded);
+    if rcode != 0 { return rcode; }
+    loaded.type_sigs = copy_section_bytes(bytes, sigs.offset, sigs.offset + sigs.length)?;
+    loaded.static_bytes = copy_section_bytes(bytes, stats.offset + stats.count * STATIC_RECORD, stats.offset + stats.length)?;
+    loaded.insts = copy_section_bytes(bytes, insts.offset, insts.offset + insts.length)?;
+    // 静态记录侧的真实校验（reader 路径上自动执行）：序号从 0 起连续升序、
+    // 条目区间完整落在字节池内、类型签名偏移可定位。违规按 Y-4 拒绝。
+    let pool_len: u32 = @len(loaded.static_bytes) as u32;
+    let sigs_len: u32 = @len(loaded.type_sigs) as u32;
+    let scode: u16 = check_statics(&loaded.statics[0..@len(loaded.statics) as u32]:Read, pool_len, sigs_len);
+    if scode != 0 { return scode; }
+    loaded.inst_total = blks.count;
+    return 0;
+}
+
+// 各节装载与语义校验。
+function load_sections(bytes: &[u8], file: YsmFile, diags: &diag::DiagBuffer:ReadWrite): YsmLoadResult!AllocError {
+    var loaded: YsmFile = YsmFile {
+        header: clone_header(&file.header:Read), sections: copy_sections(&file.sections[0..@len(file.sections) as u32]:Read),
+        type_sigs: [], static_bytes: [], statics: [], functions: [], locals: [], blocks: [], insts: [], dependencies: [], inst_total: 0,
+    };
+    let code: u16 = fill_sections(bytes, &loaded:ReadWrite)?;
+    if code != 0 {
+        emit_code(diags, types::error_code(code))?;
+        return reject(&file:Read, code);
+    }
+    return YsmLoadResult { accepted: true, file: @move(loaded), code: types::error_code(0) };
+}

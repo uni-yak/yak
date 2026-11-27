@@ -1,0 +1,19 @@
+// hash.yak —— FNV-1a 64 哈希函数（lib/README.md 设计）
+// 依赖：base 内建类型（u8/u64）、&[u8]、@len、@wrap_mul
+// 规范：symbol.md 11.2（FNV-1a 64，初始值 0xcbf29ce484222325，质数 0x100000001b3）
+// 注意：FNV 的乘法溢出是算法定义的一部分，必须用 @wrap_mul（回绕乘法），不可用 *（trap）
+
+// FNV-1a 64 常量
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+
+export function fnv1a(bytes: &[u8]): u64 {
+    var h: u64 = FNV_OFFSET;
+    var i: u32 = 0;
+    let n: u32 = @len(bytes) as u32;
+    while i < n {
+        h = @wrap_mul(h ^ (bytes[i] as u64), FNV_PRIME);
+        i = i + 1;
+    }
+    return h;
+}

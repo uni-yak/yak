@@ -1,0 +1,5 @@
+foreign assert(cond: bool): void;
+enum E { Bad, }
+function a(): (i64?)!E { return null; }
+function b(): (i64!E)? { return null; }
+function main(): void { let x: i64? = a()?; assert((x ?? 7) == 7); let y: (i64!E)? = b(); }

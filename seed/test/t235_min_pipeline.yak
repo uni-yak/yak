@@ -1,0 +1,479 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+import lex;
+import diag;
+import pipeline;
+foreign assert(cond: bool): void;
+function has_code(diags: &diag::DiagBuffer:Read, code: u16): bool {
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(diags) {
+        if diags.diags[i].code.raw == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function check_const_element(source: &[u8], code: u16, offset: u32, length: u32): void!AllocError {
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let accepted: bool = pipeline::run_frontend(source, 222, &batch:ReadWrite)?;
+    let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 222)?;
+    if code == 0u16 {
+        assert(accepted && pipeline::analysis_checked(document.status));
+        assert(@len(batch.diags) == 0 && @len(document.diagnostics.diags) == 0);
+        return;
+    }
+    assert(!accepted && pipeline::analysis_rejected(document.status));
+    assert(@len(batch.diags) == 1 && @len(document.diagnostics.diags) == 1);
+    assert(batch.diags[0].code.raw == code && document.diagnostics.diags[0].code.raw == code);
+    assert(batch.diags[0].span.file == 222 && document.diagnostics.diags[0].span.file == 222);
+    assert(batch.diags[0].span.offset == offset && document.diagnostics.diags[0].span.offset == offset);
+    assert(batch.diags[0].span.length == length && document.diagnostics.diags[0].span.length == length);
+    return;
+}
+function check_nested_constants(): void!AllocError {
+    check_const_element("const C: [[[u32; 1]; 1]; 1] = [[[1u32]]];\nfunction value(): u32 { let a: [[[u32; 1]; 1]; 1] = C; return a[0][0][0]; }\n", 0, 0, 0)?;
+    check_const_element("const C: [[[&[u8]; 1]; 1]; 1] = [[[1u32]]];\n", 2009, 12, 5)?;
+    check_const_element("const C: [[[u32[]; 1]; 1]; 1] = [[[1u32]]];\n", 5006, 12, 5)?;
+    return;
+}
+
+// 检查数组元素为 void 时的完整前端拒绝路径。
+function check_void_arrays(): void!AllocError {
+    var fixed_void: diag::DiagBuffer = diag::diagbuf_new();
+    let fixed_void_ok: bool = pipeline::run_frontend("function f(x: [void; 2]): void { @drop(x); }\n", 212, &fixed_void:ReadWrite)?;
+    assert(!fixed_void_ok && has_code(&fixed_void:Read, 5504));
+    var dynamic_void: diag::DiagBuffer = diag::diagbuf_new();
+    let dynamic_void_ok: bool = pipeline::run_frontend("function f(x: void[]): void { @drop(x); }\n", 213, &dynamic_void:ReadWrite)?;
+    assert(!dynamic_void_ok && has_code(&dynamic_void:Read, 5504));
+    assert(has_code(&dynamic_void:Read, 5502));
+    return;
+}
+function check_char_constants(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend("const K: u32 = 55296u32; function f(): char { return K as char; }\n", 214, &bad:ReadWrite)?;
+    assert(!ok && has_code(&bad:Read, 5001));
+    var upper: diag::DiagBuffer = diag::diagbuf_new();
+    let upper_ok: bool = pipeline::run_frontend("function f(): char { return (1114111u32 + 1u32) as char; }\n", 215, &upper:ReadWrite)?;
+    assert(!upper_ok && has_code(&upper:Read, 5001));
+    return;
+}
+function check_bounds(): void!AllocError {
+    // 编译期可证越界必须在前端拒绝，动态索引不能误报。
+    var bounds: diag::DiagBuffer = diag::diagbuf_new();
+    let bounds_ok: bool = pipeline::run_frontend("function f(): u8 { let a: [u8; 2] = [1u8, 2u8]; return a[2]; }\n", 193, &bounds:ReadWrite)?;
+    assert(!bounds_ok && has_code(&bounds:Read, 6002));
+    var cast_bounds: diag::DiagBuffer = diag::diagbuf_new();
+    let cast_ok: bool = pipeline::run_frontend("function f(): u8 { let a: [u8; 2] = [1u8, 2u8]; return a[2u8 as u64]; }\n", 195, &cast_bounds:ReadWrite)?;
+    assert(!cast_ok && has_code(&cast_bounds:Read, 6002));
+    var dynamic: diag::DiagBuffer = diag::diagbuf_new();
+    let dynamic_ok: bool = pipeline::run_frontend("function f(i: u32): u8 { let a: [u8; 2] = [1u8, 2u8]; return a[i]; }\n", 194, &dynamic:ReadWrite)?;
+    assert(dynamic_ok && diag::diagbuf_count(&dynamic:Read) == 0);
+    var trunc: diag::DiagBuffer = diag::diagbuf_new();
+    let trunc_ok: bool = pipeline::run_frontend("function f(): u8 { return 256u16 as u8; }\n", 196, &trunc:ReadWrite)?;
+    assert(!trunc_ok && has_code(&trunc:Read, 5004));
+    var signed_target: diag::DiagBuffer = diag::diagbuf_new();
+    let signed_ok: bool = pipeline::run_frontend("function f(): i8 { return 256u16 as i8; }\n", 198, &signed_target:ReadWrite)?;
+    assert(!signed_ok && has_code(&signed_target:Read, 5004));
+    var signed_source: diag::DiagBuffer = diag::diagbuf_new();
+    let positive_ok: bool = pipeline::run_frontend("function f(): i8 { return 256i16 as i8; }\n", 199, &signed_source:ReadWrite)?;
+    assert(!positive_ok && has_code(&signed_source:Read, 5004));
+    var nested_bounds: diag::DiagBuffer = diag::diagbuf_new();
+    let nested_ok: bool = pipeline::run_frontend("function f(): u8 { let a: [u8; 2] = [1u8, 2u8]; return a[(2u8 as u16) as u64]; }\n", 200, &nested_bounds:ReadWrite)?;
+    assert(!nested_ok && has_code(&nested_bounds:Read, 6002));
+    var const_cast: diag::DiagBuffer = diag::diagbuf_new();
+    let const_ok: bool = pipeline::run_frontend("const K: u16 = 1u8 as u16; function f(): u16 { return K; }\n", 201, &const_cast:ReadWrite)?;
+    assert(!const_ok && has_code(&const_cast:Read, 5006));
+    var bad_index: diag::DiagBuffer = diag::diagbuf_new();
+    let index_ok: bool = pipeline::run_frontend("function f(a: [u8; 2], b: bool): u8 { return a[b]; }\n", 202, &bad_index:ReadWrite)?;
+    assert(!index_ok && has_code(&bad_index:Read, 5001));
+    var negative_index: diag::DiagBuffer = diag::diagbuf_new();
+    let negative_ok: bool = pipeline::run_frontend("function f(s: &[u8]): u8 { return s[-1i8]; }\n", 203, &negative_index:ReadWrite)?;
+    assert(!negative_ok && has_code(&negative_index:Read, 6002));
+    var dynamic_index: diag::DiagBuffer = diag::diagbuf_new();
+    let index_dynamic_ok: bool = pipeline::run_frontend("function f(s: &[u8], i: i64): u8 { return s[i]; }\n", 204, &dynamic_index:ReadWrite)?;
+    assert(index_dynamic_ok && diag::diagbuf_count(&dynamic_index:Read) == 0);
+    var invalid_host: diag::DiagBuffer = diag::diagbuf_new();
+    let host_ok: bool = pipeline::run_frontend("function f(x: &u8:Read): u8 { return x[0u8]; }\n", 205, &invalid_host:ReadWrite)?;
+    assert(!host_ok && has_code(&invalid_host:Read, 5001));
+    var runtime_cast: diag::DiagBuffer = diag::diagbuf_new();
+    let runtime_ok: bool = pipeline::run_frontend("function f(x: u16): u8 { return x as u8; }\n", 197, &runtime_cast:ReadWrite)?;
+    assert(runtime_ok && diag::diagbuf_count(&runtime_cast:Read) == 0);
+    return;
+}
+// 普通 Read 参数使用目标值类型定型，不转移 owning 实参。
+function check_read_arguments(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let accepted: bool = pipeline::run_frontend("struct S { values: u8[] } function peek(x: &u8[]): void { let n: u64 = @len(*x); @drop(n); } function byte(x: &u8): void { let n: u8 = *x; @drop(n); } function f(s: S, a: u8[], r: &u8:ReadWrite): void { let b: u8 = 4; peek(a); peek(s.values); peek([1, 2]); peek([]); byte(3); byte(r); byte(&b); @drop(s); @drop(a); }\n", 216, &diags:ReadWrite)?;
+    if !accepted { diag::diagbuf_print_terminal(&diags:Read)?; }
+    assert(accepted && diag::diagbuf_count(&diags:Read) == 0);
+    var mismatch: diag::DiagBuffer = diag::diagbuf_new();
+    let wrong_type: bool = pipeline::run_frontend("function peek(x: &u8): void { let n: u8 = *x; @drop(n); } function f(x: &u16:ReadWrite): void { peek(x); peek(1u16); }\n", 217, &mismatch:ReadWrite)?;
+    assert(!wrong_type && has_code(&mismatch:Read, 5001) && diag::diagbuf_count(&mismatch:Read) == 2);
+    var limits: diag::DiagBuffer = diag::diagbuf_new();
+    let overflow: bool = pipeline::run_frontend("function peek(x: &u8[]): void { let n: u64 = @len(*x); @drop(n); } function f(): void { peek([256]); }\n", 218, &limits:ReadWrite)?;
+    assert(!overflow && has_code(&limits:Read, 1004));
+    var moved: diag::DiagBuffer = diag::diagbuf_new();
+    let expired: bool = pipeline::run_frontend("function peek(x: &u8[]): void { let n: u64 = @len(*x); @drop(n); } function f(a: u8[]): void { @drop(a); peek(a); }\n", 219, &moved:ReadWrite)?;
+    assert(!expired && has_code(&moved:Read, 6003) && diag::diagbuf_count(&moved:Read) == 1);
+    var prefix: diag::DiagBuffer = diag::diagbuf_new();
+    let explicit: bool = pipeline::run_frontend("function peek(a: &u8[]): void { let n: u64 = @len(*a); @drop(n); } function f(a: u8[]): void { peek(@move(a)); @drop(a); }\n", 220, &prefix:ReadWrite)?;
+    assert(!explicit && has_code(&prefix:Read, 6204) && diag::diagbuf_count(&prefix:Read) == 1);
+    var output: diag::DiagBuffer = diag::diagbuf_new();
+    let wrong_out: bool = pipeline::run_frontend("function peek(a: &u8[]): void { let n: u64 = @len(*a); @drop(n); } function f(): void { out r: u8[]; peek(out r); }\n", 221, &output:ReadWrite)?;
+    // R-13：非 Write 形参不能通过 out 实参建立写入通道。
+    assert(!wrong_out && has_code(&output:Read, 6101) && diag::diagbuf_count(&output:Read) == 1);
+    return;
+}
+function main(): void {
+    check_read_arguments()?;
+    // ── 合法前端：export function / struct / enum / match / 可错返回 ──
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let ok1: bool = pipeline::run_frontend(
+        "export struct Point { x: u32 }\nexport enum Color { Red, Green }\nexport function pick(c: Color): u32 { match c { Color::Red => { return 1; }, Color::Green => { return 2; }, _ => { return 3; } } }\nexport function classify(p: Point, c: Color): u32!Color { if c == Color::Red { return p.x; } return Color::Green; }\nfunction main(): void { return; }\n",
+        100, &d1:ReadWrite)?;
+    assert(ok1);
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+
+    // 运行期表达式的整数字面量也必须符合目标范围。
+    var integer: diag::DiagBuffer = diag::diagbuf_new();
+    let integer_ok: bool = pipeline::run_frontend("function f(): u8 { return 256; }\n", 183, &integer:ReadWrite)?;
+    assert(!integer_ok);
+    assert(has_code(&integer:Read, 1004));
+
+    // 无唯一上下文的比较操作数必须显式定型。
+    var untyped: diag::DiagBuffer = diag::diagbuf_new();
+    let untyped_ok: bool = pipeline::run_frontend("function f(): bool { return 1 < 2; }\n", 184, &untyped:ReadWrite)?;
+    assert(!untyped_ok && has_code(&untyped:Read, 5005));
+
+    // 已知后续数组元素可反向约束前面的整数，越界必须拒绝。
+    var array_range: diag::DiagBuffer = diag::diagbuf_new();
+    let array_range_ok: bool = pipeline::run_frontend("function f(): void { @drop([256, 1u8]); }\n", 185, &array_range:ReadWrite)?;
+    assert(!array_range_ok && has_code(&array_range:Read, 1004));
+
+    var negative_range: diag::DiagBuffer = diag::diagbuf_new();
+    let negative_ok: bool = pipeline::run_frontend("function f(): void { @drop([-129, 0i8]); }\n", 186, &negative_range:ReadWrite)?;
+    assert(!negative_ok && has_code(&negative_range:Read, 1004));
+
+    var arithmetic_range: diag::DiagBuffer = diag::diagbuf_new();
+    let arithmetic_ok: bool = pipeline::run_frontend("function f(): void { @drop([256 + 1, 0u8]); }\n", 187, &arithmetic_range:ReadWrite)?;
+    assert(!arithmetic_ok && has_code(&arithmetic_range:Read, 1004));
+
+    // 回绕原语的字面量先定型，才能检查是否越界。
+    var wrap_range: diag::DiagBuffer = diag::diagbuf_new();
+    let wrap_ok: bool = pipeline::run_frontend("function f(): void { @drop([@wrap_mul(256, 1), 0u8]); }\n", 192, &wrap_range:ReadWrite)?;
+    assert(!wrap_ok && has_code(&wrap_range:Read, 1004));
+
+    var nested_range: diag::DiagBuffer = diag::diagbuf_new();
+    let nested_ok: bool = pipeline::run_frontend("function f(): void { @drop([[256], [2u8]]); }\n", 188, &nested_range:ReadWrite)?;
+    assert(!nested_ok && has_code(&nested_range:Read, 1004));
+
+    // 非纯元素尚未定型时，数组形状仍须与后续元素一致。
+    var unknown_shape: diag::DiagBuffer = diag::diagbuf_new();
+    let unknown_ok: bool = pipeline::run_frontend("function f(): void { @drop([[@clone(1)], true]); }\n", 189, &unknown_shape:ReadWrite)?;
+    assert(!unknown_ok && has_code(&unknown_shape:Read, 5001));
+
+    var unknown_deep: diag::DiagBuffer = diag::diagbuf_new();
+    let deep_ok: bool = pipeline::run_frontend("function f(): void { @drop([[[@clone(1)]], [1u8]]); }\n", 190, &unknown_deep:ReadWrite)?;
+    assert(!deep_ok && has_code(&unknown_deep:Read, 5001));
+
+    // 非纯子树中的独立整数字面量仍应取得后续元素的类型。
+    var mixed_range: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed_range_ok: bool = pipeline::run_frontend("function f(): void { @drop([[256, @clone()], [2u8]]); }\n", 191, &mixed_range:ReadWrite)?;
+    assert(!mixed_range_ok && has_code(&mixed_range:Read, 5001) && has_code(&mixed_range:Read, 1004));
+
+    check_bounds()?;
+
+    // 数组上下文下的空字面量和元素类型必须一致。
+    var arrays: diag::DiagBuffer = diag::diagbuf_new();
+    let arrays_ok: bool = pipeline::run_frontend("function f(): void { let a: u16[] = [1, 2]; let b: u32[] = []; @drop(a); @drop(b); return; }\n", 180, &arrays:ReadWrite)?;
+    assert(arrays_ok);
+    var mixed_array: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed_ok: bool = pipeline::run_frontend("function f(): void { let a: u32[] = [1u32, true]; @drop(a); return; }\n", 181, &mixed_array:ReadWrite)?;
+    assert(!mixed_ok);
+    assert(has_code(&mixed_array:Read, 5001));
+    var short_array: diag::DiagBuffer = diag::diagbuf_new();
+    let short_ok: bool = pipeline::run_frontend("function f(): void { let a: [u32; 2] = [1u32]; @drop(a); return; }\n", 182, &short_array:ReadWrite)?;
+    assert(!short_ok);
+    assert(has_code(&short_array:Read, 5001));
+
+    // ── 类型不匹配：P-5 ──
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let ok2: bool = pipeline::run_frontend("function bad(): u32 { return true; }\n", 101, &d2:ReadWrite)?;
+    assert(!ok2);
+    assert(has_code(&d2:Read, 2005));
+
+    // ── 未定义名字：N-2 ──
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let ok3: bool = pipeline::run_frontend("function bad(): void { return missing; }\n", 102, &d3:ReadWrite)?;
+    assert(!ok3);
+    assert(has_code(&d3:Read, 4002));
+
+    // ── 布局错误：空 struct → LY-2 ──
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let ok4: bool = pipeline::run_frontend("struct Bad {}\n", 103, &d4:ReadWrite)?;
+    assert(!ok4);
+    assert(has_code(&d4:Read, 5502));
+
+    check_void_arrays()?;
+    check_nested_constants()?;
+    check_char_constants()?;
+
+    // ── 词法错误：未闭合字符串被转换为 Diag ──
+    let bad_source: &[u8] = "function bad(): void { let x: i32 = \"abc; }\n";
+    let lexed: lex::LexResult = lex::lex_scan(bad_source, 104)?;
+    assert(@len(lexed.diagnostics) > 0);
+    let expected_lex_code: u16 = lexed.diagnostics[0].code.raw;
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let ok5: bool = pipeline::run_frontend(bad_source, 104, &d5:ReadWrite)?;
+    assert(!ok5);
+    assert(diag::diagbuf_count(&d5:Read) > 0);
+    assert(has_code(&d5:Read, expected_lex_code));
+    // 互斥分支的所有权状态不得相互污染。
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let ok6: bool = pipeline::run_frontend("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { @drop(s); } else { @drop(s); } }\n", 105, &d6:ReadWrite)?;
+    assert(ok6);
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let ok7: bool = pipeline::run_frontend("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { @drop(s); } @drop(s); }\n", 106, &d7:ReadWrite)?;
+    assert(!ok7);
+    assert(has_code(&d7:Read, 6003));
+    // 穷尽匹配的各臂独立检查，合流后的失效仍须拒绝。
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let ok8: bool = pipeline::run_frontend("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { @drop(s); }, E::B => { @drop(s); } } }\n", 107, &d8:ReadWrite)?;
+    assert(ok8);
+    assert(diag::diagbuf_count(&d8:Read) == 0);
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let ok9: bool = pipeline::run_frontend("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { @drop(s); }, E::B => { } } @drop(s); }\n", 108, &d9:ReadWrite)?;
+    assert(!ok9);
+    assert(has_code(&d9:Read, 6003));
+    // 非 Copy 枚举匹配后不可再次消费，Copy 枚举可以继续匹配。
+    var d10: diag::DiagBuffer = diag::diagbuf_new();
+    let ok10: bool = pipeline::run_frontend("enum E { Some(u32[]), None }\nfunction f(e: E): void { match e { E::Some(x) => { @drop(x); }, E::None => { } } @drop(e); }\n", 109, &d10:ReadWrite)?;
+    assert(!ok10);
+    assert(has_code(&d10:Read, 6003));
+    var d11: diag::DiagBuffer = diag::diagbuf_new();
+    let ok11: bool = pipeline::run_frontend("enum E { Some(u32), None }\nfunction f(e: E): void { match e { E::Some(x) => { @drop(x); }, E::None => { } } match e { E::Some(x) => { @drop(x); }, E::None => { } } }\n", 110, &d11:ReadWrite)?;
+    if !ok11 { diag::diagbuf_print_terminal(&d11:Read)?; }
+    assert(ok11);
+    assert(diag::diagbuf_count(&d11:Read) == 0);
+    // 复合值转移后重复使用源必须在完整前端拒绝。
+    var d12: diag::DiagBuffer = diag::diagbuf_new();
+    let ok12: bool = pipeline::run_frontend("struct S { data: u32[] } struct Box { value: S }\nfunction f(s: S): void { let b: Box = Box { value: s }; @drop(s); @drop(b); }\n", 111, &d12:ReadWrite)?;
+    assert(!ok12);
+    assert(has_code(&d12:Read, 6003));
+    var d13: diag::DiagBuffer = diag::diagbuf_new();
+    let ok13: bool = pipeline::run_frontend("struct S { data: u32[] } struct Box { value: S }\nfunction f(s: S): void { let b: Box = Box { value: s }; @drop(b); }\n", 112, &d13:ReadWrite)?;
+    assert(ok13);
+    assert(diag::diagbuf_count(&d13:Read) == 0);
+    // 失效根对象不可通过投影写入，整体重新初始化后可以写入。
+    var d14: diag::DiagBuffer = diag::diagbuf_new();
+    let ok14: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; @drop(s); s.data = [2u32]; }\n", 113, &d14:ReadWrite)?;
+    assert(!ok14);
+    assert(has_code(&d14:Read, 6003));
+    var d15: diag::DiagBuffer = diag::diagbuf_new();
+    let ok15: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; @drop(s); s = S { data: [2u32] }; s.data[0u64] = 3u32; @drop(s); }\n", 114, &d15:ReadWrite)?;
+    assert(ok15);
+    assert(diag::diagbuf_count(&d15:Read) == 0);
+    // 循环体的重新初始化不能掩盖零次迭代路径。
+    var d16: diag::DiagBuffer = diag::diagbuf_new();
+    let ok16: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(b: bool): void { var s: S = S { data: [1u32] }; @drop(s); while b { s = S { data: [2u32] }; } @drop(s); }\n", 115, &d16:ReadWrite)?;
+    assert(!ok16);
+    assert(has_code(&d16:Read, 6003));
+    var d17: diag::DiagBuffer = diag::diagbuf_new();
+    let ok17: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(s: S, b: bool): void { while b { @drop(s); return; } @drop(s); }\n", 116, &d17:ReadWrite)?;
+    assert(ok17);
+    assert(diag::diagbuf_count(&d17:Read) == 0);
+    // 直线恒真循环的回边不能重复消费外部绑定。
+    var d18: diag::DiagBuffer = diag::diagbuf_new();
+    let ok18: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(s: S): void { while true { @drop(s); } }\n", 117, &d18:ReadWrite)?;
+    assert(!ok18);
+    assert(has_code(&d18:Read, 6003));
+    var d19: diag::DiagBuffer = diag::diagbuf_new();
+    let ok19: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(): void { while true { let s: S = S { data: [1u32] }; @drop(s); } }\n", 118, &d19:ReadWrite)?;
+    assert(ok19);
+    assert(diag::diagbuf_count(&d19:Read) == 0);
+    // 不可进入的循环体不改变外部状态，必经的 break 则带出末态。
+    var d20: diag::DiagBuffer = diag::diagbuf_new();
+    let ok20: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(s: S): void { while false { @drop(s); } @drop(s); }\n", 119, &d20:ReadWrite)?;
+    assert(ok20);
+    assert(diag::diagbuf_count(&d20:Read) == 0);
+    var d21: diag::DiagBuffer = diag::diagbuf_new();
+    let ok21: bool = pipeline::run_frontend("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; @drop(s); while true { s = S { data: [2u32] }; break; } @drop(s); }\n", 120, &d21:ReadWrite)?;
+    assert(ok21);
+    assert(diag::diagbuf_count(&d21:Read) == 0);
+    // 必然短路的右侧仍须遵守调用参数的静态规则。
+    var dead_call: diag::DiagBuffer = diag::diagbuf_new();
+    let dead_call_ok: bool = pipeline::run_frontend("struct S { v: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = false && take(s); @drop(b); @drop(s); }\n", 178, &dead_call:ReadWrite)?;
+    assert(!dead_call_ok);
+    assert(has_code(&dead_call:Read, 6201));
+    // 必然短路时右侧不转移所有权，动态条件则保留可能的转移。
+    var d22: diag::DiagBuffer = diag::diagbuf_new();
+    let ok22: bool = pipeline::run_frontend("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = false && take(@move(s)); @drop(b); @drop(s); }\n", 121, &d22:ReadWrite)?;
+    assert(ok22);
+    var d23: diag::DiagBuffer = diag::diagbuf_new();
+    let ok23: bool = pipeline::run_frontend("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S, c: bool): void { let b: bool = c && take(@move(s)); @drop(b); @drop(s); }\n", 122, &d23:ReadWrite)?;
+    assert(!ok23);
+    assert(has_code(&d23:Read, 6003));
+    // Copy 绑定显式析构后不可读取，但重新赋值可恢复。
+    var d24: diag::DiagBuffer = diag::diagbuf_new();
+    let ok24: bool = pipeline::run_frontend("function f(): void { let x: u32 = 1u32; @drop(x); let y: u32 = x; @drop(y); }\n", 123, &d24:ReadWrite)?;
+    assert(!ok24);
+    assert(has_code(&d24:Read, 6003));
+    var d25: diag::DiagBuffer = diag::diagbuf_new();
+    let ok25: bool = pipeline::run_frontend("function f(): void { var x: u32 = 1u32; @drop(x); x = 2u32; let y: u32 = x; @drop(y); }\n", 124, &d25:ReadWrite)?;
+    assert(ok25);
+    assert(diag::diagbuf_count(&d25:Read) == 0);
+    // 常量本身不是拥有槽位，复制出的局部绑定则可以析构。
+    var d26: diag::DiagBuffer = diag::diagbuf_new();
+    let ok26: bool = pipeline::run_frontend("const A: u32 = 1u32; function f(): void { @drop(A); }\n", 125, &d26:ReadWrite)?;
+    assert(!ok26);
+    assert(has_code(&d26:Read, 6204));
+    var d27: diag::DiagBuffer = diag::diagbuf_new();
+    let ok27: bool = pipeline::run_frontend("const A: u32 = 1u32; function f(): void { let x: u32 = A; let y: u32 = A; @drop(x); @drop(y); }\n", 126, &d27:ReadWrite)?;
+    assert(ok27);
+    assert(diag::diagbuf_count(&d27:Read) == 0);
+    // 显式移动 Copy 值同样消费源，重新初始化后可再次使用。
+    var d28: diag::DiagBuffer = diag::diagbuf_new();
+    let ok28: bool = pipeline::run_frontend("function f(): void { let x: u32 = 1u32; let y: u32 = @move(x); @drop(x); @drop(y); }\n", 127, &d28:ReadWrite)?;
+    assert(!ok28);
+    assert(has_code(&d28:Read, 6003));
+    var d29: diag::DiagBuffer = diag::diagbuf_new();
+    let ok29: bool = pipeline::run_frontend("function take(x: u32): void { @drop(x); } function f(): void { var x: u32 = 1u32; take(@move(x)); x = 2u32; @drop(x); }\n", 128, &d29:ReadWrite)?;
+    assert(ok29);
+    assert(diag::diagbuf_count(&d29:Read) == 0);
+    // 临时值不具备可移动的源绑定。
+    var d30: diag::DiagBuffer = diag::diagbuf_new();
+    let ok30: bool = pipeline::run_frontend("function f(): void { let x: u32 = @move(1u32); @drop(x); }\n", 129, &d30:ReadWrite)?;
+    assert(!ok30);
+    assert(has_code(&d30:Read, 6204));
+    var d31: diag::DiagBuffer = diag::diagbuf_new();
+    let ok31: bool = pipeline::run_frontend("function f(): void { let x: bool = true; let y: bool = @move(!x); @drop(x); @drop(y); }\n", 130, &d31:ReadWrite)?;
+    assert(!ok31);
+    assert(has_code(&d31:Read, 6204));
+    var d32: diag::DiagBuffer = diag::diagbuf_new();
+    let ok32: bool = pipeline::run_frontend("function f(): void { @drop(1u32); }\n", 131, &d32:ReadWrite)?;
+    assert(!ok32);
+    assert(has_code(&d32:Read, 6204));
+    var d33: diag::DiagBuffer = diag::diagbuf_new();
+    let ok33: bool = pipeline::run_frontend("function f(): void { let x: u32 = 1u32; @drop(x); let r: &u32 = &x; let y: u32 = *r; @drop(y); }\n", 132, &d33:ReadWrite)?;
+    assert(!ok33);
+    assert(has_code(&d33:Read, 6003));
+    assert(diag::diagbuf_count(&d33:Read) == 1);
+    // 可错载体按成功值与错误集的 Copy 性质决定转移。
+    var d34: diag::DiagBuffer = diag::diagbuf_new();
+    let ok34: bool = pipeline::run_frontend("enum E { Bad } function make(): u32!E { return 1u32; } function f(): void { let r: u32!E = make(); let s: u32!E = r; @drop(r); @drop(s); }\n", 133, &d34:ReadWrite)?;
+    assert(ok34);
+    var d35: diag::DiagBuffer = diag::diagbuf_new();
+    let ok35: bool = pipeline::run_frontend("enum E { Bad } function make(): u32[]!E { return [1u32]; } function f(): void { let r: u32[]!E = make(); let s: u32[]!E = r; @drop(r); @drop(s); }\n", 134, &d35:ReadWrite)?;
+    assert(!ok35);
+    assert(has_code(&d35:Read, 6003));
+    // 按值递归类型必须在所有权分类前得到布局诊断。
+    var d36: diag::DiagBuffer = diag::diagbuf_new();
+    let ok36: bool = pipeline::run_frontend("struct Node { next: Node } function f(n: Node): void { let x: Node = n; @drop(x); }\n", 135, &d36:ReadWrite)?;
+    assert(!ok36);
+    assert(has_code(&d36:Read, 5509));
+    // 恒假循环中的失效使用不影响可达路径。
+    var unreachable_state: diag::DiagBuffer = diag::diagbuf_new();
+    let unreachable_state_ok: bool = pipeline::run_frontend("function f(x: u32): void { @drop(x); while false { @drop(x); } }\n", 153, &unreachable_state:ReadWrite)?;
+    assert(unreachable_state_ok);
+    assert(diag::diagbuf_count(&unreachable_state:Read) == 0);
+    // 不可达不妨碍前置类型检查拒绝错误程序。
+    var unreachable_type: diag::DiagBuffer = diag::diagbuf_new();
+    let unreachable_type_ok: bool = pipeline::run_frontend("function f(): u32 { while false { return true; } return 1u32; }\n", 147, &unreachable_type:ReadWrite)?;
+    assert(!unreachable_type_ok);
+    assert(has_code(&unreachable_type:Read, 2005));
+    // 即使循环不执行，析构操作数也必须是 owning place。
+    var unreachable_drop: diag::DiagBuffer = diag::diagbuf_new();
+    let unreachable_drop_ok: bool = pipeline::run_frontend("function f(): void { while false { @drop(1u32); } }\n", 148, &unreachable_drop:ReadWrite)?;
+    assert(!unreachable_drop_ok);
+    assert(has_code(&unreachable_drop:Read, 6204));
+    // 非 Copy 值不能通过复制原语绕过所有权约束。
+    var bad_copy: diag::DiagBuffer = diag::diagbuf_new();
+    let bad_copy_ok: bool = pipeline::run_frontend("function f(x: u32[]): void { let y: u32[] = @copy(x); @drop(y); @drop(x); }\n", 188, &bad_copy:ReadWrite)?;
+    assert(!bad_copy_ok);
+    assert(has_code(&bad_copy:Read, 6202));
+    assert(diag::diagbuf_count(&bad_copy:Read) == 1);
+    // clone 不能作用于 Copy 值。
+    var bad_clone: diag::DiagBuffer = diag::diagbuf_new();
+    let bad_clone_ok: bool = pipeline::run_frontend("function f(x: u32): void!AllocError { let y: u32 = @clone(x)?; @drop(y); @drop(x); }\n", 202, &bad_clone:ReadWrite)?;
+    assert(!bad_clone_ok);
+    assert(has_code(&bad_clone:Read, 6203));
+    assert(diag::diagbuf_count(&bad_clone:Read) == 1);
+    // 合法克隆传播分配错误，源仍可使用。
+    var clone_ok: diag::DiagBuffer = diag::diagbuf_new();
+    let clone_pass: bool = pipeline::run_frontend("function f(x: u32[]): void!AllocError { let y: u32[] = @clone(x)?; @drop(x); @drop(y); }\n", 207, &clone_ok:ReadWrite)?;
+    assert(clone_pass);
+    assert(diag::diagbuf_count(&clone_ok:Read) == 0);
+    var clone_error: diag::DiagBuffer = diag::diagbuf_new();
+    let clone_error_ok: bool = pipeline::run_frontend("enum E { Bad } function f(x: u32[]): u32[]!E { return @clone(x)?; }\n", 208, &clone_error:ReadWrite)?;
+    assert(!clone_error_ok);
+    assert(has_code(&clone_error:Read, 6007));
+    // 临时值也不能绕过非 Copy 按值参数的显式移动规则。
+    var literal_call: diag::DiagBuffer = diag::diagbuf_new();
+    let literal_call_ok: bool = pipeline::run_frontend("function take(x: u32[]): void { @drop(x); } function f(): void { take([1u32]); }\n", 182, &literal_call:ReadWrite)?;
+    assert(!literal_call_ok);
+    assert(has_code(&literal_call:Read, 6201));
+    // 非 Copy 按值参数必须显式移动。
+    var implicit_call: diag::DiagBuffer = diag::diagbuf_new();
+    let implicit_call_ok: bool = pipeline::run_frontend("struct S { v: u32[] } function take(x: S): void { @drop(x); } function f(s: S): void { take(s); }\n", 173, &implicit_call:ReadWrite)?;
+    assert(!implicit_call_ok);
+    assert(has_code(&implicit_call:Read, 6201));
+    // 终止返回路径的所有权转移不污染后续分支。
+    var returned: diag::DiagBuffer = diag::diagbuf_new();
+    let returned_ok: bool = pipeline::run_frontend("struct S { v: u32[] } function f(x: S, b: bool): S { if b { return x; } return x; }\n", 164, &returned:ReadWrite)?;
+    assert(returned_ok);
+    assert(diag::diagbuf_count(&returned:Read) == 0);
+    // 继续执行的循环回边必须重新检查已失效的绑定。
+    var continued: diag::DiagBuffer = diag::diagbuf_new();
+    let continued_ok: bool = pipeline::run_frontend("function f(x: u32): void { while true { @drop(x); continue; } }\n", 139, &continued:ReadWrite)?;
+    assert(!continued_ok);
+    assert(has_code(&continued:Read, 6003));
+    // 分支内后续的无条件返回使该分支不参与合流。
+    var after_if: diag::DiagBuffer = diag::diagbuf_new();
+    let after_if_ok: bool = pipeline::run_frontend("function f(x: u32, a: bool, b: bool): void { if a { @drop(x); if b { } return; } @drop(x); }\n", 136, &after_if:ReadWrite)?;
+    assert(after_if_ok);
+    assert(diag::diagbuf_count(&after_if:Read) == 0);
+    // 动态数组不形成按值布局边，允许间接递归。
+    var d37: diag::DiagBuffer = diag::diagbuf_new();
+    let ok37: bool = pipeline::run_frontend("struct Node { children: Node[] } function f(n: Node): void { let x: Node = n; @drop(x); }\n", 136, &d37:ReadWrite)?;
+    if !ok37 { diag::diagbuf_print_terminal(&d37:Read)?; }
+    assert(ok37);
+    assert(diag::diagbuf_count(&d37:Read) == 0);
+    return;
+}

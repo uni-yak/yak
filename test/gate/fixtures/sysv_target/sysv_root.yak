@@ -1,0 +1,15 @@
+import sysv_leaf;
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    assert(sysv_leaf::split(1, 2, 3, 4, 5, "yak", 13) == 340);
+    let pair: sysv_leaf::Pair = sysv_leaf::Pair { wide: 19, tail: 29 };
+    assert(sysv_leaf::whole_stack(1, 2, 3, 4, 5, pair, 31) == 434);
+    let small: sysv_leaf::Pair = sysv_leaf::small(pair);
+    assert(small.wide == 36 && small.tail == 52);
+    let big: sysv_leaf::Big = sysv_leaf::Big { left: 37, marker: 41, right: 43 };
+    let returned: sysv_leaf::Big = sysv_leaf::large(47, big, 53);
+    assert(returned.left == 84 && returned.marker == 42 && returned.right == 96);
+    write("sysv-ok");
+}

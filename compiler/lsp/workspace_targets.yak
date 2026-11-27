@@ -1,0 +1,93 @@
+// 仅索引宿主预先授权为同一构建产物的源码和接口，不解析 URI 对应的文件。
+import diag;
+import documents;
+import hash;
+import iface;
+import iface_load;
+import pipeline;
+import positions;
+import types;
+
+// 0 可用，1 预算或 URI 非法，2 身份不匹配，3 公开声明不完整或不可映射。
+function refused(status: u8): documents::DefinitionTarget {
+    return documents::DefinitionTarget { status: status, module: [], interface_digest: [], source_digest: [], uri: [], locations: [], names: [], symbols: [] };
+}
+
+function absent(): positions::RangeResult {
+    let point: positions::Position = positions::Position { line: 0, character: 0 };
+    return positions::RangeResult { valid: false, range: positions::Range { start: point, end: point } };
+}
+
+function copy_bytes(source: &[u8]): u8[]!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(source) as u32 { @push(bytes, source[i])?; i = i + 1u32; }
+    return bytes;
+}
+
+// 读取器已校验顺序键与连续编号；按同一键寻找公开声明，不能以源码顺序编号。
+function export_id(loaded: &iface::LoadedInterface:Read, name: &[u8], kind: u8): u32 {
+    let key: u64 = hash::fnv1a(name);
+    var lo: u32 = 0;
+    var hi: u32 = @len(loaded.exports) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        let row: iface::LoadedExport = loaded.exports[mid];
+        let value: &[u8] = &loaded.name_bytes[row.name_off..row.name_off + row.name_len as u32]:Read;
+        if iface::export_key_less(row.name_hash, value, row.kind, key, name, kind) { lo = mid + 1u32; }
+        else { hi = mid; }
+    }
+    if lo == @len(loaded.exports) as u32 { return 0u32; }
+    let row: iface::LoadedExport = loaded.exports[lo];
+    if row.kind != kind || row.name_hash != key || iface::bytes_order(&loaded.name_bytes[row.name_off..row.name_off + row.name_len as u32]:Read, name) != 0 { return 0u32; }
+    return row.export_id;
+}
+
+// 预期源摘要必须来自可信构建登记；对当前候选临时计算摘要不能建立此绑定。
+export function build(uri: &[u8], module_name: &[u8], expected_source: &[u8], expected_interface: &[u8], source: &[u8], binary: &[u8]): documents::DefinitionTarget!AllocError {
+    if !documents::analysis_size_allowed(@len(source)) || @len(binary) > 32768u64 || @len(module_name) > 1024u64 || !documents::valid_uri(uri) || !documents::symbol_utf8(uri) { return refused(1u8); }
+    if @len(expected_source) != 32u64 || @len(expected_interface) != 32u64 { return refused(2u8); }
+    let digest: u8[] = iface::sha256(source)?;
+    if iface::bytes_order(&digest[0..32]:Read, expected_source) != 0 { return refused(2u8); }
+    var errors: diag::DiagBuffer = diag::diagbuf_limited(1u32);
+    let loaded: iface::LoadedInterface = iface_load::load_expected_interface(binary, module_name, expected_interface, &errors:ReadWrite)?;
+    if diag::diagbuf_has_error(&errors:Read) || @len(loaded.digest) != 32u64 { return refused(2u8); }
+    if @len(loaded.exports) > 512u64 { return refused(1u8); }
+    let decls: pipeline::PublicDeclarations = pipeline::public_declarations(source, 1u16)?;
+    if !decls.valid || @len(decls.items) != @len(loaded.exports) { return refused(3u8); }
+    let index: positions::Index = positions::build(source)?;
+    if index.status != 0u8 { return refused(3u8); }
+    var locations: positions::RangeResult[] = [];
+    var names: u8[] = [];
+    var symbols: documents::TargetSymbol[] = [];
+    var end: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(decls.items) as u32 { @push(locations, absent())?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(decls.items) as u32 {
+        let span: types::Span = decls.items[i].name;
+        let range: positions::RangeResult = positions::span_range(&index:Read, source, span.file, 1u16, span.offset, span.length);
+        if !range.valid || span.length == 0u32 || span.offset < end { return refused(3u8); }
+        end = span.offset + span.length;
+        let kind: u8 = decls.items[i].kind;
+        let id: u32 = export_id(&loaded:Read, &source[span.offset..end]:Read, kind);
+        if id == 0u32 || locations[id - 1u32].valid { return refused(3u8); }
+        locations[id - 1u32] = range;
+        @push(symbols, documents::TargetSymbol { name_start: @len(names) as u32, name_len: span.length, kind: kind, export_id: id })?;
+        var at: u32 = span.offset;
+        while at < end { @push(names, source[at])?; at = at + 1u32; }
+        i = i + 1u32;
+    }
+    return documents::DefinitionTarget { status: 0u8, module: copy_bytes(module_name)?, interface_digest: copy_bytes(expected_interface)?,
+        source_digest: @move(digest), uri: copy_bytes(uri)?, locations: @move(locations), names: @move(names), symbols: @move(symbols) };
+}
+
+// 导出编号必须与引用端的模块和接口摘要同时匹配才有意义。
+export function location(target: &documents::DefinitionTarget:Read, module_name: &[u8], interface_digest: &[u8], id: u32): positions::RangeResult {
+    return documents::target_location(target, module_name, interface_digest, id);
+}
+
+// 查询与会话共享同一实现；目标构建仍保留独立信任边界。
+export function symbols(store: &documents::Store:Read, targets: &[documents::DefinitionTarget]:Read, query: &[u8]): documents::SymbolResult!AllocError {
+    return documents::symbols(store, targets, query)?;
+}

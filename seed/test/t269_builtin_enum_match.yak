@@ -1,0 +1,89 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+foreign assert(cond: bool): void;
+function check(src: &[u8], count: u32, code: u16): void!AllocError {
+    let tokens: lex::LexResult = lex::lex_scan(src, 1)?;
+    assert(@len(tokens.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_file(&tokens.tokens[0..@len(tokens.tokens)]:Read, &tokens.names:Read, 1)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &tokens.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let result: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == count);
+    if count != 0 { assert(diags.diags[0].code.raw == code); }
+    if count == 2 { assert(diags.diags[1].code.raw == 2002); }
+    return;
+}
+function check_import(): void!AllocError {
+    var dep: resolve_refs::Iface = resolve_refs::iface_new("dep")?;
+    let host: u32 = resolve_refs::iface_add_export(&dep:ReadWrite, "E", 2)?;
+    resolve_refs::iface_add_enum_member(&dep:ReadWrite, host, "OutOfMemory", 0)?;
+    resolve_refs::iface_add_enum_member(&dep:ReadWrite, host, "Other", 1)?;
+    dep.enum_members[0].known = true;
+    dep.enum_members[1].known = true;
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    @push(deps.ifaces, dep)?;
+    check_import_case(&deps:Read, "import dep; function f(e: dep::E): void { match e { OutOfMemory => { return; }, Other => { return; } } }\n", 0)?;
+    check_import_case(&deps:Read, "import dep; function f(e: dep::E): void { match e { OutOfMemory => { return; } } }\n", 2002)?;
+    check_import_case(&deps:Read, "import dep; function f(e: dep::E): void { match e { OutOfMemory => { return; }, dep::E::OutOfMemory => { return; }, _ => { return; } } }\n", 2014)?;
+    check_import_case(&deps:Read, "import dep; function f(e: dep::E): void { match e { OutOfMemory(x) => { x; }, _ => { return; } } }\n", 2003)?;
+    return;
+}
+function check_import_case(deps: &resolve_refs::DependencySet:Read, src: &[u8], code: u16): void!AllocError {
+    let tokens: lex::LexResult = lex::lex_scan(src, 1)?;
+    let parsed: parse::ParseResult = parse::parse_file(&tokens.tokens[0..@len(tokens.tokens)]:Read, &tokens.names:Read, 1)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &tokens.names:Read, deps, "", &diags:ReadWrite)?;
+    let result: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    if code == 0 { assert(diag::diagbuf_count(&diags:Read) == 0); }
+    else { assert(diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == code); }
+    return;
+}
+function run(): void!AllocError {
+    check_import()?;
+    // 直接测试类型检查接口；固有错误参数样例不代表合法的完整程序。
+    check("function f(e: AllocError): void { match e { AllocError::OutOfMemory => { return; } } }\n", 0, 0)?;
+    check("function f(e: AllocError): void { match e { OutOfMemory => { return; } } }\n", 0, 0)?;
+    check("function f(e: AllocError): void { match e { OutOfMemory(x) => { x; } } }\n", 1, 2003)?;
+    check("function f(e: AllocError): void { match e { OutOfMemory => { return; }, AllocError::OutOfMemory => { return; } } }\n", 1, 2014)?;
+    check("function f(e: AllocError): void { match e { Wrong => { return; } } }\n", 2, 2013)?;
+    check("enum E { OutOfMemory } function f(e: E): void { match e { OutOfMemory => { return; } } }\n", 0, 0)?;
+    check("function f(e: AllocError): void { match e { AllocError::OutOfMemory => { return; }, AllocError::OutOfMemory => { return; } } }\n", 1, 2014)?;
+    check("function f(e: AllocError): void { match e { AllocError::OutOfMemory(x) => { x; } } }\n", 1, 2003)?;
+    check("enum E { A } function f(e: E): void { match e { AllocError::OutOfMemory => { return; }, _ => { return; } } }\n", 1, 2013)?;
+    check("enum E { A } function f(e: AllocError): void { match e { E::A => { return; } } }\n", 2, 2013)?;
+    check("enum E { A } function f(e: AllocError): void { match e { E::A => { return; }, _ => { return; } } }\n", 1, 2013)?;
+    return;
+}
+function main(): void { run()?; }

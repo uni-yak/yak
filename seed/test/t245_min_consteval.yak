@@ -1,0 +1,258 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import consteval;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    if @len(r.diagnostics) != 0 { write(src); }
+    assert(@len(r.diagnostics) == 0);
+    // 走带静态池的入口，字符串字面量的字节与静态下标必须随 AST 进入检查阶段。
+    let parsed: parse::ParseResult = parse::parse_lexed(&r:Read, file)?;
+    return Loaded { parsed: parsed, lexed: r };
+}
+function run_case(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): typecheck::TypeCheckResult!AllocError {
+    let loaded: Loaded = load(src, file)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", diags)?;
+    return typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, diags)?;
+}
+// 绑定按声明顺序追加；取值不依赖 DefId 编号。
+function binding_count(table: &consteval::ConstTable:Read): u32 { return @len(table.bindings) as u32; }
+function binding_bits(table: &consteval::ConstTable:Read, index: u32): u64 {
+    let value: u32 = table.bindings[index].value;
+    if value == 0 { return 0u64; }
+    return table.values[value - 1].bits;
+}
+function binding_kind(table: &consteval::ConstTable:Read, index: u32): u8 {
+    let value: u32 = table.bindings[index].value;
+    if value == 0 { return 255u8; }
+    return table.values[value - 1].kind;
+}
+function binding_variant(table: &consteval::ConstTable:Read, index: u32): u32 {
+    let value: u32 = table.bindings[index].value;
+    if value == 0 { return 4294967295u32; }
+    return table.values[value - 1].variant;
+}
+function has_code(diags: &diag::DiagBuffer:Read, code: u16): bool {
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(diags) {
+        if diags.diags[i].code.raw == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function check_arithmetic(): void!AllocError {
+    // 常量链按优先级求值；常量被函数引用，避免未使用诊断干扰。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u32 = 1 + 2 * 3; function f(): u32 { return A; }\n", 700, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 1);
+    assert(binding_bits(&r.consts:Read, 0) == 7u64);
+    // 减法、除法、取模与位运算。
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("const A: u32 = 10 - 4; const B: u32 = 20 / 3; const C: u32 = 20 % 3; const D: u32 = 6 & 3; const E: u32 = 6 | 9; const F: u32 = 6 ^ 3; function f(): u32 { return A + B + C + D + E + F; }\n", 701, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 0);
+    assert(binding_count(&r2.consts:Read) == 6);
+    assert(binding_bits(&r2.consts:Read, 0) == 6u64);
+    assert(binding_bits(&r2.consts:Read, 1) == 6u64);
+    assert(binding_bits(&r2.consts:Read, 2) == 2u64);
+    assert(binding_bits(&r2.consts:Read, 3) == 2u64);
+    assert(binding_bits(&r2.consts:Read, 4) == 15u64);
+    assert(binding_bits(&r2.consts:Read, 5) == 5u64);
+    return;
+}
+function check_shift(): void!AllocError {
+    // 左移按位宽掩码，右移保留符号位。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u32 = 1 << 4; const B: u32 = 256 >> 2; function f(): u32 { return A + B; }\n", 702, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 2);
+    assert(binding_bits(&r.consts:Read, 0) == 16u64);
+    assert(binding_bits(&r.consts:Read, 1) == 64u64);
+    return;
+}
+function check_overflow(): void!AllocError {
+    // 无符号加溢出必须拒绝。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u8 = 250 + 10; function f(): u8 { return A; }\n", 703, &d:ReadWrite)?;
+    assert(has_code(&d:Read, 5008));
+    assert(binding_count(&r.consts:Read) == 0);
+    // 字面量超出目标宽度必须拒绝。
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("const A: u8 = 300; function f(): u8 { return A; }\n", 704, &d2:ReadWrite)?;
+    assert(has_code(&d2:Read, 1004));
+    assert(binding_count(&r2.consts:Read) == 0);
+    // 除零必须拒绝。
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("const A: u32 = 1 / 0; function f(): u32 { return A; }\n", 705, &d3:ReadWrite)?;
+    assert(has_code(&d3:Read, 5008));
+    assert(binding_count(&r3.consts:Read) == 0);
+    return;
+}
+function check_signed(): void!AllocError {
+    // 负字面量与有符号算术。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: i32 = -5; const B: i32 = -5 + 8; function f(): i32 { return A + B; }\n", 706, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 2);
+    assert(binding_bits(&r.consts:Read, 0) == 4294967291u64);
+    assert(binding_bits(&r.consts:Read, 1) == 3u64);
+    // 有符号溢出必须拒绝。
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("const A: i8 = 127 + 1; function f(): i8 { return A; }\n", 707, &d2:ReadWrite)?;
+    assert(has_code(&d2:Read, 5008));
+    assert(binding_count(&r2.consts:Read) == 0);
+    return;
+}
+function check_suffix(): void!AllocError {
+    // 显式后缀决定类型；与目标宽度不符必须拒绝。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u16 = 7u16; function f(): u16 { return A; }\n", 708, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 1);
+    assert(binding_bits(&r.consts:Read, 0) == 7u64);
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("const A: u16 = 7u32; function f(): u16 { return A; }\n", 709, &d2:ReadWrite)?;
+    assert(has_code(&d2:Read, 5001));
+    assert(binding_count(&r2.consts:Read) == 0);
+    return;
+}
+function check_forward(): void!AllocError {
+    // 常量可以引用先声明的常量。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u32 = 2; const B: u32 = A + 3; function f(): u32 { return B; }\n", 710, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 2);
+    assert(binding_bits(&r.consts:Read, 0) == 2u64);
+    assert(binding_bits(&r.consts:Read, 1) == 5u64);
+    return;
+}
+function check_bool(): void!AllocError {
+    // bool 常量按位存储。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: bool = true; const B: bool = false; function f(): bool { return A; } function g(): bool { return B; }\n", 711, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 2);
+    assert(binding_bits(&r.consts:Read, 0) == 1u64);
+    assert(binding_bits(&r.consts:Read, 1) == 0u64);
+    return;
+}
+function check_enum(): void!AllocError {
+    // 无 payload 枚举常量记录变体号。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("enum E { A, B } const X: E = E::B; function f(): E { return X; }\n", 712, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 1);
+    assert(binding_kind(&r.consts:Read, 0) == 5u8);
+    assert(binding_variant(&r.consts:Read, 0) == 1u32);
+    return;
+}
+function check_call_diag(src: &[u8], code: u16, offset: u32, len: u32): void!AllocError {
+    let loaded: Loaded = load(src, 713)?;
+    assert(@len(loaded.parsed.diagnostics) == 0);
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 1);
+    assert(d.diags[0].code.raw == code);
+    assert(d.diags[0].span.offset == offset);
+    assert(d.diags[0].span.length == len);
+    return;
+}
+function check_reject(): void!AllocError {
+    // 先识别真实被调项，再拒绝未启用的常量调用；函数定义顺序和实参数量不改变诊断。
+    check_call_diag("const A: u32 = g(); function g(): u32 { return 1; } function f(): u32 { return A; }\n", 3008, 15, 3)?;
+    check_call_diag("function g(a: u32, b: u32): u32 { return a + b; } function f(): u32 { const A: u32 = g(1, 2); return A; }\n", 3008, 85, 7)?;
+    check_call_diag("foreign assert(cond: bool): void; const A: u32 = assert(true); function f(): u32 { return A; }\n", 3008, 49, 12)?;
+    check_call_diag("const A: u32 = missing(); function f(): u32 { return A; }\n", 4002, 15, 7)?;
+
+    // 变体构造仍走枚举载荷元数校验，不会被当作函数调用。
+    var arity: diag::DiagBuffer = diag::diagbuf_new();
+    let bad: typecheck::TypeCheckResult = run_case("enum E { Value(u32) } const A: E = E::Value(); const B: E = E::Value(1, 2); function f(b: bool): E { if b { return A; } return B; }\n", 717, &arity:ReadWrite)?;
+    // 类型推断与常量求值都可拒绝；验证码位和每个调用的位置，不固定报告次数。
+    var i: u32 = 0;
+    var zero: bool = false;
+    var multiple: bool = false;
+    while i < diag::diagbuf_count(&arity:Read) {
+        assert(arity.diags[i].code.raw == 5804);
+        let offset: u32 = arity.diags[i].span.offset;
+        assert(offset == 35 || offset == 60);
+        if offset == 35 { zero = true; }
+        if offset == 60 { multiple = true; }
+        i = i + 1;
+    }
+    assert(zero && multiple);
+    assert(binding_count(&bad.consts:Read) == 0);
+
+    // 非常量类型仍走常量物化拒绝；不是所有常量错误都变成函数调用错误。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u32[] = [1]; function f(): u32[] { return A; }\n", 716, &d:ReadWrite)?;
+    assert(has_code(&d:Read, 5006));
+    assert(binding_count(&r.consts:Read) == 0);
+    return;
+}
+function check_static(): void!AllocError {
+    // 字符串常量记录静态池下标。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const S: &[u8] = \"hi\"; function f(): &[u8] { return S; }\n", 714, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(binding_count(&r.consts:Read) == 1);
+    assert(binding_kind(&r.consts:Read, 0) == 4u8);
+    return;
+}
+function check_unused(): void!AllocError {
+    // 未被引用的模块常量报 N-9，且不影响求值本身。
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: typecheck::TypeCheckResult = run_case("const A: u32 = 9;\n", 715, &d:ReadWrite)?;
+    assert(has_code(&d:Read, 4009));
+    assert(binding_count(&r.consts:Read) == 1);
+    assert(binding_bits(&r.consts:Read, 0) == 9u64);
+    return;
+}
+function main(): void {
+    check_arithmetic()?;
+    check_shift()?;
+    check_overflow()?;
+    check_signed()?;
+    check_suffix()?;
+    check_forward()?;
+    check_bool()?;
+    check_enum()?;
+    check_reject()?;
+    check_static()?;
+    check_unused()?;
+    return;
+}

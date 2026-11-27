@@ -1,0 +1,38 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function main(): void {
+    // 同宽寄存器和 32 位内存源可用 MOV；16 位内存源在处理器之间读取宽度不同。
+    let aliases: [u8; 15] = [0x63, 0xd1, 0x66, 0x63, 0xd1, 0x45, 0x63, 0xc1,
+        0x44, 0x63, 0x4d, 0x80, 0x66, 0x63, 0x01];
+    encoding(&aliases[0..2]:Read, 7102)?;
+    encoding(&aliases[2..5]:Read, 7102)?;
+    encoding(&aliases[5..8]:Read, 7102)?;
+    encoding(&aliases[8..12]:Read, 7102)?;
+    encoding(&aliases[12..15]:Read, 7101)?;
+    encoding(&aliases[8..11]:Read, 7101)?;
+
+    // 多余前缀仍归长形态；必要的 64 位符号扩展继续合法。
+    let prefixed: [u8; 3] = [0x40, 0x63, 0xd1];
+    encoding(&prefixed[0..3]:Read, 7103)?;
+    let extended_word: [u8; 11] = [0x66, 0x45, 0x63, 0xc1,
+        0x66, 0x44, 0x63, 0x4d, 0x80, 0x66, 0x63];
+    encoding(&extended_word[0..4]:Read, 7102)?;
+    encoding(&extended_word[4..9]:Read, 7101)?;
+    encoding(&extended_word[4..8]:Read, 7101)?;
+    encoding(&extended_word[9..11]:Read, 7101)?;
+    let canonical: [u8; 18] = [0x89, 0xca, 0x66, 0x89, 0xca, 0x45, 0x89, 0xc8,
+        0x44, 0x8b, 0x4d, 0x80, 0x66, 0x8b, 0x01, 0x48, 0x63, 0xd1];
+    encoding(&canonical[0..18]:Read, 0)?;
+    return;
+}

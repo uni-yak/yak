@@ -1,0 +1,7 @@
+// expected_code: E1004
+// spec: spec/lang/type/u64.md L-4
+// 触发：带类型后缀的数值 18446744073709551616 超出 u64 的正值上界。
+function main(): void {
+    @drop(18446744073709551616u64);
+    return;
+}

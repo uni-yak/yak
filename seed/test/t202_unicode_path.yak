@@ -1,0 +1,3 @@
+// input: src=fixtures/中文.txt
+foreign file_size(name: &[u8]): u64; foreign assert(cond: bool): void;
+function main(): void { assert(file_size("src") == 3); }

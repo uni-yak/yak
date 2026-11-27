@@ -1,0 +1,135 @@
+// 未解析的解析器 AST。名字在检查阶段前保持 NameId 值。
+import types;
+import lex;
+
+export struct AstItem { kind: u8, span: types::Span, data: u32 }
+export struct AstFile { items: AstItem[], file: u16 }
+export struct Param { name: u32, type_ref: u32, span: types::Span }
+export struct FnDecl { name: u32, is_hash: bool, is_export: bool, params: Param[], ret_type: u32, body: u32, span: types::Span }
+export struct EnumVariant { name: u32, payload_type: u32, span: types::Span }
+export struct EnumDecl { name: u32, is_export: bool, variants: EnumVariant[], span: types::Span }
+export struct StructField { name: u32, type_ref: u32, span: types::Span }
+export struct StructDecl { name: u32, is_export: bool, fields: StructField[], span: types::Span }
+export struct ConstDecl { name: u32, type_ref: u32, init: u32, span: types::Span }
+export struct ForeignDecl { name: u32, is_hash: bool, params: Param[], ret_type: u32, span: types::Span }
+export struct ImportDecl { path: u32[], span: types::Span }
+
+export struct Block { stmts: u32[], span: types::Span }
+// 保留绑定只参与诊断阶段的名字解析；零表示普通条件分支。
+export struct IfBranch { condition: u32, body: u32, span: types::Span, reserved_binding: u32, binding_span: types::Span }
+export struct IfStmt { branches: IfBranch[], else_body: u32, span: types::Span }
+export struct WhileStmt { label: u32, condition: u32, body: u32, span: types::Span }
+export struct MatchPattern { kind: u8, path: u32[], binding: u32, span: types::Span }
+export struct MatchArm { pattern: u32, body: u32, span: types::Span }
+export struct MatchStmt { scrutinee: u32, arms: MatchArm[], span: types::Span }
+export struct AssignStmt { target: u32, value: u32, span: types::Span }
+export struct LocalDecl { name: u32, is_var: bool, is_out: bool, is_const: bool, type_ref: u32, init: u32, span: types::Span }
+export struct Stmt { kind: u8, span: types::Span, data: u32 }
+export struct Expr { kind: u8, span: types::Span, data: u64, integer_suffix: u8 }
+export struct UnaryExpr { operand: u32, op: u8, capability: u32, has_capability: bool, span: types::Span }
+export struct BinaryExpr { left: u32, right: u32, op: u8, span: types::Span }
+export struct CallArg { kind: u8, value: u32, span: types::Span }
+export struct CallExpr { callee: u32, args: CallArg[], span: types::Span, in_const: bool }
+// property 只记录拼写：1 为 len，2 为 cap。对象类型决定是否为内建属性。
+export struct MemberExpr { object: u32, name: u32, property: u8, recovery_name: bool, optional: bool, nullable_dispatch: bool, tag_name: bool, payload_name: bool, span: types::Span }
+export struct IndexExpr { object: u32, index: u32, span: types::Span }
+// 闭区间的 high 已是加一后的半开上界，inclusive_upper 保存原表达式供溢出诊断。
+export struct SliceExpr { object: u32, low: u32, high: u32, span: types::Span, inclusive_upper: u32 }
+export struct CastExpr { operand: u32, target_type: u32, span: types::Span }
+export struct StructFieldInit { name: u32, value: u32, span: types::Span }
+export struct StructCtorExpr { path: u32[], fields: StructFieldInit[], span: types::Span }
+export struct ArrayExpr { elements: u32[], span: types::Span }
+export struct PathExpr { segments: u32[], span: types::Span }
+export struct TypePath { segments: u32[], span: types::Span }
+export struct FixedArrayType { element: u32, length: u64, span: types::Span }
+export struct RefType { referent: u32, capability: u32, span: types::Span }
+export struct FnType { params: u32[], ret_type: u32, span: types::Span }
+export struct ErrorSet { members: u32[], span: types::Span }
+export struct PlainUnion { members: u32[], span: types::Span }
+export struct FallibleType { success: u32, error_set: u32, span: types::Span }
+export struct Type { kind: u8, span: types::Span, data: u32 }
+export struct AstPool {
+    items: AstItem[], functions: FnDecl[], enums: EnumDecl[], structs: StructDecl[],
+    consts: ConstDecl[], foreigns: ForeignDecl[], imports: ImportDecl[],
+    blocks: Block[], ifs: IfStmt[], whiles: WhileStmt[], matches: MatchStmt[], patterns: MatchPattern[], assigns: AssignStmt[], stmts: Stmt[], exprs: Expr[], unaries: UnaryExpr[], binaries: BinaryExpr[], calls: CallExpr[], members: MemberExpr[], indices: IndexExpr[], slices: SliceExpr[], casts: CastExpr[], ctors: StructCtorExpr[], arrays: ArrayExpr[], paths: PathExpr[], type_paths: TypePath[], fixed_arrays: FixedArrayType[], refs: RefType[], fn_refs: FnType[], error_sets: ErrorSet[], fallibles: FallibleType[], types: Type[], locals: LocalDecl[],
+    statics: lex::StaticEntry[], static_bytes: u8[], plain_unions: PlainUnion[], option_syntax: bool, union_syntax: bool, text_syntax: bool,
+}
+
+// 干净解析按后序写入表达式池；异常边不交给后续递归语义遍历。
+function child_depth(depths: &[u32], child: u32): u32 {
+    if child >= @len(depths) as u32 { return 4294967295u32; }
+    return depths[child];
+}
+
+function deeper(current: u32, depths: &[u32], child: u32): u32 {
+    let depth: u32 = child_depth(depths, child);
+    if depth > current { return depth; }
+    return current;
+}
+
+function descendants(pool: &AstPool:Read, depths: &[u32], kind: u8, data: u32): u32 {
+    if kind <= 5u8 || kind == 25u8 || kind == 29u8 || kind == 31u8 { return 0u32; }
+    if kind == 13u8 { return child_depth(depths, data); }
+    if kind == 20u8 && data < @len(pool.binaries) as u32 {
+        return deeper(child_depth(depths, pool.binaries[data].left), depths, pool.binaries[data].right);
+    }
+    if kind == 21u8 && data < @len(pool.unaries) as u32 { return child_depth(depths, pool.unaries[data].operand); }
+    if kind == 22u8 && data < @len(pool.calls) as u32 {
+        let call: &CallExpr:Read = &pool.calls[data]:Read;
+        var depth: u32 = child_depth(depths, call.callee);
+        var i: u32 = 0;
+        while i < @len(call.args) as u32 {
+            let arg: CallArg = call.args[i];
+            // out 实参保存名字而非表达式下标；移动实参仍是表达式。
+            if arg.kind == 0u8 || arg.kind == 2u8 { depth = deeper(depth, depths, arg.value); }
+            elseif arg.kind != 1u8 { return 4294967295u32; }
+            i = i + 1u32;
+        }
+        return depth;
+    }
+    if kind == 23u8 && data < @len(pool.members) as u32 { return child_depth(depths, pool.members[data].object); }
+    if kind == 24u8 && data < @len(pool.indices) as u32 {
+        return deeper(child_depth(depths, pool.indices[data].object), depths, pool.indices[data].index);
+    }
+    if kind == 26u8 && data < @len(pool.arrays) as u32 {
+        let array: &ArrayExpr:Read = &pool.arrays[data]:Read;
+        var depth: u32 = 0;
+        var i: u32 = 0;
+        while i < @len(array.elements) as u32 {
+            depth = deeper(depth, depths, array.elements[i]);
+            i = i + 1u32;
+        }
+        return depth;
+    }
+    if kind == 27u8 && data < @len(pool.slices) as u32 {
+        let slice: SliceExpr = pool.slices[data];
+        let depth: u32 = deeper(child_depth(depths, slice.object), depths, slice.low);
+        return deeper(depth, depths, slice.high);
+    }
+    if (kind == 28u8 || kind == 32u8) && data < @len(pool.casts) as u32 { return child_depth(depths, pool.casts[data].operand); }
+    if kind == 30u8 && data < @len(pool.ctors) as u32 {
+        let ctor: &StructCtorExpr:Read = &pool.ctors[data]:Read;
+        var depth: u32 = 0;
+        var i: u32 = 0;
+        while i < @len(ctor.fields) as u32 {
+            depth = deeper(depth, depths, ctor.fields[i].value);
+            i = i + 1u32;
+        }
+        return depth;
+    }
+    return 4294967295u32;
+}
+
+// 深度以节点数计，叶为一。每条已解析的表达式边只检查一次，不递归。
+export function expression_depth_within(pool: &AstPool:Read, limit: u32): bool!AllocError {
+    var depths: u32[] = [];
+    var id: u32 = 0;
+    while id < @len(pool.exprs) as u32 {
+        let expr: Expr = pool.exprs[id];
+        let max_child: u32 = descendants(pool, &depths[0..id]:Read, expr.kind, expr.data as u32);
+        if max_child >= limit { return false; }
+        @push(depths, max_child + 1u32)?;
+        id = id + 1u32;
+    }
+    return true;
+}

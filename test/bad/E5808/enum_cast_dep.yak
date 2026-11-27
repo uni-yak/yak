@@ -1,0 +1,2 @@
+// 为跨模块转换提供公开枚举。
+export enum Remote { Ready }

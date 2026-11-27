@@ -1,0 +1,7 @@
+// expected_code: E5809
+// spec: spec/lang/type/enum.md EN-6
+// 触发：成员 Value 的载荷是不可比较的结构体。
+struct Item { value: u32 }
+enum Choice { Empty, Value(Item) }
+function bad(a: Choice, b: Choice): void { @drop(a == b); }
+function main(): void { return; }

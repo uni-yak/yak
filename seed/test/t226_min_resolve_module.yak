@@ -1,0 +1,256 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+import lex;
+import parse;
+import diag;
+import resolve;
+foreign assert(cond: bool): void;
+function parse_ok(src: &[u8], file: u16): parse::ParseResult!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    return parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+}
+function main(): void {
+    // ── N-1：模块作用域重复声明 ──
+    let p1: parse::ParseResult = parse_ok("function a(): void { return; } function a(): void { return; }\n", 200)?;
+    assert(@len(p1.diagnostics) == 0);
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: resolve::ResolveResult = resolve::reserve_module(&p1.file:Read, &p1.pool:Read, &d1:ReadWrite)?;
+    assert(@len(r1.tables.defs) == 2);
+    assert(@len(r1.tables.scopes) == 3);
+    assert(r1.tables.scopes[0].parent == 0);
+    assert(r1.tables.scopes[0].kind == 1);
+    assert(r1.tables.scopes[0].binding_count == 1);
+    assert(r1.tables.scopes[1].kind == 3);
+    assert(r1.tables.scopes[1].parent == 1);
+    assert(r1.tables.scopes[1].owner == 1);
+    assert(r1.tables.scopes[2].kind == 3);
+    assert(r1.tables.scopes[2].owner == 2);
+    assert(r1.tables.block_scope[p1.pool.functions[0].body] == 2);
+    assert(r1.tables.block_scope[p1.pool.functions[1].body] == 3);
+    assert(@len(r1.tables.bindings) == 1);
+    assert(r1.tables.bindings[0].def == 1);
+    assert(@len(r1.file.items) == 2);
+    assert(r1.file.items[0].def_id == 1);
+    assert(r1.file.items[1].def_id == 2);
+    assert(r1.file.file == 200);
+    assert(diag::diagbuf_count(&d1:Read) == 1);
+    assert(d1.diags[0].code.raw == 4001);
+    assert(d1.diags[0].severity == 0);
+
+    // ── EN-1：enum 标签重名 ──
+    let p2: parse::ParseResult = parse_ok("enum E { A, A }\n", 201)?;
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: resolve::ResolveResult = resolve::reserve_module(&p2.file:Read, &p2.pool:Read, &d2:ReadWrite)?;
+    assert(@len(r2.tables.defs) == 1);
+    assert(@len(r2.tables.enum_members) == 1);
+    assert(diag::diagbuf_count(&d2:Read) == 1);
+    assert(d2.diags[0].code.raw == 5803);
+
+    // ── import 绑定、HashName 标记、struct 成员表 ──
+    let p3: parse::ParseResult = parse_ok("import io::fs; function #f(): void { return; } struct S { x: i32, y: i32 }\n", 202)?;
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: resolve::ResolveResult = resolve::reserve_module(&p3.file:Read, &p3.pool:Read, &d3:ReadWrite)?;
+    assert(@len(r3.tables.defs) == 3);
+    assert(@len(r3.tables.scopes) == 2);
+    assert(r3.tables.scopes[1].kind == 3);
+    assert(r3.tables.scopes[1].owner == 2);
+    assert(r3.tables.block_scope[p3.pool.functions[0].body] == 2);
+    assert(r3.tables.defs[0].kind == 6);
+    assert(r3.tables.defs[0].name != 0);
+    assert(r3.tables.defs[1].kind == 1);
+    assert((r3.tables.defs[1].flags & 1) == 1);
+    assert(r3.tables.defs[2].kind == 3);
+    assert(@len(r3.tables.bindings) == 3);
+    assert(r3.tables.bindings[0].name < r3.tables.bindings[1].name);
+    assert(r3.tables.bindings[1].name < r3.tables.bindings[2].name);
+    assert(@len(r3.tables.struct_fields) == 2);
+    assert(@len(r3.tables.enum_members) == 0);
+    assert(@len(r3.file.items) == 3);
+    assert(diag::diagbuf_count(&d3:Read) == 0);
+
+    // ── import 名与 function 名冲突 ──
+    let p4: parse::ParseResult = parse_ok("import io::fs; function io(): void { return; }\n", 203)?;
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: resolve::ResolveResult = resolve::reserve_module(&p4.file:Read, &p4.pool:Read, &d4:ReadWrite)?;
+    assert(@len(r4.tables.defs) == 2);
+    assert(@len(r4.tables.bindings) == 1);
+    assert(diag::diagbuf_count(&d4:Read) == 1);
+    assert(d4.diags[0].code.raw == 4006);
+
+    // ── #f 与 f 共享 NameId，不能共存 ──
+    let p5: parse::ParseResult = parse_ok("function #f(): void { return; } function f(): void { return; }\n", 204)?;
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: resolve::ResolveResult = resolve::reserve_module(&p5.file:Read, &p5.pool:Read, &d5:ReadWrite)?;
+    assert(@len(r5.tables.defs) == 2);
+    assert((r5.tables.defs[0].flags & 1) == 1);
+    assert(r5.tables.defs[1].flags == 0);
+    assert(@len(r5.tables.bindings) == 1);
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+    assert(d5.diags[0].code.raw == 4001);
+
+    // ── 函数 / 块 / 循环 / match arm 作用域与绑定 ──
+    let p6: parse::ParseResult = parse_ok("function f(a: i32, b: i32): void { let x: i32 = 1; if a > b { let x: i32 = 2; return; } while b > 0 { let y: i32 = 1; break; } match c { E::V(v) => { let z: i32 = 1; return; }, _ => { return; } } return; }\n", 205)?;
+    assert(@len(p6.diagnostics) == 0);
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let r6: resolve::ResolveResult = resolve::reserve_module(&p6.file:Read, &p6.pool:Read, &d6:ReadWrite)?;
+    assert(@len(r6.tables.defs) == 8);
+    assert(@len(r6.tables.scopes) == 8);
+    assert(r6.tables.defs[0].kind == 1);
+    assert(r6.tables.defs[1].kind == 7);
+    assert(r6.tables.defs[2].kind == 7);
+    assert(r6.tables.defs[3].kind == 8);
+    assert(r6.tables.defs[6].kind == 12);
+    assert(r6.tables.defs[1].scope == 2);
+    assert(r6.tables.defs[3].scope == 2);
+    assert(r6.tables.defs[4].scope == 3);
+    assert(r6.tables.defs[5].scope == 4);
+    assert(r6.tables.defs[6].scope == 5);
+    assert(r6.tables.defs[7].scope == 6);
+    assert(r6.tables.block_scope[p6.pool.functions[0].body] == 2);
+    assert(r6.tables.scopes[1].kind == 3);
+    assert(r6.tables.scopes[1].owner == 1);
+    assert(r6.tables.scopes[1].binding_count == 3);
+    assert(r6.tables.scopes[2].kind == 4);
+    assert(r6.tables.scopes[2].parent == 2);
+    assert(r6.tables.scopes[2].binding_count == 1);
+    assert(r6.tables.scopes[3].kind == 4);
+    assert(r6.tables.scopes[3].parent == 2);
+    assert(r6.tables.scopes[3].binding_count == 1);
+    assert(r6.tables.scopes[4].kind == 5);
+    assert(r6.tables.scopes[4].parent == 2);
+    assert(r6.tables.scopes[4].binding_count == 1);
+    assert(r6.tables.scopes[5].kind == 4);
+    assert(r6.tables.scopes[5].parent == 5);
+    assert(r6.tables.scopes[5].binding_count == 1);
+    assert(r6.tables.scopes[6].kind == 5);
+    assert(r6.tables.scopes[6].parent == 2);
+    assert(r6.tables.scopes[6].binding_count == 0);
+    assert(r6.tables.scopes[7].kind == 4);
+    assert(r6.tables.scopes[7].parent == 7);
+    assert(r6.tables.scopes[7].binding_count == 0);
+    assert(@len(r6.tables.bindings) == 8);
+    // 内层同名绑定遮蔽外层，参数仅能通过父链查到。
+    let scopes: &resolve::ResolveTables:Read = &r6.tables:Read;
+    let x: u32 = scopes.defs[3].name;
+    let a: u32 = scopes.defs[1].name;
+    assert(resolve::binding_in_scope(scopes, 3, x) == 5);
+    assert(resolve::lookup_binding(scopes, 3, x) == 5);
+    assert(resolve::binding_in_scope(scopes, 3, a) == 0);
+    assert(resolve::lookup_binding(scopes, 3, a) == 2);
+    assert(resolve::lookup_binding(scopes, 3, 4294967295u32) == 0);
+    assert(diag::diagbuf_count(&d6:Read) == 0);
+
+    // ── N-11：参数重名 ──
+    let p7: parse::ParseResult = parse_ok("function g(a: i32, a: i32): void { return; }\n", 206)?;
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let r7: resolve::ResolveResult = resolve::reserve_module(&p7.file:Read, &p7.pool:Read, &d7:ReadWrite)?;
+    assert(@len(r7.tables.defs) == 3);
+    assert(@len(r7.tables.scopes) == 2);
+    assert(@len(r7.tables.bindings) == 2);
+    assert(diag::diagbuf_count(&d7:Read) == 1);
+    assert(d7.diags[0].code.raw == 4011);
+
+    // ── N-1：同一 block 内重复局部声明 ──
+    let p8: parse::ParseResult = parse_ok("function h(): void { let x: i32 = 1; let x: i32 = 2; return; }\n", 207)?;
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let r8: resolve::ResolveResult = resolve::reserve_module(&p8.file:Read, &p8.pool:Read, &d8:ReadWrite)?;
+    assert(@len(r8.tables.defs) == 3);
+    assert(@len(r8.tables.scopes) == 2);
+    assert(@len(r8.tables.bindings) == 2);
+    assert(diag::diagbuf_count(&d8:Read) == 1);
+    assert(d8.diags[0].code.raw == 4001);
+
+    // ── N-1：函数体顶层局部与参数同域，不可遮蔽 ──
+    let p9: parse::ParseResult = parse_ok("function k(a: i32): void { let a: i32 = 1; return; }\n", 208)?;
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let r9: resolve::ResolveResult = resolve::reserve_module(&p9.file:Read, &p9.pool:Read, &d9:ReadWrite)?;
+    assert(@len(r9.tables.defs) == 3);
+    assert(@len(r9.tables.bindings) == 2);
+    assert(diag::diagbuf_count(&d9:Read) == 1);
+    assert(d9.diags[0].code.raw == 4001);
+    reserve_interleaved()?;
+    reserve_match_arm_collision()?;
+    return;
+}
+
+// 同臂直接局部不可遮蔽载荷；更深的块与独立的臂仍可使用同名。
+function reserve_match_arm_collision(): void!AllocError {
+    let parsed: parse::ParseResult = parse_ok("function f(): void { match e { A(n) => { let n: u32 = 0u32; if true { let n: u32 = 1u32; } }, B(n) => {} } }\n", 210u16)?;
+    assert(@len(parsed.diagnostics) == 0);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var work: resolve::ReservationBudget = resolve::reservation_budget(0u32);
+    work.index_locals = true;
+    let result: resolve::ResolveResult = resolve::reserve_module_limited(&parsed.file:Read, &parsed.pool:Read, &diags:ReadWrite, &work:ReadWrite)?;
+    let t: &resolve::ResolveTables:Read = &result.tables:Read;
+    let name: u32 = t.defs[1].name;
+    assert(@len(t.defs) == 5 && @len(t.bindings) == 4);
+    assert(diags.count == 1u32 && diags.diags[0].code.raw == 4010u16);
+    assert(diags.diags[0].span.file == 210u16 && diags.diags[0].span.offset == t.defs[2].decl_offset);
+    assert(diags.diags[0].span.length == parsed.pool.locals[0].span.length);
+    assert(diags.diags[0].refs.count == 2u8);
+    assert(diags.diags[0].refs.items[0].kind == 0u8 && diags.diags[0].refs.items[0].value == 2u32);
+    assert(diags.diags[0].refs.items[1].kind == 0u8 && diags.diags[0].refs.items[1].value == 3u32);
+    assert(resolve::is_rejected_arm_binding(t.defs[2]) && !resolve::is_rejected_arm_binding(t.defs[3]));
+    assert(resolve::binding_in_scope(t, t.defs[2].scope, name) == 0u32);
+    assert(resolve::lookup_binding(t, t.defs[2].scope, name) == 2u32);
+    assert(resolve::lookup_binding(t, t.defs[3].scope, name) == 4u32);
+    assert(resolve::lookup_binding(t, t.defs[4].scope, name) == 5u32);
+    assert(resolve::local_decl_def(t, 0u32, t.defs[2].scope, parsed.pool.locals[0]) == 0u32);
+    assert(resolve::local_decl_def(t, 1u32, t.defs[3].scope, parsed.pool.locals[1]) == 4u32);
+    return;
+}
+
+// 顶层、参数和子块交错预留；只比较同域先前声明，最后按作用域和名称物化。
+function reserve_interleaved(): void!AllocError {
+    let src: &[u8] = "function f(a: bool, b: bool): void { if true { const a: bool = true; } let c: bool = false; const a: bool = true; }\nfunction g(a: bool): void {}\nfunction f(): void {}\n";
+    let parsed: parse::ParseResult = parse_ok(src, 209u16)?;
+    assert(@len(parsed.diagnostics) == 0);
+    var exact_diags: diag::DiagBuffer = diag::diagbuf_new();
+    // 同域查重六次，插入排序比较十一次。
+    var exact: resolve::ReservationBudget = resolve::reservation_budget(17u32);
+    exact.index_locals = true;
+    let good: resolve::ResolveResult = resolve::reserve_module_limited(&parsed.file:Read, &parsed.pool:Read, &exact_diags:ReadWrite, &exact:ReadWrite)?;
+    assert(!exact.exhausted && exact.remaining == 0u32);
+    let t: &resolve::ResolveTables = &good.tables:Read;
+    assert(@len(t.defs) == 9 && @len(t.bindings) == 7 && @len(t.scopes) == 5 && @len(t.scoped) == 0);
+    assert(t.bindings[0].def == 1u32 && t.bindings[1].def == 7u32);
+    assert(t.bindings[2].def == 2u32 && t.bindings[3].def == 3u32 && t.bindings[4].def == 5u32);
+    assert(t.bindings[5].def == 4u32 && t.bindings[6].def == 8u32);
+    assert(@len(t.local_defs) == 2 && t.local_defs[0] == 4u32 && t.local_defs[1] == 5u32);
+    assert(resolve::local_decl_def(t, 2u32, 2u32, parsed.pool.locals[2]) == 0u32);
+    assert(@len(t.const_inits) == 1 && t.const_inits[0].def == 4u32 && t.const_inits[0].expr == parsed.pool.locals[0].init);
+    let name: u32 = t.defs[1].name;
+    assert(resolve::binding_in_scope(t, 2u32, name) == 2u32);
+    assert(resolve::binding_in_scope(t, 3u32, name) == 4u32);
+    assert(resolve::binding_in_scope(t, 4u32, name) == 8u32);
+    assert(exact_diags.count == 2u32 && exact_diags.diags[0].code.raw == 4001u16 && exact_diags.diags[1].code.raw == 4001u16);
+    assert(exact_diags.diags[0].span.offset == t.defs[5].decl_offset && exact_diags.diags[1].span.offset == t.defs[8].decl_offset);
+
+    var stopped_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var stopped: resolve::ReservationBudget = resolve::reservation_budget(5u32);
+    stopped.index_locals = true;
+    let partial: resolve::ResolveResult = resolve::reserve_module_limited(&parsed.file:Read, &parsed.pool:Read, &stopped_diags:ReadWrite, &stopped:ReadWrite)?;
+    assert(stopped.exhausted && stopped.remaining == 0u32 && @len(partial.tables.bindings) == 0);
+    assert(@len(partial.tables.local_defs) == 0 && @len(partial.tables.const_inits) == 0);
+    assert(stopped_diags.count == 1u32 && stopped_diags.diags[0].span.offset == exact_diags.diags[0].span.offset);
+    var i: u32 = 0;
+    while i < @len(partial.tables.scopes) as u32 {
+        assert(partial.tables.scopes[i].binding_start == 0u32 && partial.tables.scopes[i].binding_count == 0u32);
+        i = i + 1u32;
+    }
+    return;
+}

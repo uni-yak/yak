@@ -1,0 +1,38 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+enum Failure { Bad }
+function items(ok: bool, count: &u32:ReadWrite): Item[]!Failure {
+    *count = *count + 1u32;
+    if !ok { return Failure::Bad; }
+    return [Item { data: [42u32] }];
+}
+function index(ok: bool, count: &u32:ReadWrite): u32!Failure {
+    *count = *count + 1u32;
+    if !ok { return Failure::Bad; }
+    return 0u32;
+}
+function read(a: bool, b: bool, c: bool, count: &u32:ReadWrite): u32!Failure {
+    return (items(a, count)?)[index(b, count)?].data[index(c, count)?];
+}
+function recover(e: &Failure): u32 { return 99u32; }
+function first(count: &u32:ReadWrite): u32 { assert(*count == 1u32); *count = 2u32; return 0u32; }
+function second(count: &u32:ReadWrite): u32 { assert(*count == 2u32); *count = 3u32; return 0u32; }
+function order(count: &u32:ReadWrite): u32!Failure { return (items(true, count)?)[first(count)].data[second(count)]; }
+function main(): void {
+    var seen: u32 = 0u32;
+    assert(order(&seen:ReadWrite).catch(&recover) == 42u32);
+    assert(seen == 3u32);
+    let held: Item[] = [Item { data: [7u32] }];
+    assert((&held[0u32..1u32])[0u32].data[0u32] == 7u32);
+    var count: u32 = 0u32;
+    assert(read(false, true, true, &count:ReadWrite).catch(&recover) == 99u32);
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(read(true, false, true, &count:ReadWrite).catch(&recover) == 99u32);
+        assert(read(true, true, false, &count:ReadWrite).catch(&recover) == 99u32);
+        assert(read(true, true, true, &count:ReadWrite).catch(&recover) == 42u32);
+        i = i + 1u32;
+    }
+    assert(count == 4001u32);
+}

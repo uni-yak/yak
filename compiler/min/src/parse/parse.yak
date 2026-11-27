@@ -1,0 +1,329 @@
+// T1/base 解析器入口。仅 full 层的形态由词法器或解析器拒绝。
+// 语法：spec/lang/parse.md；诊断使用 spec/proc/error.def 码位。
+import lex;
+import types;
+import ast;
+import parse_core;
+import type_parser;
+import position;
+import parse_expr;
+import parse_stmt;
+
+export struct ParseResult { file: ast::AstFile, pool: ast::AstPool, diagnostics: parse_core::ParseDiagnostic[], diagnostics_truncated: bool, depth_exceeded: bool, match_path_exceeded: bool, recovery_exceeded: bool }
+
+const ALLOW_BATCH_DROP: u8 = 1;
+const CLASSIFY_IF_LET: u8 = 2;
+
+function span_at(p: &parse_core::Parser:Read, index: u32): types::Span { return parse_core::span_at(p, index); }
+function fail_code(p: &parse_core::Parser:ReadWrite, index: u32, code: types::ErrorCode): void!AllocError { parse_core::fail_code(p, index, code)?; return; }
+function fail(p: &parse_core::Parser:ReadWrite, index: u32): void!AllocError { parse_core::fail(p, index)?; return; }
+function is_kind(p: &parse_core::Parser:Read, kind: u8): bool { return parse_core::is_kind(p, kind); }
+function is_keyword(p: &parse_core::Parser:Read, id: u8): bool { return parse_core::is_keyword(p, id); }
+function is_op(p: &parse_core::Parser:Read, id: u8): bool { return parse_core::is_op(p, id); }
+function advance(p: &parse_core::Parser:ReadWrite): void { parse_core::advance(p); return; }
+function take_ident(p: &parse_core::Parser:ReadWrite): u32!AllocError { return parse_core::take_ident(p)?; }
+function expect_op(p: &parse_core::Parser:ReadWrite, id: u8): void!AllocError { parse_core::expect_op(p, id)?; return; }
+function parse_type(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError { return type_parser::parse_type(p, pool)?; }
+
+// ── 声明 ──
+function push_item(pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite, kind: u8, span: types::Span, data: u32): void!AllocError {
+    @push(pool.items, ast::AstItem { kind: kind, span: span, data: data })?;
+    @push(file.items, pool.items[@len(pool.items) as u32 - 1])?;
+    return;
+}
+function push_function(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite, exported: bool, names: &lex::NameTable:Read): void!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let hashed: bool = is_kind(p, 1);
+    let name: u32 = parse_core::take_callable_name(p)?;
+    if is_op(p, 16) {
+        // 无增泛型声明在当前 profile 有独立诊断，优先于一般泛型拒绝。
+        var code: u16 = 5101;
+        if hashed { code = 7022; }
+        type_parser::reject_generic_form(p, types::error_code(code))?;
+    }
+    if p.recovery_exceeded { return; }
+    expect_op(p, 26)?;
+    let params: ast::Param[] = parse_stmt::parse_params(p, pool, names, false)?;
+    if p.recovery_exceeded { return; }
+    expect_op(p, 27)?;
+    expect_op(p, 24)?;
+    let ret_type: u32 = parse_type(p, pool)?;
+    if p.recovery_exceeded { return; }
+    position::validate_return(p, pool, ret_type)?;
+    if !is_op(p, 28) {
+        fail(p, p.pos)?;
+        return;
+    }
+    let body: u32 = parse_stmt::parse_block(p, pool)?;
+    if p.match_path_exceeded || p.recovery_exceeded { return; }
+    let end: u32 = p.pos - 1;
+    let span: types::Span = parse_core::span_through(p, start, end);
+    let id: u32 = @len(pool.functions) as u32;
+    @push(pool.functions, ast::FnDecl { name: name, is_hash: hashed, is_export: exported, params: params, ret_type: ret_type, body: body, span: span })?;
+    push_item(pool, file, 0, span, id)?;
+    return;
+}
+function push_enum(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite, exported: bool): void!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let name: u32 = take_ident(p)?;
+    if is_op(p, 16) { type_parser::reject_generic_form(p, types::error_code(5101))?; }
+    if p.recovery_exceeded { return; }
+    expect_op(p, 28)?;
+    var variants: ast::EnumVariant[] = [];
+    while p.pos < @len(p.tokens) as u32 && !is_op(p, 29) && !is_kind(p, 9) {
+        let variant_start: u32 = p.pos;
+        if is_kind(p, 10) {
+            fail_code(p, p.pos, types::error_code(5810))?;
+            parse_core::recover_advance(p);
+            if is_op(p, 32) { parse_core::recover_advance(p); }
+            if p.recovery_exceeded { return; }
+            continue;
+        }
+        let variant_name: u32 = take_ident(p)?;
+        var payload: u32 = 4294967295u32;
+        if is_op(p, 26) {
+            advance(p);
+            payload = parse_type(p, pool)?;
+            if p.recovery_exceeded { return; }
+            position::validate_field(p, pool, payload)?;
+            expect_op(p, 27)?;
+        }
+        @push(variants, ast::EnumVariant { name: variant_name, payload_type: payload, span: span_at(p, variant_start) })?;
+        if is_op(p, 32) { advance(p); continue; }
+        if !is_op(p, 29) {
+            fail(p, p.pos)?;
+            parse_stmt::sync_members(p);
+            if p.recovery_exceeded { return; }
+        }
+    }
+    let end: u32 = p.pos;
+    expect_op(p, 29)?;
+    let span: types::Span = parse_core::span_through(p, start, end);
+    let id: u32 = @len(pool.enums) as u32;
+    @push(pool.enums, ast::EnumDecl { name: name, is_export: exported, variants: variants, span: span })?;
+    push_item(pool, file, 1, span, id)?;
+    return;
+}
+function push_struct(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite, exported: bool): void!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let name: u32 = take_ident(p)?;
+    if is_op(p, 16) { type_parser::reject_generic_form(p, types::error_code(5101))?; }
+    if p.recovery_exceeded { return; }
+    expect_op(p, 28)?;
+    var fields: ast::StructField[] = [];
+    while p.pos < @len(p.tokens) as u32 && !is_op(p, 29) && !is_kind(p, 9) {
+        let field_start: u32 = p.pos;
+        let field_name: u32 = take_ident(p)?;
+        expect_op(p, 24)?;
+        let type_ref: u32 = parse_type(p, pool)?;
+        if p.recovery_exceeded { return; }
+        position::validate_field(p, pool, type_ref)?;
+        @push(fields, ast::StructField { name: field_name, type_ref: type_ref, span: span_at(p, field_start) })?;
+        if is_op(p, 32) { advance(p); continue; }
+        if !is_op(p, 29) {
+            fail(p, p.pos)?;
+            parse_stmt::sync_members(p);
+            if p.recovery_exceeded { return; }
+        }
+    }
+    let end: u32 = p.pos;
+    expect_op(p, 29)?;
+    let span: types::Span = parse_core::span_through(p, start, end);
+    let id: u32 = @len(pool.structs) as u32;
+    @push(pool.structs, ast::StructDecl { name: name, is_export: exported, fields: fields, span: span })?;
+    push_item(pool, file, 2, span, id)?;
+    return;
+}
+function push_foreign(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite, names: &lex::NameTable:Read): void!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let hashed: bool = is_kind(p, 1);
+    let name: u32 = parse_core::take_callable_name(p)?;
+    if is_op(p, 16) { type_parser::reject_generic_form(p, types::error_code(2001))?; }
+    if p.recovery_exceeded { return; }
+    expect_op(p, 26)?;
+    let params: ast::Param[] = parse_stmt::parse_params(p, pool, names, true)?;
+    if p.recovery_exceeded { return; }
+    expect_op(p, 27)?;
+    expect_op(p, 24)?;
+    let ret_type: u32 = parse_type(p, pool)?;
+    if p.recovery_exceeded { return; }
+    position::validate_foreign_return(p, pool, ret_type)?;
+    let end: u32 = p.pos;
+    expect_op(p, 33)?;
+    let span: types::Span = parse_core::span_through(p, start, end);
+    let id: u32 = @len(pool.foreigns) as u32;
+    @push(pool.foreigns, ast::ForeignDecl { name: name, is_hash: hashed, params: params, ret_type: ret_type, span: span })?;
+    push_item(pool, file, 4, span, id)?;
+    return;
+}
+function push_const(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite): void!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let name: u32 = take_ident(p)?;
+    expect_op(p, 24)?;
+    let type_ref: u32 = parse_type(p, pool)?;
+    if p.recovery_exceeded { return; }
+    position::validate_const(p, pool, type_ref)?;
+    var init: u32 = 4294967295u32;
+    if is_op(p, 22) {
+        advance(p);
+        init = parse_expr::parse_const_expr(p, pool, 1)?;
+    } else {
+        fail_code(p, p.pos, types::error_code(2008))?;
+    }
+    let end: u32 = p.pos;
+    expect_op(p, 33)?;
+    let span: types::Span = parse_core::span_through(p, start, end);
+    let id: u32 = @len(pool.consts) as u32;
+    @push(pool.consts, ast::ConstDecl { name: name, type_ref: type_ref, init: init, span: span })?;
+    push_item(pool, file, 3, span, id)?;
+    return;
+}
+function push_import(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, file: &ast::AstFile:ReadWrite): void!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    var path: u32[] = [];
+    @push(path, take_ident(p)?)?;
+    while is_op(p, 0) {
+        advance(p);
+        @push(path, take_ident(p)?)?;
+    }
+    if !is_op(p, 33) {
+        fail(p, p.pos)?;
+        return;
+    }
+    let end: u32 = p.pos;
+    advance(p);
+    let span: types::Span = parse_core::span_through(p, start, end);
+    let id: u32 = @len(pool.imports) as u32;
+    @push(pool.imports, ast::ImportDecl { path: path, span: span })?;
+    push_item(pool, file, 5, span, id)?;
+    return;
+}
+
+function parse_file_limited(tokens: &[lex::Token], names: &lex::NameTable:Read, file: u16, limit: u32, depth_limit: u32, match_path_limit: u32, recovery_limit: u32, syntax_profile: u8): ParseResult!AllocError {
+    let methods: [u32; 4] = [parse_core::find_name(names, "then"), parse_core::find_name(names, "catch"),
+        parse_core::find_name(names, "or"), parse_core::find_name(names, "unwrap")];
+    var p: parse_core::Parser = parse_core::Parser { tokens: [], pos: 0, file: file, diagnostics: [], cap_read: 0, cap_write: 0, cap_readwrite: 0, float_f32: 0, float_f64: 0, len_name: 0, cap_name: 0, carrier_methods: methods, union_on_name: 0, tag_name: 0, payload_name: 0, string_name: 0, diagnostic_limit: limit, diagnostics_truncated: false, depth_limit: depth_limit, depth: 0, depth_exceeded: false, match_path_remaining: match_path_limit, match_path_limited: match_path_limit != 0u32, match_path_exceeded: false, recovery_remaining: recovery_limit, recovery_limited: recovery_limit != 0u32, recovery_exceeded: false, syntax_profile: syntax_profile };
+    p.cap_read = parse_core::find_name(names, "Read");
+    p.cap_write = parse_core::find_name(names, "Write");
+    p.cap_readwrite = parse_core::find_name(names, "ReadWrite");
+    p.float_f32 = parse_core::find_name(names, "f32");
+    p.float_f64 = parse_core::find_name(names, "f64");
+    p.len_name = parse_core::find_name(names, "len");
+    p.cap_name = parse_core::find_name(names, "cap");
+    p.string_name = parse_core::find_name(names, "string");
+    let nullable: bool = parse_core::option_syntax(&p:Read);
+    if nullable {
+        p.union_on_name = parse_core::find_name(names, "on");
+        p.tag_name = parse_core::find_name(names, "tag");
+    }
+    if parse_core::union_syntax(&p:Read) { p.payload_name = parse_core::find_name(names, "payload"); }
+    var copy_index: u32 = 0;
+    while copy_index < @len(tokens) as u32 { @push(p.tokens, tokens[copy_index])?; copy_index = copy_index + 1; }
+    var pool: ast::AstPool = ast::AstPool { items: [], functions: [], enums: [], structs: [], consts: [], foreigns: [], imports: [], blocks: [], ifs: [], whiles: [], matches: [], patterns: [], assigns: [], stmts: [], exprs: [], unaries: [], binaries: [], calls: [], members: [], indices: [], slices: [], casts: [], ctors: [], arrays: [], paths: [], type_paths: [], fixed_arrays: [], refs: [], fn_refs: [], error_sets: [], fallibles: [], types: [], locals: [], statics: [], static_bytes: [], plain_unions: [], option_syntax: nullable, union_syntax: parse_core::union_syntax(&p:Read), text_syntax: parse_core::text_syntax(&p:Read) };
+    var root: ast::AstFile = ast::AstFile { items: [], file: file };
+    while p.pos < @len(p.tokens) as u32 && !is_kind(&p:Read, 9) {
+        if !parse_core::is_item_start(&p:Read) {
+            let bad_pos: u32 = p.pos;
+            fail(&p:ReadWrite, bad_pos)?;
+            parse_core::recover_to_item(&p:ReadWrite);
+            continue;
+        }
+        if is_keyword(&p:Read, 16) { push_import(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite)?; }
+        elseif is_keyword(&p:Read, 0) { push_function(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, false, names)?; }
+        elseif is_keyword(&p:Read, 12) { push_enum(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, false)?; }
+        elseif is_keyword(&p:Read, 13) { push_struct(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, false)?; }
+        elseif is_keyword(&p:Read, 3) { push_const(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite)?; }
+        elseif is_keyword(&p:Read, 18) { push_foreign(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, names)?; }
+        elseif is_keyword(&p:Read, 17) {
+            advance(&p:ReadWrite);
+            if is_keyword(&p:Read, 0) { push_function(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, true, names)?; }
+            elseif is_keyword(&p:Read, 12) { push_enum(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, true)?; }
+            elseif is_keyword(&p:Read, 13) { push_struct(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, true)?; }
+            elseif is_keyword(&p:Read, 18) {
+                let foreign_pos: u32 = p.pos;
+                fail_code(&p:ReadWrite, foreign_pos, types::error_code(9204))?;
+                push_foreign(&p:ReadWrite, &pool:ReadWrite, &root:ReadWrite, names)?;
+            } else {
+                let bad_pos: u32 = p.pos;
+                fail(&p:ReadWrite, bad_pos)?;
+                parse_core::recover_to_item(&p:ReadWrite);
+            }
+        }
+        if p.pos < @len(p.tokens) as u32 && !is_kind(&p:Read, 9) && !parse_core::is_item_start(&p:Read) {
+            let tail_pos: u32 = p.pos;
+            fail(&p:ReadWrite, tail_pos)?;
+            parse_core::recover_to_item(&p:ReadWrite);
+        }
+    }
+    if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded {
+        return ParseResult { file: root, pool: pool, diagnostics: [], diagnostics_truncated: false, depth_exceeded: p.depth_exceeded, match_path_exceeded: p.match_path_exceeded, recovery_exceeded: p.recovery_exceeded };
+    }
+    parse_core::normalize_diagnostics(&p:ReadWrite)?;
+    var diagnostics: parse_core::ParseDiagnostic[] = [];
+    var diagnostic_index: u32 = 0;
+    while diagnostic_index < @len(p.diagnostics) as u32 {
+        @push(diagnostics, p.diagnostics[diagnostic_index])?;
+        diagnostic_index = diagnostic_index + 1;
+    }
+    return ParseResult { file: root, pool: pool, diagnostics: diagnostics, diagnostics_truncated: p.diagnostics_truncated, depth_exceeded: false, match_path_exceeded: false, recovery_exceeded: false };
+}
+
+export function parse_file(tokens: &[lex::Token], names: &lex::NameTable:Read, file: u16): ParseResult!AllocError {
+    return parse_file_limited(tokens, names, file, 0u32, 0u32, 0u32, 0u32, 0u8)?;
+}
+
+// 在解析的同时挂上词法阶段的静态池：字符串字面量的字节与静态索引需要在 MIR 生成时可见。
+// 旧的 parse_file 入口保持不变，只有需要静态池的调用方走这里，避免改动既有调用点。
+// 超限的解析结果不具备静态池，也不能提供给语义阶段。
+function parse_lexed_profile(lexed: &lex::LexResult:Read, file: u16, limit: u32, depth_limit: u32, match_path_limit: u32, recovery_limit: u32, syntax_profile: u8): ParseResult!AllocError {
+    var result: ParseResult = parse_file_limited(&lexed.tokens[0..@len(lexed.tokens)]:Read, &lexed.names:Read, file, limit, depth_limit, match_path_limit, recovery_limit, syntax_profile)?;
+    if result.depth_exceeded || result.match_path_exceeded || result.recovery_exceeded { return result; }
+    var i: u32 = 0;
+    while i < @len(lexed.statics) as u32 {
+        @push(result.pool.statics, lex::StaticEntry { offset: lexed.statics[i].offset, length: lexed.statics[i].length })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(lexed.static_bytes) as u32 {
+        @push(result.pool.static_bytes, lexed.static_bytes[i])?;
+        i = i + 1;
+    }
+    return result;
+}
+
+export function parse_lexed_limited(lexed: &lex::LexResult:Read, file: u16, limit: u32, depth_limit: u32, match_path_limit: u32, recovery_limit: u32): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, limit, depth_limit, match_path_limit, recovery_limit, 0u8)?;
+}
+
+export function parse_lexed(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_limited(lexed, file, 0u32, 0u32, 0u32, 0u32)?;
+}
+
+// 批量析构由调用方显式启用。输出只包含现有单参析构节点。
+export function parse_lexed_batch_drop(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, ALLOW_BATCH_DROP)?;
+}
+
+// 保留分支只进入名字解析与类型诊断，不能生成控制流。
+export function parse_lexed_reserved_if_let(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, CLASSIFY_IF_LET)?;
+}
+
+// 当前只开可空语法与类型检查路径；默认驱动仍拒绝扩展语法。
+export function parse_lexed_nullable(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 4u8)?;
+}
+
+export function parse_lexed_plain_union(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 12u8)?;
+}
+
+export function parse_lexed_text(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 16u8)?;
+}

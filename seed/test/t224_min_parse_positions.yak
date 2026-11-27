@@ -1,0 +1,494 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+import lex;
+import parse;
+foreign assert(cond: bool): void;
+function parse_ok(src: &[u8], file: u16): parse::ParseResult!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    return parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+}
+function check_params_expressions(): void!AllocError {
+    // ── 按值参数、访问位与函数静态引用 ──
+    let p1: parse::ParseResult = parse_ok("struct P { x: i32 } function f(p: P, y: &i32:Read): void { return; }\n", 100)?;
+    assert(@len(p1.diagnostics) == 0);
+    assert(@len(p1.pool.functions[0].params) == 2);
+    assert(p1.pool.types[p1.pool.functions[0].params[0].type_ref].kind == 1);
+    assert(p1.pool.types[p1.pool.functions[0].params[1].type_ref].kind == 4);
+    let pm: parse::ParseResult = parse_ok("function f(move: &i32): void { return; }\n", 99)?;
+    assert(@len(pm.diagnostics) == 0);
+    assert(@len(pm.pool.functions[0].params) == 1);
+    let p2: parse::ParseResult = parse_ok("struct Callback { run: &function(&i32): void }\nfunction f(cb: &function(&i32): void): void { return; }\n", 101)?;
+    assert(@len(p2.diagnostics) == 0);
+    assert(@len(p2.pool.fn_refs) == 2);
+    assert(p2.pool.types[p2.pool.structs[0].fields[0].type_ref].kind == 6);
+
+    // ── const 表达式与局部 const ──
+    let p3: parse::ParseResult = parse_ok("const a: i32 = 1 + 2 * 3; const b: [u8; 2] = [1, 2]; const c: &[u8] = \"ok\";\n", 102)?;
+    assert(@len(p3.diagnostics) == 0);
+    assert(@len(p3.pool.consts) == 3);
+    assert(@len(p3.pool.binaries) == 2);
+    assert(@len(p3.pool.arrays) == 1);
+    assert(p3.pool.types[p3.pool.consts[1].type_ref].kind == 2);
+    assert(p3.pool.types[p3.pool.consts[2].type_ref].kind == 5);
+    let p4: parse::ParseResult = parse_ok("function g(): void { const k: i32 = 1 + 2; let x: i32 = k as i32; @drop(x); return; }\n", 103)?;
+    assert(@len(p4.diagnostics) == 0);
+    assert(@len(p4.pool.locals) == 2);
+    assert(p4.pool.locals[0].is_const);
+    assert(!p4.pool.locals[1].is_const);
+    assert(@len(p4.pool.casts) == 1);
+    assert(@len(p4.pool.stmts) == 4);
+    assert(p4.pool.stmts[2].kind == 18);
+    assert(p4.pool.stmts[3].kind == 10);
+
+    // ── 切片、? 传播、前缀 && 与 @ 原语 ──
+    let p5: parse::ParseResult = parse_ok("function h(b: &[u8]): void { let s: &[u8] = &b[0..2]; let q: i32 = f()?; let r: &i32 = &&b; let n: u32 = @len(b) as u32; return; }\n", 104)?;
+    assert(@len(p5.diagnostics) == 0);
+    assert(@len(p5.pool.slices) == 1);
+    assert(p5.pool.exprs[@len(p5.pool.exprs) as u32 - 1].kind == 28);
+    assert(@len(p5.pool.unaries) == 3);
+    assert(p5.pool.unaries[1].op == 19);
+    assert(p5.pool.unaries[2].op == 19);
+    assert(@len(p5.pool.casts) == 1);
+    var question_count: u32 = 0;
+    var primitive_count: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(p5.pool.exprs) as u32 {
+        if p5.pool.exprs[i].kind == 13 { question_count = question_count + 1; }
+        if p5.pool.exprs[i].kind == 29 { primitive_count = primitive_count + 1; }
+        i = i + 1;
+    }
+    assert(question_count == 1);
+    assert(primitive_count == 1);
+
+    // ── 优先级：== 低于 <，& 低于 == ──
+    let p6: parse::ParseResult = parse_ok("function q(): void { let a: i32 = 1 + 2 * 3 == 7 && true; let b: i32 = 1 == 2 < 3; return; }\n", 105)?;
+    assert(@len(p6.diagnostics) == 0);
+    assert(@len(p6.pool.binaries) == 6);
+    assert(p6.pool.binaries[0].op == 13);
+    assert(p6.pool.binaries[1].op == 11);
+    assert(p6.pool.binaries[2].op == 1);
+    assert(p6.pool.binaries[3].op == 5);
+    assert(p6.pool.binaries[4].op == 16);
+    assert(p6.pool.binaries[5].op == 1);
+    assert(p6.pool.exprs[p6.pool.binaries[5].right].kind == 20);
+    assert(p6.pool.binaries[p6.pool.exprs[p6.pool.binaries[5].right].data as u32].op == 16);
+    let p7: parse::ParseResult = parse_ok("function u(): void { let x: bool = a & b == c; return; }\n", 106)?;
+    assert(@len(p7.diagnostics) == 0);
+    assert(@len(p7.pool.binaries) == 2);
+    assert(p7.pool.binaries[0].op == 1);
+    assert(p7.pool.binaries[1].op == 19);
+
+    return;
+}
+
+function check_positions(): void!AllocError {
+    // ── 位置规则负例 ──
+    let n1: parse::ParseResult = parse_ok("function bad(move x: &i32): void { return; }\n", 110)?;
+    assert(@len(n1.diagnostics) == 1);
+    assert(n1.diagnostics[0].code.raw == 2001);
+    assert(n1.diagnostics[0].span.offset == 13);
+    assert(n1.diagnostics[0].span.length == 4);
+    let n2: parse::ParseResult = parse_ok("function bad(x: i32!Err): void { return; }\n", 111)?;
+    assert(@len(n2.diagnostics) == 1);
+    assert(n2.diagnostics[0].code.raw == 5811);
+    let n3: parse::ParseResult = parse_ok("function bad(): void { out x: &function(&i32): void; return; }\n", 112)?;
+    assert(@len(n3.diagnostics) == 1);
+    assert(n3.diagnostics[0].code.raw == 6104);
+    let out_nullable: parse::ParseResult = parse_ok("function bad(): void { out x: (u32?); }\n", 118)?;
+    assert(@len(out_nullable.diagnostics) == 1);
+    assert(out_nullable.diagnostics[0].code.raw == 6104);
+    assert(out_nullable.diagnostics[0].span.length == 4);
+    let out_union: parse::ParseResult = parse_ok("function bad(): void { out x: (u32 | u64); }\n", 119)?;
+    assert(@len(out_union.diagnostics) == 1);
+    assert(out_union.diagnostics[0].code.raw == 6104);
+    let out_errors: parse::ParseResult = parse_ok("function bad(): void { out x: u32!(ErrA | ErrB); }\n", 120)?;
+    assert(@len(out_errors.diagnostics) == 1);
+    assert(out_errors.diagnostics[0].code.raw == 6104);
+    let n4: parse::ParseResult = parse_ok("function bad(): void { let a: [&i32; 2] = [1, 2]; return; }\n", 113)?;
+    assert(@len(n4.diagnostics) == 1);
+    assert(n4.diagnostics[0].code.raw == 2009);
+    let n5: parse::ParseResult = parse_ok("function bad(): void { let a: (&i32)[] = []; return; }\n", 114)?;
+    assert(@len(n5.diagnostics) == 1);
+    assert(n5.diagnostics[0].code.raw == 2009);
+    let n6: parse::ParseResult = parse_ok("const bad: &i32 = 1;\n", 115)?;
+    assert(@len(n6.diagnostics) == 1);
+    assert(n6.diagnostics[0].code.raw == 2009);
+    let n7: parse::ParseResult = parse_ok("const bad: i32[] = [1];\n", 116)?;
+    assert(@len(n7.diagnostics) == 1);
+    assert(n7.diagnostics[0].code.raw == 5006);
+    let n8: parse::ParseResult = parse_ok("const bad: [&i32; 2] = [1, 2];\n", 117)?;
+    assert(@len(n8.diagnostics) == 1);
+    assert(n8.diagnostics[0].code.raw == 2009);
+    let n9: parse::ParseResult = parse_ok("const bad: i32 = 1 && 2;\n", 118)?;
+    assert(@len(n9.diagnostics) == 1);
+    assert(n9.diagnostics[0].code.raw == 5006);
+    let n10: parse::ParseResult = parse_ok("const bad: i32 = a.b;\n", 119)?;
+    assert(@len(n10.diagnostics) == 1);
+    assert(n10.diagnostics[0].code.raw == 5006);
+
+    return;
+}
+
+// 枚举载荷遵守视图位置限制，函数静态引用不属于普通视图。
+function check_enum_payload_positions(): void!AllocError {
+    let ref: parse::ParseResult = parse_ok("enum E { A(&i32) }\n", 180)?;
+    assert(@len(ref.diagnostics) == 1 && ref.diagnostics[0].code.raw == 2009);
+    assert(ref.diagnostics[0].span.offset == 11 && ref.diagnostics[0].span.length == 4);
+    let slice: parse::ParseResult = parse_ok("enum E { A(&[u8]) }\n", 181)?;
+    assert(@len(slice.diagnostics) == 1 && slice.diagnostics[0].code.raw == 2009);
+    assert(slice.diagnostics[0].span.offset == 11 && slice.diagnostics[0].span.length == 5);
+    let nested: parse::ParseResult = parse_ok("enum E { A([&u8; 2]) }\n", 182)?;
+    assert(@len(nested.diagnostics) == 1 && nested.diagnostics[0].code.raw == 2009);
+    let callback: parse::ParseResult = parse_ok("enum E { A(&function(&u8): void) }\n", 183)?;
+    assert(@len(callback.diagnostics) == 0);
+    return;
+}
+function check_names_ctors(): void!AllocError {
+    // ── 引用能力名合法性（R-13 的语法部分）──
+    let cap1: parse::ParseResult = parse_ok("function bad(x: &i32:Bogus): void { return; }\n", 154)?;
+    assert(@len(cap1.diagnostics) == 1);
+    assert(cap1.diagnostics[0].code.raw == 2001);
+    assert(cap1.diagnostics[0].span.length == 5);
+    let cap2: parse::ParseResult = parse_ok("function ok(x: &i32:ReadWrite): void { return; }\n", 155)?;
+    assert(@len(cap2.diagnostics) == 0);
+    let cap3: parse::ParseResult = parse_ok("function bad(): void { let r: &i32 = &x:Bogus; return; }\n", 156)?;
+    assert(@len(cap3.diagnostics) == 1);
+    assert(cap3.diagnostics[0].code.raw == 2001);
+
+    // ── Write 不可由普通绑定、切片形参或外部形参建立 ──
+    let write_ok: parse::ParseResult = parse_ok("function fill(x: &u32:Write): void { *x = 1u32; }\nforeign read(data: &[u8]:ReadWrite): void;\n", 220)?;
+    assert(@len(write_ok.diagnostics) == 0);
+    let write_local: parse::ParseResult = parse_ok("function f(x: &u32): void { let v: (&u32:Write) = x; return; }\n", 221)?;
+    assert(@len(write_local.diagnostics) == 1);
+    assert(write_local.diagnostics[0].code.raw == 6101);
+    assert(write_local.diagnostics[0].span.length == 10);
+    let write_const: parse::ParseResult = parse_ok("const data: &[u8]:Write = \"x\";\n", 222)?;
+    assert(@len(write_const.diagnostics) == 1);
+    assert(write_const.diagnostics[0].code.raw == 6101);
+    let write_slice: parse::ParseResult = parse_ok("function f(x: &[u32]:Write): void { return; }\n", 223)?;
+    assert(@len(write_slice.diagnostics) == 1);
+    assert(write_slice.diagnostics[0].code.raw == 6101);
+    let write_foreign: parse::ParseResult = parse_ok("foreign f(x: &u32:Write, y: &[u8]:Write): void;\n", 225)?;
+    assert(@len(write_foreign.diagnostics) == 2);
+    assert(write_foreign.diagnostics[0].code.raw == 9201);
+    assert(write_foreign.diagnostics[1].code.raw == 9201);
+    let write_slot: parse::ParseResult = parse_ok("function f(): void { out x: &u32:Write; }\n", 226)?;
+    assert(@len(write_slot.diagnostics) == 1);
+    assert(write_slot.diagnostics[0].code.raw == 6104);
+
+    // ── enum 标签构造候选（解析层保留路径/调用，判定留给 check）──
+    let e1: parse::ParseResult = parse_ok("enum C { R, G(u8) } function f(): void { let a: C = C::R; let b: C = C::G(1); return; }\n", 157)?;
+    assert(@len(e1.diagnostics) == 0);
+    assert(@len(e1.pool.paths) == 2);
+    assert(@len(e1.pool.calls) == 1);
+
+    // ── 嵌套泛型 / union 与 error-set 交错恢复 ──
+    let g1: parse::ParseResult = parse_ok("function f(x: Vec<Vec<i32>>): void { return; }\n", 158)?;
+    assert(@len(g1.diagnostics) == 1);
+    assert(g1.diagnostics[0].code.raw == 5101);
+    assert(@len(g1.pool.functions) == 1);
+    let g2: parse::ParseResult = parse_ok("function f(): A | B!C { return; }\n", 159)?;
+    assert(@len(g2.diagnostics) == 1);
+    assert(g2.diagnostics[0].code.raw == 3008);
+    let g3: parse::ParseResult = parse_ok("function f(): A!(B | C) | D { return; }\n", 160)?;
+    assert(@len(g3.diagnostics) == 1);
+    assert(g3.diagnostics[0].code.raw == 3008);
+    let g4: parse::ParseResult = parse_ok("function f(): A | B | C { return; }\n", 161)?;
+    assert(@len(g4.diagnostics) == 1);
+    assert(g4.diagnostics[0].code.raw == 3008);
+
+    return;
+}
+
+function check_decl_rules(): void!AllocError {
+    // ── P-15 HashName 位置 ──
+    let h1: parse::ParseResult = parse_ok("function #ok(): void { return; }\nforeign #write(data: &[u8]): void;\n", 120)?;
+    assert(@len(h1.diagnostics) == 0);
+    assert(h1.pool.functions[0].is_hash);
+    assert(h1.pool.foreigns[0].is_hash);
+    let h2: parse::ParseResult = parse_ok("function bad(): void { let #x: i32 = 1; return; }\n", 121)?;
+    assert(@len(h2.diagnostics) == 1);
+    assert(h2.diagnostics[0].code.raw == 2015);
+    assert(h2.diagnostics[0].span.length == 2);
+    let h3: parse::ParseResult = parse_ok("struct Bad { #f: i32 }\n", 122)?;
+    assert(@len(h3.diagnostics) == 1);
+    assert(h3.diagnostics[0].code.raw == 2015);
+    let h4: parse::ParseResult = parse_ok("function bad(): void { #f(); return; }\n", 123)?;
+    assert(@len(h4.diagnostics) == 1);
+    assert(h4.diagnostics[0].code.raw == 2015);
+    let h5: parse::ParseResult = parse_ok("function bad(x: #T): void { return; }\n", 124)?;
+    assert(@len(h5.diagnostics) == 1);
+    assert(h5.diagnostics[0].code.raw == 2015);
+
+    // ── P-14 match 标签重复 / 通配臂位置 ──
+    let m1: parse::ParseResult = parse_ok("enum C { R } function f(): void { match c { C::R => { return; }, C::R => { return; } } }\n", 130)?;
+    assert(@len(m1.diagnostics) == 1);
+    assert(m1.diagnostics[0].code.raw == 2014);
+    let m2: parse::ParseResult = parse_ok("function f(): void { match c { _ => { return; }, _ => { return; } } }\n", 131)?;
+    assert(@len(m2.diagnostics) == 1);
+    assert(m2.diagnostics[0].code.raw == 2014);
+    let m3: parse::ParseResult = parse_ok("enum C { R } function f(): void { match c { _ => { return; }, C::R => { return; } } }\n", 132)?;
+    assert(@len(m3.diagnostics) == 1);
+    assert(m3.diagnostics[0].code.raw == 2014);
+
+    // ── full-only 组合与声明恢复 ──
+    let f1: parse::ParseResult = parse_ok("function bad(): i32!E? { return; }\n", 140)?;
+    assert(@len(f1.diagnostics) > 0);
+    assert(f1.diagnostics[0].code.raw == 5812);
+    let f2: parse::ParseResult = parse_ok("function bad(): (i32!E)? { return; }\n", 141)?;
+    assert(@len(f2.diagnostics) > 0);
+    assert(f2.diagnostics[0].code.raw == 3008);
+    let f3: parse::ParseResult = parse_ok("function bad(): A | B { return; }\n", 142)?;
+    assert(@len(f3.diagnostics) == 1);
+    assert(f3.diagnostics[0].code.raw == 3008);
+    let f4: parse::ParseResult = parse_ok("enum E<T> { A }\n", 143)?;
+    assert(@len(f4.diagnostics) == 1);
+    assert(f4.diagnostics[0].code.raw == 5101);
+    assert(@len(f4.pool.enums) == 1);
+    let f5: parse::ParseResult = parse_ok("export foreign write(data: &[u8]): void;\n", 144)?;
+    assert(@len(f5.diagnostics) == 1);
+    assert(f5.diagnostics[0].code.raw == 9204);
+    assert(@len(f5.pool.foreigns) == 1);
+    // 外部声明没有泛型形参语法，仍按普通产生式失败恢复。
+    let f6: parse::ParseResult = parse_ok("foreign write<T>(data: &[u8]): void;\n", 144)?;
+    assert(@len(f6.diagnostics) == 1 && f6.diagnostics[0].code.raw == 2001);
+    assert(@len(f6.pool.foreigns) == 1);
+    // 浮点类型拒绝在名称处；普通同名标识符与限定路径仍可解析。
+    let float_a: parse::ParseResult = parse_ok("function bad(x: f32): void { return; } function next(): void { return; }\n", 144)?;
+    assert(@len(float_a.diagnostics) == 1 && float_a.diagnostics[0].code.raw == 5002);
+    assert(float_a.diagnostics[0].span.offset == 16 && float_a.diagnostics[0].span.length == 3);
+    let float_b: parse::ParseResult = parse_ok("function bad(): void!f64 { return; }\n", 144)?;
+    assert(@len(float_b.diagnostics) == 1 && float_b.diagnostics[0].code.raw == 5002);
+    assert(float_b.diagnostics[0].span.offset == 21 && float_b.diagnostics[0].span.length == 3);
+    let float_c: parse::ParseResult = parse_ok("struct Bad { value: [f64; 2] }\n", 144)?;
+    assert(@len(float_c.diagnostics) == 1 && float_c.diagnostics[0].code.raw == 5002);
+    assert(float_c.diagnostics[0].span.offset == 21 && float_c.diagnostics[0].span.length == 3);
+    assert(@len(float_a.pool.functions) == 2);
+    let named: parse::ParseResult = parse_ok("import m; function f32(f64: m::f32): void { return; }\n", 144)?;
+    assert(@len(named.diagnostics) == 0);
+    let r1: parse::ParseResult = parse_ok("function ok1(): void { return; } let bad: i32 = 1; function ok2(): void { return; }\n", 145)?;
+    assert(@len(r1.diagnostics) == 1);
+    assert(@len(r1.pool.functions) == 2);
+    let r2: parse::ParseResult = parse_ok("enum E { A B }\n", 146)?;
+    assert(@len(r2.diagnostics) == 1);
+    assert(@len(r2.pool.enums) == 1);
+    assert(@len(r2.pool.enums[0].variants) == 1);
+    let r3: parse::ParseResult = parse_ok("struct S { x: i32 y: i32 }\n", 147)?;
+    assert(@len(r3.diagnostics) == 1);
+    assert(@len(r3.pool.structs) == 1);
+    assert(@len(r3.pool.structs[0].fields) == 1);
+    let r4: parse::ParseResult = parse_ok("foreign bad(x: [u8; 2]): void;\n", 148)?;
+    assert(@len(r4.diagnostics) == 1);
+    assert(r4.diagnostics[0].code.raw == 9201);
+    assert(@len(r4.pool.foreigns) == 1);
+
+    // ── struct 构造与 if/while 条件消歧 ──
+    let c1: parse::ParseResult = parse_ok("struct Point { x: i32, y: i32 } function f(): void { let p: Point = Point { x: 1, y: 2 }; return; }\n", 149)?;
+    assert(@len(c1.diagnostics) == 0);
+    assert(@len(c1.pool.ctors) == 1);
+    assert(@len(c1.pool.ctors[0].path) == 1);
+    assert(@len(c1.pool.ctors[0].fields) == 2);
+    assert(c1.pool.ctors[0].fields[0].name != c1.pool.ctors[0].fields[1].name);
+    let c2: parse::ParseResult = parse_ok("function f(): void { let p: m::Point = m::Point { x: 1, }; return; }\n", 150)?;
+    assert(@len(c2.diagnostics) == 0);
+    assert(@len(c2.pool.ctors) == 1);
+    assert(@len(c2.pool.ctors[0].path) == 2);
+    assert(@len(c2.pool.ctors[0].fields) == 1);
+    let c3: parse::ParseResult = parse_ok("function f(): void { let p: i32 = 1 { x: 2 }; return; }\n", 151)?;
+    assert(@len(c3.diagnostics) > 0);
+    assert(@len(c3.pool.ctors) == 0);
+    let c4: parse::ParseResult = parse_ok("function f(x: bool): void { if x { y: while true { break; } } return; }\n", 152)?;
+    assert(@len(c4.diagnostics) == 0);
+    assert(@len(c4.pool.whiles) == 1);
+    assert(c4.pool.whiles[0].label != 0);
+    let c5: parse::ParseResult = parse_ok("struct P { x: i32 } function f(): void { let p: P = P {}; return; }\n", 153)?;
+    assert(@len(c5.diagnostics) == 0);
+    assert(@len(c5.pool.ctors) == 1);
+    assert(@len(c5.pool.ctors[0].fields) == 0);
+
+    return;
+}
+
+function check_call_args(): void!AllocError {
+    // ── out 实参与 MoveArg ──
+    let ca1: parse::ParseResult = parse_ok("function f(): void { out r: u32; divide(20, 4, out r); return; }\n", 180)?;
+    assert(@len(ca1.diagnostics) == 0);
+    assert(@len(ca1.pool.calls) == 1);
+    assert(@len(ca1.pool.calls[0].args) == 3);
+    assert(ca1.pool.calls[0].args[0].kind == 0);
+    assert(ca1.pool.calls[0].args[2].kind == 1);
+    assert(ca1.pool.calls[0].args[2].value != 0);
+    let ca2: parse::ParseResult = parse_ok("function f(): void { sink(@move(p), q); return; }\n", 181)?;
+    assert(@len(ca2.diagnostics) == 0);
+    assert(@len(ca2.pool.calls) == 1);
+    assert(@len(ca2.pool.calls[0].args) == 2);
+    assert(ca2.pool.calls[0].args[0].kind == 2);
+    assert(ca2.pool.calls[0].args[1].kind == 0);
+    let ca3: parse::ParseResult = parse_ok("function f(): void { sink(@move(p)); return; }\n", 182)?;
+    assert(@len(ca3.diagnostics) == 0);
+    assert(@len(ca3.pool.calls) == 1);
+    assert(@len(ca3.pool.calls[0].args) == 1);
+    assert(ca3.pool.calls[0].args[0].kind == 2);
+    let ca4: parse::ParseResult = parse_ok("function f(): void { sink(out); return; }\n", 183)?;
+    assert(@len(ca4.diagnostics) > 0);
+    let ca5: parse::ParseResult = parse_ok("function f(): void { let x: u32[] = @move(a); return; }\n", 184)?;
+    assert(@len(ca5.diagnostics) == 0);
+    assert(@len(ca5.pool.calls) == 1);
+    assert(ca5.pool.exprs[ca5.pool.calls[0].callee].kind == 29);
+
+    return;
+}
+
+function check_spans(): void!AllocError {
+    // ── 诊断 code / offset / length 矩阵 ──
+    let sp1: parse::ParseResult = parse_ok("function f(): void { (1 + 2) = 3; return; }\n", 170)?;
+    assert(@len(sp1.diagnostics) == 1);
+    assert(sp1.diagnostics[0].code.raw == 2006);
+    assert(sp1.diagnostics[0].span.offset == 29);
+    assert(sp1.diagnostics[0].span.length == 1);
+    let sp2: parse::ParseResult = parse_ok("function f(): void { out x: i32 = 1; return; }\n", 171)?;
+    assert(@len(sp2.diagnostics) == 1);
+    assert(sp2.diagnostics[0].code.raw == 2007);
+    assert(sp2.diagnostics[0].span.offset == 32);
+    assert(sp2.diagnostics[0].span.length == 1);
+    let sp3: parse::ParseResult = parse_ok("function f(): void { let x: i32; return; }\n", 172)?;
+    assert(@len(sp3.diagnostics) == 1);
+    assert(sp3.diagnostics[0].code.raw == 2008);
+    assert(sp3.diagnostics[0].span.offset == 31);
+    assert(sp3.diagnostics[0].span.length == 1);
+    let sp4: parse::ParseResult = parse_ok("struct S { f: &i32 }\n", 173)?;
+    assert(@len(sp4.diagnostics) == 1);
+    assert(sp4.diagnostics[0].code.raw == 2009);
+    assert(sp4.diagnostics[0].span.offset == 14);
+    assert(sp4.diagnostics[0].span.length == 4);
+    let sp5: parse::ParseResult = parse_ok("function f(): i32? { return; }\n", 174)?;
+    assert(@len(sp5.diagnostics) == 1);
+    assert(sp5.diagnostics[0].code.raw == 3008);
+    assert(sp5.diagnostics[0].span.offset == 17);
+    assert(sp5.diagnostics[0].span.length == 1);
+    let sp6: parse::ParseResult = parse_ok("function f(): void { match x { _ => { return; }, _ => { return; } } }\n", 175)?;
+    assert(@len(sp6.diagnostics) == 1);
+    assert(sp6.diagnostics[0].code.raw == 2014);
+    assert(sp6.diagnostics[0].span.offset == 49);
+    assert(sp6.diagnostics[0].span.length == 1);
+    let sp7: parse::ParseResult = parse_ok("function f(): void { let #x: i32 = 1; return; }\n", 176)?;
+    assert(@len(sp7.diagnostics) == 1);
+    assert(sp7.diagnostics[0].code.raw == 2015);
+    assert(sp7.diagnostics[0].span.offset == 25);
+    assert(sp7.diagnostics[0].span.length == 2);
+    let sp8: parse::ParseResult = parse_ok("function f(): A | B { return; }\n", 177)?;
+    assert(@len(sp8.diagnostics) == 1);
+    assert(sp8.diagnostics[0].code.raw == 3008);
+    assert(sp8.diagnostics[0].span.offset == 16);
+    assert(sp8.diagnostics[0].span.length == 1);
+    let sp9: parse::ParseResult = parse_ok("function f(x: i32!E): void { return; }\n", 178)?;
+    assert(@len(sp9.diagnostics) == 1);
+    assert(sp9.diagnostics[0].code.raw == 5811);
+    assert(sp9.diagnostics[0].span.offset == 14);
+    assert(sp9.diagnostics[0].span.length == 5);
+    let sp10: parse::ParseResult = parse_ok("export foreign write(x: u8): void;\n", 179)?;
+    assert(@len(sp10.diagnostics) == 1);
+    assert(sp10.diagnostics[0].code.raw == 9204);
+    assert(sp10.diagnostics[0].span.offset == 7);
+    assert(sp10.diagnostics[0].span.length == 7);
+
+    // 双点仅在下标下界结束时充当切片分隔符。
+    let range: parse::ParseResult = parse_ok("function f(): void { let k: u32 = 1 + 2..3; return; }\n", 184)?;
+    assert(@len(range.diagnostics) == 1);
+    assert(range.diagnostics[0].code.raw == 1010);
+    assert(range.diagnostics[0].span.offset == 39);
+    assert(range.diagnostics[0].span.length == 2);
+    let group_range: parse::ParseResult = parse_ok("function f(a: &[u8]): void { let k: u8 = a[(1..2)]; return; }\n", 185)?;
+    assert(@len(group_range.diagnostics) == 1);
+    assert(group_range.diagnostics[0].code.raw == 1010);
+    assert(group_range.diagnostics[0].span.offset == 45);
+    assert(group_range.diagnostics[0].span.length == 2);
+    let const_range: parse::ParseResult = parse_ok("const k: u32 = 1..2;\n", 186)?;
+    assert(@len(const_range.diagnostics) == 1);
+    assert(const_range.diagnostics[0].code.raw == 1010);
+    assert(const_range.diagnostics[0].span.offset == 16);
+    assert(const_range.diagnostics[0].span.length == 2);
+    let slice: parse::ParseResult = parse_ok("function f(a: &[u8], b: &[u32]): void { let v: &[u8] = &a[b[0..2][0] + 1..4]; return; }\n", 187)?;
+    assert(@len(slice.diagnostics) == 0);
+    assert(@len(slice.pool.slices) == 2);
+    assert(@len(slice.pool.indices) == 1);
+    let const_slice: parse::ParseResult = parse_ok("const k: u32 = A[0..1];\n", 188)?;
+    assert(@len(const_slice.diagnostics) == 1);
+    assert(const_slice.diagnostics[0].code.raw == 5006);
+    let item_range: parse::ParseResult = parse_ok("..\nfunction f(): void { return; }\n", 189)?;
+    assert(@len(item_range.diagnostics) == 1);
+    assert(item_range.diagnostics[0].code.raw == 1010);
+    assert(item_range.diagnostics[0].span.offset == 0);
+    assert(item_range.diagnostics[0].span.length == 2);
+    let prefix_range: parse::ParseResult = parse_ok("function f(): u32 { return ..2; }\n", 190)?;
+    assert(@len(prefix_range.diagnostics) == 1);
+    assert(prefix_range.diagnostics[0].code.raw == 1010);
+    assert(prefix_range.diagnostics[0].span.offset == 27);
+    assert(prefix_range.diagnostics[0].span.length == 2);
+    let prefix_const_range: parse::ParseResult = parse_ok("const k: u32 = ..2;\n", 191)?;
+    assert(@len(prefix_const_range.diagnostics) == 1);
+    assert(prefix_const_range.diagnostics[0].code.raw == 1010);
+    assert(prefix_const_range.diagnostics[0].span.offset == 15);
+    assert(prefix_const_range.diagnostics[0].span.length == 2);
+    assert(@len(item_range.pool.functions) == 1);
+
+    // ── 诊断排序与 span ──
+    let s1: parse::ParseResult = parse_ok("function bad(): void { let #x: i32 = 1; let #y: i32 = 2; return; }\n", 150)?;
+    assert(@len(s1.diagnostics) == 2);
+    assert(s1.diagnostics[0].span.offset < s1.diagnostics[1].span.offset);
+    assert(s1.diagnostics[0].span.file == 150);
+    return;
+}
+
+// 大块和声明保留完整字节跨度，缺右花括号仍在 EOF 报告零宽诊断。
+function check_long_spans(): void!AllocError {
+    var src: u8[] = [];
+    let prefix: &[u8] = "function long(): void { let x: i32 = ";
+    let suffix: &[u8] = "1; return; }\n";
+    var i: u32 = 0;
+    while i < @len(prefix) as u32 { @push(src, prefix[i])?; i = i + 1; }
+    i = 0;
+    let padding: u32 = 65536;
+    while i < padding { @push(src, 32u8)?; i = i + 1; }
+    i = 0;
+    while i < @len(suffix) as u32 { @push(src, suffix[i])?; i = i + 1; }
+    let size: u32 = @len(src) as u32;
+    let good: parse::ParseResult = parse_ok(&src[0..size]:Read, 180)?;
+    assert(@len(good.diagnostics) == 0);
+    assert(@len(good.pool.functions) == 1 && @len(good.pool.blocks) == 1 && @len(good.pool.locals) == 1);
+    // 函数和块以右花括号收尾，局部声明包含第一个分号。
+    let brace_end: u32 = size - 1u32;
+    let local_end: u32 = (@len(prefix) as u32) + padding + 2u32;
+    assert(good.pool.functions[0].span.offset == 0 && good.pool.functions[0].span.length == brace_end);
+    assert(good.pool.blocks[0].span.offset == 22 && good.pool.blocks[0].span.length == brace_end - 22u32);
+    assert(good.pool.locals[0].span.offset == 24 && good.pool.locals[0].span.length == local_end - 24u32);
+    src[size - 2] = 32u8;
+    let broken: parse::ParseResult = parse_ok(&src[0..size]:Read, 181)?;
+    assert(@len(broken.diagnostics) == 1);
+    assert(broken.diagnostics[0].code.raw == 2001 && broken.diagnostics[0].span.file == 181);
+    assert(broken.diagnostics[0].span.offset == size && broken.diagnostics[0].span.length == 0);
+    return;
+}
+
+function main(): void {
+    check_long_spans()?;
+    check_params_expressions()?;
+    check_positions()?;
+    check_enum_payload_positions()?;
+    check_names_ctors()?;
+    check_decl_rules()?;
+    check_call_args()?;
+    check_spans()?;
+    return;
+}

@@ -1,0 +1,26 @@
+// t15: 互递归（同模块前向引用）+ assert
+foreign assert(cond: bool): void;
+
+function is_even(n: u32): bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+function is_odd(n: u32): bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+function main(): void {
+    let e: bool = is_even(10);
+    let o: bool = is_odd(7);
+    assert(e == true);
+    assert(o == true);
+    assert(is_even(3) == false);
+    assert(is_odd(4) == false);
+    return;
+}

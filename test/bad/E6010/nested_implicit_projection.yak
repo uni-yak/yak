@@ -1,0 +1,10 @@
+// expected_code: E6010
+// expected_diagnostics: E6010 E6010
+// spec: spec/lang/base.md#R-16
+// 触发：字段和数组索引都不能隐式穿过两层引用。
+struct Record { value: u32 }
+
+function field(r: &Record:Read): u32 { return (&r).value; }
+function index(a: &([u32; 2]):Read): u32 { return (&a)[0u32]; }
+
+function main(): void { return; }

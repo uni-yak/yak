@@ -1,0 +1,17 @@
+// t46: 函数返回值assert（真实assert）
+foreign assert(cond: bool): void;
+
+function add(a: u32, b: u32): u32 {
+    return a + b;
+}
+
+function mul(a: u32, b: u32): u32 {
+    return a * b;
+}
+
+function main(): void {
+    assert(add(3, 4) == 7);
+    assert(mul(6, 7) == 42);
+    assert(add(mul(2, 3), mul(4, 5)) == 26);
+    return;
+}

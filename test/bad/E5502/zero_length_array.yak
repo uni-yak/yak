@@ -1,0 +1,6 @@
+// expected_code: E5502
+// spec: spec/lang/type/array.md#LY-2
+// 触发：用零长度定长数组作可存储字段。
+struct Container { items: [u32; 0] }
+
+function main(): void { return; }

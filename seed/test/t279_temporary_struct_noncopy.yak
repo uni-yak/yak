@@ -1,0 +1,4 @@
+// expected_trap: partial move forbidden
+struct Item { data: u32[] }
+function make(): Item { return Item { data: [1u32] }; }
+function main(): void { let value: u32[] = make().data; @drop(value); }

@@ -1,0 +1,6 @@
+// 开放管道诊断探针，保持空能力集。
+import diagnostic_service;
+
+function main(): void {
+    diagnostic_service::run(false);
+}

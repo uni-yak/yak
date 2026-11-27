@@ -1,0 +1,13 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad }
+function index(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 1u32; }
+function read(data: &[u32], ok: bool): u32!Failure { return (&data[0u32..2u32])[index(ok)?]; }
+function recover(e: &Failure): u32 { return 99u32; }
+function main(): void {
+    assert("abc"[1u32] == 98u8);
+    let data: u32[] = [7u32, 8u32, 9u32];
+    assert((&data[0u32..2u32])[1u32] == 8u32);
+    assert(read(&data[0u32..2u32], true).catch(&recover) == 8u32);
+    assert(read(&data[0u32..2u32], false).catch(&recover) == 99u32);
+    assert(data[2u32] == 9u32);
+}

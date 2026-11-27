@@ -1,0 +1,8 @@
+// expected_code: E5804
+// spec: spec/lang/type/enum.md EN-2
+// 触发：构造带载荷标签时省略载荷。
+enum Record { Payload(u16) }
+
+function make(): Record { return Record::Payload; }
+
+function main(): void { return; }

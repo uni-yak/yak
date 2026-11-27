@@ -1,0 +1,28 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+function values(ok: bool, count: &u32:ReadWrite): u32[]!Failure {
+    *count = *count + 1u32;
+    if !ok { return Failure::Bad; }
+    return [1u32, 2u32, 3u32];
+}
+function length(ok: bool, count: &u32:ReadWrite): u64!Failure {
+    return (values(ok, count)?).len;
+}
+function capacity(ok: bool, count: &u32:ReadWrite): u64!Failure {
+    return (values(ok, count)?).cap;
+}
+function recover(e: &Failure): u64 { return 99u64; }
+function main(): void {
+    var count: u32 = 0;
+    assert(length(false, &count:ReadWrite).catch(&recover) == 99u64);
+    assert(capacity(false, &count:ReadWrite).catch(&recover) == 99u64);
+    assert(count == 2u32);
+    var i: u32 = 0;
+    while i < 1000 {
+        assert(length(true, &count:ReadWrite).catch(&recover) == 3u64);
+        assert(capacity(true, &count:ReadWrite).catch(&recover) >= 3u64);
+        i = i + 1u32;
+    }
+    assert(count == 2002u32);
+}

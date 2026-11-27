@@ -1,0 +1,11 @@
+// t73: &x:ReadWrite 写入通道 + 区域结束释放排他锁
+foreign assert(cond: bool): void;
+function main(): void {
+    var x: u32 = 10;
+    {
+        let r: &u32:ReadWrite = &x:ReadWrite;
+        *r = 99;
+    }
+    assert(x == 99);
+    return;
+}

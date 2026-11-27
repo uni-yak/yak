@@ -1,0 +1,2 @@
+// expected_trap: slice element type mismatch
+function main(): void { let values: u32[] = [1]; let bytes: &[u8] = &values[0..1]; }

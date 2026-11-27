@@ -1,0 +1,10 @@
+// t42: 运算符优先级assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(2 + 3 * 4 == 14);
+    assert(2 * 3 + 4 == 10);
+    assert(1 + 2 * 3 - 1 == 6);
+    assert(1 << 2 + 1 == 8);
+    return;
+}

@@ -1,0 +1,3 @@
+// expected_trap: unterminated literal
+function main(): void { let text: &[u8] = "unfinished
+}

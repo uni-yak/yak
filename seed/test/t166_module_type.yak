@@ -1,0 +1,3 @@
+// module: point=fixtures/point.yak
+import point; foreign assert(cond: bool): void;
+function main(): void { let p: point::Point = point::make(); assert(point::get(&p) == 42); assert(p.x == 42); }

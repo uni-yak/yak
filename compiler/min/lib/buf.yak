@@ -1,0 +1,146 @@
+// buf.yak —— ByteBuf：字节缓冲读写（lib/README.md 设计）
+// 依赖：base 内建类型（u8/u16/u32/u64/bool/void/AllocError）、T[]、@push/@len/@move
+// 无 import 依赖
+
+export struct ByteBuf {
+    data: u8[],
+    pos: u32,
+}
+
+// ── 构造 ──
+
+export function buf_new(): ByteBuf {
+    var buf: ByteBuf = ByteBuf { data: [], pos: 0 };
+    return buf;
+}
+
+export function buf_from(bytes: &[u8]): ByteBuf!AllocError {
+    var buf: ByteBuf = ByteBuf { data: [], pos: 0 };
+    buf_push_bytes(&buf:ReadWrite, bytes)?;
+    buf_rewind(&buf:ReadWrite);
+    return buf;
+}
+
+// ── 写入（在 pos 处追加，推进 pos）──
+
+export function buf_push_u8(buf: &ByteBuf:ReadWrite, val: u8): void!AllocError {
+    @push(buf.data, val)?;
+    buf.pos = buf.pos + 1;
+    return;
+}
+
+export function buf_push_u16(buf: &ByteBuf:ReadWrite, val: u16): void!AllocError {
+    @push(buf.data, (val & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 8) & 0xFF) as u8)?;
+    buf.pos = buf.pos + 2;
+    return;
+}
+
+export function buf_push_u32(buf: &ByteBuf:ReadWrite, val: u32): void!AllocError {
+    @push(buf.data, (val & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 8) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 16) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 24) & 0xFF) as u8)?;
+    buf.pos = buf.pos + 4;
+    return;
+}
+
+export function buf_push_u64(buf: &ByteBuf:ReadWrite, val: u64): void!AllocError {
+    @push(buf.data, (val & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 8) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 16) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 24) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 32) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 40) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 48) & 0xFF) as u8)?;
+    @push(buf.data, ((val >> 56) & 0xFF) as u8)?;
+    buf.pos = buf.pos + 8;
+    return;
+}
+
+export function buf_push_bytes(buf: &ByteBuf:ReadWrite, src: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    let n: u32 = @len(src) as u32;
+    while i < n {
+        @push(buf.data, src[i])?;
+        buf.pos = buf.pos + 1;
+        i = i + 1;
+    }
+    return;
+}
+
+// ── 读取（在 pos 处读取，推进 pos）──
+
+export function buf_read_u8(buf: &ByteBuf:ReadWrite): u8 {
+    let val: u8 = buf.data[buf.pos];
+    buf.pos = buf.pos + 1;
+    return val;
+}
+
+export function buf_read_u16(buf: &ByteBuf:ReadWrite): u16 {
+    let lo: u8 = buf.data[buf.pos];
+    let hi: u8 = buf.data[buf.pos + 1];
+    buf.pos = buf.pos + 2;
+    return (lo as u16) | ((hi as u16) << 8);
+}
+
+export function buf_read_u32(buf: &ByteBuf:ReadWrite): u32 {
+    let b0: u8 = buf.data[buf.pos];
+    let b1: u8 = buf.data[buf.pos + 1];
+    let b2: u8 = buf.data[buf.pos + 2];
+    let b3: u8 = buf.data[buf.pos + 3];
+    buf.pos = buf.pos + 4;
+    return (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
+}
+
+export function buf_read_u64(buf: &ByteBuf:ReadWrite): u64 {
+    let b0: u8 = buf.data[buf.pos];
+    let b1: u8 = buf.data[buf.pos + 1];
+    let b2: u8 = buf.data[buf.pos + 2];
+    let b3: u8 = buf.data[buf.pos + 3];
+    let b4: u8 = buf.data[buf.pos + 4];
+    let b5: u8 = buf.data[buf.pos + 5];
+    let b6: u8 = buf.data[buf.pos + 6];
+    let b7: u8 = buf.data[buf.pos + 7];
+    buf.pos = buf.pos + 8;
+    return (b0 as u64) | ((b1 as u64) << 8) | ((b2 as u64) << 16) | ((b3 as u64) << 24)
+         | ((b4 as u64) << 32) | ((b5 as u64) << 40) | ((b6 as u64) << 48) | ((b7 as u64) << 56);
+}
+
+// ── 随机访问（不移动游标）──
+
+export function buf_get(buf: &ByteBuf:Read, off: u32): u8 {
+    return buf.data[off];
+}
+
+export function buf_equals(buf: &ByteBuf:Read, off: u32, bytes: &[u8]): bool {
+    let n: u32 = @len(bytes) as u32;
+    if off > (@len(buf.data) as u32) { return false; }
+    if n > (@len(buf.data) as u32) - off { return false; }
+    var i: u32 = 0;
+    while i < n {
+        if buf.data[off + i] != bytes[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ── 游标 ──
+
+export function buf_len(buf: &ByteBuf:Read): u32 {
+    return @len(buf.data) as u32;
+}
+
+export function buf_pos(buf: &ByteBuf:Read): u32 {
+    return buf.pos;
+}
+
+export function buf_seek(buf: &ByteBuf:ReadWrite, pos: u32): void {
+    buf.pos = pos;
+    return;
+}
+
+export function buf_rewind(buf: &ByteBuf:ReadWrite): void {
+    buf.pos = 0;
+    return;
+}

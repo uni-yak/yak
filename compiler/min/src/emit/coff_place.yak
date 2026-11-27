@@ -1,0 +1,673 @@
+// MIR 地址、聚合槽和拥有值销毁的 Win64 降级。
+
+import pe;
+import mir;
+import typecheck;
+import layout;
+import coff_state;
+
+// 再由 `load` / `store` 按类型宽度读写。地址槽一律 8 字节，与指针同宽。
+function is_address_type(types: &typecheck::TypeTable:Read, id: u32): bool {
+    if id == 0 || id > @len(types.entries) as u32 { return false; }
+    return types.entries[id - 1].kind == 4;
+}
+// 结构体字段地址：目标 = 基址槽 + 常量偏移。基址是引用时按引用值直接解引用。
+export function lower_field_addr(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    // inst.b 为基址 LocalId，inst.c 为字段字节偏移（MIR 已按布局算好）。
+    // 目标指令将 imm32 符号扩展，不可把大于 i32 最大值的正偏移编码成负数。
+    if inst.c > 2147483647u32 { return false; }
+    let base_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    if base_disp == 0 { return false; }
+    if inst.value as u32 != 0 { pe::load_slot(&em.code:ReadWrite, pe::rax(), base_disp, 8)?; }
+    else { pe::lea_rbp(&em.code:ReadWrite, pe::rax(), base_disp)?; }
+    pe::add_imm32(&em.code:ReadWrite, pe::rax(), inst.c)?;
+    coff_state::store_local(em, inst.a, pe::rax())?;
+    return true;
+}
+// 数组元素地址：目标 = 基址槽 + 索引 * 元素宽度。
+export function lower_index_addr(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let slicing: bool = inst.op == 130;
+    let base_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    if base_disp == 0 { return false; }
+    let indirect: u32 = (inst.value >> 32u64) as u32;
+    var base_type: u32 = indirect;
+    if base_type == 0 { base_type = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b); }
+    if base_type == 0 || base_type > @len(em.types.entries) as u32 { return false; }
+    let base: typecheck::TypeEntry = em.types.entries[base_type - 1];
+    let fixed: bool = base.kind == 7;
+    if !fixed && base.kind != 5 && base.kind != 6 { return false; }
+    if slicing && ((!fixed && base.kind != 5 && base.kind != 6) || !coff_state::is_slice_type(&em.types:Read, inst.value_type_id)) { return false; }
+    // 索引和切片共用边界扩展；负数先于无符号比较进入陷阱。
+    var bound: u32 = inst.c;
+    var reg: u8 = pe::rcx();
+    while true {
+        let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, bound);
+        let width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, bound);
+        if disp == 0 || width == 0 { return false; }
+        let value_type_id: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, bound);
+        let signed: bool = coff_state::type_signed(&em.types:Read, value_type_id);
+        if signed && width == 1 { pe::movsx8_slot(&em.code:ReadWrite, reg, disp)?; }
+        elseif signed && width == 2 { pe::movsx16_slot(&em.code:ReadWrite, reg, disp)?; }
+        else {
+            pe::load_slot(&em.code:ReadWrite, reg, disp, width)?;
+            if signed && width == 4 { pe::movsx32_rr(&em.code:ReadWrite, reg, reg)?; }
+        }
+        if signed {
+            pe::cmp_zero(&em.code:ReadWrite, reg)?;
+            coff_state::jump_trap(em, pe::cc_l())?;
+        }
+        if !slicing || reg == pe::rdx() { break; }
+        bound = inst.value as u32;
+        reg = pe::rdx();
+    }
+    if fixed { pe::mov_imm64(&em.code:ReadWrite, pe::rax(), base.length)?; }
+    elseif indirect != 0 {
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), base_disp, 8)?;
+        pe::load_base(&em.code:ReadWrite, pe::rax(), pe::rax(), 8, 8)?;
+    } else { pe::load_slot_off(&em.code:ReadWrite, pe::rax(), base_disp, 8, 8)?; }
+    let packed_stride: u32 = inst.value as u32;
+    var stride: u64 = packed_stride as u64;
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    if slicing {
+        // 半开区间允许空切片，且末尾可等于基址元素数。
+        if dst < 16 { return false; }
+        pe::cmp_rr(&em.code:ReadWrite, pe::rcx(), pe::rdx())?;
+        coff_state::jump_trap(em, pe::cc_a())?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rdx(), pe::rax())?;
+        coff_state::jump_trap(em, pe::cc_a())?;
+        pe::sub_rr(&em.code:ReadWrite, pe::rdx(), pe::rcx())?;
+        pe::store_slot(&em.code:ReadWrite, pe::rdx(), dst - 8, 8)?;
+        stride = coff_state::type_size(em, base.elem);
+    } else {
+        pe::cmp_rr(&em.code:ReadWrite, pe::rcx(), pe::rax())?;
+        coff_state::jump_trap(em, pe::cc_ae())?;
+        if !fixed { stride = coff_state::type_size(em, base.elem); }
+    }
+    if stride == 0 || stride > 2147483647u64 { return false; }
+    if stride != 1 {
+        pe::mov_imm64(&em.code:ReadWrite, pe::rax(), stride)?;
+        pe::imul_rr(&em.code:ReadWrite, pe::rcx(), pe::rax())?;
+    }
+    if indirect != 0 || !fixed { pe::load_slot(&em.code:ReadWrite, pe::rax(), base_disp, 8)?; }
+    else { pe::lea_rbp(&em.code:ReadWrite, pe::rax(), base_disp)?; }
+    if indirect != 0 && !fixed { pe::load_base(&em.code:ReadWrite, pe::rax(), pe::rax(), 0, 8)?; }
+    pe::add_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+    if slicing { pe::store_slot(&em.code:ReadWrite, pe::rax(), dst, 8)?; }
+    else { coff_state::store_local(em, inst.a, pe::rax())?; }
+    return true;
+}
+// 从地址槽读出指针，再按结果类型宽度取值写入目标槽。
+export function lower_load(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let addr_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    if addr_disp == 0 { return false; }
+    pe::load_slot(&em.code:ReadWrite, pe::rax(), addr_disp, 8)?;
+    let size: u64 = coff_state::type_size(em, inst.value_type_id);
+    let dst_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    if dst_disp == 0 || size == 0 || size > coff_state::abi_copy_limit() as u64 { return false; }
+    copy_projected(em, dst_disp, size as u32, false)?;
+    return true;
+}
+// 按 TypeId 记忆化判定类型是否含动态数组成员：状态 0 未访问、1 访问中、2 否、3 是。
+// 预计算递归拥有资源的类型。导入结构体缺字段签名时保守保留析构。
+function resolve_dyn_flag(types: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, fields_ordered: bool, states: &u8[]:ReadWrite, id: u32): bool {
+    if id == 0 || id > @len(types.entries) as u32 { return false; }
+    let st: u8 = (*states)[id - 1];
+    if st == 3 { return true; }
+    if st == 2 || st == 1 { return false; }
+    (*states)[id - 1] = 1;
+    let e: typecheck::TypeEntry = types.entries[id - 1];
+    var res: bool = false;
+    if e.kind == 6 { res = true; }
+    elseif e.kind == 9 {
+        res = resolve_dyn_flag(types, fields, enums, imported, imported_enums, fields_ordered, states, e.success) ||
+            resolve_dyn_flag(types, fields, enums, imported, imported_enums, fields_ordered, states, e.elem);
+    } elseif e.kind == 11 {
+        let total: u32 = @len(types.members) as u32;
+        if e.members_start <= total && e.members_count <= total - e.members_start {
+            var i: u32 = 0;
+            while i < e.members_count && !res {
+                res = resolve_dyn_flag(types, fields, enums, imported, imported_enums, fields_ordered, states, types.members[e.members_start + i]);
+                i = i + 1;
+            }
+        }
+    }
+    elseif e.kind == 7 { res = resolve_dyn_flag(types, fields, enums, imported, imported_enums, fields_ordered, states, e.elem); }
+    elseif (e.kind == 2 || e.kind == 3) && mir::enum_count_of(types, enums, imported_enums, id) != 0 {
+        res = mir::storage_shape(types, fields, enums, imported, imported_enums, id, 0) == 2;
+    } elseif e.kind == 2 {
+        var i: u32 = 0;
+        while i < @len(fields.items) as u32 {
+            if fields.items[i].def == e.def && resolve_dyn_flag(types, fields, enums, imported, imported_enums, fields_ordered, states, fields.items[i].type_id) { res = true; break; }
+            i = i + 1;
+        }
+    } elseif e.kind == 3 {
+        var count: u32 = 0;
+        var i: u32 = layout::imported_fields_start(imported, e.dep, e.export_id, fields_ordered);
+        let total: u32 = @len(imported.items) as u32;
+        while i < total {
+            let item: layout::ImportedFieldLayout = imported.items[i];
+            let matches: bool = item.dep == e.dep && item.export_id == e.export_id;
+            if fields_ordered && !matches { break; }
+            if matches {
+                count = count + 1;
+                if !item.known { res = true; break; }
+                if resolve_dyn_flag(types, fields, enums, imported, imported_enums, fields_ordered, states, item.value_type_id) { res = true; break; }
+            }
+            i = i + 1;
+        }
+        if count == 0 { res = true; }
+    }
+    if res { (*states)[id - 1] = 3; }
+    else { (*states)[id - 1] = 2; }
+    return res;
+}
+export function compute_dyn_flags(module: &mir::MirModule:Read, fields_ordered: bool): u8[]!AllocError {
+    let n: u32 = @len(module.types.entries) as u32;
+    var states: u8[] = [];
+    var i: u32 = 0;
+    while i < n { @push(states, 0u8)?; i = i + 1; }
+    i = 0;
+    while i < n {
+        resolve_dyn_flag(&module.types:Read, &module.fields:Read, &module.enums:Read, &module.imported_fields:Read, &module.imported_enums:Read, fields_ordered, &states:ReadWrite, i + 1);
+        i = i + 1;
+    }
+    var flags: u8[] = [];
+    i = 0;
+    while i < n {
+        if states[i] == 3 { @push(flags, 1u8)?; }
+        else { @push(flags, 0u8)?; }
+        i = i + 1;
+    }
+    return flags;
+}
+export function em_has_dyn(em: &coff_state::Emitter:Read, id: u32): bool {
+    return id != 0 && id <= @len(em.dyn_flags) as u32 && em.dyn_flags[id - 1] != 0;
+}
+
+struct ShapeEdge { offset: u32, child: u32 }
+
+// 只读节点为 kind/size/tag_width/count 及 (offset, child_distance) 边。
+// 标量只复制值字节；记录按字段、数组按元素、枚举按唯一活跃载荷处理。
+function value_shape(em: &coff_state::Emitter:ReadWrite, id: u32, depth: u32): u32!AllocError {
+    if depth > 16 || !mir::valid_type(&em.types:Read, id) { return 0; }
+    let size: u64 = coff_state::type_size(em, id);
+    if size == 0 || size > 4294967295u64 { return 0; }
+    while @len(em.shape_indices) < id as u64 { @push(em.shape_indices, 0)?; }
+    let cached: u32 = em.shape_indices[id - 1];
+    if cached != 0 { return cached; }
+    let entry: typecheck::TypeEntry = em.types.entries[id - 1];
+    var variants: u32 = mir::enum_count_of(&em.types:Read, &em.enums:Read, &em.imported_enums:Read, id);
+    if entry.kind == 11 {
+        let total: u32 = @len(em.types.members) as u32;
+        if entry.members_start > total || entry.members_count == 0 || entry.members_count > total - entry.members_start { return 0; }
+        // 单成员 ErrorSet 与其枚举共用物理表示；多成员用外层标签选择枚举。
+        if entry.members_count == 1 {
+            let member: u32 = em.types.members[entry.members_start];
+            let child: u32 = value_shape(em, member, depth)?;
+            em.shape_indices[id - 1] = child;
+            return child;
+        }
+        variants = entry.members_count;
+    }
+    var kind: u32 = 0;
+    var tag: u32 = 0;
+    var count: u32 = 0;
+    var edges: ShapeEdge[] = [];
+    if entry.kind == 6 || entry.kind == 7 {
+        kind = 2;
+        if entry.kind == 6 { kind = 3; }
+        if entry.length > 4294967295u64 { return 0; }
+        count = entry.length as u32;
+        let child: u32 = value_shape(em, entry.elem, depth + 1)?;
+        if child == 0 { return 0; }
+        @push(edges, ShapeEdge { offset: 0, child: child })?;
+    } elseif variants != 0 {
+        kind = 4;
+        tag = coff_state::type_tag(em, id) as u32;
+        count = variants;
+        let offset: u64 = coff_state::type_payload_off(em, id);
+        if (tag != 1 && tag != 2) || offset > size { return 0; }
+        let identity: mir::EnumIdentity = mir::enum_identity_of(&em.types:Read, id);
+        var i: u32 = 0;
+        while i < variants {
+            var payload: u32 = 0;
+            if entry.kind == 11 { payload = em.types.members[entry.members_start + i]; }
+            else { payload = mir::variant_payload(&em.enums:Read, &em.imported_enums:Read, identity, i); }
+            var child: u32 = 0;
+            if payload != 0 {
+                child = value_shape(em, payload, depth + 1)?;
+                if child == 0 { return 0; }
+            }
+            @push(edges, ShapeEdge { offset: offset as u32, child: child })?;
+            i = i + 1;
+        }
+    } elseif entry.kind == 9 {
+        // 可错载体与枚举同为活动载荷布局：标签 0 对应成功值，标签 1 对应错误集。
+        kind = 4;
+        tag = coff_state::type_tag(em, id) as u32;
+        count = 2;
+        let offset: u64 = coff_state::type_payload_off(em, id);
+        if tag != 1 || offset == 0 || offset >= size { return 0; }
+        var success: u32 = 0;
+        if !mir::is_void(&em.types:Read, entry.success) {
+            success = value_shape(em, entry.success, depth + 1)?;
+            if success == 0 { return 0; }
+        }
+        let failure: u32 = value_shape(em, entry.elem, depth + 1)?;
+        if failure == 0 { return 0; }
+        @push(edges, ShapeEdge { offset: offset as u32, child: success })?;
+        @push(edges, ShapeEdge { offset: offset as u32, child: failure })?;
+    } elseif entry.kind == 2 || entry.kind == 3 {
+        kind = 1;
+        var i: u32 = 0;
+        if entry.kind == 2 {
+            let range: layout::FieldRange = layout::field_range(&em.layouts:Read, &em.fields:Read, entry.def);
+            i = range.start;
+            while i < range.end {
+                if em.fields.items[i].def == entry.def {
+                    let field: u32 = em.fields.items[i].type_id;
+                    let offset: u64 = layout::field_byte_offset_from_table(&em.layouts:Read, &em.fields:Read, entry.def, count);
+                    let child: u32 = value_shape(em, field, depth + 1)?;
+                    if child == 0 || offset >= size { return 0; }
+                    @push(edges, ShapeEdge { offset: offset as u32, child: child })?;
+                    count = count + 1;
+                }
+                i = i + 1;
+            }
+        } else {
+            let ordered: bool = em.imported_fields_ordered;
+            i = layout::imported_fields_start(&em.imported_fields:Read, entry.dep, entry.export_id, ordered);
+            while i < @len(em.imported_fields.items) as u32 {
+                let field: layout::ImportedFieldLayout = em.imported_fields.items[i];
+                let matches: bool = field.dep == entry.dep && field.export_id == entry.export_id;
+                if ordered && !matches { break; }
+                if matches {
+                    if !field.known || field.field != count + 1 || field.offset >= size { return 0; }
+                    let child: u32 = value_shape(em, field.value_type_id, depth + 1)?;
+                    if child == 0 { return 0; }
+                    @push(edges, ShapeEdge { offset: field.offset as u32, child: child })?;
+                    count = count + 1;
+                }
+                i = i + 1;
+            }
+        }
+        if count == 0 { return 0; }
+    } elseif !mir::is_scalar(&em.types:Read, id) && entry.kind != 8 { return 0; }
+    let start: u64 = @len(em.value_shapes);
+    if start + 4u64 + @len(edges) * 2u64 > 1073741823u64 { return 0; }
+    let index: u32 = start as u32 + 1;
+    @push(em.value_shapes, kind)?;
+    @push(em.value_shapes, size as u32)?;
+    @push(em.value_shapes, tag)?;
+    @push(em.value_shapes, count)?;
+    var i: u32 = 0;
+    while i < @len(edges) as u32 {
+        let edge: ShapeEdge = edges[i];
+        var distance: u32 = 0;
+        if edge.child != 0 { distance = index - edge.child; }
+        @push(em.value_shapes, edge.offset)?;
+        @push(em.value_shapes, distance)?;
+        i = i + 1;
+    }
+    em.shape_indices[id - 1] = index;
+    return index;
+}
+
+// 使用与普通静态常量相同的 RIP 相对重定位载入描述节点。
+export function load_value_shape(em: &coff_state::Emitter:ReadWrite, id: u32, target: u8): bool!AllocError {
+    let node: u32 = value_shape(em, id, 0)?;
+    if node == 0 || @len(em.static_lengths) + @len(em.shape_refs) >= 4294967295u64 { return false; }
+    let index: u32 = (@len(em.static_lengths) + @len(em.shape_refs)) as u32;
+    @push(em.shape_refs, node - 1)?;
+    let at: u32 = pe::lea_rip(&em.code:ReadWrite, target)?;
+    @push(em.data_refs, coff_state::DataRef { at: at, index: index })?;
+    return true;
+}
+
+// 记忆化计算析构各类型所需的最大动态数组元素循环嵌套深度（无拥有型元素时为 0）。
+function resolve_drop_depth(types: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, imported: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, fields_ordered: bool, dyn_flags: &[u8]:Read, states: &u8[]:ReadWrite, depths: &u32[]:ReadWrite, id: u32): u32 {
+    if id == 0 || id > @len(dyn_flags) as u32 || dyn_flags[id - 1] == 0 { return 0; }
+    if (*states)[id - 1] == 2 { return (*depths)[id - 1]; }
+    if (*states)[id - 1] == 1 { return 0; }
+    (*states)[id - 1] = 1;
+    let e: typecheck::TypeEntry = types.entries[id - 1];
+    var best: u32 = 0;
+    if e.kind == 6 {
+        if e.elem != 0 && e.elem <= @len(dyn_flags) as u32 && dyn_flags[e.elem - 1] != 0 {
+            best = 1 + resolve_drop_depth(types, fields, imported, imported_enums, fields_ordered, dyn_flags, states, depths, e.elem);
+        }
+    } elseif e.kind == 9 {
+        best = resolve_drop_depth(types, fields, imported, imported_enums, fields_ordered, dyn_flags, states, depths, e.success);
+    } elseif e.kind == 7 {
+        best = resolve_drop_depth(types, fields, imported, imported_enums, fields_ordered, dyn_flags, states, depths, e.elem);
+    } elseif e.kind == 2 {
+        var i: u32 = 0;
+        while i < @len(fields.items) as u32 {
+            if fields.items[i].def == e.def {
+                let d: u32 = resolve_drop_depth(types, fields, imported, imported_enums, fields_ordered, dyn_flags, states, depths, fields.items[i].type_id);
+                if d > best { best = d; }
+            }
+            i = i + 1;
+        }
+    } elseif e.kind == 3 {
+        var is_enum: bool = false;
+        var i: u32 = 0;
+        while i < @len(imported_enums.items) as u32 {
+            if imported_enums.items[i].dep == e.dep && imported_enums.items[i].export_id == e.export_id { is_enum = true; break; }
+            i = i + 1;
+        }
+        if !is_enum {
+            i = layout::imported_fields_start(imported, e.dep, e.export_id, fields_ordered);
+            let total: u32 = @len(imported.items) as u32;
+            while i < total {
+                let item: layout::ImportedFieldLayout = imported.items[i];
+                let matches: bool = item.dep == e.dep && item.export_id == e.export_id;
+                if fields_ordered && !matches { break; }
+                if matches && item.known {
+                    let d: u32 = resolve_drop_depth(types, fields, imported, imported_enums, fields_ordered, dyn_flags, states, depths, item.value_type_id);
+                    if d > best { best = d; }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    (*depths)[id - 1] = best;
+    (*states)[id - 1] = 2;
+    return best;
+}
+export function compute_drop_depths(module: &mir::MirModule:Read, fields_ordered: bool, dyn_flags: &[u8]:Read): u32[]!AllocError {
+    let n: u32 = @len(module.types.entries) as u32;
+    var states: u8[] = [];
+    var depths: u32[] = [];
+    var i: u32 = 0;
+    while i < n { @push(states, 0u8)?; @push(depths, 0u32)?; i = i + 1; }
+    i = 0;
+    // 已证明无动态数组的类型保留零深度，不再进入递归字段扫描。
+    let types: &typecheck::TypeTable:Read = &module.types:Read;
+    let fields: &typecheck::FieldTable:Read = &module.fields:Read;
+    let imported: &layout::ImportedFieldLayoutTable:Read = &module.imported_fields:Read;
+    let enums: &typecheck::ImportedEnumTable:Read = &module.imported_enums:Read;
+    while i < n {
+        if dyn_flags[i] != 0 { resolve_drop_depth(types, fields, imported, enums, fields_ordered, dyn_flags, &states:ReadWrite, &depths:ReadWrite, i + 1); }
+        i = i + 1;
+    }
+    return depths;
+}
+export function plan_drop_depth(func: &mir::MirFunction:Read, drop_depths: &[u32]:Read): u32 {
+    var best: u32 = 0;
+    var k: u32 = 0;
+    while k < @len(func.insts) as u32 {
+        let op: u8 = func.insts[k].op;
+        var ty: u32 = 0;
+        if op == 115 && func.insts[k].b != 0 && func.insts[k].b <= @len(func.locals) as u32 {
+            ty = func.locals[func.insts[k].b - 1].value_type_id;
+        } elseif op == 178 && func.insts[k].c != 0 && func.insts[k].c <= @len(func.locals) as u32 {
+            ty = func.locals[func.insts[k].c - 1].value_type_id;
+        }
+        if ty != 0 && ty <= @len(drop_depths) as u32 {
+            let d: u32 = drop_depths[ty - 1];
+            if d > best { best = d; }
+        }
+        k = k + 1;
+    }
+    return best;
+}
+function drop_described(em: &coff_state::Emitter:ReadWrite, disp: u32, offset: u32, id: u32, indirect: bool): bool!AllocError {
+    if !em_has_dyn(em, id) { return true; }
+    let sysv: bool = em.code.sysv;
+    let first: u8 = coff_state::call_reg(sysv, 0);
+    if !load_value_shape(em, id, coff_state::call_reg(sysv, 1))? { return false; }
+    if indirect {
+        if offset > 2147483647u32 { return false; }
+        pe::load_slot(&em.code:ReadWrite, first, disp, 8)?;
+        if offset != 0 { pe::add_imm32(&em.code:ReadWrite, first, offset)?; }
+    } else {
+        pe::lea_rbp(&em.code:ReadWrite, first, disp - offset)?;
+    }
+    let at: u32 = pe::call_rel32(&em.code:ReadWrite)?;
+    @push(em.calls, coff_state::CallSite { at: at, symbol: coff_state::rt_symbol_drop_value(), kind: 115 })?;
+    return true;
+}
+
+// 编译期共享只读布局描述，运行时逆序析构拥有成员和活跃载荷。
+export function drop_value(em: &coff_state::Emitter:ReadWrite, disp: u32, off: u64, id: u32, indirect: bool, depth: u32): bool!AllocError {
+    if disp == 0 || id == 0 || id > @len(em.types.entries) as u32 || off >= 4294967279u64 || (!indirect && off >= disp as u64) { return false; }
+    let offset: u32 = off as u32;
+    let e: typecheck::TypeEntry = em.types.entries[id - 1];
+    if e.kind == 2 || e.kind == 7 || e.kind == 9 || e.kind == 11 ||
+        (e.kind == 3 && mir::enum_count_of(&em.types:Read, &em.enums:Read, &em.imported_enums:Read, id) != 0) {
+        return drop_described(em, disp, offset, id, indirect)?;
+    }
+    if e.kind == 6 {
+        let stride: u64 = coff_state::type_size(em, e.elem);
+        if stride == 0 || stride > 4294967295u64 { return false; }
+        // 若元素含动态数组成员，先按索引逆序逐个析构活跃元素（owner.md 6.2），再释放外层缓冲。
+        if em_has_dyn(em, e.elem) {
+            if depth >= em.drop_depth || em.drop_scratch < depth * 16 + 16 { return false; }
+            let ptr_slot: u32 = em.drop_scratch - depth * 16;
+            let cnt_slot: u32 = ptr_slot - 8;
+            if indirect {
+                pe::load_slot(&em.code:ReadWrite, pe::rax(), disp, 8)?;
+                pe::load_base(&em.code:ReadWrite, pe::rcx(), pe::rax(), offset, 8)?;
+                pe::load_base(&em.code:ReadWrite, pe::rdx(), pe::rax(), offset + 8, 8)?;
+            } else {
+                pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), disp, offset, 8)?;
+                pe::load_slot_off(&em.code:ReadWrite, pe::rdx(), disp, offset + 8, 8)?;
+            }
+            pe::test_rr(&em.code:ReadWrite, pe::rcx(), pe::rcx())?;
+            let skip_null: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+            pe::test_rr(&em.code:ReadWrite, pe::rdx(), pe::rdx())?;
+            let skip_empty: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+            pe::mov_imm64(&em.code:ReadWrite, pe::rax(), stride)?;
+            pe::imul_rr(&em.code:ReadWrite, pe::rax(), pe::rdx())?;
+            pe::add_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+            pe::store_slot(&em.code:ReadWrite, pe::rax(), ptr_slot, 8)?;
+            pe::store_slot(&em.code:ReadWrite, pe::rdx(), cnt_slot, 8)?;
+            let loop_head: u32 = pe::code_len(&em.code:Read);
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), cnt_slot, 8)?;
+            pe::test_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+            let loop_exit: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+            pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), 1u64)?;
+            pe::sub_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+            pe::store_slot(&em.code:ReadWrite, pe::rax(), cnt_slot, 8)?;
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), ptr_slot, 8)?;
+            pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), stride)?;
+            pe::sub_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+            pe::store_slot(&em.code:ReadWrite, pe::rax(), ptr_slot, 8)?;
+            if !drop_value(em, ptr_slot, 0, e.elem, true, depth + 1)? { return false; }
+            pe::jump_to(&em.code:ReadWrite, loop_head)?;
+            let after_loop: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, skip_null, after_loop);
+            pe::patch_rel32(&em.code:ReadWrite, skip_empty, after_loop);
+            pe::patch_rel32(&em.code:ReadWrite, loop_exit, after_loop);
+        }
+        // Write 形参仅保存底址，每个叶子在释放前重新取址，避免跨调用依赖寄存器。
+        if indirect {
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), disp, 8)?;
+            pe::load_base(&em.code:ReadWrite, pe::rcx(), pe::rax(), offset, 8)?;
+            pe::load_base(&em.code:ReadWrite, pe::rdx(), pe::rax(), offset + 16, 8)?;
+        } else {
+            pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), disp, offset, 8)?;
+            pe::load_slot_off(&em.code:ReadWrite, pe::rdx(), disp, offset + 16, 8)?;
+        }
+        pe::test_rr(&em.code:ReadWrite, pe::rcx(), pe::rcx())?;
+        let skip_at: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+        pe::mov_imm64(&em.code:ReadWrite, pe::rax(), stride)?;
+        pe::imul_rr(&em.code:ReadWrite, pe::rdx(), pe::rax())?;
+        if em.code.sysv {
+            pe::mov_rr(&em.code:ReadWrite, pe::rdi(), pe::rcx())?;
+            pe::mov_rr(&em.code:ReadWrite, pe::rsi(), pe::rdx())?;
+        }
+        let at: u32 = pe::call_rel32(&em.code:ReadWrite)?;
+        @push(em.calls, coff_state::CallSite { at: at, symbol: coff_state::rt_symbol_free(), kind: 115 })?;
+        let end_at: u32 = pe::code_len(&em.code:Read);
+        pe::patch_rel32(&em.code:ReadWrite, skip_at, end_at);
+        return true;
+    }
+    if e.kind == 3 {
+        // 已验证有序时只逆序遍历目标字段段；无序表仍按原次序全表筛选。
+        let total: u32 = @len(em.imported_fields.items) as u32;
+        let ordered: bool = em.imported_fields_ordered;
+        let start: u32 = layout::imported_fields_start(&em.imported_fields:Read, e.dep, e.export_id, ordered);
+        var i: u32 = total;
+        if ordered {
+            i = start;
+            while i < total && em.imported_fields.items[i].dep == e.dep && em.imported_fields.items[i].export_id == e.export_id {
+                i = i + 1;
+            }
+        }
+        var found: bool = false;
+        while i > start {
+            i = i - 1;
+            let item: layout::ImportedFieldLayout = em.imported_fields.items[i];
+            if item.dep == e.dep && item.export_id == e.export_id {
+                found = true;
+                if !item.known { return false; }
+                if em_has_dyn(em, item.value_type_id) {
+                    if !drop_value(em, disp, offset as u64 + item.offset, item.value_type_id, indirect, depth)? { return false; }
+                }
+            }
+        }
+        return found;
+    }
+    return true;
+}
+export function lower_drop(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): bool!AllocError {
+    if inst.a != 0 { return false; }
+    if inst.b == 0 || inst.b > @len(em.slots) as u32 { return false; }
+    let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    if disp == 0 { return false; }
+    let value_type_id: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+    let indirect: bool = func.locals[inst.b - 1].kind == 3 && func.locals[inst.b - 1].state == 11;
+    if inst.c == 0 { return drop_value(em, disp, 0, value_type_id, indirect, 0)?; }
+    // 标志只对应普通整值，不读取已移出值的存储，也不代替 out 状态。
+    let flag: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+    if flag == 0 || func.locals[inst.b - 1].kind == 3 { return false; }
+    pe::load_slot(&em.code:ReadWrite, pe::rax(), flag, 1)?;
+    pe::test_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+    let skip: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+    if !drop_value(em, disp, 0, value_type_id, indirect, 0)? { return false; }
+    let after_drop: u32 = pe::code_len(&em.code:Read);
+    pe::patch_rel32(&em.code:ReadWrite, skip, after_drop);
+    return true;
+}
+// 按对象布局的精确尺寸写入，避免覆盖紧邻字段或元素。
+export function lower_store(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let addr_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let value_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+    let size: u64 = coff_state::type_size(em, inst.value_type_id);
+    if addr_disp == 0 || value_disp == 0 || size == 0 || size > coff_state::abi_copy_limit() as u64 { return false; }
+    pe::load_slot(&em.code:ReadWrite, pe::rax(), addr_disp, 8)?;
+    copy_projected(em, value_disp, size as u32, true)?;
+    return true;
+}
+// rax 保持投影地址；末段按 4、2、1 字节搬运，不读写对象外的字节。
+function copy_projected(em: &coff_state::Emitter:ReadWrite, disp: u32, size: u32, writing: bool): void!AllocError {
+    var done: u32 = 0;
+    while done < size {
+        let remain: u32 = size - done;
+        var width: u8 = 1;
+        if remain >= 8 { width = 8; }
+        elseif remain >= 4 { width = 4; }
+        elseif remain >= 2 { width = 2; }
+        if writing {
+            pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), disp, done, width)?;
+            pe::store_base(&em.code:ReadWrite, pe::rcx(), pe::rax(), done, width)?;
+        } else {
+            pe::load_base(&em.code:ReadWrite, pe::rcx(), pe::rax(), done, width)?;
+            pe::store_slot_off(&em.code:ReadWrite, pe::rcx(), disp, done, width)?;
+        }
+        done = done + width as u32;
+    }
+    return;
+}
+// 聚合构造按声明序放置分量；字段偏移与数组步长均取自布局。
+export function lower_aggregate(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): bool!AllocError {
+    let dst_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    if dst_disp == 0 || inst.value_type_id == 0 || inst.value_type_id > @len(em.types.entries) as u32 { return false; }
+    if inst.args_count == 0 {
+        // 空字面量 `[]` 只用于动态数组：生成全零的 24 字节头（ptr/len/cap = 0）。
+        if inst.value_type_id == 0 || inst.value_type_id > @len(em.types.entries) as u32 { return false; }
+        if em.types.entries[inst.value_type_id - 1].kind != 6 { return false; }
+        coff_state::zero_slot_blocks(em, dst_disp, 24u64)?;
+        return true;
+    }
+    let agg: typecheck::TypeEntry = em.types.entries[inst.value_type_id - 1];
+    if inst.op == 96 && agg.kind == 3 {
+        let size: u64 = coff_state::type_size(em, inst.value_type_id);
+        if size == 0 || size > coff_state::abi_copy_limit() as u64 { return false; }
+        coff_state::zero_slot_blocks(em, dst_disp, size)?;
+        var field: u32 = 0;
+        var ordinal: u32 = 0;
+        while field < @len(em.imported_fields.items) as u32 {
+            let item: layout::ImportedFieldLayout = em.imported_fields.items[field];
+            if item.dep == agg.dep && item.export_id == agg.export_id {
+                if !item.known || item.field != ordinal + 1 || ordinal >= inst.args_count || item.offset > size || item.size == 0 || item.size > size - item.offset { return false; }
+                let value: u32 = func.args[inst.args_start + ordinal];
+                let slot: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, value);
+                let value_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, value);
+                if slot == 0 || value_type != item.value_type_id || coff_state::type_size(em, item.value_type_id) != item.size { return false; }
+                coff_state::copy_bytes_between(em, slot, 0, dst_disp, item.offset as u32, item.size as u32)?;
+                ordinal = ordinal + 1;
+            }
+            field = field + 1;
+        }
+        return ordinal == inst.args_count;
+    }
+    let size: u64 = coff_state::type_size(em, inst.value_type_id);
+    if size == 0 || size > coff_state::abi_copy_limit() as u64 { return false; }
+    var stride: u64 = 0;
+    if agg.kind != 2 {
+        if agg.kind != 7 || agg.length == 0 || size % agg.length != 0 { return false; }
+        stride = size / agg.length;
+    }
+    coff_state::zero_slot_blocks(em, dst_disp, size)?;
+    var p: u32 = 0;
+    while p < inst.args_count {
+        let value: u32 = func.args[inst.args_start + p];
+        let src_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, value);
+        let value_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, value);
+        let width: u64 = coff_state::type_size(em, value_type);
+        var offset: u64 = stride * p as u64;
+        if agg.kind == 2 { offset = layout::field_byte_offset_from_table(&em.layouts:Read, &em.fields:Read, agg.def, p); }
+        if src_disp == 0 || offset > size || width == 0 || width > size - offset { return false; }
+        coff_state::copy_bytes_between(em, src_disp, 0, dst_disp, offset as u32, width as u32)?;
+        p = p + 1;
+    }
+    return true;
+}
+// 搬运指令：move / copy 语义一致，标量按槽宽搬运，聚合按 8 字节块逐块搬运。
+// 聚合尺寸按布局计算，非 8 的整数倍时按向上取整的块数处理，避免读写越界。
+export function lower_move_copy(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let dst_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let src_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    if dst_disp == 0 || src_disp == 0 { return false; }
+    let size: u32 = em.agg_sizes[inst.a - 1];
+    if size == 0 {
+        let width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.b);
+        if width == 0 || width > 8 { return false; }
+        // 切片局部是 16 字节胖指针：只搬 8 字节指针会丢高 8 字节的长度字段，
+        // 故把指针（槽内偏移 0）与长度（槽内偏移 -8）按两个 8 字节字分别搬运。
+        if coff_state::local_slice(em, inst.a) {
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), src_disp, 8)?;
+            pe::store_slot(&em.code:ReadWrite, pe::rax(), dst_disp, 8)?;
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), src_disp - 8, 8)?;
+            pe::store_slot(&em.code:ReadWrite, pe::rax(), dst_disp - 8, 8)?;
+            return true;
+        }
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), src_disp, width)?;
+        coff_state::store_local(em, inst.a, pe::rax())?;
+        return true;
+    }
+    var blocks: u32 = size / 8;
+    if size % 8 != 0 { blocks = blocks + 1; }
+    var i: u32 = 0;
+    while i < blocks {
+        let at: u32 = i * 8;
+        pe::load_slot_off(&em.code:ReadWrite, pe::rax(), src_disp, at, 8)?;
+        pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst_disp, at, 8)?;
+        i = i + 1;
+    }
+    return true;
+}
+// 整数常量：直接写入目标槽，宽度按类型截断。

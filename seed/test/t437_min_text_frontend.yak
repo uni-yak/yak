@@ -1,0 +1,107 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+import lex;
+import layout;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import desugar;
+foreign assert(condition: bool): void;
+foreign write(text: &[u8]): void;
+
+struct Frontend { parsed: parse::ParseResult, resolved: resolve_refs::Resolution }
+
+function load(source: &[u8], diagnostics: &diag::DiagBuffer:ReadWrite): Frontend!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan_text(source, 54)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed_text(&lexed:Read, 54)?;
+    assert(@len(parsed.diagnostics) == 0);
+    assert(desugar::verify_text_frontend(&parsed.file:Read, &parsed.pool:Read, diagnostics)?);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolved: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", diagnostics)?;
+    assert(diag::diagbuf_count(diagnostics) == 0);
+    return Frontend { parsed: @move(parsed), resolved: @move(resolved) };
+}
+
+function precise_rejection(): void!AllocError {
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let fixture: Frontend = load("function f(s: &string): void { @drop(s); }\n", &diagnostics:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&fixture.parsed.file:Read, &fixture.parsed.pool:Read, &fixture.resolved:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E6204 spec/lang/type/string.md#STR-1
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 6204);
+    assert(diagnostics.diags[0].span.file == 54 && diagnostics.diags[0].span.offset == 31 && diagnostics.diags[0].span.length == 5);
+    assert(@len(checked.funcs.items) == 1);
+    return;
+}
+
+function check(source: &[u8], code: u16): void!AllocError {
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let front: Frontend = load(source, &diagnostics:ReadWrite)?;
+    typecheck_driver::typecheck_unit(&front.parsed.file:Read, &front.parsed.pool:Read, &front.resolved:Read, &diagnostics:ReadWrite)?;
+    let count: u32 = diag::diagbuf_count(&diagnostics:Read);
+    var expected: bool = count == 0 && code == 0;
+    if count == 1 && code != 0 { expected = diagnostics.diags[0].code.raw == code; }
+    if !expected { write(source); diag::diagbuf_print_terminal(&diagnostics:Read)?; }
+    assert(expected);
+    return;
+}
+
+function ownership_types(): void!AllocError {
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let front: Frontend = load("function f(owner: string, view: &string, raw: &[u8]): u64 { let v: &string = &owner; return @len(view) + @len(v) + @len(raw); }\n", &diagnostics:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&front.parsed.file:Read, &front.parsed.pool:Read, &front.resolved:Read, &diagnostics:ReadWrite)?;
+    assert(diag::diagbuf_count(&diagnostics:Read) == 0);
+    let params: &[u32] = &checked.funcs.items[0].params[0..3]:Read;
+    assert(params[0] != params[1] && params[1] != params[2]);
+    assert(typecheck::owned_text(&checked.types:Read, params[0]));
+    assert(typecheck::borrowed_text(&checked.types:Read, params[1]));
+    let layouts: layout::LayoutResult = layout::layout_unit(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, &diagnostics:ReadWrite)?;
+    assert(diag::diagbuf_count(&diagnostics:Read) == 0);
+    assert(layouts.table.items[params[0] - 1].known && layouts.table.items[params[0] - 1].size == 24);
+    assert(layouts.table.items[params[1] - 1].known && layouts.table.items[params[1] - 1].size == 16);
+    return;
+}
+
+function main(): void {
+    precise_rejection()?;
+    ownership_types()?;
+    check("function f(s: &string): void { @clone(s); }\n", 6204)?;
+    check("function f(s: &string): void { @move(s); }\n", 6204)?;
+    check("function g(s: &string): u64 { return @len(s); } function f(s: &string): u64 { return g(@move(s)); }\n", 6204)?;
+    check("function f(s: string): string { return @move(s); }\n", 0)?;
+    check("function f(s: string): void { @drop(s); }\n", 0)?;
+    check("function f(s: string): string!AllocError { return @clone(s); }\n", 0)?;
+    check("function f(): u64 { let v: &string = \"中\"; return @len(v); }\n", 0)?;
+    check("function f(s: &string): u64 { let v: &[u8] = s as &[u8]; return @len(v); }\n", 0)?;
+    check("function f(raw: &[u8]): u64 { let v: &string = raw as &string; return @len(v); }\n", 5001)?;
+    return;
+}

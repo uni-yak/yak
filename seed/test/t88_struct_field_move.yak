@@ -1,0 +1,11 @@
+// t88: struct 字段初始化移动 owning（owner.md 2.3）
+foreign assert(cond: bool): void;
+struct Wrap {
+    v: u32[],
+}
+function main(): void {
+    let a: u32[] = [1, 2];
+    let w: Wrap = Wrap { v: a };
+    assert(@len(w.v) == 2);
+    return;
+}

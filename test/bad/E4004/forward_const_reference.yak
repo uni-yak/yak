@@ -1,0 +1,11 @@
+// expected_code: E4004
+// spec: spec/lang/name.md N-4
+// 触发：先使用后声明的局部常量；首个绑定随后确实被使用。
+foreign exit(code: u8): void;
+
+function main(): void {
+    let first: u8 = later;
+    const later: u8 = 1u8;
+    exit(first);
+    return;
+}

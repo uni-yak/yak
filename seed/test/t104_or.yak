@@ -1,0 +1,14 @@
+// t104: .or 恢复糖 —— Err 时惰性求值 fallback，Ok 时解包（result.md full）
+foreign assert(cond: bool): void;
+enum E { Bad, }
+function f(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function main(): void {
+    let a: u32 = f(0).or(99);
+    let b: u32 = f(5).or(99);
+    assert(a == 99);
+    assert(b == 5);
+    return;
+}

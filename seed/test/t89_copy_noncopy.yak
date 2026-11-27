@@ -1,0 +1,7 @@
+// t89: @copy 对非 Copy（owning）值 → trap（owner.md 5.3）
+// expected_trap: @copy on non-Copy
+function main(): void {
+    let a: u32[] = [1];
+    let b: u32[] = @copy(a);
+    return;
+}

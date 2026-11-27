@@ -1,0 +1,10 @@
+foreign read(buf: &[u8]:ReadWrite): u32;
+foreign write(data: &[u8]): void;
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var bytes: [u8; 3] = [65u8, 0u8, 66u8];
+    let count: u32 = read(&bytes[1..2]:ReadWrite);
+    assert(count == 1 && bytes[0u64] == 65u8 && bytes[1u64] == 90u8 && bytes[2u64] == 66u8);
+    write(&bytes[1..2]:Read);
+}

@@ -1,0 +1,83 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产选择器在 127 与 128 两侧分别使用符号扩展短形态和完整立即数。
+    var code: pe::Code = pe::code_new();
+    pe::add_imm32(&code:ReadWrite, pe::rax(), 127)?;
+    pe::add_imm32(&code:ReadWrite, pe::rax(), 128)?;
+    assert(pe::code_len(&code:Read) == 10 && code.bytes[1] == 0x83 && code.bytes[5] == 0x05);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    let controls: [u8; 29] = [0xc3, 0xc2, 8, 0, 0x66, 0x05, 0x7f, 0, 0x04, 0x7f,
+        0x05, 0x80, 0, 0, 0, 0x48, 0x3d, 0x7f, 0xff, 0xff, 0xff,
+        0x48, 0x83, 0xf8, 0x80, 0x66, 0xc3, 0xc2, 0];
+    encoding(&controls[0..25]:Read, 0)?;
+    encoding(&controls[25..27]:Read, 7101)?;
+    encoding(&controls[27..29]:Read, 7101)?;
+    let longer: [u8; 24] = [0xc2, 0, 0, 0x66, 0xc2, 0, 0, 0x05, 0x7f, 0, 0, 0,
+        0x48, 0x3d, 0x80, 0xff, 0xff, 0xff, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff];
+    // 零栈调整、正负边界和非 ADD 的同组指令不得保留长形态。
+    encoding(&longer[0..3]:Read, 7103)?;
+    encoding(&longer[3..7]:Read, 7101)?;
+    encoding(&longer[7..12]:Read, 7103)?;
+    encoding(&longer[12..18]:Read, 7103)?;
+    encoding(&longer[18..24]:Read, 7103)?;
+    // 16 位累加器专用形态和 83 形态一样长；固定选用前者。
+    let word_aliases: [u8; 24] = [0x66, 0x83, 0xc0, 0x7f, 0x66, 0x83, 0xc8, 0x80,
+        0x66, 0x83, 0xe0, 0x01, 0x66, 0x83, 0xe8, 0xff, 0x66, 0x83, 0xf0, 0x01, 0x66, 0x83, 0xf8, 0x80];
+    var at: u32 = 0;
+    while at < 24 {
+        encoding(&word_aliases[at..at + 4]:Read, 7102)?;
+        at = at + 4;
+    }
+    let word_controls: [u8; 18] = [0x66, 0x2d, 0x80, 0xff, 0x66, 0x3d, 0x80, 0,
+        0x66, 0x83, 0xf9, 0x80, 0x66, 0x41, 0x83, 0xf8, 0x80, 0xc3];
+    encoding(&word_controls[0..18]:Read, 0)?;
+    let redundant_alias: [u8; 5] = [0x66, 0x40, 0x83, 0xc0, 0x01];
+    encoding(&redundant_alias[0..5]:Read, 7103)?;
+    encoding(&word_aliases[0..3]:Read, 7101)?;
+    // ADD、CMP 和扩展寄存器 SUB 仅在可符号扩展时缩短。
+    let alu_bounds: [u8; 47] = [
+        0x83, 0xc0, 0x7f,
+        0x05, 0x80, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xf8, 0x80,
+        0x48, 0x3d, 0x7f, 0xff, 0xff, 0xff,
+        0x49, 0x83, 0xe8, 0x7f,
+        0x49, 0x81, 0xe8, 0x80, 0x00, 0x00, 0x00,
+        0x05, 0x7f, 0x00, 0x00, 0x00,
+        0x48, 0x3d, 0x80, 0xff, 0xff, 0xff,
+        0x49, 0x81, 0xe8, 0x7f, 0x00, 0x00, 0x00
+    ];
+    encoding(&alu_bounds[0..3]:Read, 0)?;
+    encoding(&alu_bounds[3..8]:Read, 0)?;
+    encoding(&alu_bounds[8..12]:Read, 0)?;
+    encoding(&alu_bounds[12..18]:Read, 0)?;
+    encoding(&alu_bounds[18..22]:Read, 0)?;
+    encoding(&alu_bounds[22..29]:Read, 0)?;
+    encoding(&alu_bounds[29..34]:Read, 7103)?;
+    encoding(&alu_bounds[29..33]:Read, 7101)?;
+    encoding(&alu_bounds[34..40]:Read, 7103)?;
+    encoding(&alu_bounds[34..39]:Read, 7101)?;
+    encoding(&alu_bounds[40..47]:Read, 7103)?;
+    encoding(&alu_bounds[40..46]:Read, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

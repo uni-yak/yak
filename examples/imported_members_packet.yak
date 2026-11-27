@@ -1,0 +1,40 @@
+// 在根单元构造导入结构体和枚举，重复按值使用并核对全部载荷。
+import imported_members_mid;
+import imported_struct_dep;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+export function wrap(x: imported_struct_dep::Pair): imported_members_mid::Packet {
+    return imported_members_mid::Packet::Value(x);
+}
+
+function score(p: imported_members_mid::Packet): u32 {
+    match p {
+        Value(v) => {
+            assert(v.a == 11u32 && v.b == 12u32 && v.c == 13u32);
+            return v.a + v.b + v.c;
+        }
+    }
+}
+
+// 显式臂与通配臂都可忽略整个 Copy 载荷，不影响原值。
+function ignore(p: imported_members_mid::Packet, named: bool): u32 {
+    if named {
+        match p { Value => { return 17u32; } }
+    }
+    match p { _ => { return 19u32; } }
+}
+
+function main(): void {
+    let a: imported_struct_dep::Pair = imported_members_mid::make_pair(11u32);
+    assert(imported_members_mid::read_pair(a) == 11u32);
+    assert(imported_members_mid::read_pair(a) == 11u32);
+    let b: imported_members_mid::Box = imported_members_mid::Box { pair: a };
+    let p: imported_members_mid::Packet = wrap(b.pair);
+    assert(ignore(p, true) == 17u32);
+    assert(ignore(p, false) == 19u32);
+    let first: u32 = score(p);
+    let second: u32 = score(p);
+    exit((first + second - 30u32) as u8);
+    return;
+}

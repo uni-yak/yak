@@ -1,0 +1,18 @@
+// expected_code: E3008
+// expected_diagnostics: E3008 E3008 E3008 E3008
+// dependency: ctfe_dep.yak
+// spec: spec/lang/const.md C-4
+// 触发：模块和块级常量都不启用函数求值，参数数量不改变诊断。
+import ctfe_dep;
+foreign assert(cond: bool): void;
+
+const FIRST: u32 = zero();
+function zero(): u32 { return 1u32; }
+function sum(left: u32, right: u32): u32 { return left + right; }
+
+function main(): void {
+    const SECOND: u32 = sum(1u32, 2u32);
+    const THIRD: u32 = assert(true);
+    const FOURTH: u32 = ctfe_dep::fold(10u32);
+    assert(FIRST == SECOND + THIRD + FOURTH);
+}

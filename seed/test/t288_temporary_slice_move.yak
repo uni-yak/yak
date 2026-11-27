@@ -1,0 +1,6 @@
+// expected_trap: partial move forbidden
+function main(): void {
+    let data: [u32[]; 1] = [[1u32]];
+    let value: u32[] = (&data[0u32..1u32])[0u32];
+    @drop(value);
+}

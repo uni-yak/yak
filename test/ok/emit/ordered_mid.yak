@@ -1,0 +1,6 @@
+// 中间单元使用叶接口，要求按登记的前序顺序编译。
+import ordered_leaf;
+
+export function doubled(): u32 {
+    return ordered_leaf::base_value() * 2u32;
+}

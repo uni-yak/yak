@@ -1,0 +1,3 @@
+// expected_trap: must @move to extract
+function fill(out x: u32): void { x = 1; }
+function main(): void { out x: u32; fill(out x); let value: u32 = x; }

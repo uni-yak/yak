@@ -1,0 +1,6 @@
+// expected_code: E5807
+// spec: spec/lang/type/result.md RE-1
+// 触发：以普通整数类型作为 ErrorSet 成员。
+function make(): void!u16 { return; }
+
+function main(): void { return; }

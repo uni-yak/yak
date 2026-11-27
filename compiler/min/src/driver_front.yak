@@ -1,0 +1,109 @@
+// 保留并验证供代码生成使用的单元前端产物。
+import host;
+import ast;
+import lex;
+import buf;
+import parse;
+import parse_core;
+import desugar;
+import diag;
+import diag_jsonl;
+import resolve;
+import resolve_refs;
+import typecheck;
+import driver_diag;
+
+foreign exit(code: u8): void;
+foreign write(data: &[u8]): void;
+
+export struct ParsedUnit { lexed: lex::LexResult, parsed: parse::ParseResult }
+
+// 前端聚合管线不保留中间结果，驱动必须按同一顺序自行保留各阶段产物。
+function emit_lex(diags: &diag::DiagBuffer:ReadWrite, errors: &[lex::LexDiagnostic]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+function emit_parse(diags: &diag::DiagBuffer:ReadWrite, errors: &[parse_core::ParseDiagnostic]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+function name_equals(names: &lex::NameTable:Read, name: u32, text: &[u8]): bool {
+    if name == 0 || name > @len(names.entries) as u32 { return false; }
+    let e: lex::NameEntry = names.entries[name - 1];
+    if e.text_len as u32 != @len(text) as u32 { return false; }
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    var i: u32 = 0;
+    while i < @len(text) as u32 {
+        if arena.data[e.text_off + i] != text[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+// 入口只接受无参数且返回 void 的普通函数（base.md 5.10）。
+export function find_root_main(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, checked: &typecheck::TypeCheckResult:Read): u32 {
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 0 {
+            let decl_index: u32 = file.items[i].data;
+            let fn_item: &ast::FnDecl:Read = &pool.functions[decl_index]:Read;
+            if @len(fn_item.params) == 0 && name_equals(names, fn_item.name, "main") {
+                let resolved: &resolve::ResolveResult:Read = &resolution.result:Read;
+                let def_id: u32 = resolved.file.items[i].def_id;
+                var j: u32 = 0;
+                while j < @len(checked.funcs.items) as u32 {
+                    if checked.funcs.items[j].def == def_id {
+                        let ret_type: u32 = checked.funcs.items[j].ret;
+                        // TypeEntry.kind 的 TK_VOID 是 0，但 TypeId 自身非零。
+                        if ret_type == 0 || ret_type > @len(checked.types.entries) as u32 || checked.types.entries[ret_type - 1].kind != 0 { return 0; }
+                        return def_id;
+                    }
+                    j = j + 1;
+                }
+                return 0;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 失败收尾：默认模式保持原有终端文本；JSONL 模式只写具名诊断输出，绝不落到 stderr。
+export function fail(diags: &diag::DiagBuffer:ReadWrite, jsonl_mode: bool, unit_name: &[u8]:Read): void!AllocError {
+    driver_diag::require_codes(diags);
+    diag::diagbuf_sort(diags);
+    if jsonl_mode {
+        var body: buf::ByteBuf = buf::buf_new();
+        let accepted: bool = diag_jsonl::write_into(&body:ReadWrite, diags, unit_name)?;
+        @drop(accepted);
+        host::output_bytes("diag", &body.data[0..@len(body.data)]:Read);
+        exit(1);
+    }
+    diag::diagbuf_print_terminal(diags)?;
+    exit(1);
+}
+
+export function parse_input(source: &[u8], module_name: &[u8], jsonl_mode: bool, diags: &diag::DiagBuffer:ReadWrite): ParsedUnit!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(source, 0)?;
+    emit_lex(diags, &lexed.diagnostics[0..@len(lexed.diagnostics)]:Read)?;
+    if @len(lexed.diagnostics) > 0 {
+        fail(diags, jsonl_mode, module_name)?;
+    }
+    // 与前端管线一致：走 parse_lexed，字符串字面量的静态字节才能到达 MIR。
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 0)?;
+    emit_parse(diags, &parsed.diagnostics[0..@len(parsed.diagnostics)]:Read)?;
+    if @len(parsed.diagnostics) > 0 {
+        fail(diags, jsonl_mode, module_name)?;
+    }
+    let base_ok: bool = desugar::verify_base(&parsed.file:Read, &parsed.pool:Read, diags)?;
+    if !base_ok {
+        fail(diags, jsonl_mode, module_name)?;
+    }
+    return ParsedUnit { lexed: @move(lexed), parsed: @move(parsed) };
+}

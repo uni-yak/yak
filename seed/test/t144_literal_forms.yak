@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { let x: u64 = 0b1010u64; let y: u64 = 0o12u64; let z: i64 = -9223372036854775808i64; assert(x == y); assert(z < -1i64); assert('中' == '\u{4E2D}'); let text: &[u8] = "\u{4E2D}"; assert(@len(text) == 3); }

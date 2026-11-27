@@ -1,0 +1,135 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import desugar;
+foreign assert(condition: bool): void;
+foreign write(text: &[u8]): void;
+
+struct Frontend { parsed: parse::ParseResult, resolved: resolve_refs::Resolution }
+
+function load(source: &[u8], diagnostics: &diag::DiagBuffer:ReadWrite): Frontend!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan_nullable(source, 53)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed_nullable(&lexed:Read, 53)?;
+    assert(@len(parsed.diagnostics) == 0);
+    assert(desugar::verify_nullable_frontend(&parsed.file:Read, &parsed.pool:Read, diagnostics)?);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolved: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", diagnostics)?;
+    assert(diag::diagbuf_count(diagnostics) == 0);
+    return Frontend { parsed: @move(parsed), resolved: @move(resolved) };
+}
+
+function precise_rejections(): void!AllocError {
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let null_value: Frontend = load("function f(): u32 { return null; }\n", &diagnostics:ReadWrite)?;
+    let checked_null: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&null_value.parsed.file:Read, &null_value.parsed.pool:Read, &null_value.resolved:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E5813 spec/lang/type/option.md#OP-1
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 5813);
+    assert(diagnostics.diags[0].span.file == 53 && diagnostics.diags[0].span.offset == 27 && diagnostics.diags[0].span.length == 4);
+
+    diagnostics = diag::diagbuf_new();
+    let fallback: Frontend = load("function f(a: u32): u32 { return a ?? 2; }\n", &diagnostics:ReadWrite)?;
+    let checked_fallback: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&fallback.parsed.file:Read, &fallback.parsed.pool:Read, &fallback.resolved:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E5814 spec/lang/type/option.md#OP-2
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 5814);
+    assert(diagnostics.diags[0].span.file == 53 && diagnostics.diags[0].span.offset == 35 && diagnostics.diags[0].span.length == 2);
+
+    diagnostics = diag::diagbuf_new();
+    let propagate: Frontend = load("function f(a: u32?): u32? { return a?; }\n", &diagnostics:ReadWrite)?;
+    let checked_propagate: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&propagate.parsed.file:Read, &propagate.parsed.pool:Read, &propagate.resolved:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E5815 spec/lang/type/option.md#OP-3
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 5815);
+    assert(diagnostics.diags[0].span.file == 53 && diagnostics.diags[0].span.offset == 36 && diagnostics.diags[0].span.length == 1);
+
+    diagnostics = diag::diagbuf_new();
+    let forge: Frontend = load("function f(): u32? { return 0u32 as u32?; }\n", &diagnostics:ReadWrite)?;
+    let checked_forge: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&forge.parsed.file:Read, &forge.parsed.pool:Read, &forge.resolved:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E5816 spec/lang/type/option.md#OP-4
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 5816);
+    assert(diagnostics.diags[0].span.file == 53 && diagnostics.diags[0].span.offset == 33 && diagnostics.diags[0].span.length == 2);
+    assert(@len(checked_null.funcs.items) == 1 && @len(checked_fallback.funcs.items) == 1 && @len(checked_propagate.funcs.items) == 1 && @len(checked_forge.funcs.items) == 1);
+    return;
+}
+
+function check(source: &[u8], code: u16): void!AllocError {
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let front: Frontend = load(source, &diagnostics:ReadWrite)?;
+    typecheck_driver::typecheck_unit(&front.parsed.file:Read, &front.parsed.pool:Read, &front.resolved:Read, &diagnostics:ReadWrite)?;
+    let count: u32 = diag::diagbuf_count(&diagnostics:Read);
+    var expected: bool = count == 0 && code == 0;
+    if count == 1 && code != 0 { expected = diagnostics.diags[0].code.raw == code; }
+    if !expected { write(source); diag::diagbuf_print_terminal(&diagnostics:Read)?; }
+    assert(expected);
+    return;
+}
+
+function parse_rejects(source: &[u8], code: u16): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan_nullable(source, 54)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed_nullable(&lexed:Read, 54)?;
+    assert(@len(parsed.diagnostics) == 1 && parsed.diagnostics[0].code.raw == code);
+    return;
+}
+
+function main(): void {
+    precise_rejections()?;
+    check("function f(): u32? { return null; }\n", 0)?;
+    check("function f(): u32? { return 0; }\n", 0)?;
+    check("function f(a: u32?): u32 { return a ?? 5; }\n", 0)?;
+    check("struct Item { id: u32 } function f(a: Item?): u32? { return a?.id; }\n", 0)?;
+    check("enum E { Offline } function f(): (u32?)!E { return null; }\n", 0)?;
+    check("enum E { Offline } function f(): (u32!E)? { return null; }\n", 0)?;
+    check("function f(): void? { return null; }\n", 5813)?;
+    check("function f(): (&u32)? { return null; }\n", 5813)?;
+    check("function f(): (u32?)? { return null; }\n", 5813)?;
+    check("function f(): void { let value = null; @drop(value); }\n", 5813)?;
+    check("function f(): void { return null; }\n", 5813)?;
+    check("function f(): u32 { return 1 ?? 2; }\n", 5814)?;
+    check("function f(a: u32): u32? { return a?.item; }\n", 5814)?;
+    check("function g(): u32!AllocError { return 1; } function f(): u32 { return g() ?? 2; }\n", 5814)?;
+    check("function f(a: u32?): u32 { return a.catch(); }\n", 5815)?;
+    check("function f(a: u32?): u32 { return a.or(2); }\n", 5815)?;
+    check("function f(a: u32?): u32 { return a.on(); }\n", 5815)?;
+    check("function f(a: u32?): u32 { return a.else(); }\n", 5815)?;
+    check("function f(a: u32?): u32 { return a as u32; }\n", 5816)?;
+    check("function f(): u32? { var a: u32? = 1; a.tag = 0u32; return a; }\n", 5816)?;
+    check("struct Item { tag: u32, on: u32 } function f(a: Item): u32 { return a.tag + a.on; }\n", 0)?;
+    parse_rejects("enum E { Fail } function f(): u32?!E { return; }\n", 5816)?;
+    parse_rejects("enum E { Fail } function f(): u32!?E { return; }\n", 5816)?;
+    parse_rejects("function f(): u32?! { return; }\n", 5816)?;
+    parse_rejects("function f(): void { var a: u32?; }\n", 5816)?;
+    parse_rejects("enum E { Fail } struct S { x: (u32!E)? }\n", 5811)?;
+    parse_rejects("enum E { Fail } function f(x: (u32!E)?): void { return; }\n", 5811)?;
+    return;
+}

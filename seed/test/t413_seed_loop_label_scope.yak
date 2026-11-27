@@ -1,0 +1,11 @@
+// expected_trap: loop control: unknown label
+function other(): void {
+    while true { continue caller; }
+}
+
+function main(): void {
+    caller: while true {
+        other();
+        break;
+    }
+}

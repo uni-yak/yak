@@ -1,0 +1,26 @@
+// 通过中间单元传播，并在根单元加入排在两个用户枚举之前的固有枚举。
+import imported_errors_dep;
+import imported_errors_mid;
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+export function widen(x: u32): void!(imported_errors_dep::Widthy | AllocError | imported_errors_dep::Z) {
+    let value: u32 = imported_errors_mid::relay(x)?;
+    write("ok");
+    exit(value as u8);
+    return;
+}
+
+function main(): void {
+    widen(0u32);
+    widen(1u32);
+    widen(42u32);
+    return;
+}
+
+// 源码先写中间模块，但规范顺序先排底层模块，且两个 Z 不得合并。
+export function mixed(x: u32): u32!(imported_errors_mid::Z | imported_errors_dep::Widthy | imported_errors_dep::Z) {
+    if x == 2u32 { return imported_errors_mid::Z::Bad(19u8); }
+    let value: u32 = imported_errors_mid::relay(x)?;
+    return value;
+}

@@ -1,0 +1,7 @@
+// t90: @clone 对 Copy 值 → trap（owner.md 5.4）
+// expected_trap: @clone on non-owning
+function main(): void {
+    let x: u32 = 5;
+    let y: u32 = @clone(x);
+    return;
+}

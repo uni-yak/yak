@@ -1,0 +1,53 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 真实栈槽取址没有索引，仍保留基址与最短位移。
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 129)?;
+    assert(pe::code_len(&code:Read) == 7 && code.bytes[2] == 0x85);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // 普通访存保留栈段方向；双 BP 类的规范方向、真实缩放或无索引也不套用此规则。
+    let controls: [u8; 25] = [0x48, 0x8b, 0x44, 0x0d, 1, 0x48, 0x8b, 0x44, 0x29, 1,
+        0x4a, 0x8d, 0x44, 0x2d, 1, 0x48, 0x8d, 0x44, 0x4d, 1, 0x49, 0x8d, 0x44, 0x24, 1];
+    encoding(&controls[0..25]:Read, 0)?;
+    // 零位移或可缩窄的 disp32 更长；尚未读完整位移时优先报截断。
+    let long_forms: [u8; 13] = [0x48, 0x8d, 0x44, 0x0d, 0,
+        0x48, 0x8d, 0x84, 0x0d, 0x7f, 0, 0, 0];
+    encoding(&long_forms[0..5]:Read, 7103)?;
+    encoding(&long_forms[5..13]:Read, 7103)?;
+    encoding(&long_forms[5..12]:Read, 7101)?;
+    // 三种目的宽度下，保留非 BP 基址，拒绝等长的倒序形态。
+    let wide_forms: [u8; 10] = [0x48, 0x8d, 0x44, 0x29, 0x01,
+        0x48, 0x8d, 0x44, 0x0d, 0x01];
+    encoding(&wide_forms[0..5]:Read, 0)?;
+    encoding(&wide_forms[5..10]:Read, 7102)?;
+    let dword_forms: [u8; 16] = [0x47, 0x8d, 0x84, 0x2c, 0x7f, 0xff, 0xff, 0xff,
+        0x47, 0x8d, 0x84, 0x25, 0x7f, 0xff, 0xff, 0xff];
+    encoding(&dword_forms[0..8]:Read, 0)?;
+    encoding(&dword_forms[8..16]:Read, 7102)?;
+    let word_forms: [u8; 12] = [0x66, 0x42, 0x8d, 0x44, 0x29, 0x80,
+        0x66, 0x41, 0x8d, 0x44, 0x0d, 0x80];
+    encoding(&word_forms[0..6]:Read, 0)?;
+    encoding(&word_forms[6..12]:Read, 7102)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

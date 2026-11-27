@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { let x: i32 = -8; assert((x >> 2) == -2); }

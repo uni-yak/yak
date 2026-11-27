@@ -1,0 +1,347 @@
+// ELF64 可重定位对象容器，只接收已编码的节与链接记录，不负责指令或调用降级。
+import buf;
+
+// 节号依次为文本、只读数据、可写数据；零只用于未定义的全局符号。
+export struct Section { index: u16, flags: u64, bytes: u8[] }
+export struct Symbol { link: u32, name: u8[], section: u16, kind: u8, public: bool, value: u64, size: u64 }
+export struct Relocation { section: u16, offset: u64, target: u32, kind: u32, width: u8, addend: i64 }
+export struct ObjectInput { sections: Section[], symbols: Symbol[], relocations: Relocation[], small_mode: bool }
+export struct ObjectResult { code: u16, bytes: buf::ByteBuf }
+
+const BUFFER_LIMIT: u64 = 4294967295u64;
+const SYMBOL_BYTES: u64 = 24u64;
+const RELA_BYTES: u64 = 24u64;
+const ELF_HEADER_BYTES: u64 = 64u64;
+const SECTION_HEADER_BYTES: u64 = 64u64;
+const SECTION_COUNT: u16 = 10;
+const SYMTAB: u16 = 7;
+const STRTAB: u16 = 8;
+const SHSTRTAB: u16 = 9;
+
+// 错误码来自 spec/proc/error.def；拒绝时不交付对象字节。
+const EM_UNDEFINED: u16 = 8002;
+const EM_DUPLICATE: u16 = 8003;
+const EM_PROFILE: u16 = 8005;
+const EL_HEADER: u16 = 8018;
+const EL_SECTION: u16 = 8019;
+const EL_RELOCATION: u16 = 8020;
+const EL_ORDER: u16 = 8021;
+
+struct Check { code: u16, strings: u64, first_global: u32 }
+struct Placement { offset: u64, size: u64 }
+
+function alignment(section: u16): u64 {
+    if section == 1 { return 16; }
+    return 8;
+}
+
+function aligned(at: u64, unit: u64): u64 {
+    let rest: u64 = at % unit;
+    if rest == 0 { return at; }
+    return at + unit - rest;
+}
+
+function validate_sections(input: &ObjectInput:Read): u16 {
+    if @len(input.sections) != 3u64 { return EL_SECTION; }
+    if input.sections[0].index != 1 || input.sections[0].flags != 6 { return EL_SECTION; }
+    if input.sections[1].index != 2 || input.sections[1].flags != 2 { return EL_SECTION; }
+    if input.sections[2].index != 3 || input.sections[2].flags != 3 { return EL_SECTION; }
+    var i: u32 = 0;
+    while i < 3 {
+        if @len(input.sections[i].bytes) > BUFFER_LIMIT { return EM_PROFILE; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function checked_symbol(input: &ObjectInput:Read, symbol: &Symbol:Read): u16 {
+    if symbol.section > 3 { return EL_SECTION; }
+    if symbol.kind != 0 && symbol.kind != 2 { return EM_PROFILE; }
+    if symbol.link == 0 || @len(symbol.name) == 0 { return EM_UNDEFINED; }
+    if symbol.section == 0 {
+        if !symbol.public || symbol.value != 0 || symbol.size != 0 { return EM_UNDEFINED; }
+    } else {
+        let length: u64 = @len(input.sections[symbol.section - 1].bytes);
+        if symbol.value > length { return EM_UNDEFINED; }
+        if symbol.size > length - symbol.value { return EM_UNDEFINED; }
+    }
+    return 0;
+}
+
+// 一次检查链接号与 ELF 局部符号前缀；既不重排链接号也不静默改绑定。
+function validate_symbols(input: &ObjectInput:Read): Check {
+    var checked: Check = Check { code: 0, strings: 1, first_global: 1 };
+    let count: u64 = @len(input.symbols);
+    if count >= BUFFER_LIMIT / SYMBOL_BYTES { checked.code = EM_PROFILE; return checked; }
+    var previous: u32 = 0;
+    var global_seen: bool = false;
+    var i: u32 = 0;
+    while i < count as u32 {
+        let symbol: &Symbol:Read = &input.symbols[i]:Read;
+        checked.code = checked_symbol(input, symbol);
+        if checked.code != 0 { return checked; }
+        if symbol.link == previous { checked.code = EM_DUPLICATE; return checked; }
+        if symbol.link < previous { checked.code = EL_ORDER; return checked; }
+        if symbol.public { global_seen = true; }
+        elseif global_seen { checked.code = EL_ORDER; return checked; }
+        else { checked.first_global = checked.first_global + 1; }
+        let length: u64 = @len(symbol.name);
+        if length >= BUFFER_LIMIT - checked.strings { checked.code = EM_PROFILE; return checked; }
+        var j: u32 = 0;
+        while j < length as u32 {
+            if symbol.name[j] == 0 { checked.code = EM_UNDEFINED; return checked; }
+            j = j + 1;
+        }
+        checked.strings = checked.strings + length + 1;
+        previous = symbol.link;
+        i = i + 1;
+    }
+    return checked;
+}
+
+// ELF 的零号符号是保留记录，输入符号的位置加一才是实际索引。
+function symbol_index(input: &ObjectInput:Read, id: u32): u32 {
+    let count: u32 = @len(input.symbols) as u32;
+    var low: u32 = 0;
+    var high: u32 = count;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2;
+        if input.symbols[mid].link < id { low = mid + 1; }
+        else { high = mid; }
+    }
+    if low < count && input.symbols[low].link == id { return low + 1; }
+    return 0;
+}
+
+function relocation_width(kind: u32, small_mode: bool): u8 {
+    if kind == 1 { return 8; }
+    if kind == 2 || kind == 4 || (kind == 10 && small_mode) { return 4; }
+    return 0;
+}
+
+function validate_relocations(input: &ObjectInput:Read): u16 {
+    let count: u64 = @len(input.relocations);
+    if count > BUFFER_LIMIT / RELA_BYTES { return EM_PROFILE; }
+    var i: u32 = 0;
+    var previous_section: u16 = 0;
+    var previous_end: u64 = 0;
+    while i < count as u32 {
+        let r: Relocation = input.relocations[i];
+        if r.section == 0 || r.section > 3 { return EL_SECTION; }
+        let width: u8 = relocation_width(r.kind, input.small_mode);
+        if width == 0 || r.width != width { return EL_RELOCATION; }
+        let length: u64 = @len(input.sections[r.section - 1].bytes);
+        if r.offset > length { return EL_RELOCATION; }
+        if (width as u64) > length - r.offset { return EL_RELOCATION; }
+        if r.section < previous_section || (r.section == previous_section && r.offset < previous_end) { return EL_RELOCATION; }
+        let index: u32 = symbol_index(input, r.target);
+        if index == 0 { return EM_UNDEFINED; }
+        let target: &Symbol:Read = &input.symbols[index - 1]:Read;
+        // 同节局部 PC32 的差值可在链接前确定；外部地址保留给链接器检查。
+        if r.kind == 2 && !target.public && target.section == r.section {
+            let delta: i64 = (target.value as i64) - (r.offset as i64);
+            if r.addend < (0i64 - 2147483648i64) - delta || r.addend > 2147483647i64 - delta { return EL_RELOCATION; }
+        }
+        previous_section = r.section;
+        previous_end = r.offset + (width as u64);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 小端缓冲的游标为 u32；在变更任何缓冲前核算整个对象的大小。
+function object_fits(input: &ObjectInput:Read, strings: u64): bool {
+    var size: u64 = ELF_HEADER_BYTES;
+    var i: u16 = 1;
+    while i <= 3 {
+        size = aligned(size, alignment(i)) + @len(input.sections[i - 1].bytes);
+        i = i + 1;
+    }
+    size = aligned(size, 8) + @len(input.relocations) * RELA_BYTES;
+    size = size + (@len(input.symbols) + 1) * SYMBOL_BYTES + strings;
+    // 节名称表只含固定 ASCII 名；开头和每个名字末尾各有一个零字节。
+    size = size + @len(".text.rodata.data.rela.text.rela.rodata.rela.data.symtab.strtab.shstrtab") + (SECTION_COUNT as u64);
+    return aligned(size, 8) + (SECTION_COUNT as u64) * SECTION_HEADER_BYTES <= BUFFER_LIMIT;
+}
+
+function position(output: &buf::ByteBuf:Read): u64 { return buf::buf_pos(output) as u64; }
+
+function zeros(output: &buf::ByteBuf:ReadWrite, count: u64): void!AllocError {
+    var i: u64 = 0;
+    while i < count { buf::buf_push_u8(output, 0)?; i = i + 1; }
+    return;
+}
+
+function pad(output: &buf::ByteBuf:ReadWrite, unit: u64): void!AllocError {
+    let at: u64 = position(output);
+    zeros(output, aligned(at, unit) - at)?;
+    return;
+}
+
+function raw_string(output: &buf::ByteBuf:ReadWrite, text: &[u8]): void!AllocError {
+    buf::buf_push_bytes(output, text)?;
+    buf::buf_push_u8(output, 0)?;
+    return;
+}
+
+function header(output: &buf::ByteBuf:ReadWrite): void!AllocError {
+    buf::buf_push_u8(output, 127)?; buf::buf_push_bytes(output, "ELF")?;
+    buf::buf_push_u8(output, 2)?; buf::buf_push_u8(output, 1)?; buf::buf_push_u8(output, 1)?;
+    zeros(output, 9)?;
+    buf::buf_push_u16(output, 1)?; buf::buf_push_u16(output, 62)?; buf::buf_push_u32(output, 1)?;
+    // 入口、程序头与尚未回填的节表偏移均为零；不写处理器标记。
+    zeros(output, 28)?;
+    buf::buf_push_u16(output, 64)?; buf::buf_push_u16(output, 0)?; buf::buf_push_u16(output, 0)?;
+    buf::buf_push_u16(output, 64)?; buf::buf_push_u16(output, SECTION_COUNT)?; buf::buf_push_u16(output, SHSTRTAB)?;
+    return;
+}
+
+// 对象发布前检查已序列化的 ELF64 标识、目标和入口，错误时舍弃整个缓冲。
+export function validate_header(bytes: &[u8]:Read): u16 {
+    if @len(bytes) < ELF_HEADER_BYTES { return EL_HEADER; }
+    if bytes[0] != 127 || bytes[1] != 69 || bytes[2] != 76 || bytes[3] != 70
+        || bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 { return EL_HEADER; }
+    if bytes[16] != 1 || bytes[17] != 0 || bytes[18] != 62 || bytes[19] != 0
+        || bytes[20] != 1 || bytes[21] != 0 || bytes[22] != 0 || bytes[23] != 0 { return EL_HEADER; }
+    var i: u32 = 24;
+    while i < 32 {
+        if bytes[i] != 0 { return EL_HEADER; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function patch_section_offset(output: &buf::ByteBuf:ReadWrite, offset: u64): void {
+    var i: u32 = 0;
+    while i < 8 {
+        output.data[40 + i] = ((offset >> ((i as u64) * 8u64)) & 255u64) as u8;
+        i = i + 1;
+    }
+    return;
+}
+
+function section_header(output: &buf::ByteBuf:ReadWrite, name: u32, kind: u32, flags: u64, body: Placement, link: u32, info: u32, align: u64, entry: u64): void!AllocError {
+    buf::buf_push_u32(output, name)?; buf::buf_push_u32(output, kind)?; buf::buf_push_u64(output, flags)?;
+    buf::buf_push_u64(output, 0)?; buf::buf_push_u64(output, body.offset)?; buf::buf_push_u64(output, body.size)?;
+    buf::buf_push_u32(output, link)?; buf::buf_push_u32(output, info)?;
+    buf::buf_push_u64(output, align)?; buf::buf_push_u64(output, entry)?;
+    return;
+}
+
+function addend_bits(value: i64): u64 {
+    if value >= 0 { return value as u64; }
+    // 不对最小 i64 取相反数，始终写出原有补码位。
+    return 18446744073709551615u64 - ((0i64 - (value + 1i64)) as u64);
+}
+
+function section_name(section: u16, output: &buf::ByteBuf:ReadWrite): void!AllocError {
+    if section == 1 { raw_string(output, ".text")?; }
+    elseif section == 2 { raw_string(output, ".rodata")?; }
+    elseif section == 3 { raw_string(output, ".data")?; }
+    elseif section == 4 { raw_string(output, ".rela.text")?; }
+    elseif section == 5 { raw_string(output, ".rela.rodata")?; }
+    elseif section == 6 { raw_string(output, ".rela.data")?; }
+    elseif section == SYMTAB { raw_string(output, ".symtab")?; }
+    elseif section == STRTAB { raw_string(output, ".strtab")?; }
+    else { raw_string(output, ".shstrtab")?; }
+    return;
+}
+
+function build_object(input: &ObjectInput:Read, first_global: u32): buf::ByteBuf!AllocError {
+    var output: buf::ByteBuf = buf::buf_new();
+    var placements: Placement[] = [];
+    @push(placements, Placement { offset: 0, size: 0 })?;
+    header(&output:ReadWrite)?;
+    var section: u16 = 1;
+    while section <= 3 {
+        let bytes: &[u8]:Read = &input.sections[section - 1].bytes[0..@len(input.sections[section - 1].bytes)]:Read;
+        pad(&output:ReadWrite, alignment(section))?;
+        let start: u64 = position(&output:Read);
+        buf::buf_push_bytes(&output:ReadWrite, bytes)?;
+        @push(placements, Placement { offset: start, size: @len(bytes) })?;
+        section = section + 1;
+    }
+    var ri: u32 = 0;
+    section = 1;
+    while section <= 3 {
+        pad(&output:ReadWrite, 8)?;
+        let start: u64 = position(&output:Read);
+        while ri < @len(input.relocations) as u32 && input.relocations[ri].section == section {
+            let r: Relocation = input.relocations[ri];
+            let index: u64 = symbol_index(input, r.target) as u64;
+            buf::buf_push_u64(&output:ReadWrite, r.offset)?;
+            buf::buf_push_u64(&output:ReadWrite, (index << 32u64) | (r.kind as u64))?;
+            buf::buf_push_u64(&output:ReadWrite, addend_bits(r.addend))?;
+            ri = ri + 1;
+        }
+        @push(placements, Placement { offset: start, size: position(&output:Read) - start })?;
+        section = section + 1;
+    }
+    let sym_start: u64 = position(&output:Read);
+    zeros(&output:ReadWrite, SYMBOL_BYTES)?;
+    var name_at: u32 = 1;
+    var si: u32 = 0;
+    while si < @len(input.symbols) as u32 {
+        let s: &Symbol:Read = &input.symbols[si]:Read;
+        var info: u8 = s.kind;
+        if s.public { info = info + 16; }
+        buf::buf_push_u32(&output:ReadWrite, name_at)?;
+        buf::buf_push_u8(&output:ReadWrite, info)?; buf::buf_push_u8(&output:ReadWrite, 0)?;
+        buf::buf_push_u16(&output:ReadWrite, s.section)?;
+        buf::buf_push_u64(&output:ReadWrite, s.value)?; buf::buf_push_u64(&output:ReadWrite, s.size)?;
+        name_at = name_at + (@len(s.name) as u32) + 1;
+        si = si + 1;
+    }
+    let str_start: u64 = position(&output:Read);
+    @push(placements, Placement { offset: sym_start, size: str_start - sym_start })?;
+    buf::buf_push_u8(&output:ReadWrite, 0)?;
+    si = 0;
+    while si < @len(input.symbols) as u32 {
+        let s: &Symbol:Read = &input.symbols[si]:Read;
+        raw_string(&output:ReadWrite, &s.name[0..@len(s.name)]:Read)?;
+        si = si + 1;
+    }
+    let shstr_start: u64 = position(&output:Read);
+    @push(placements, Placement { offset: str_start, size: shstr_start - str_start })?;
+    var names: u32[] = [];
+    @push(names, 0)?;
+    buf::buf_push_u8(&output:ReadWrite, 0)?;
+    section = 1;
+    while section < SECTION_COUNT {
+        @push(names, (position(&output:Read) - shstr_start) as u32)?;
+        section_name(section, &output:ReadWrite)?;
+        section = section + 1;
+    }
+    @push(placements, Placement { offset: shstr_start, size: position(&output:Read) - shstr_start })?;
+    pad(&output:ReadWrite, 8)?;
+    let table: u64 = position(&output:Read);
+    patch_section_offset(&output:ReadWrite, table);
+    zeros(&output:ReadWrite, SECTION_HEADER_BYTES)?;
+    section = 1;
+    while section <= 3 {
+        section_header(&output:ReadWrite, names[section], 1, input.sections[section - 1].flags, placements[section], 0, 0, alignment(section), 0)?;
+        section = section + 1;
+    }
+    while section <= 6 {
+        section_header(&output:ReadWrite, names[section], 4, 64, placements[section], SYMTAB as u32, (section - 3) as u32, 8, RELA_BYTES)?;
+        section = section + 1;
+    }
+    section_header(&output:ReadWrite, names[SYMTAB], 2, 0, placements[SYMTAB], STRTAB as u32, first_global, 8, SYMBOL_BYTES)?;
+    section_header(&output:ReadWrite, names[STRTAB], 3, 0, placements[STRTAB], 0, 0, 1, 0)?;
+    section_header(&output:ReadWrite, names[SHSTRTAB], 3, 0, placements[SHSTRTAB], 0, 0, 1, 0)?;
+    return @move(output);
+}
+
+export function emit_object(input: &ObjectInput:Read): ObjectResult!AllocError {
+    let bad_sections: u16 = validate_sections(input);
+    if bad_sections != 0 { return ObjectResult { code: bad_sections, bytes: buf::buf_new() }; }
+    let symbols: Check = validate_symbols(input);
+    if symbols.code != 0 { return ObjectResult { code: symbols.code, bytes: buf::buf_new() }; }
+    let bad_relocations: u16 = validate_relocations(input);
+    if bad_relocations != 0 { return ObjectResult { code: bad_relocations, bytes: buf::buf_new() }; }
+    if !object_fits(input, symbols.strings) { return ObjectResult { code: EM_PROFILE, bytes: buf::buf_new() }; }
+    let object: buf::ByteBuf = build_object(input, symbols.first_global)?;
+    let header_status: u16 = validate_header(&object.data[0..@len(object.data)]:Read);
+    if header_status != 0 { return ObjectResult { code: header_status, bytes: buf::buf_new() }; }
+    return ObjectResult { code: 0, bytes: @move(object) };
+}

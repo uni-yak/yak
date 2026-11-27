@@ -1,0 +1,9 @@
+import error_set_source_cases;
+
+foreign exit(status: u8): void;
+
+function main(): void {
+    let unhandled: void!AllocError = error_set_source_cases::verify_source_boundaries(true);
+    @drop(unhandled);
+    exit(1);
+}

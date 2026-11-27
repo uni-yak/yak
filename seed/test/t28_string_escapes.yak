@@ -1,0 +1,8 @@
+// t28: 字符串转义序列
+// expected_stdout: a	b
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    write("a\tb\n");
+    return;
+}

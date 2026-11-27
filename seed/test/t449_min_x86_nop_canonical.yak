@@ -1,0 +1,45 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 单字节空操作不限制连续出现的次数。
+    let short_forms: [u8; 3] = [0x90, 0x90, 0x90];
+    encoding(&short_forms[0..3]:Read, 0)?;
+    // 非 /0、缺少 ModRM／SIB／位移，以及 XCHG 的扩展寄存器形式都不是合法的 NOP。
+    let invalid_forms: [u8; 5] = [0x0f, 0x1f, 0xc8, 0x41, 0x90];
+    encoding(&invalid_forms[0..3]:Read, 7101)?;
+    encoding(&invalid_forms[3..5]:Read, 7101)?;
+    let long_forms: [u8; 18] = [0x0f, 0x1f, 0xc0, 0x0f, 0x1f, 0, 0x0f, 0x1f, 0x44, 0x91, 0xf8,
+        0x0f, 0x1f, 0x80, 0x7f, 0xff, 0xff, 0xff];
+    encoding(&long_forms[0..2]:Read, 7101)?;
+    encoding(&long_forms[6..9]:Read, 7101)?;
+    encoding(&long_forms[6..10]:Read, 7101)?;
+    encoding(&long_forms[11..17]:Read, 7101)?;
+    encoding(&long_forms[0..3]:Read, 7103)?;
+    encoding(&long_forms[3..6]:Read, 7103)?;
+    encoding(&long_forms[6..11]:Read, 7103)?;
+    encoding(&long_forms[11..18]:Read, 7103)?;
+    let prefixed: [u8; 6] = [0x66, 0x90, 0x66, 0x0f, 0x1f, 0];
+    encoding(&prefixed[0..2]:Read, 7103)?;
+    encoding(&prefixed[2..6]:Read, 7103)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = verify();
+    @drop(result);
+    assert(false);
+    return;
+}

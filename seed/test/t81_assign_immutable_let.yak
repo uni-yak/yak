@@ -1,0 +1,7 @@
+// t81: 对 let 重新赋值 → trap（owner.md 2.6：let 不可变，需 var）
+// expected_trap: assignment to immutable let
+function main(): void {
+    let x: u32 = 1;
+    x = 2;
+    return;
+}

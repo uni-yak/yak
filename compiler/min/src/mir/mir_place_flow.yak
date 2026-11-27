@@ -1,0 +1,323 @@
+// 沿正常和失败边验证 owning place 活性及析构守卫。
+import mir;
+import typecheck;
+import copy_facts;
+
+struct GuardPair {
+    flag: u32, column: u32, next_place: u32, next_flag: u32,
+}
+
+struct PlaceLiveness {
+    columns: u32[], origins: u32[], loaded_from: u32[], loads: u32[], next_load: u32[],
+    consumed: u32[], effect_ends: u32[], dispatch: u32[], state: u8[], entries: u8[],
+    pairs: GuardPair[], place_pairs: u32[], flag_pairs: u32[], drop_pair: u32[], bool_literal: u8[],
+    reached: bool[], queued: bool[], queue: u32[],
+}
+
+function track_place(flow: &PlaceLiveness:ReadWrite, local: u32): void!AllocError {
+    if flow.columns[local - 1] == 0 {
+        @push(flow.state, 2)?;
+        flow.columns[local - 1] = @len(flow.state) as u32;
+    }
+    return;
+}
+
+function is_copy_type(module: &mir::MirModule:Read, id: u32, order: u8, cache: &typecheck::CopyFacts:ReadWrite): bool!AllocError {
+    if id == 0 || id > @len(module.types.entries) as u32 { return false; }
+    while @len(cache.items) < id as u64 { @push(cache.items, 0)?; }
+    if cache.items[id - 1] == 0 {
+        let yes: bool = copy_facts::copy_from_tables(&module.types:Read, &module.fields:Read, &module.enums:Read,
+            &module.imported_field_types:Read, &module.imported_enum_signatures:Read,
+            id, order, false, &*cache:Read, @len(module.types.entries) as u32);
+        if yes { cache.items[id - 1] = 1; } else { cache.items[id - 1] = 2; }
+    }
+    return cache.items[id - 1] == 1;
+}
+
+function record_handoff(ctx: &mir::MirFunction:Read, module: &mir::MirModule:Read, order: u8, cache: &typecheck::CopyFacts:ReadWrite, flow: &PlaceLiveness:ReadWrite, local: u32, forced: bool): void!AllocError {
+    if local == 0 || ctx.locals[local - 1].kind == 3 { return; }
+    if !forced && is_copy_type(module, ctx.locals[local - 1].value_type_id, order, cache)? { return; }
+    track_place(flow, local)?;
+    let src: u32 = flow.loaded_from[local - 1];
+    if src != 0 { track_place(flow, src)?; }
+    @push(flow.consumed, local)?;
+    return;
+}
+
+// 槽被覆盖或交接后，从旧槽读出的 owning 位模式也随之失效。
+function discard_loads(flow: &PlaceLiveness:ReadWrite, slot: u32, retain: bool): void {
+    var local: u32 = flow.loads[slot - 1];
+    while local != 0 {
+        set_liveness(flow, local, 2, retain);
+        local = flow.next_load[local - 1];
+    }
+    return;
+}
+
+function consume_place(flow: &PlaceLiveness:ReadWrite, local: u32, retain: bool): void {
+    var slot: u32 = flow.loaded_from[local - 1];
+    if slot == 0 { slot = local; }
+    set_liveness(flow, slot, 2, retain);
+    discard_loads(flow, slot, retain);
+    return;
+}
+
+function unavailable(flow: &PlaceLiveness:Read, local: u32): bool {
+    var id: u32 = local;
+    while id != 0 {
+        let column: u32 = flow.columns[id - 1];
+        if column != 0 && (flow.state[column - 1] & 2) != 0 { return true; }
+        id = flow.origins[id - 1];
+    }
+    return false;
+}
+
+// 每对位置与标志用三组各两位记录可能状态：标志未写、为假、为真。
+// 每组的位 0 表示存活，位 1 表示失效；前驱合流时按位取并集。
+function set_liveness(flow: &PlaceLiveness:ReadWrite, local: u32, state: u8, retain: bool): void {
+    if local == 0 { return; }
+    let column: u32 = flow.columns[local - 1];
+    if column == 0 { return; }
+    var updated: u8 = state;
+    if retain { updated = updated | flow.state[column - 1]; }
+    flow.state[column - 1] = updated;
+    if @len(flow.place_pairs) == 0 { return; }
+    var p: u32 = flow.place_pairs[local - 1];
+    while p != 0 {
+        let pair: GuardPair = flow.pairs[p - 1];
+        let old: u8 = flow.state[pair.column];
+        var next: u8 = 0;
+        if (old & 3) != 0 { next = state; }
+        if (old & 12) != 0 { next = next | (state << 2); }
+        if (old & 48) != 0 { next = next | (state << 4); }
+        if retain { next = next | old; }
+        flow.state[pair.column] = next;
+        p = pair.next_place;
+    }
+    return;
+}
+
+function guard_pair(flow: &PlaceLiveness:ReadWrite, local: u32, flag: u32): u32!AllocError {
+    var p: u32 = flow.place_pairs[local - 1];
+    while p != 0 {
+        if flow.pairs[p - 1].flag == flag { return p; }
+        p = flow.pairs[p - 1].next_place;
+    }
+    let column: u32 = @len(flow.state) as u32;
+    @push(flow.state, 2)?;
+    @push(flow.pairs, GuardPair { flag: flag, column: column, next_place: flow.place_pairs[local - 1], next_flag: flow.flag_pairs[flag - 1] })?;
+    let id: u32 = @len(flow.pairs) as u32;
+    flow.place_pairs[local - 1] = id;
+    flow.flag_pairs[flag - 1] = id;
+    return id;
+}
+
+function write_guard(flow: &PlaceLiveness:ReadWrite, slot: u32, value: u32): void {
+    if @len(flow.flag_pairs) == 0 { return; }
+    let literal: u8 = flow.bool_literal[value - 1];
+    var p: u32 = flow.flag_pairs[slot - 1];
+    while p != 0 {
+        let pair: GuardPair = flow.pairs[p - 1];
+        let old: u8 = flow.state[pair.column];
+        let live: u8 = (old | (old >> 2) | (old >> 4)) & 3;
+        var next: u8 = 0;
+        if literal != 2 { next = live << 2; }
+        if literal != 1 { next = next | (live << 4); }
+        flow.state[pair.column] = next;
+        p = pair.next_flag;
+    }
+    return;
+}
+
+function guarded_consume(flow: &PlaceLiveness:ReadWrite, local: u32, id: u32): bool {
+    let column: u32 = flow.pairs[id - 1].column;
+    let states: u8 = flow.state[column];
+    // 读取未初始化标志，或标志为真时析构已经失效的位置，都不能通过验证。
+    if (states & 35) != 0 { return false; }
+    if (states & 16) == 0 { return true; }
+    let when_false: u8 = states & 12;
+    if (when_false & 4) == 0 && flow.loaded_from[local - 1] == 0 {
+        consume_place(flow, local, false);
+    } else {
+        consume_place(flow, local, when_false != 0);
+        flow.state[flow.columns[local - 1] - 1] = (when_false >> 2) | 2;
+    }
+    flow.state[column] = when_false | 32;
+    return true;
+}
+
+function join_liveness(flow: &PlaceLiveness:ReadWrite, dest: u32): void!AllocError {
+    let width: u32 = @len(flow.state) as u32;
+    let at: u32 = dest * width;
+    var changed: bool = !flow.reached[dest];
+    var c: u32 = 0;
+    while c < width {
+        let next: u8 = flow.entries[at + c] | flow.state[c];
+        if next != flow.entries[at + c] { flow.entries[at + c] = next; changed = true; }
+        c = c + 1;
+    }
+    flow.reached[dest] = true;
+    if changed && !flow.queued[dest] {
+        @push(flow.queue, dest)?;
+        flow.queued[dest] = true;
+    }
+    return;
+}
+
+// 普通读和投影读取旧值；对整个可写槽的 store 可以重新初始化已消费的位置。
+function uses_live_places(ctx: &mir::MirFunction:Read, flow: &PlaceLiveness:Read, ins: mir::MirInst): bool {
+    let op: u8 = ins.op;
+    if ins.b != 0 && mir::reads_first(op) {
+        let writes_slot: bool = (op == 81 && ctx.locals[ins.b - 1].kind == 2) || op == 209;
+        let guarded_drop: bool = op == 115 && ins.c != 0;
+        if !writes_slot && !guarded_drop && unavailable(flow, ins.b) { return false; }
+    }
+    if mir::reads_second(op) && unavailable(flow, ins.c) { return false; }
+    if (op == 130 || op == 176) && unavailable(flow, ins.value as u32) { return false; }
+    var p: u32 = 0;
+    while p < ins.args_count {
+        if unavailable(flow, ctx.args[ins.args_start + p]) { return false; }
+        p = p + 1;
+    }
+    return true;
+}
+
+// 沿正常边和指令失败边传播所有权交接。合流存在失效路径即不能使用旧值。
+export function verify_place_liveness(ctx: &mir::MirFunction:Read, module: &mir::MirModule:Read, order: u8, cache: &typecheck::CopyFacts:ReadWrite, code: &u16:ReadWrite): bool!AllocError {
+    var flow: PlaceLiveness = PlaceLiveness { columns: [], origins: [], loaded_from: [], loads: [], next_load: [],
+        consumed: [], effect_ends: [], dispatch: [], state: [], entries: [], pairs: [], place_pairs: [],
+        flag_pairs: [], drop_pair: [], bool_literal: [], reached: [], queued: [], queue: [] };
+    var has_guards: bool = false;
+    var i: u32 = 0;
+    while i < @len(ctx.insts) as u32 {
+        if ctx.insts[i].op == 115 && ctx.insts[i].c != 0 { has_guards = true; break; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.locals) as u32 {
+        @push(flow.columns, 0)?; @push(flow.origins, 0)?;
+        @push(flow.loaded_from, 0)?; @push(flow.loads, 0)?; @push(flow.next_load, 0)?;
+        if has_guards {
+            @push(flow.place_pairs, 0)?; @push(flow.flag_pairs, 0)?; @push(flow.bool_literal, 0)?;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.insts) as u32 {
+        let ins: mir::MirInst = ctx.insts[i];
+        let op: u8 = ins.op;
+        if op == 82 || op == 83 || op == 128 || op == 129 || op == 130 {
+            flow.origins[ins.a - 1] = ins.b;
+        } elseif op == 113 && ins.a != 0 && ins.b != 0 {
+            if !is_copy_type(module, mir::local_type(ctx, ins.b), order, cache)? { return false; }
+            let kind: u8 = module.types.entries[ins.value_type_id - 1].kind;
+            if kind == 4 || kind == 5 { flow.origins[ins.a - 1] = ins.b; }
+        } elseif op == 80 && ctx.locals[ins.b - 1].kind == 2
+            && !is_copy_type(module, ins.value_type_id, order, cache)? {
+            flow.loaded_from[ins.a - 1] = ins.b;
+            flow.next_load[ins.a - 1] = flow.loads[ins.b - 1];
+            flow.loads[ins.b - 1] = ins.a;
+            track_place(&flow:ReadWrite, ins.a)?;
+        }
+        i = i + 1;
+    }
+    @push(flow.effect_ends, 0)?;
+    i = 0;
+    while i < @len(ctx.insts) as u32 {
+        let ins: mir::MirInst = ctx.insts[i];
+        record_handoff(ctx, module, order, cache, &flow:ReadWrite, mir::handoff_source(ins), ins.op == 112 || ins.op == 115)?;
+        if mir::hands_off_args(ins.op) {
+            var p: u32 = 0;
+            while p < ins.args_count {
+                record_handoff(ctx, module, order, cache, &flow:ReadWrite, ctx.args[ins.args_start + p], false)?;
+                p = p + 1;
+            }
+        }
+        if has_guards {
+            var pair: u32 = 0;
+            if ins.op == 115 && ins.c != 0 { pair = guard_pair(&flow:ReadWrite, ins.b, ins.c)?; }
+            if ins.op == 2 { flow.bool_literal[ins.a - 1] = ins.value as u8 + 1; }
+            @push(flow.drop_pair, pair)?;
+        }
+        @push(flow.effect_ends, @len(flow.consumed) as u32)?;
+        i = i + 1;
+    }
+    let blocks: u32 = @len(ctx.blocks) as u32;
+    i = 0;
+    while i < blocks {
+        let end: mir::MirTerminator = ctx.blocks[i].terminator;
+        let start: u32 = @len(flow.consumed) as u32;
+        if end.op == 162 || end.op == 177 { record_handoff(ctx, module, order, cache, &flow:ReadWrite, end.a, false)?; }
+        var taken: u32 = 0;
+        if @len(flow.consumed) as u32 != start { taken = end.a; }
+        @push(flow.dispatch, taken)?;
+        i = i + 1;
+    }
+    let width: u32 = @len(flow.state) as u32;
+    if width == 0 { return true; }
+    if width as u64 * blocks as u64 > 4294967295u64 { *code = 9001; return false; }
+    i = 0;
+    while i < blocks {
+        @push(flow.reached, false)?;
+        @push(flow.queued, false)?;
+        var c: u32 = 0;
+        while c < width { @push(flow.entries, 0)?; c = c + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.params) as u32 { set_liveness(&flow:ReadWrite, ctx.params[i], 1, false); i = i + 1; }
+    join_liveness(&flow:ReadWrite, ctx.entry as u32)?;
+    var next: u32 = 0;
+    while next < @len(flow.queue) as u32 {
+        let block: u32 = flow.queue[next];
+        next = next + 1;
+        flow.queued[block] = false;
+        var c: u32 = 0;
+        while c < width { flow.state[c] = flow.entries[block * width + c]; c = c + 1; }
+        set_liveness(&flow:ReadWrite, ctx.blocks[block].payload, 1, false);
+        var j: u32 = 0;
+        while j < ctx.blocks[block].inst_count {
+            let site: u32 = ctx.blocks[block].inst_start + j;
+            let ins: mir::MirInst = ctx.insts[site];
+            if !uses_live_places(ctx, &flow:Read, ins) { *code = 7031; return false; }
+            if has_guards && ins.op == 129 && flow.flag_pairs[ins.b - 1] != 0 {
+                // 可写借用会使标志状态脱离本地数据流。
+                *code = 7031;
+                return false;
+            }
+            var taken: u32 = flow.effect_ends[site];
+            while taken < flow.effect_ends[site + 1] {
+                let local: u32 = flow.consumed[taken];
+                if ins.op == 115 && ins.c != 0 {
+                    let pair: u32 = flow.drop_pair[site];
+                    if !guarded_consume(&flow:ReadWrite, local, pair) { *code = 7031; return false; }
+                } else {
+                    if unavailable(&flow:Read, local) { *code = 7031; return false; }
+                    consume_place(&flow:ReadWrite, local, false);
+                }
+                taken = taken + 1;
+            }
+            // 失败的调用已交接 owning 实参，尚未定义结果或接收输出槽。
+            if ins.trap != 0 { join_liveness(&flow:ReadWrite, ins.trap - 1)?; }
+            if ins.op == 81 && ctx.locals[ins.b - 1].kind == 2 {
+                discard_loads(&flow:ReadWrite, ins.b, false);
+                set_liveness(&flow:ReadWrite, ins.b, 1, false);
+                write_guard(&flow:ReadWrite, ins.b, ins.c);
+            }
+            set_liveness(&flow:ReadWrite, ins.a, 1, false);
+            j = j + 1;
+        }
+        let end: mir::MirTerminator = ctx.blocks[block].terminator;
+        if (end.op == 162 || end.op == 177 || end.op == 193 || end.op == 194 || end.op == 197)
+            && unavailable(&flow:Read, end.a) { *code = 7031; return false; }
+        let dispatch_source: u32 = flow.dispatch[block];
+        if dispatch_source != 0 { consume_place(&flow:ReadWrite, dispatch_source, false); }
+        if end.op == 162 || end.op == 192 || end.op == 193 { join_liveness(&flow:ReadWrite, end.b)?; }
+        if end.op == 162 || end.op == 193 { join_liveness(&flow:ReadWrite, end.c)?; }
+        if end.op == 177 {
+            var arm: u32 = 0;
+            while arm < end.c { join_liveness(&flow:ReadWrite, ctx.arms[end.b + arm].block as u32)?; arm = arm + 1; }
+        }
+    }
+    return true;
+}

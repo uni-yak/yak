@@ -1,0 +1,11 @@
+// t45: 位运算assert（& 优先级低于 ==，需括号）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert((0xFF & 0x0F) == 0x0F);
+    assert((0xF0 | 0x0F) == 0xFF);
+    assert((0xFF ^ 0x0F) == 0xF0);
+    assert(1 << 4 == 16);
+    assert(256 >> 4 == 16);
+    return;
+}

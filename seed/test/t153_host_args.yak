@@ -1,0 +1,4 @@
+// arg: alpha
+// arg: 中文
+foreign args_count(): u32; foreign args_len(index: u32): u32; foreign args_read(index: u32, buffer: &[u8]:ReadWrite): u32; foreign assert(cond: bool): void;
+function main(): void { assert(args_count() == 2); assert(args_len(1) == 6); var b: u8[] = []; var i: u32 = 0; while i < 6 { @push(b, 0)?; i = i + 1; } assert(args_read(1, &b[0..6]:ReadWrite) == 6); assert(b[0] == 228); }

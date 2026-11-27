@@ -1,0 +1,6 @@
+// 传递依赖链中间层：调用 leaf，期望值 3 + 4 = 7。
+import lower::value;
+
+export function mid_value(): u32 {
+    return lower::value::leaf_value() + 4u32;
+}

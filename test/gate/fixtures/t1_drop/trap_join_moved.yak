@@ -1,0 +1,15 @@
+// 合流后同一个零除点必须按实际分支清理整值。
+foreign write(data: &[u8]): void;
+
+function run(consume: bool, mode: u32): void!AllocError {
+    var a: u32[] = [];
+    @push(a, 61u32)?;
+    if consume { @drop(a); }
+    write("before-join-trap\n");
+    let divisor: u32 = mode - mode;
+    let result: u32 = 1u32 / divisor;
+    if result == 0 { return; }
+    return;
+}
+
+function main(): void { run(true, 0u32); return; }

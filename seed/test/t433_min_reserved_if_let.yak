@@ -1,0 +1,80 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+import lex;
+import parse;
+import types;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+foreign assert(condition: bool): void;
+
+function diagnose_fallible(): void!AllocError {
+    let source: &[u8] = "function value(): u64!AllocError { return 4; }\nfunction use(): u64 { if let payload = value() { return payload; } return 0; }\n";
+    let lexed: lex::LexResult = lex::lex_scan(source, 41)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let base: parse::ParseResult = parse::parse_lexed(&lexed:Read, 41)?;
+    assert(@len(base.diagnostics) == 1 && base.diagnostics[0].code.raw == 3008);
+    let parsed: parse::ParseResult = parse::parse_lexed_reserved_if_let(&lexed:Read, 41)?;
+    assert(@len(parsed.diagnostics) == 0 && @len(parsed.pool.ifs) == 1);
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolved: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diagnostics:ReadWrite)?;
+    assert(diag::diagbuf_count(&diagnostics:Read) == 0);
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolved:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E3004 spec/lang/sugar.md#SU-4
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 3004);
+    let at: types::Span = diagnostics.diags[0].span;
+    assert(at.file == 41 && at.offset == base.diagnostics[0].span.offset && at.length == 6);
+    let operand: u32 = parsed.pool.ifs[0].branches[0].condition;
+    assert(checked.types.entries[checked.expr_types.items[operand] - 1].kind == 9);
+    return;
+}
+
+function check(source: &[u8], code: u16): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(source, 42)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed_reserved_if_let(&lexed:Read, 42)?;
+    assert(@len(parsed.diagnostics) == 0);
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolved: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diagnostics:ReadWrite)?;
+    assert(diag::diagbuf_count(&diagnostics:Read) == 0);
+    typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolved:Read, &diagnostics:ReadWrite)?;
+    if code == 0 { assert(diag::diagbuf_count(&diagnostics:Read) == 0); }
+    else { assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == code); }
+    return;
+}
+
+function main(): void {
+    diagnose_fallible()?;
+    check("function f(): void { if let unused = true { return; } }\n", 3008)?;
+    check("function f(x: bool): bool { if x { return true; } elseif false { return false; } return x; }\n", 0)?;
+    check("function value(): i32!AllocError { return 5; }\nfunction f(): void { let carrier: i32!AllocError = value(); if false { return; } elseif let item = carrier { return; } }\n", 3004)?;
+    return;
+}

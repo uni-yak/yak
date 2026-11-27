@@ -1,0 +1,6 @@
+// expected_code: E4011
+// expected_diagnostics: E4009 E4009 E4011
+// spec: spec/lang/name.md N-11
+// 触发：同一函数的两个形参使用同一名称。
+function bad(value: i32, value: i32): void { return; }
+function main(): void { return; }

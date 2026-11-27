@@ -1,0 +1,157 @@
+// PE/COFF 对象容器的记录编码层：字节输出流、文件头、节表、符号记录与重定位记录。
+// 依据 spec/target/pe.md 二～四节。
+// 本模块只做小端字节序列化，不依赖任何其它模块：上层 coff.yak 单向依赖它，
+// 因此模块图中不可能出现循环依赖（module.md N-5）。
+//
+// 格式常量在本模块私有：Yak 的 const 不跨模块导出，外部一律使用
+// machine_amd64()/scn_text()/rel_rel32() 等导出函数取值（与 pe.yak 同约定）。
+
+// 符号名内联上限：8 字节以内直接写入名字段，超出则写偏移 + 字符串表。
+const NAME_INLINE_LIMIT: u32 = 8;
+
+// 字节输出流：与 pe::Code 相互独立，避免容器层耦合到机器码编码器。
+export struct Bytes { data: u8[] }
+
+export function bytes_new(): Bytes {
+    return Bytes { data: [] };
+}
+export function bytes_len(buf: &Bytes:Read): u32 {
+    return @len(buf.data) as u32;
+}
+export function bytes_u8(buf: &Bytes:ReadWrite, value: u8): void!AllocError {
+    @push(buf.data, value)?;
+    return;
+}
+export function bytes_u16(buf: &Bytes:ReadWrite, value: u16): void!AllocError {
+    @push(buf.data, (value & 255) as u8)?;
+    @push(buf.data, ((value >> 8) & 255) as u8)?;
+    return;
+}
+export function bytes_u32(buf: &Bytes:ReadWrite, value: u32): void!AllocError {
+    @push(buf.data, (value & 255) as u8)?;
+    @push(buf.data, ((value >> 8) & 255) as u8)?;
+    @push(buf.data, ((value >> 16) & 255) as u8)?;
+    @push(buf.data, ((value >> 24) & 255) as u8)?;
+    return;
+}
+export function bytes_u64(buf: &Bytes:ReadWrite, value: u64): void!AllocError {
+    var i: u32 = 0;
+    while i < 8 {
+        @push(buf.data, ((value >> ((i as u64) * 8)) & 255) as u8)?;
+        i = i + 1;
+    }
+    return;
+}
+export function bytes_raw(buf: &Bytes:ReadWrite, src: &[u8]): void!AllocError {
+    let size: u32 = @len(src) as u32;
+    let full: u32 = size - size % 8;
+    var i: u32 = 0;
+    while i < full {
+        @push(buf.data, src[i])?;
+        @push(buf.data, src[i + 1])?;
+        @push(buf.data, src[i + 2])?;
+        @push(buf.data, src[i + 3])?;
+        @push(buf.data, src[i + 4])?;
+        @push(buf.data, src[i + 5])?;
+        @push(buf.data, src[i + 6])?;
+        @push(buf.data, src[i + 7])?;
+        i = i + 8;
+    }
+    while i < size { @push(buf.data, src[i])?; i = i + 1; }
+    return;
+}
+// 补齐到 alignment 的整数倍，用 0 填充。
+export function bytes_pad(buf: &Bytes:ReadWrite, alignment: u32): void!AllocError {
+    if alignment == 0 { return; }
+    while bytes_len(buf) % alignment != 0 {
+        @push(buf.data, 0)?;
+    }
+    return;
+}
+export function bytes_patch_u32(buf: &Bytes:ReadWrite, offset: u32, value: u32): void {
+    if offset + 4 > @len(buf.data) as u32 { return; }
+    buf.data[offset] = (value & 255) as u8;
+    buf.data[offset + 1] = ((value >> 8) & 255) as u8;
+    buf.data[offset + 2] = ((value >> 16) & 255) as u8;
+    buf.data[offset + 3] = ((value >> 24) & 255) as u8;
+    return;
+}
+
+// ── 记录编码 ──
+// COFF 文件头，共 20 字节。TimeDateStamp 恒为 0 以满足确定性（pe.md 2.2）。
+export struct FileHeader {
+    machine: u16, sections: u16, timestamp: u32,
+    symtab: u32, symbols: u32, opt_size: u16, characteristics: u16,
+}
+export function emit_file_header(buf: &Bytes:ReadWrite, head: FileHeader): void!AllocError {
+    bytes_u16(buf, head.machine)?;
+    bytes_u16(buf, head.sections)?;
+    bytes_u32(buf, head.timestamp)?;
+    bytes_u32(buf, head.symtab)?;
+    bytes_u32(buf, head.symbols)?;
+    bytes_u16(buf, head.opt_size)?;
+    bytes_u16(buf, head.characteristics)?;
+    return;
+}
+// 节表项，共 40 字节。名称为 8 字节定长，不足补 0。
+export struct SectionHeader {
+    name: u8[], virtual_size: u32, virtual_address: u32,
+    raw_size: u32, raw_ptr: u32, reloc_ptr: u32, line_ptr: u32,
+    relocs: u16, lines: u16, characteristics: u32,
+}
+export function emit_section_header(buf: &Bytes:ReadWrite, head: &SectionHeader:Read): void!AllocError {
+    var i: u32 = 0;
+    while i < 8 {
+        var value: u8 = 0;
+        if i < @len(head.name) as u32 { value = head.name[i]; }
+        @push(buf.data, value)?;
+        i = i + 1;
+    }
+    bytes_u32(buf, head.virtual_size)?;
+    bytes_u32(buf, head.virtual_address)?;
+    bytes_u32(buf, head.raw_size)?;
+    bytes_u32(buf, head.raw_ptr)?;
+    bytes_u32(buf, head.reloc_ptr)?;
+    bytes_u32(buf, head.line_ptr)?;
+    bytes_u16(buf, head.relocs)?;
+    bytes_u16(buf, head.lines)?;
+    bytes_u32(buf, head.characteristics)?;
+    return;
+}
+// 符号记录，共 18 字节。短名（不超过 8 字节）内联写入名字段；
+// 长名写 4 字节零 + 4 字节字符串表偏移，偏移相对字符串表起点（含首 4 字节长度字段）。
+export function emit_symbol_at(buf: &Bytes:ReadWrite, name: &[u8]:Read, value: u32, section: i16, kind: u16, storage: u8, name_offset: u32): void!AllocError {
+    if @len(name) as u32 <= NAME_INLINE_LIMIT {
+        var i: u32 = 0;
+        while i < NAME_INLINE_LIMIT {
+            var byte: u8 = 0;
+            if i < @len(name) as u32 { byte = name[i]; }
+            @push(buf.data, byte)?;
+            i = i + 1;
+        }
+    } else {
+        // 长名以 4 字节零 + 4 字节字符串表偏移表示，偏移由装配阶段按符号次序计算。
+        bytes_u32(buf, 0)?;
+        bytes_u32(buf, name_offset)?;
+    }
+    bytes_u32(buf, value)?;
+    bytes_u16(buf, section as u16)?;
+    bytes_u16(buf, kind)?;
+    bytes_u8(buf, storage)?;
+    bytes_u8(buf, 0)?;
+    return;
+}
+// 短名符号记录：名字不超过 8 字节时直接调用；长名必须经 emit_symbol_at 携带字符串表偏移。
+export function emit_symbol(buf: &Bytes:ReadWrite, name: &[u8]:Read, value: u32, section: i16, kind: u16, storage: u8): void!AllocError {
+    emit_symbol_at(buf, name, value, section, kind, storage, 0)?;
+    return;
+}
+// 重定位记录，共 10 字节。
+export function emit_reloc(buf: &Bytes:ReadWrite, address: u32, symbol: u32, kind: u16): void!AllocError {
+    bytes_u32(buf, address)?;
+    bytes_u32(buf, symbol)?;
+    bytes_u16(buf, kind)?;
+    return;
+}
+// 符号名内联上限的导出取值：常量不跨模块，上层按需经此函数判断。
+export function name_inline_limit(): u32 { return 8; }

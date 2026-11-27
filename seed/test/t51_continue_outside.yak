@@ -1,0 +1,6 @@
+// t51: continue 在循环外（应 trap）
+// expected_trap: continue outside loop
+function main(): void {
+    continue;
+    return;
+}

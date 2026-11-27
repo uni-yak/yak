@@ -1,0 +1,100 @@
+# symbol.def — 固有符号闭集配置源（UTF-8、LF、确定性字节序）
+# 本文件是全部固有 BuiltinId（base + full）名称、slot、阶段、kind、零 payload 固有 enum 成员与派生规则的唯一真源。
+# stage=base 的条目由 min 激活；stage=full 的条目仅由 full 激活，编号提前冻结但不提前暴露。
+# 编译器不在用户构建热路径读取本文件；symgen 只在本文件变更时生成静态查找表。
+# 物理块顺序 = 分区码顺序 = 依赖顺序，禁止重排。
+
+format 2
+
+# ── 分区声明（按分区码序） ──
+partition type_symbols      code 0x1 depends -
+partition lang_items        code 0x2 depends type_symbols
+partition kind_consts       code 0x3 depends type_symbols
+partition type_value_consts code 0x4 depends type_symbols
+partition functions         code 0x5 depends type_symbols
+partition annotations      code 0x6 depends type_symbols,functions
+partition modules           code 0x7 depends -
+
+# ── 0x1 type_symbols：固有类型 ──
+# base 连续前缀 0x001–0x00C，full 只能追加，不得重排。
+entry type_symbols slot 0x001 stage base kind type name "u8"
+entry type_symbols slot 0x002 stage base kind type name "u16"
+entry type_symbols slot 0x003 stage base kind type name "u32"
+entry type_symbols slot 0x004 stage base kind type name "u64"
+entry type_symbols slot 0x005 stage base kind type name "i8"
+entry type_symbols slot 0x006 stage base kind type name "i16"
+entry type_symbols slot 0x007 stage base kind type name "i32"
+entry type_symbols slot 0x008 stage base kind type name "i64"
+entry type_symbols slot 0x009 stage base kind type name "bool"
+entry type_symbols slot 0x00A stage base kind type name "char"
+entry type_symbols slot 0x00B stage base kind type name "void"
+entry type_symbols slot 0x00C stage base kind enum name "AllocError"
+# 固有 enum 成员不是 BuiltinId；id 与逻辑 tag 均显式冻结。
+enum_variant host "AllocError" id 0 stage base name "OutOfMemory"
+entry type_symbols slot 0x00D stage full kind type name "string"
+entry type_symbols slot 0x00E stage full kind type name "f32"
+entry type_symbols slot 0x00F stage full kind type name "f64"
+entry type_symbols slot 0x010 stage full kind type name "ptr"
+entry type_symbols slot 0x011 stage full kind type name "cptr"
+reserve type_symbols from 0x012 to 0xFFF
+
+# ── 0x2 lang_items：类型标记，不是命名类型；仅 full 激活 ──
+entry lang_items slot 0x001 stage full kind lang_item name "Copy"
+entry lang_items slot 0x002 stage full kind lang_item name "Clone"
+entry lang_items slot 0x003 stage full kind lang_item name "Drop"
+entry lang_items slot 0x004 stage full kind lang_item name "Error"
+reserve lang_items from 0x005 to 0xFFF
+
+# ── 0x3 kind_consts：槽位镜像 type_symbols（派生，无 entry） ──
+derive kind_consts mode mirror source type_symbols
+
+# ── 0x4 type_value_consts：类型关联常量，显式 value block ──
+# value_slot 定义可用槽位名；value_block 声明每个类型的 block 编号与激活槽。
+# 无符号整数 min = 0 平凡，不登记；有符号整数 min 为负值，须登记。
+# char min = 0 平凡，不登记。
+value_slot 0x1 name "max"
+value_slot 0x2 name "min"
+value_slot 0x3 name "epsilon"
+value_slot 0x4 name "infinity"
+value_slot 0x5 name "nan"
+value_block type "u8"  block 0x001 enable 0x1,0x2
+value_block type "u16" block 0x002 enable 0x1,0x2
+value_block type "u32" block 0x003 enable 0x1,0x2
+value_block type "u64" block 0x004 enable 0x1,0x2
+value_block type "i8"  block 0x005 enable 0x1,0x2
+value_block type "i16" block 0x006 enable 0x1,0x2
+value_block type "i32" block 0x007 enable 0x1,0x2
+value_block type "i64" block 0x008 enable 0x1,0x2
+value_block type "char" block 0x009 enable 0x1,0x2
+value_block type "bool" block 0x00C enable 0x1,0x2
+value_block type "f32" block 0x00A enable 0x1,0x2,0x3,0x4,0x5
+value_block type "f64" block 0x00B enable 0x1,0x2,0x3,0x4,0x5
+reserve type_value_consts from 0xFF9 to 0xFFF
+
+# ── 0x5 functions：@ 前缀原语 ──
+# foreign 服务与普通 std 函数不在此分区。
+entry functions slot 0x001 stage base kind primitive name "@move"
+entry functions slot 0x002 stage base kind primitive name "@copy"
+entry functions slot 0x003 stage base kind primitive name "@clone"
+entry functions slot 0x004 stage base kind primitive name "@drop"
+entry functions slot 0x005 stage base kind primitive name "@push"
+entry functions slot 0x006 stage base kind primitive name "@len"
+entry functions slot 0x007 stage full kind primitive name "@size_of"
+entry functions slot 0x008 stage full kind primitive name "@align_of"
+entry functions slot 0x009 stage full kind primitive name "@offset_of"
+entry functions slot 0x00A stage full kind primitive name "@is_null"
+entry functions slot 0x00B stage full kind primitive name "@panic"
+entry functions slot 0x00C stage full kind primitive name "@breakpoint"
+entry functions slot 0x00D stage base kind primitive name "@wrap_add"
+entry functions slot 0x00E stage base kind primitive name "@wrap_sub"
+entry functions slot 0x00F stage base kind primitive name "@wrap_mul"
+reserve functions from 0x010 to 0xFFF
+
+# ── 0x6 annotations：编译器可识别注解 ──
+entry annotations slot 0x001 stage full kind annotation name "@inline"
+entry annotations slot 0x002 stage full kind annotation name "@align"
+reserve annotations from 0x003 to 0xFFF
+
+# ── 0x7 modules：预留分区，未激活 ──
+# 普通标准库模块走 .iface，不占 BuiltinId。
+reserve modules from 0x001 to 0xFFF

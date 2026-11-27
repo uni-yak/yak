@@ -1,0 +1,28 @@
+// 探针只验证有界帧往返；不解释 JSON，也不是语言服务入口。
+import frame;
+foreign exit(code: u8): void;
+
+function echo_one(): u8!AllocError {
+    let size: u32 = frame::read_header()?;
+    if frame::end_of_stream(size) { return 0u8; }
+    if frame::invalid_header(size) { return 2u8; }
+    let body: u8[] = frame::read_body(size)?;
+    if @len(body) != (size as u64) { return 2u8; }
+    if !frame::write_frame(&body[0..size]:Read) { return 2u8; }
+    if size == 0 { return 0u8; }
+    return 3u8;
+}
+
+function echo_frames(): u8!AllocError {
+    var status: u8 = 3;
+    while status == 3u8 { status = echo_one()?; }
+    exit(status);
+    return status;
+}
+
+function main(): void {
+    // 正常路径已经退出；只有分配错误还能返回到本函数。
+    let failed: u8!AllocError = echo_frames();
+    @drop(failed);
+    exit(1);
+}

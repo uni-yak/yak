@@ -1,0 +1,1013 @@
+// 所有权位置、租约状态与退出计划，供表达式和控制流检查共享。
+import ast;
+import types;
+import diag;
+import typecheck;
+import copy_facts;
+import resolve;
+import resolve_refs;
+
+// 类型种类编号与 typecheck 的 TypeEntry.kind 保持一致。
+// seed 参考解释器的跨模块成员查找只覆盖函数、结构体与枚举，不覆盖常量，
+// 因此这里就地声明，不通过 typecheck::TK_* 跨模块引用。
+const KIND_REF: u8 = 4;
+const KIND_SLICE: u8 = 5;
+const KIND_DYN_ARRAY: u8 = 6;
+const KIND_FIXED_ARRAY: u8 = 7;
+
+// place 状态：0=live，1=moved，2=dropped，3=maybe live（部分前驱仍持有所有权）。
+const PLACE_LIVE: u8 = 0;
+const PLACE_MOVED: u8 = 1;
+const PLACE_DROPPED: u8 = 2;
+// 条件所有者：合流前驱中一部分已消费、另一部分仍 live，出口须保留该项按条件析构（owner.md 6.1）。
+// 该状态不可再读取或再次移动，只能作为正常出口的析构候选。
+const PLACE_MAYBE_LIVE: u8 = 3;
+// 合流占位：尚未收到任何有效前驱的状态。首个前驱直接继承自身状态（含已 dropped），
+// 避免把入口已消费的值重新当成 live（owner.md 6.1）。
+const PLACE_UNSET: u8 = 4;
+
+// out 槽位状态：0=empty，1=lent，2=full，3=consumed。
+const SLOT_EMPTY: u8 = 0;
+const SLOT_FULL: u8 = 2;
+const SLOT_CONSUMED: u8 = 3;
+
+// 内建原语编号，来自 spec/lang/symbol.def。
+const BUILTIN_COPY: u16 = 20482;
+
+// 单个 place 的检查状态。
+// def 为 DefId（0 表示非绑定 place，例如临时值）；state 取 PLACE_*；
+// slot 取 SLOT_*，仅在 out 参数上有效。
+export struct PlaceState { def: u32, state: u8, slot: u8, is_out: bool, span: types::Span }
+export struct PlaceTable { items: PlaceState[] }
+
+// 文档分别限制快照复制、冲突查询、位置合流、按定义查找、离块清理和槽位跳转，跨函数、回放与不可达路径共享。
+export struct OwnerWorkBudget { copy_limited: bool, copy_remaining: u32, copy_exhausted: bool, conflict_limited: bool, conflict_remaining: u32, conflict_exhausted: bool, merge_limited: bool, merge_remaining: u32, merge_exhausted: bool, lookup_limited: bool, lookup_remaining: u32, lookup_exhausted: bool, exit_limited: bool, exit_remaining: u32, exit_exhausted: bool, slot_jump_limited: bool, slot_jump_remaining: u32, slot_jump_exhausted: bool, slice_jump_limited: bool, slice_jump_remaining: u32, slice_jump_exhausted: bool, use_out_refs: bool, place_roots: u32[], slice_sources: u32[] }
+
+export function owner_work_stopped(work: &OwnerWorkBudget:Read): bool {
+    return work.copy_exhausted || work.conflict_exhausted || work.merge_exhausted || work.lookup_exhausted || work.exit_exhausted || work.slot_jump_exhausted || work.slice_jump_exhausted;
+}
+
+// 合流按每次整表走访的行数预扣；快照复制由独立配额处理。
+export function charge_place_merge(work: &OwnerWorkBudget:ReadWrite, rows: u64): bool {
+    if !work.merge_limited { return true; }
+    if rows > work.merge_remaining as u64 { work.merge_exhausted = true; return false; }
+    work.merge_remaining = work.merge_remaining - rows as u32;
+    return true;
+}
+
+// 离块按每个候选位置和实际访问的非零作用域节点计费。
+export function visit_place_exit(work: &OwnerWorkBudget:ReadWrite): bool {
+    if !work.exit_limited { return true; }
+    if work.exit_remaining == 0u32 { work.exit_exhausted = true; return false; }
+    work.exit_remaining = work.exit_remaining - 1u32;
+    return true;
+}
+
+// 槽位跳转按实际查找、记录和归并的步骤计费。
+export function visit_slot_jump(work: &OwnerWorkBudget:ReadWrite): bool {
+    if !work.slot_jump_limited { return true; }
+    if work.slot_jump_remaining == 0u32 { work.slot_jump_exhausted = true; return false; }
+    work.slot_jump_remaining = work.slot_jump_remaining - 1u32;
+    return true;
+}
+
+// 切片跳转只计读取目标帧、写入记录和收集记录，不重复计入可见性与合流。
+export function visit_slice_jump(work: &OwnerWorkBudget:ReadWrite): bool {
+    if !work.slice_jump_limited { return true; }
+    if work.slice_jump_remaining == 0u32 { work.slice_jump_exhausted = true; return false; }
+    work.slice_jump_remaining = work.slice_jump_remaining - 1u32;
+    return true;
+}
+
+// 只计实际比较的借用行，命中后不扫描其余行。
+function visit_borrow(work: &OwnerWorkBudget:ReadWrite): bool {
+    if !work.conflict_limited { return true; }
+    if work.conflict_remaining == 0u32 { work.conflict_exhausted = true; return false; }
+    work.conflict_remaining = work.conflict_remaining - 1u32;
+    return true;
+}
+
+// 借用区域：owner 为被借用 place 的 DefId，cap 为 0=Read、1=ReadWrite，
+// scope 记录建立借用的块作用域，用于判定逃逸。
+export struct BorrowRecord { owner: u32, cap: u8, scope: u32, span: types::Span }
+export struct BorrowTable { items: BorrowRecord[] }
+
+// 来源仍在变量中时 current 为真；已建立的借用保留到其作用域结束。
+// site 为借用表达式加一（切片为零），parent 指向被暂停的独占借用。
+export struct SliceLoan { binding: u32, root: u32, current: bool, exclusive: bool, site: u64, parent: u64, scope: u32 }
+export struct SliceState { items: SliceLoan[] }
+export struct SliceLoop { scope: u32, label: u32 }
+export struct SliceJump { depth: u32, back: bool, loan: SliceLoan }
+// 槽位跳转记录目标深度；def 为零的记录标记一条边结束，即使没有外层槽位也保留可达性。
+export struct SlotJump { depth: u32, back: bool, def: u32, slot: u8, span: types::Span }
+export struct BorrowState { roots: u32[], active: u64, read_roots: u32[], read_active: u64, scalar_temps: SliceLoan[], scalar_active: u64, slices: SliceState, loops: SliceLoop[], depth: u32, jumps: SliceJump[], jump_count: u64, slot_jumps: SlotJump[], slot_jump_count: u64, slot_live: bool, copy_order: u8 }
+
+export function new_borrows(copy_order: u8): BorrowState {
+    return BorrowState { roots: [], active: 0, read_roots: [], read_active: 0, scalar_temps: [], scalar_active: 0, slices: SliceState { items: [] }, loops: [], depth: 0, jumps: [], jump_count: 0, slot_jumps: [], slot_jump_count: 0, slot_live: true, copy_order: copy_order };
+}
+
+// 显式返回用 AST 语句索引，错误传播用 AST 表达式索引，隐式返回保留独立序列；
+// 作用域退出计划按边种类区分：2=break（语句索引）、3=continue（语句索引）、4=子块正常落尾（块索引）。
+export struct ReturnDropPlan { site: u32, on_error: bool, defs: u32[] }
+export struct ScopeDropPlan { edge: u32, site: u32, defs: u32[] }
+export struct ReturnDropTable { items: ReturnDropPlan[], scopes: ScopeDropPlan[], locals_start: u32, enabled: bool }
+export struct DropPlan { func_def: u32, defs: u32[], returns: ReturnDropTable }
+export struct DropPlanTable { items: DropPlan[] }
+
+export function emit(diags: &diag::DiagBuffer:ReadWrite, code: types::ErrorCode, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: code, severity: 0, span: span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+
+// 类型未定时不再产生所有权诊断；已知类型由共享的成员递归规则判定。
+export function is_copy_type(checked: &typecheck::TypeCheckResult:Read, id: u32): bool {
+    return id == 0 || id > @len(checked.types.entries) as u32 || copy_facts::is_copy_value(checked, id);
+}
+
+export function is_copy_type_ordered(checked: &typecheck::TypeCheckResult:Read, id: u32, copy_order: u8): bool {
+    return id == 0 || id > @len(checked.types.entries) as u32 || copy_facts::is_copy_value_ordered(checked, id, copy_order);
+}
+
+// 判定类型是否携带 owning 资源（即非 Copy 且非视图）。
+export function is_owning_type(checked: &typecheck::TypeCheckResult:Read, id: u32): bool {
+    return !is_copy_type(checked, id);
+}
+
+// 满聚合槽离开作用域时必须结束槽位状态，即使载荷是 Copy、无需释放。
+export function needs_exit_drop(checked: &typecheck::TypeCheckResult:Read, order: u8, place: PlaceState): bool {
+    if place.def == 0 || (place.state != PLACE_LIVE && place.state != PLACE_MAYBE_LIVE) { return false; }
+    if !place.is_out { return def_is_owning(checked, order, place.def); }
+    if place.slot != SLOT_FULL || place.def > @len(checked.def_types.items) as u32 { return false; }
+    let ty: u32 = checked.def_types.items[place.def - 1];
+    if ty == 0 || ty > @len(checked.types.entries) as u32 { return false; }
+    let entry: &typecheck::TypeEntry:Read = &checked.types.entries[ty - 1]:Read;
+    return entry.kind == 2 || entry.kind == 3 || entry.kind == 6 || entry.kind == 7 || (entry.kind == 1 && entry.builtin == 4108);
+}
+
+// 先限定可比较的行数；耗尽时调用者先检查停止状态，再区分下标与缺失。
+export function place_index(places: &PlaceTable:Read, work: &OwnerWorkBudget:ReadWrite, def: u32): u32 {
+    if work.lookup_exhausted { return 0; }
+    let count: u32 = @len(places.items) as u32;
+    var end: u32 = count;
+    if work.lookup_limited && work.lookup_remaining < end { end = work.lookup_remaining; }
+    var i: u32 = 0;
+    while i < end {
+        if places.items[i].def == def {
+            if work.lookup_limited { work.lookup_remaining = work.lookup_remaining - (i + 1u32); }
+            return i + 1u32;
+        }
+        i = i + 1u32;
+    }
+    if work.lookup_limited {
+        work.lookup_remaining = work.lookup_remaining - end;
+        if end < count { work.lookup_exhausted = true; }
+    }
+    return 0;
+}
+
+export function place_state(places: &PlaceTable:Read, work: &OwnerWorkBudget:ReadWrite, def: u32): u8 {
+    let index: u32 = place_index(places, work, def);
+    if index == 0 { return PLACE_LIVE; }
+    return places.items[index - 1].state;
+}
+
+export function place_slot(places: &PlaceTable:Read, work: &OwnerWorkBudget:ReadWrite, def: u32): u8 {
+    let index: u32 = place_index(places, work, def);
+    if index == 0 { return SLOT_EMPTY; }
+    return places.items[index - 1].slot;
+}
+
+export function place_is_out(places: &PlaceTable:Read, work: &OwnerWorkBudget:ReadWrite, def: u32): bool {
+    let index: u32 = place_index(places, work, def);
+    if index == 0 { return false; }
+    return places.items[index - 1].is_out;
+}
+
+// 写入或更新 place 状态；不存在时追加。
+export function set_place(places: &PlaceTable:ReadWrite, work: &OwnerWorkBudget:ReadWrite, def: u32, state: u8, slot: u8, is_out: bool, span: types::Span): void!AllocError {
+    let index: u32 = place_index(places, work, def);
+    if work.lookup_exhausted { return; }
+    if index == 0 {
+        @push(places.items, PlaceState { def: def, state: state, slot: slot, is_out: is_out, span: span })?;
+        return;
+    }
+    places.items[index - 1].state = state;
+    places.items[index - 1].slot = slot;
+    places.items[index - 1].is_out = is_out;
+    places.items[index - 1].span = span;
+    return;
+}
+
+export function set_place_state(places: &PlaceTable:ReadWrite, work: &OwnerWorkBudget:ReadWrite, def: u32, state: u8, span: types::Span): void!AllocError {
+    let index: u32 = place_index(places, work, def);
+    if work.lookup_exhausted { return; }
+    if index == 0 {
+        @push(places.items, PlaceState { def: def, state: state, slot: SLOT_EMPTY, is_out: false, span: span })?;
+        return;
+    }
+    places.items[index - 1].state = state;
+    return;
+}
+
+// 直接位置按根判定重叠；from 可限制为子表达式新建立的借用。
+export function exclusively_borrowed(borrows: &BorrowState:Read, def: u32, from: u64, work: &OwnerWorkBudget:ReadWrite): bool {
+    if def == 0 { return false; }
+    var i: u64 = from;
+    while i < borrows.active {
+        if !visit_borrow(work) { return false; }
+        if borrows.roots[i] == def { return true; }
+        i = i + 1;
+    }
+    if from == 0 {
+        i = 0;
+        while i < @len(borrows.slices.items) {
+            if !visit_borrow(work) { return false; }
+            if borrows.slices.items[i].root == def && borrows.slices.items[i].exclusive { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+export function shared_borrowed(borrows: &BorrowState:Read, def: u32, work: &OwnerWorkBudget:ReadWrite): bool {
+    if def == 0 { return false; }
+    var i: u64 = 0;
+    while i < borrows.read_active {
+        if !visit_borrow(work) { return false; }
+        if borrows.read_roots[i] == def { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(borrows.slices.items) {
+        if !visit_borrow(work) { return false; }
+        if borrows.slices.items[i].root == def && !borrows.slices.items[i].exclusive { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+export function add_shared_borrow(borrows: &BorrowState:ReadWrite, def: u32, work: &OwnerWorkBudget:ReadWrite): void!AllocError {
+    if shared_borrowed(borrows, def, work) || work.conflict_exhausted { return; }
+    let active: u64 = borrows.read_active;
+    if active == @len(borrows.read_roots) { @push(borrows.read_roots, def)?; }
+    else { borrows.read_roots[active] = def; }
+    borrows.read_active = active + 1;
+    return;
+}
+
+// 标记 place 被移动或析构；已不在 live 状态时报 OW-1。
+export function consume_place(places: &PlaceTable:ReadWrite, borrows: &BorrowState:Read, diags: &diag::DiagBuffer:ReadWrite, work: &OwnerWorkBudget:ReadWrite, def: u32, target: u8, span: types::Span): void!AllocError {
+    let out_slot: bool = place_is_out(places, work, def);
+    if work.lookup_exhausted { return; }
+    if out_slot { emit(diags, types::error_code(6102), span)?; return; }
+    let state: u8 = place_state(places, work, def);
+    if work.lookup_exhausted { return; }
+    if state != PLACE_LIVE { emit(diags, types::error_code(6003), span)?; return; }
+    let conflict: bool = exclusively_borrowed(borrows, def, 0, work) || (!work.conflict_exhausted && shared_borrowed(borrows, def, work));
+    if work.conflict_exhausted { return; }
+    if conflict { emit(diags, types::error_code(6004), span)?; return; }
+    set_place_state(places, work, def, target, span)?;
+    return;
+}
+
+// 读取 place：moved/dropped 报 OW-1；out 槽位不可直接读取，只能经 @move 提取（OW-8）。
+export function read_place(places: &PlaceTable:Read, borrows: &BorrowState:Read, diags: &diag::DiagBuffer:ReadWrite, work: &OwnerWorkBudget:ReadWrite, def: u32, span: types::Span): void!AllocError {
+    let out_slot: bool = place_is_out(places, work, def);
+    if work.lookup_exhausted { return; }
+    if out_slot { emit(diags, types::error_code(6102), span)?; return; }
+    let state: u8 = place_state(places, work, def);
+    if work.lookup_exhausted { return; }
+    if state != PLACE_LIVE { emit(diags, types::error_code(6003), span)?; return; }
+    if exclusively_borrowed(borrows, def, 0, work) { emit(diags, types::error_code(6004), span)?; }
+    return;
+}
+
+// 查找表达式的根 DefId：标识符路径取绑定，成员/索引/切片回溯到根。
+// 返回 0 表示该表达式不是可命名的 place。
+export function place_root(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32): u32 {
+    if expr >= @len(pool.exprs) as u32 { return 0; }
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    if kind == 0 || kind == 25 {
+        let index: u32 = typecheck::ref_index(refs, 0, expr);
+        if index == 0 { return 0; }
+        if refs.items[index - 1].kind != 0 { return 0; }
+        return refs.items[index - 1].x;
+    }
+    if kind == 23 {
+        // 成员访问回溯到对象根。
+        if data >= @len(pool.members) as u32 { return 0; }
+        return place_root(pool, refs, pool.members[data].object);
+    }
+    if kind == 24 {
+        // 索引访问回溯到被索引对象。
+        if data >= @len(pool.indices) as u32 { return 0; }
+        return place_root(pool, refs, pool.indices[data].object);
+    }
+    if kind == 27 {
+        // 切片访问回溯到被切片对象。
+        if data >= @len(pool.slices) as u32 { return 0; }
+        return place_root(pool, refs, pool.slices[data].object);
+    }
+    return 0;
+}
+
+// 文档在解析后已验证表达式边为后序；引用索引完整时才建立根绑定表。
+export function build_place_roots(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read): u32[]!AllocError {
+    var roots: u32[] = [];
+    if @len(refs.expr_index) != @len(pool.exprs) { return roots; }
+    if @len(pool.members) == 0 && @len(pool.indices) == 0 && @len(pool.slices) == 0 { return roots; }
+    var expr: u32 = 0u32;
+    while expr < @len(pool.exprs) as u32 {
+        let node: ast::Expr = pool.exprs[expr];
+        let data: u32 = node.data as u32;
+        var object: u32 = 4294967295u32;
+        var root: u32 = 0u32;
+        if node.kind == 0 || node.kind == 25 { root = place_root(pool, refs, expr); }
+        elseif node.kind == 23 && data < @len(pool.members) as u32 { object = pool.members[data].object; }
+        elseif node.kind == 24 && data < @len(pool.indices) as u32 { object = pool.indices[data].object; }
+        elseif node.kind == 27 && data < @len(pool.slices) as u32 { object = pool.slices[data].object; }
+        if object < expr { root = roots[object]; }
+        @push(roots, root)?;
+        expr = expr + 1u32;
+    }
+    return roots;
+}
+
+export function indexed_place_root(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, work: &OwnerWorkBudget:Read, expr: u32): u32 {
+    if @len(work.place_roots) == 0 { return place_root(pool, refs, expr); }
+    if expr >= @len(work.place_roots) as u32 { return 0u32; }
+    return work.place_roots[expr];
+}
+
+// 判定一元运算是否建立借用。op 18 是逻辑非，19 是取引用，13 是解引用。
+function unary_is_borrow(pool: &ast::AstPool:Read, expr: u32): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    if pool.exprs[expr].kind != 21 { return false; }
+    let data: u32 = pool.exprs[expr].data as u32;
+    if data >= @len(pool.unaries) as u32 { return false; }
+    return pool.unaries[data].op == 19;
+}
+
+// 判定调用是否 `@move` / `@copy` / `@clone` / `@drop` 原语，返回原语编号，否则 0。
+export function primitive_of(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, call: u32): u16 {
+    if call >= @len(pool.calls) as u32 { return 0; }
+    let callee: u32 = pool.calls[call].callee;
+    if callee >= @len(pool.exprs) as u32 { return 0; }
+    if pool.exprs[callee].kind != 29 { return 0; }
+    let index: u32 = typecheck::ref_index(refs, 0, callee);
+    if index == 0 { return 0; }
+    if refs.items[index - 1].kind != 1 { return 0; }
+    return refs.items[index - 1].x as u16;
+}
+
+// 来源查询只读类型与 AST；活跃借用仍由赋值点的状态决定。
+struct SliceSourceStep { node: u32, follow: bool }
+
+function slice_source_step(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, expr: u32): SliceSourceStep {
+    let none: SliceSourceStep = SliceSourceStep { node: 4294967295u32, follow: false };
+    if expr >= @len(checked.expr_types.items) as u32 { return none; }
+    let type_id: u32 = checked.expr_types.items[expr];
+    if type_id == 0 || checked.types.entries[type_id - 1].kind != KIND_SLICE { return none; }
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    if kind == 27 {
+        let object: u32 = pool.slices[data].object;
+        let base: u32 = checked.expr_types.items[object];
+        if base != 0 && checked.types.entries[base - 1].kind == KIND_DYN_ARRAY { return SliceSourceStep { node: expr, follow: false }; }
+        return SliceSourceStep { node: object, follow: true };
+    }
+    if kind == 21 && unary_is_borrow(pool, expr) {
+        let range_id: u32 = pool.unaries[data].operand;
+        if pool.exprs[range_id].kind == 27 {
+            let range: ast::SliceExpr = pool.slices[pool.exprs[range_id].data as u32];
+            let base: u32 = checked.expr_types.items[range.object];
+            if base != 0 && checked.types.entries[base - 1].kind == KIND_FIXED_ARRAY { return SliceSourceStep { node: range_id, follow: false }; }
+            return SliceSourceStep { node: range_id, follow: true };
+        }
+    }
+    if kind == 22 && primitive_of(pool, refs, data) == BUILTIN_COPY && @len(pool.calls[data].args) == 1 {
+        return SliceSourceStep { node: pool.calls[data].args[0].value, follow: true };
+    }
+    if kind == 0 || kind == 25 { return SliceSourceStep { node: expr, follow: false }; }
+    return none;
+}
+
+// 批处理保持逐链查询；文档只在首次切片赋值时建立整表。
+export function slice_source(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, start: u32): u32 {
+    var expr: u32 = start;
+    while true {
+        let step: SliceSourceStep = slice_source_step(pool, refs, checked, expr);
+        if !step.follow { return step.node; }
+        expr = step.node;
+    }
+    return 4294967295u32;
+}
+
+export function build_slice_sources(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read): u32[]!AllocError {
+    var sources: u32[] = [];
+    if @len(refs.expr_index) != @len(pool.exprs) { return sources; }
+    var expr: u32 = 0u32;
+    while expr < @len(pool.exprs) as u32 {
+        let step: SliceSourceStep = slice_source_step(pool, refs, checked, expr);
+        var source: u32 = step.node;
+        if step.follow {
+            source = 4294967295u32;
+            if step.node < expr { source = sources[step.node]; }
+        }
+        @push(sources, source)?;
+        expr = expr + 1u32;
+    }
+    return sources;
+}
+
+export function scope_encloses(tables: &resolve::ResolveTables:Read, outer: u32, inner: u32): bool {
+    var current: u32 = inner;
+    while current != 0 {
+        if current == outer { return true; }
+        current = tables.scopes[current - 1].parent;
+    }
+    return false;
+}
+
+export function place_exit_scope_encloses(tables: &resolve::ResolveTables:Read, outer: u32, inner: u32, work: &OwnerWorkBudget:ReadWrite): bool {
+    if !work.exit_limited { return scope_encloses(tables, outer, inner); }
+    var current: u32 = inner;
+    while current != 0u32 {
+        if !visit_place_exit(work) { return false; }
+        if current == outer { return true; }
+        current = tables.scopes[current - 1].parent;
+    }
+    return false;
+}
+
+export function slot_jump_scope_encloses(tables: &resolve::ResolveTables:Read, outer: u32, inner: u32, work: &OwnerWorkBudget:ReadWrite): bool {
+    if !work.slot_jump_limited { return scope_encloses(tables, outer, inner); }
+    var current: u32 = inner;
+    while current != 0u32 {
+        if !visit_slot_jump(work) { return false; }
+        if current == outer { return true; }
+        current = tables.scopes[current - 1].parent;
+    }
+    return false;
+}
+
+// 不同前驱取并集；同一绑定可携带不同来源和独占父借用。
+export function include_slice(state: &SliceState:ReadWrite, loan: SliceLoan): bool!AllocError {
+    var i: u64 = 0;
+    while i < @len(state.items) {
+        if state.items[i].binding == loan.binding && state.items[i].root == loan.root && state.items[i].site == loan.site && state.items[i].parent == loan.parent {
+            let changed: bool = (!state.items[i].current && loan.current) || (!state.items[i].exclusive && loan.exclusive);
+            state.items[i].current = state.items[i].current || loan.current;
+            state.items[i].exclusive = state.items[i].exclusive || loan.exclusive;
+            return changed;
+        }
+        i = i + 1;
+    }
+    @push(state.items, loan)?;
+    return true;
+}
+
+// 单版文档共享；批处理禁用，不限制借用传播。
+export struct SliceMergeBudget { limited: bool, remaining: u32, exhausted: bool }
+
+export function include_slice_join(state: &SliceState:ReadWrite, loan: SliceLoan, budget: &SliceMergeBudget:ReadWrite): bool!AllocError {
+    if budget.limited {
+        // 计入候选记录及线性查找上界；必须在扫描或改动目标表之前扣除。
+        let rows: u64 = @len(state.items);
+        if rows >= budget.remaining as u64 { budget.exhausted = true; return false; }
+        budget.remaining = budget.remaining - rows as u32 - 1u32;
+    }
+    return include_slice(state, loan)?;
+}
+
+export function merge_slices(state: &SliceState:ReadWrite, from: &SliceState:Read, budget: &SliceMergeBudget:ReadWrite): bool!AllocError {
+    var changed: bool = false;
+    var i: u64 = 0;
+    while i < @len(from.items) {
+        if (include_slice_join(state, from.items[i], budget)?) { changed = true; }
+        if budget.exhausted { return false; }
+        i = i + 1;
+    }
+    return changed;
+}
+
+// 只计快照复制的源表行数，离块过滤和合流分别处理。
+export struct SliceCopyBudget { limited: bool, remaining: u32, exhausted: bool }
+
+export function copy_slices(from: &SliceState:Read, budget: &SliceCopyBudget:ReadWrite): SliceState!AllocError {
+    if budget.limited {
+        let rows: u64 = @len(from.items);
+        if rows > budget.remaining as u64 { budget.exhausted = true; return SliceState { items: [] }; }
+        budget.remaining = budget.remaining - rows as u32;
+    }
+    var state: SliceState = SliceState { items: [] };
+    var i: u64 = 0;
+    while i < @len(from.items) { @push(state.items, from.items[i])?; i = i + 1; }
+    return state;
+}
+
+// 过滤和赋值各用独立的扫描计数器，批处理不扣配额。
+export struct SliceScopeBudget { limited: bool, remaining: u32, exhausted: bool }
+
+export function charge_slice_steps(budget: &SliceScopeBudget:ReadWrite, steps: u64): bool {
+    if !budget.limited { return true; }
+    if steps > budget.remaining as u64 { budget.exhausted = true; return false; }
+    budget.remaining = budget.remaining - steps as u32;
+    return true;
+}
+
+export function slice_scope_encloses(tables: &resolve::ResolveTables:Read, outer: u32, inner: u32, budget: &SliceScopeBudget:ReadWrite): bool {
+    if !budget.limited { return scope_encloses(tables, outer, inner); }
+    var current: u32 = inner;
+    while current != 0u32 {
+        if !charge_slice_steps(budget, 1u64) { return false; }
+        if current == outer { return true; }
+        current = tables.scopes[current - 1].parent;
+    }
+    return false;
+}
+
+export function keep_slices(from: &SliceState:Read, tables: &resolve::ResolveTables:Read, scope: u32, budget: &SliceScopeBudget:ReadWrite): SliceState!AllocError {
+    var state: SliceState = SliceState { items: [] };
+    var i: u64 = 0;
+    while i < @len(from.items) {
+        if !charge_slice_steps(budget, 1u64) { return SliceState { items: [] }; }
+        let loan: SliceLoan = from.items[i];
+        if slice_scope_encloses(tables, tables.defs[loan.binding - 1].scope, scope, budget) { @push(state.items, loan)?; }
+        if budget.exhausted { return SliceState { items: [] }; }
+        i = i + 1;
+    }
+    return state;
+}
+
+export function assign_slice(state: &SliceState:ReadWrite, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, diags: &diag::DiagBuffer:ReadWrite, work: &OwnerWorkBudget:ReadWrite, binding: u32, expr: u32, span: types::Span, budget: &SliceScopeBudget:ReadWrite): void!AllocError {
+    let type_id: u32 = def_type_of(checked, binding);
+    if type_id == 0 || checked.types.entries[type_id - 1].kind != KIND_SLICE { return; }
+    if work.use_out_refs && @len(work.slice_sources) == 0 && expr < @len(pool.exprs) as u32 {
+        work.slice_sources = build_slice_sources(pool, refs, checked)?;
+    }
+    var source: u32 = 4294967295u32;
+    if @len(work.slice_sources) == 0 { source = slice_source(pool, refs, checked, expr); }
+    elseif expr < @len(work.slice_sources) as u32 { source = work.slice_sources[expr]; }
+    var roots: u32[] = [];
+    if source != 4294967295u32 {
+        if pool.exprs[source].kind == 27 {
+            let root: u32 = indexed_place_root(pool, refs, work, pool.slices[pool.exprs[source].data as u32].object);
+            if root != 0 { @push(roots, root)?; }
+        } else {
+            if !charge_slice_steps(budget, @len(state.items)) { return; }
+            let source_def: u32 = indexed_place_root(pool, refs, work, source);
+            var i: u64 = 0;
+            while i < @len(state.items) {
+                if state.items[i].binding == source_def && state.items[i].current { @push(roots, state.items[i].root)?; }
+                i = i + 1;
+            }
+        }
+    }
+    // 先读来源再覆盖，使自赋值和显式复制仍保留正确来源。
+    if !charge_slice_steps(budget, @len(state.items)) { return; }
+    var i: u64 = 0;
+    while i < @len(state.items) {
+        if state.items[i].binding == binding { state.items[i].current = false; }
+        i = i + 1;
+    }
+    i = 0;
+    let scope: u32 = tables.defs[binding - 1].scope;
+    while i < @len(roots) {
+        if !charge_slice_steps(budget, 1u64) { return; }
+        let root: u32 = roots[i];
+        if !slice_scope_encloses(tables, tables.defs[root - 1].scope, scope, budget) {
+            if !budget.exhausted { emit(diags, types::error_code(6005), span)?; }
+            return;
+        }
+        // 按整表上界预扣查重，即使很早命中已有记录。
+        if !charge_slice_steps(budget, @len(state.items)) { return; }
+        include_slice(state, SliceLoan { binding: binding, root: root, current: true, exclusive: checked.types.entries[type_id - 1].cap == 1, site: 0u64, parent: 0u64, scope: scope })?;
+        i = i + 1;
+    }
+    return;
+}
+
+// 副本保留原借用的身份；只沿能产生引用值的表达式查找。
+function scalar_value_source(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32): u32 {
+    var node: u32 = expr;
+    while node < @len(pool.exprs) as u32 {
+        let value: ast::Expr = pool.exprs[node];
+        let data: u32 = value.data as u32;
+        if value.kind != 22 || primitive_of(pool, refs, data) != BUILTIN_COPY || @len(pool.calls[data].args) != 1 { break; }
+        node = pool.calls[data].args[0].value;
+    }
+    return node;
+}
+
+export function scalar_ref_type(checked: &typecheck::TypeCheckResult:Read, expr: u32): u32 {
+    if expr >= @len(checked.expr_types.items) as u32 { return 0u32; }
+    let id: u32 = checked.expr_types.items[expr];
+    if id == 0 || checked.types.entries[id - 1].kind != KIND_REF { return 0u32; }
+    return id;
+}
+
+// 显式解引用与成员、索引的隐式解引用共享同一投影根。
+export function scalar_place_view(pool: &ast::AstPool:Read, checked: &typecheck::TypeCheckResult:Read, expr: u32): u32 {
+    var node: u32 = expr;
+    while node < @len(pool.exprs) as u32 {
+        let value: ast::Expr = pool.exprs[node];
+        let data: u32 = value.data as u32;
+        if value.kind == 21 && pool.unaries[data].op == 13 { return pool.unaries[data].operand; }
+        if value.kind == 23 { node = pool.members[data].object; }
+        elseif value.kind == 24 { node = pool.indices[data].object; }
+        else { break; }
+        if scalar_ref_type(checked, node) != 0 { return node; }
+    }
+    return 4294967295u32;
+}
+
+export function scalar_sources(borrows: &BorrowState:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, work: &OwnerWorkBudget:ReadWrite, expr: u32): SliceLoan[]!AllocError {
+    var result: SliceLoan[] = [];
+    let source: u32 = scalar_value_source(pool, refs, expr);
+    if source >= @len(pool.exprs) as u32 { return result; }
+    if unary_is_borrow(pool, source) {
+        let site: u64 = source as u64 + 1u64;
+        var t: u64 = 0;
+        while t < borrows.scalar_active {
+            if !visit_borrow(work) { return result; }
+            if borrows.scalar_temps[t].site == site { @push(result, borrows.scalar_temps[t])?; }
+            t = t + 1;
+        }
+    } else {
+        let binding: u32 = indexed_place_root(pool, refs, work, source);
+        var i: u64 = 0;
+        while binding != 0 && i < @len(borrows.slices.items) {
+            if !visit_borrow(work) { return result; }
+            let row: SliceLoan = borrows.slices.items[i];
+            if row.binding == binding && row.current && row.site != 0 { @push(result, row)?; }
+            i = i + 1;
+        }
+    }
+    return result;
+}
+
+export struct CallLoan { root: u32, exclusive: bool }
+
+// 查找为实参投影提供访问能力的引用或切片。
+function call_place_view(pool: &ast::AstPool:Read, checked: &typecheck::TypeCheckResult:Read, expr: u32): u32 {
+    var node: u32 = expr;
+    while node < @len(pool.exprs) as u32 {
+        let item: ast::Expr = pool.exprs[node];
+        let data: u32 = item.data as u32;
+        if item.kind == 21 && pool.unaries[data].op == 13 { return pool.unaries[data].operand; }
+        if item.kind == 23 { node = pool.members[data].object; }
+        elseif item.kind == 24 { node = pool.indices[data].object; }
+        else { break; }
+        let ty: u32 = checked.expr_types.items[node];
+        if ty != 0 && (checked.types.entries[ty - 1].kind == KIND_REF || checked.types.entries[ty - 1].kind == KIND_SLICE) { return node; }
+    }
+    return 4294967295u32;
+}
+
+// 按已求值实参的次序检查重叠；同一个实参的多个合流来源不互相比对。
+function note_call_loan(loans: &CallLoan[]:ReadWrite, work: &OwnerWorkBudget:ReadWrite, prior: u64, root: u32, exclusive: bool): bool!AllocError {
+    if root == 0 { return false; }
+    var i: u64 = 0;
+    while i < prior {
+        if !visit_borrow(work) { return false; }
+        if (*loans)[i].root == root && ((*loans)[i].exclusive || exclusive) { return true; }
+        i = i + 1;
+    }
+    @push(*loans, CallLoan { root: root, exclusive: exclusive })?;
+    return false;
+}
+
+export function record_call_view(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, borrows: &BorrowState:Read, work: &OwnerWorkBudget:ReadWrite, loans: &CallLoan[]:ReadWrite, expr: u32, exclusive: bool): bool!AllocError {
+    let prior: u64 = @len(*loans);
+    let actual: u32 = checked.expr_types.items[expr];
+    if actual == 0 { return false; }
+    var node: u32 = scalar_value_source(pool, refs, expr);
+    var kind: u8 = checked.types.entries[actual - 1].kind;
+    if kind != KIND_REF && kind != KIND_SLICE {
+        let view: u32 = call_place_view(pool, checked, node);
+        if view < @len(checked.expr_types.items) as u32 && checked.expr_types.items[view] != 0 {
+            kind = checked.types.entries[checked.expr_types.items[view] - 1].kind;
+            node = view;
+        }
+    }
+    if kind == KIND_REF {
+        let sources: SliceLoan[] = scalar_sources(borrows, pool, refs, work, node)?;
+        var i: u64 = 0;
+        while i < @len(sources) {
+            if note_call_loan(loans, work, prior, sources[i].root, exclusive)? { return true; }
+            i = i + 1;
+        }
+        if @len(sources) != 0 { return false; }
+        if unary_is_borrow(pool, node) { node = pool.unaries[pool.exprs[node].data as u32].operand; }
+    } elseif kind == KIND_SLICE {
+        // 裁剪的切片沿宿主继续，绑定副本从当前来源集合取根。
+        while node < @len(pool.exprs) as u32 {
+            let n: ast::Expr = pool.exprs[node];
+            if n.kind == 27 { node = pool.slices[n.data as u32].object; }
+            elseif unary_is_borrow(pool, node) { node = pool.unaries[n.data as u32].operand; }
+            else { break; }
+        }
+        let binding: u32 = indexed_place_root(pool, refs, work, node);
+        if binding == 0 { return false; }
+        var found: bool = false;
+        var i: u64 = 0;
+        while i < @len(borrows.slices.items) {
+            if !visit_borrow(work) { return false; }
+            let row: SliceLoan = borrows.slices.items[i];
+            if row.binding == binding && row.current && row.site == 0 {
+                found = true;
+                if note_call_loan(loans, work, prior, row.root, exclusive)? { return true; }
+            }
+            i = i + 1;
+        }
+        if found { return false; }
+    }
+    let root: u32 = indexed_place_root(pool, refs, work, node);
+    return note_call_loan(loans, work, prior, root, exclusive)?;
+}
+
+export function register_implicit_access(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, borrows: &BorrowState:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, work: &OwnerWorkBudget:ReadWrite, expr: u32, root: u32, cap: u8, scope: u32, span: types::Span): void!AllocError {
+    let view: u32 = call_place_view(pool, checked, expr);
+    if view < @len(checked.expr_types.items) as u32 {
+        let ty: u32 = checked.expr_types.items[view];
+        if ty == 0 { return; }
+        let source: typecheck::TypeEntry = checked.types.entries[ty - 1];
+        if cap == 1 && typecheck::expr_array_property(&checked.types:Read, &checked.expr_types:Read, pool, expr) != 0 {
+            emit(diags, types::error_code(2006), span)?; return;
+        }
+        if cap == 1 && source.cap != 1 { emit(diags, types::error_code(6008), span)?; return; }
+        if source.kind == KIND_REF {
+            let sources: SliceLoan[] = scalar_sources(&*borrows:Read, pool, refs, work, view)?;
+            var i: u64 = 0;
+            while i < @len(sources) {
+                let loan: SliceLoan = sources[i];
+                var parent: u64 = loan.parent;
+                if loan.exclusive { parent = loan.site; }
+                remember_scalar(borrows, loan.root, expr, parent, scope, cap)?;
+                i = i + 1;
+            }
+        }
+        return;
+    }
+    if root == 0 || root > @len(tables.defs) as u32 {
+        if cap == 1 { emit(diags, types::error_code(2006), span)?; }
+        return;
+    }
+    if cap == 0 { add_shared_borrow(borrows, root, work)?; return; }
+    let binding: u8 = tables.defs[root - 1].kind;
+    if binding == 4 || typecheck::expr_array_property(&checked.types:Read, &checked.expr_types:Read, pool, expr) != 0 {
+        emit(diags, types::error_code(2006), span)?; return;
+    }
+    if binding != 9 { emit(diags, types::error_code(6009), span)?; return; }
+    if shared_borrowed(&*borrows:Read, root, work) { emit(diags, types::error_code(6004), span)?; return; }
+    if work.conflict_exhausted { return; }
+    let active: u64 = borrows.active;
+    if active == @len(borrows.roots) { @push(borrows.roots, root)?; }
+    else { borrows.roots[active] = root; }
+    borrows.active = active + 1;
+    return;
+}
+
+// 子租约绑定后，其临时祖先也保持活跃，但不是绑定当前指向的引用。
+function persist_scalar_parents(borrows: &BorrowState:ReadWrite, binding: u32, child: SliceLoan, budget: &SliceScopeBudget:ReadWrite): void!AllocError {
+    if child.parent == 0 { return; }
+    var needed: u64[] = [];
+    @push(needed, child.parent)?;
+    var i: u64 = borrows.scalar_active;
+    // 父租约总在子租约之前登记；同一取址点的所有可能来源都要保留。
+    while i != 0 {
+        i = i - 1;
+        if !charge_slice_steps(budget, 1u64) { return; }
+        var ancestor: SliceLoan = borrows.scalar_temps[i];
+        if ancestor.root != child.root { continue; }
+        var j: u64 = 0;
+        while j < @len(needed) {
+            if !charge_slice_steps(budget, 1u64) { return; }
+            if needed[j] == ancestor.site { break; }
+            j = j + 1;
+        }
+        if j == @len(needed) { continue; }
+        if !charge_slice_steps(budget, @len(borrows.slices.items) + 1u64) { return; }
+        if ancestor.parent != 0 { @push(needed, ancestor.parent)?; }
+        ancestor.binding = binding;
+        ancestor.current = false;
+        include_slice(&borrows.slices:ReadWrite, ancestor)?;
+    }
+    return;
+}
+
+export function assign_scalar(borrows: &BorrowState:ReadWrite, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, diags: &diag::DiagBuffer:ReadWrite, work: &OwnerWorkBudget:ReadWrite, binding: u32, expr: u32, span: types::Span, budget: &SliceScopeBudget:ReadWrite): void!AllocError {
+    let type_id: u32 = def_type_of(checked, binding);
+    if type_id == 0 || checked.types.entries[type_id - 1].kind != KIND_REF { return; }
+    let sources: SliceLoan[] = scalar_sources(borrows, pool, refs, work, expr)?;
+    if work.conflict_exhausted || !charge_slice_steps(budget, @len(borrows.slices.items)) { return; }
+    let scope: u32 = tables.defs[binding - 1].scope;
+    var i: u64 = 0;
+    while i < @len(sources) {
+        if !charge_slice_steps(budget, 1u64) { return; }
+        if !slice_scope_encloses(tables, sources[i].scope, scope, budget) {
+            if !budget.exhausted { emit(diags, types::error_code(6005), span)?; }
+            return;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(borrows.slices.items) {
+        if borrows.slices.items[i].binding == binding { borrows.slices.items[i].current = false; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(sources) {
+        if !charge_slice_steps(budget, @len(borrows.slices.items) + 1u64) { return; }
+        var row: SliceLoan = sources[i];
+        row.binding = binding;
+        include_slice(&borrows.slices:ReadWrite, row)?;
+        persist_scalar_parents(borrows, binding, row, budget)?;
+        if budget.exhausted { return; }
+        i = i + 1;
+    }
+    return;
+}
+
+// 引用形参没有本地宿主；编号与本函数的取引用结点分离。
+export function include_scalar_parameter(state: &SliceState:ReadWrite, checked: &typecheck::TypeCheckResult:Read, binding: u32, scope: u32, budget: &SliceScopeBudget:ReadWrite): void!AllocError {
+    let id: u32 = def_type_of(checked, binding);
+    if id == 0 || checked.types.entries[id - 1].kind != KIND_REF || checked.types.entries[id - 1].cap != 1 { return; }
+    if !charge_slice_steps(budget, @len(state.items) + 1u64) { return; }
+    include_slice(state, SliceLoan { binding: binding, root: 0u32, current: true, exclusive: true, site: 4294967296u64 + binding as u64, parent: 0u64, scope: scope })?;
+    return;
+}
+
+// 写回与读借用都按租约身份检查，不能把引用变量自身误当成宿主。
+export function scalar_suspended(borrows: &BorrowState:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, work: &OwnerWorkBudget:ReadWrite, view: u32, read_reborrow: bool): bool!AllocError {
+    if view >= @len(pool.exprs) as u32 || (borrows.scalar_active == 0 && @len(borrows.slices.items) == 0) { return false; }
+    let sources: SliceLoan[] = scalar_sources(borrows, pool, refs, work, view)?;
+    var i: u64 = 0;
+    while i < @len(sources) && !work.conflict_exhausted {
+        let source: SliceLoan = sources[i];
+        var t: u64 = 0;
+        while t < borrows.scalar_active {
+            if !visit_borrow(work) { return false; }
+            let loan: SliceLoan = borrows.scalar_temps[t];
+            if loan.root == source.root && loan.parent == source.site && (!read_reborrow || loan.exclusive) { return true; }
+            t = t + 1;
+        }
+        var p: u64 = 0;
+        while p < @len(borrows.slices.items) {
+            if !visit_borrow(work) { return false; }
+            let loan: SliceLoan = borrows.slices.items[p];
+            if loan.root == source.root && loan.parent == source.site && (!read_reborrow || loan.exclusive) { return true; }
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+export function remember_scalar(borrows: &BorrowState:ReadWrite, root: u32, expr: u32, parent: u64, scope: u32, cap: u8): void!AllocError {
+    let loan: SliceLoan = SliceLoan { binding: 0u32, root: root, current: true, exclusive: cap == 1, site: expr as u64 + 1u64, parent: parent, scope: scope };
+    let i: u64 = borrows.scalar_active;
+    if i == @len(borrows.scalar_temps) { @push(borrows.scalar_temps, loan)?; }
+    else { borrows.scalar_temps[i] = loan; }
+    borrows.scalar_active = i + 1u64;
+    return;
+}
+
+// 判定表达式是否为 owning 值。类型未知时保守视为非 owning，避免误报。
+export function expr_is_owning(checked: &typecheck::TypeCheckResult:Read, copy_order: u8, expr: u32): bool {
+    if expr >= @len(checked.expr_types.items) as u32 { return false; }
+    let type_id: u32 = checked.expr_types.items[expr];
+    if type_id == 0 { return false; }
+    return !is_copy_type_ordered(checked, type_id, copy_order);
+}
+
+// 取绑定 DefId 的类型；未知返回 0。
+export function def_type_of(checked: &typecheck::TypeCheckResult:Read, def: u32): u32 {
+    if def == 0 || def > @len(checked.def_types.items) as u32 { return 0; }
+    return checked.def_types.items[def - 1];
+}
+
+// 判定表达式是否为成员（23）/ 索引（24）/ 切片（27）投影，不含类型判定。
+export function is_projection_expr(pool: &ast::AstPool:Read, expr: u32): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    let kind: u8 = pool.exprs[expr].kind;
+    return kind == 23 || kind == 24 || kind == 27;
+}
+
+// 判定表达式是否为 owning 聚合的投影（成员 / 索引 / 切片）。
+// 规格 2.5 不提供部分移动，且不区分宿主是绑定、临时值还是常量。
+export function is_owning_projection(pool: &ast::AstPool:Read, checked: &typecheck::TypeCheckResult:Read, copy_order: u8, expr: u32): bool {
+    if !is_projection_expr(pool, expr) { return false; }
+    return expr_is_owning(checked, copy_order, expr);
+}
+
+// 判定绑定是否为 owning：按声明类型分类，未知时保守视为非 owning。
+export function def_is_owning(checked: &typecheck::TypeCheckResult:Read, copy_order: u8, def: u32): bool {
+    let type_id: u32 = def_type_of(checked, def);
+    if type_id == 0 { return false; }
+    return !is_copy_type_ordered(checked, type_id, copy_order);
+}
+
+// 不可达路径只保留不依赖 place 状态的诊断。
+export function emit_static_diags(diags: &diag::DiagBuffer:ReadWrite, dead: &diag::DiagBuffer:Read): void!AllocError {
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(dead) {
+        let item: diag::Diag = dead.diags[i];
+        let original: types::ErrorCode = item.code;
+        if original.raw != 6003 && original.raw != 6004 && original.raw != 6102 { diag::diagbuf_emit(diags, item)?; }
+        i = i + 1;
+    }
+    if dead.truncated { diag::diagbuf_note_truncated(diags); }
+    return;
+}
+
+// 分支各自持有状态快照，避免互斥路径相互污染。
+export function copy_places(source: &PlaceTable:Read, work: &OwnerWorkBudget:ReadWrite): PlaceTable!AllocError {
+    if work.copy_limited {
+        let count: u64 = @len(source.items);
+        if count > work.copy_remaining as u64 {
+            work.copy_exhausted = true;
+            return PlaceTable { items: [] };
+        }
+        work.copy_remaining = work.copy_remaining - count as u32;
+    }
+    var result: PlaceTable = PlaceTable { items: [] };
+    var i: u32 = 0;
+    while i < @len(source.items) as u32 { @push(result.items, source.items[i])?; i = i + 1; }
+    return result;
+}
+
+// 合流两个前驱的 place 状态：两条前驱都已消费时保持已消费（不得重复析构）；
+// 一条已消费、另一条仍持有所有权时收敛为条件所有者；否则保持仍存活（owner.md 6.1）。
+function merge_state(left: u8, right: u8): u8 {
+    let left_dead: bool = left == PLACE_MOVED || left == PLACE_DROPPED;
+    let right_dead: bool = right == PLACE_MOVED || right == PLACE_DROPPED;
+    if left_dead && right_dead { return left; }
+    if left_dead || right_dead { return PLACE_MAYBE_LIVE; }
+    if left == PLACE_MAYBE_LIVE || right == PLACE_MAYBE_LIVE { return PLACE_MAYBE_LIVE; }
+    return PLACE_LIVE;
+}
+
+// 快照保留入口顺序；普通位置按三值规则合流，out 槽位仍由 merge_slots 单独处理。
+export function merge_place_states(target: &PlaceTable:ReadWrite, source: &PlaceTable:Read, work: &OwnerWorkBudget:ReadWrite): void {
+    if !charge_place_merge(work, @len(target.items)) { return; }
+    var i: u32 = 0;
+    while i < @len(target.items) as u32 {
+        if !target.items[i].is_out {
+            // 首个有效前驱直接继承；否则按三值规则合并（owner.md 6.1）。
+            if target.items[i].state == PLACE_UNSET { target.items[i].state = source.items[i].state; }
+            else { target.items[i].state = merge_state(target.items[i].state, source.items[i].state); }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// 首条实际前驱提供槽位状态；其他前驱必须逐槽一致（OW-8）。
+export function join_slot(target: &PlaceTable:ReadWrite, index: u32, slot: u8, compare: bool, diags: &diag::DiagBuffer:ReadWrite, span: types::Span): void!AllocError {
+    if compare {
+        if target.items[index].slot != slot { emit(diags, types::error_code(6103), span)?; }
+    } else {
+        target.items[index].slot = slot;
+        if slot == SLOT_CONSUMED { target.items[index].state = PLACE_MOVED; }
+        else { target.items[index].state = PLACE_LIVE; }
+    }
+    return;
+}
+
+export function merge_slots(target: &PlaceTable:ReadWrite, source: &PlaceTable:Read, diags: &diag::DiagBuffer:ReadWrite, work: &OwnerWorkBudget:ReadWrite, compare: bool, span: types::Span): void!AllocError {
+    if !charge_place_merge(work, @len(target.items)) { return; }
+    var i: u32 = 0;
+    while i < @len(target.items) as u32 {
+        if target.items[i].is_out { join_slot(target, i, source.items[i].slot, compare, diags, span)?; }
+        i = i + 1;
+    }
+    return;
+}
+
+// 只有不含循环转移的块，才可依赖其后续语句判定返回。
+// 在当前出口快照中，逆序收集本函数仍为 live 且 owning 的局部绑定（owner.md 6.2）。
+// 条件所有者（合流前驱中一部分已消费）也进入函数出口计划：其后端按条件析构，
+// 否则该路径上的所有权会泄漏（owner.md 4.4 / 6.1）。
+export function live_drop_defs(checked: &typecheck::TypeCheckResult:Read, copy_order: u8, places: &PlaceTable:Read, start: u32): u32[]!AllocError {
+    var defs: u32[] = [];
+    var i: u32 = @len(places.items) as u32;
+    // 从区间末尾向前扫描，直接得到声明逆序（owner.md 6.2）。
+    while i > start {
+        i = i - 1;
+        let place: PlaceState = places.items[i];
+        if needs_exit_drop(checked, copy_order, place) { @push(defs, place.def)?; }
+    }
+    return defs;
+}
+
+export function record_exit_drop(returns: &ReturnDropTable:ReadWrite, checked: &typecheck::TypeCheckResult:Read, copy_order: u8, places: &PlaceTable:Read, site: u32, on_error: bool): void!AllocError {
+    if returns.enabled {
+        // 离开函数的边同时覆盖按值形参：其所有权在调用点已经转移给被调方。
+        let defs: u32[] = live_drop_defs(checked, copy_order, places, 0)?;
+        @push(returns.items, ReturnDropPlan { site: site, on_error: on_error, defs: @move(defs) })?;
+    }
+    return;
+}

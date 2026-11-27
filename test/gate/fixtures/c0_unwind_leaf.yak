@@ -1,0 +1,40 @@
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+foreign read(buffer: &[u8]:ReadWrite): u32;
+foreign write(data: &[u8]): void;
+
+export struct Payload { bytes: u8[] }
+export enum Failure { Bad }
+
+export function fill(dst: &Payload:Write): void {
+    *dst = Payload { bytes: [88u8] };
+    return;
+}
+
+export function fail(mode: u8, data: u8[], dst: &Payload:Write): void!Failure {
+    *dst = Payload { bytes: [81u8] };
+    let inner: u8[] = [83u8];
+    if mode == 0u8 { assert(inner[0u64] == 0u8); }
+    elseif mode == 1u8 {
+        let zero: u8 = inner[0u64] - 83u8;
+        assert(1u8 / zero == 0u8);
+    } elseif mode == 2u8 { exit(37u8); }
+    elseif mode == 3u8 { return Failure::Bad; }
+    elseif mode == 5u8 {
+        var input: [u8; 1] = [0u8];
+        let count: u32 = read(&input[0u64..1u64]:ReadWrite);
+        assert(count == 1u32);
+    } elseif mode == 6u8 { write("unexpected stdout"); }
+    elseif mode == 8u8 { exit(0u8); }
+    assert(data[0u64] == 82u8);
+    return;
+}
+
+export function callback(level: &u8): void {
+    let inner: u8[] = [84u8];
+    if *level == 0u8 { assert(inner[0u64] == 0u8); }
+    else {
+        let next: u8 = *level - 1u8;
+        callback(&next);
+    }
+}

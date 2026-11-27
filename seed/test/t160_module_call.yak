@@ -1,0 +1,3 @@
+// module: helper=fixtures/helper.yak
+import helper; foreign assert(cond: bool): void;
+function main(): void { assert(helper::answer() == 42); }

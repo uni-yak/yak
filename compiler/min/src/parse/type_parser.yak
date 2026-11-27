@@ -1,0 +1,352 @@
+// 类型语法解析器。类型节点在检查阶段前保持未解析。
+// 语法：parse.md 四。仅 full 层的 carrier 形态解析到足以拒绝。
+import lex;
+import parse_core;
+import ast;
+import types;
+import position;
+
+function current_payload(p: &parse_core::Parser:Read): u64 {
+    let tok: lex::Token = p.tokens[p.pos];
+    return tok.payload;
+}
+
+function make(pool: &ast::AstPool:ReadWrite, kind: u8, span: types::Span, data: u32): u32!AllocError {
+    let id: u32 = @len(pool.types) as u32;
+    @push(pool.types, ast::Type { kind: kind, span: span, data: data })?;
+    return id;
+}
+// 调用方按语法位置选择诊断；此处只报一次并消费配对的尖括号。
+export function reject_generic_form(p: &parse_core::Parser:ReadWrite, code: types::ErrorCode): void!AllocError {
+    parse_core::fail_code(p, p.pos, code)?;
+    var depth: u32 = 0;
+    while p.pos < @len(p.tokens) as u32 {
+        if parse_core::is_op(p, 16) {
+            depth = depth + 1;
+        } elseif parse_core::is_op(p, 17) {
+            if depth <= 1 { parse_core::recover_advance(p); break; }
+            depth = depth - 1;
+        } elseif parse_core::is_op(p, 8) {
+            if depth <= 2 { parse_core::recover_advance(p); break; }
+            depth = depth - 2;
+        }
+        parse_core::recover_advance(p);
+    }
+    return;
+}
+// 仅裸类型路径对应尚未激活的浮点类型；限定名仍交给名称解析。
+function reject_float_path(p: &parse_core::Parser:ReadWrite, start: u32, segments: &[u32]): void!AllocError {
+    if @len(segments) == 1 && parse_core::is_kind_at(p, start, 0) {
+        let name: u32 = segments[0];
+        if name != 0 && (name == p.float_f32 || name == p.float_f64) {
+            parse_core::fail_code(p, start, types::error_code(5002))?;
+        }
+    }
+    return;
+}
+// 错误类型 ErrorType ::= TypePath（parse.md 4.3）
+function parse_error_path(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    var segments: u32[] = [];
+    if parse_core::is_kind(p, 1) {
+        parse_core::fail_code(p, p.pos, types::error_code(2015))?;
+        @push(segments, current_payload(p) as u32)?;
+        parse_core::advance(p);
+    } elseif parse_core::is_kind(p, 0) {
+        @push(segments, current_payload(p) as u32)?;
+        parse_core::advance(p);
+    } else {
+        parse_core::fail(p, p.pos)?;
+        return 0;
+    }
+    while parse_core::is_op(p, 0) {
+        parse_core::advance(p);
+        @push(segments, parse_core::take_ident(p)?)?;
+    }
+    if @len(segments) == 1 && p.string_name != 0 && segments[0] == p.string_name {
+        parse_core::fail_code(p, start, types::error_code(3008))?;
+    }
+    reject_float_path(p, start, &segments[0..@len(segments)]:Read)?;
+    if parse_core::is_op(p, 16) { reject_generic_form(p, types::error_code(5101))?; }
+    let path_id: u32 = @len(pool.type_paths) as u32;
+    @push(pool.type_paths, ast::TypePath { segments: segments, span: parse_core::span_range(p, start, p.pos) })?;
+    return make(pool, 1, parse_core::span_range(p, start, p.pos), path_id)?;
+}
+export function parse_error_spec(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    var members: u32[] = [];
+    if parse_core::is_op(p, 26) {
+        parse_core::advance(p);
+        if parse_core::is_op(p, 27) {
+            parse_core::fail(p, p.pos)?;
+        } else {
+            @push(members, parse_error_path(p, pool)?)?;
+            while parse_core::is_op(p, 20) {
+                parse_core::advance(p);
+                @push(members, parse_error_path(p, pool)?)?;
+            }
+        }
+        parse_core::expect_op(p, 27)?;
+    } else {
+        @push(members, parse_error_path(p, pool)?)?;
+    }
+    let id: u32 = @len(pool.error_sets) as u32;
+    @push(pool.error_sets, ast::ErrorSet { members: members, span: parse_core::span_range(p, start, p.pos) })?;
+    return id;
+}
+function parse_type_path(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    var segments: u32[] = [];
+    if parse_core::is_kind(p, 1) {
+        parse_core::fail_code(p, p.pos, types::error_code(2015))?;
+        @push(segments, current_payload(p) as u32)?;
+        parse_core::advance(p);
+    } elseif parse_core::is_kind(p, 0) {
+        @push(segments, current_payload(p) as u32)?;
+        parse_core::advance(p);
+    } else {
+        parse_core::fail(p, p.pos)?;
+        return 0;
+    }
+    while parse_core::is_op(p, 0) {
+        parse_core::advance(p);
+        @push(segments, parse_core::take_ident(p)?)?;
+    }
+    if @len(segments) == 1 && p.string_name != 0 && segments[0] == p.string_name {
+        parse_core::fail_code(p, start, types::error_code(3008))?;
+    }
+    reject_float_path(p, start, &segments[0..@len(segments)]:Read)?;
+    if parse_core::is_op(p, 16) { reject_generic_form(p, types::error_code(5101))?; }
+    let path_id: u32 = @len(pool.type_paths) as u32;
+    @push(pool.type_paths, ast::TypePath { segments: segments, span: parse_core::span_range(p, start, p.pos) })?;
+    return make(pool, 1, parse_core::span_range(p, start, p.pos), path_id)?;
+}
+function parse_type_atom(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, out_payload: bool): u32!AllocError {
+    let start: u32 = p.pos;
+    if parse_core::text_syntax(p) && parse_core::is_kind(p, 16) {
+        parse_core::advance(p);
+        return make(pool, 10, parse_core::span_at(p, start), 0)?;
+    }
+    if parse_core::is_op(p, 26) {
+        parse_core::advance(p);
+        let inner: u32 = parse_type_context(p, pool, out_payload)?;
+        parse_core::expect_op(p, 27)?;
+        return inner;
+    }
+    if parse_core::is_op(p, 30) {
+        parse_core::advance(p);
+        let element: u32 = parse_type(p, pool)?;
+        parse_core::expect_op(p, 33)?;
+        var length: u64 = 0;
+        if parse_core::is_kind(p, 2) {
+            length = current_payload(p);
+            parse_core::advance(p);
+        } else { parse_core::fail(p, p.pos)?; }
+        parse_core::expect_op(p, 31)?;
+        let fixed_id: u32 = @len(pool.fixed_arrays) as u32;
+        @push(pool.fixed_arrays, ast::FixedArrayType { element: element, length: length, span: parse_core::span_range(p, start, p.pos) })?;
+        return make(pool, 2, parse_core::span_range(p, start, p.pos), fixed_id)?;
+    }
+    if parse_core::is_kind(p, 0) || parse_core::is_kind(p, 1) {
+        return parse_type_path(p, pool)?;
+    }
+    parse_core::fail(p, p.pos)?;
+    return 0;
+}
+function parse_plain_postfix(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, out_payload: bool): u32!AllocError {
+    let start: u32 = p.pos;
+    var type_id: u32 = parse_type_atom(p, pool, out_payload)?;
+    while parse_core::is_op(p, 30) {
+        parse_core::advance(p);
+        parse_core::expect_op(p, 31)?;
+        type_id = make(pool, 3, parse_core::span_range(p, start, p.pos), type_id)?;
+    }
+    return type_id;
+}
+// PlainPostfixType 后接 carrier 后缀 '?' 与 '!'。
+function parse_carrier_suffix(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, start: u32, out_payload: bool): u32!AllocError {
+    var type_id: u32 = parse_plain_postfix(p, pool, out_payload)?;
+    let nullable: bool = parse_core::option_syntax(p);
+    if nullable && parse_core::is_op(p, 36) {
+        parse_core::fail_code(p, p.pos, types::error_code(5816))?;
+        parse_core::advance(p);
+        return type_id;
+    }
+    if parse_core::is_op(p, 25) {
+        if out_payload {
+            parse_core::fail_span(p, parse_core::span_range(p, start, p.pos + 1), types::error_code(6104))?;
+        } elseif !nullable { parse_core::fail_code(p, p.pos, types::error_code(3008))?; }
+        parse_core::advance(p);
+        type_id = make(pool, 8, parse_core::span_range(p, start, p.pos), type_id)?;
+        if parse_core::is_op(p, 18) {
+            var code: u16 = 5812;
+            if nullable { code = 5816; }
+            parse_core::fail_code(p, p.pos, types::error_code(code))?;
+            parse_core::advance(p);
+            if !nullable || parse_core::is_kind(p, 0) || parse_core::is_kind(p, 1) || parse_core::is_op(p, 26) { parse_error_spec(p, pool)?; }
+        }
+        if parse_core::is_op(p, 25) {
+            var code: u16 = 5812;
+            if nullable { code = 5816; }
+            parse_core::fail_code(p, p.pos, types::error_code(code))?;
+            parse_core::advance(p);
+        }
+        return type_id;
+    }
+    if parse_core::is_op(p, 18) {
+        parse_core::advance(p);
+        if nullable && (parse_core::is_op(p, 25) || parse_core::is_op(p, 36)) {
+            parse_core::fail_code(p, p.pos, types::error_code(5816))?;
+            parse_core::advance(p);
+            if parse_core::is_kind(p, 0) || parse_core::is_kind(p, 1) || parse_core::is_op(p, 26) { parse_error_spec(p, pool)?; }
+            return type_id;
+        }
+        let error_set_id: u32 = parse_error_spec(p, pool)?;
+        let fallible_id: u32 = @len(pool.fallibles) as u32;
+        @push(pool.fallibles, ast::FallibleType { success: type_id, error_set: error_set_id, span: parse_core::span_range(p, start, p.pos) })?;
+        type_id = make(pool, 7, parse_core::span_range(p, start, p.pos), fallible_id)?;
+        if parse_core::is_op(p, 25) || (nullable && parse_core::is_op(p, 36)) {
+            var code: u16 = 5812;
+            if nullable { code = 5816; }
+            parse_core::fail_code(p, p.pos, types::error_code(code))?;
+            parse_core::advance(p);
+            type_id = make(pool, 8, parse_core::span_range(p, start, p.pos), type_id)?;
+        } elseif parse_core::is_op(p, 18) {
+            parse_core::fail_code(p, p.pos, types::error_code(5812))?;
+            parse_core::advance(p);
+            parse_error_spec(p, pool)?;
+        }
+    }
+    return type_id;
+}
+function parse_capability(p: &parse_core::Parser:ReadWrite): u32!AllocError {
+    if !parse_core::is_op(p, 24) { return 0; }
+    parse_core::advance(p);
+    if parse_core::is_kind(p, 1) {
+        parse_core::fail_code(p, p.pos, types::error_code(2015))?;
+        parse_core::advance(p);
+        return 4294967295u32;
+    }
+    if parse_core::is_kind(p, 0) {
+        let capability: u32 = current_payload(p) as u32;
+        // Capability ::= 'Read' | 'Write' | 'ReadWrite'（parse.md 4.7）；R-13 语义
+        // （例如 out 通道之外使用 Write）仍属检查阶段。
+        if !parse_core::is_capability(p, capability) { parse_core::fail(p, p.pos)?; }
+        let code: u32 = parse_core::capability_code(p, capability);
+        parse_core::advance(p);
+        return code;
+    }
+    parse_core::fail(p, p.pos)?;
+    return 0;
+}
+function parse_ref(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    if p.depth_limit == 0u32 {
+        return parse_ref_inner(p, pool)?;
+    }
+    if !parse_core::enter_depth(p) { return 4294967295u32; }
+    let value: u32 = parse_ref_inner(p, pool)?;
+    parse_core::leave_depth(p);
+    return value;
+}
+function parse_ref_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    parse_core::advance(p);
+    if parse_core::text_syntax(p) && parse_core::is_kind(p, 16) {
+        parse_core::advance(p);
+        let capability: u32 = parse_capability(p)?;
+        let span: types::Span = parse_core::span_range(p, start, p.pos);
+        if capability == 1 || capability == 2 { parse_core::fail_span(p, span, types::error_code(6101))?; }
+        return make(pool, 11, span, 0)?;
+    }
+    if parse_core::is_keyword(p, 0) {
+        parse_core::advance(p);
+        parse_core::expect_op(p, 26)?;
+        var params: u32[] = [];
+        if !parse_core::is_op(p, 27) {
+            while true {
+                @push(params, parse_ref(p, pool)?)?;
+                if parse_core::is_op(p, 32) {
+                    parse_core::advance(p);
+                    continue;
+                }
+                break;
+            }
+        }
+        parse_core::expect_op(p, 27)?;
+        parse_core::expect_op(p, 24)?;
+        let ret_type: u32 = parse_type(p, pool)?;
+        position::validate_return(p, pool, ret_type)?;
+        let fn_id: u32 = @len(pool.fn_refs) as u32;
+        @push(pool.fn_refs, ast::FnType { params: params, ret_type: ret_type, span: parse_core::span_range(p, start, p.pos) })?;
+        return make(pool, 6, parse_core::span_range(p, start, p.pos), fn_id)?;
+    }
+    var slice: bool = false;
+    var referent: u32 = 0;
+    if parse_core::is_op(p, 30) {
+        slice = true;
+        parse_core::advance(p);
+        referent = parse_type(p, pool)?;
+        parse_core::expect_op(p, 31)?;
+    } else {
+        referent = parse_carrier_suffix(p, pool, p.pos, false)?;
+    }
+    let capability: u32 = parse_capability(p)?;
+    let ref_id: u32 = @len(pool.refs) as u32;
+    @push(pool.refs, ast::RefType { referent: referent, capability: capability, span: parse_core::span_range(p, start, p.pos) })?;
+    var ref_kind: u8 = 4;
+    if slice { ref_kind = 5; }
+    return make(pool, ref_kind, parse_core::span_range(p, start, p.pos), ref_id)?;
+}
+function parse_type_context(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, out_payload: bool): u32!AllocError {
+    if p.depth_limit == 0u32 {
+        return parse_type_context_inner(p, pool, out_payload)?;
+    }
+    if !parse_core::enter_depth(p) { return 4294967295u32; }
+    let value: u32 = parse_type_context_inner(p, pool, out_payload)?;
+    parse_core::leave_depth(p);
+    return value;
+}
+function parse_type_context_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, out_payload: bool): u32!AllocError {
+    let start: u32 = p.pos;
+    var type_id: u32 = 0;
+    if parse_core::is_op(p, 19) {
+        type_id = parse_ref(p, pool)?;
+    } else {
+        type_id = parse_carrier_suffix(p, pool, start, out_payload)?;
+    }
+    if parse_core::is_op(p, 20) {
+        if !out_payload && parse_core::union_syntax(p) {
+            var members: u32[] = [type_id];
+            while parse_core::is_op(p, 20) {
+                parse_core::advance(p);
+                var member: u32 = 0;
+                if parse_core::is_op(p, 19) { member = parse_ref(p, pool)?; }
+                else { member = parse_carrier_suffix(p, pool, p.pos, false)?; }
+                if p.depth_exceeded || p.recovery_exceeded { return 4294967295u32; }
+                @push(members, member)?;
+            }
+            let item: u32 = @len(pool.plain_unions) as u32;
+            let span: types::Span = parse_core::span_range(p, start, p.pos);
+            @push(pool.plain_unions, ast::PlainUnion { members: @move(members), span: span })?;
+            return make(pool, 9, span, item)?;
+        }
+        // 普通联合仅 full 层（base.md 11.2 / R-24）。按成员恢复。
+        if out_payload { parse_core::fail_code(p, p.pos, types::error_code(6104))?; }
+        else { parse_core::fail_code(p, p.pos, types::error_code(3008))?; }
+        while parse_core::is_op(p, 20) {
+            parse_core::advance(p);
+            if parse_core::is_op(p, 19) {
+                type_id = parse_ref(p, pool)?;
+            } else {
+                type_id = parse_carrier_suffix(p, pool, p.pos, false)?;
+            }
+        }
+    }
+    return type_id;
+}
+export function parse_type(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    return parse_type_context(p, pool, false)?;
+}
+export function parse_out_type(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    return parse_type_context(p, pool, true)?;
+}

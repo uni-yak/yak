@@ -1,0 +1,6 @@
+// expected_code: E2005
+// spec: spec/lang/parse.md P-5
+// 触发：声明返回 u32 的函数实际返回 bool。
+function bad(): u32 { return true; }
+
+function main(): void { return; }

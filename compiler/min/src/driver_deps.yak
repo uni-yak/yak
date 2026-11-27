@@ -1,0 +1,51 @@
+// 装载直接接口和传递名义类型，保持规范依赖编号。
+import ast;
+import lex;
+import types;
+import diag;
+import host;
+import host_args;
+import iface;
+import iface_load;
+import resolve_refs;
+import driver_diag;
+
+foreign exit(code: u8): void;
+
+// 装配结果整体按值搬运：base 子集禁止对结构体字段做部分移动，拆成独立字段会破坏返回。
+export struct Dependencies { candidates: iface::LoadedInterface[], order: u32[], assembly: iface_load::DependencyAssembly }
+
+// JSONL 模式下不存在可写终端文本，失败一律回到驱动统一收尾。
+function empty_dependencies(): Dependencies {
+    return Dependencies { candidates: [], order: [], assembly: iface_load::DependencyAssembly { valid: false, targets: [], deps: resolve_refs::DependencySet { ifaces: [] } } };
+}
+export function load(args: &[u8]:Read, argc: u32, first: u32, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, diags: &diag::DiagBuffer:ReadWrite, jsonl_mode: bool, profile: u32): Dependencies!AllocError {
+    // 前序接口是候选；只有 import 指向的模块参与本单元的 DependencyId 分配。
+    var arg_index: u32 = first;
+    var candidates: iface::LoadedInterface[] = [];
+    var order: u32[] = [];
+    while arg_index < argc {
+        let iface_name: u8[] = host_args::get(args, arg_index)?;
+        let iface_bytes: u8[] = host::input_bytes(&iface_name[0..@len(iface_name)]:Read)?;
+        let loaded: iface::LoadedInterface = iface_load::load_target_interface(&iface_bytes[0..@len(iface_bytes)]:Read, profile, diags)?;
+        if diag::diagbuf_has_error(diags) { break; }
+        let direct: bool = resolve_refs::imports_module(pool, names, &loaded.module_name[0..@len(loaded.module_name)]:Read);
+        if direct {
+            if @len(order) == 65535 {
+                if jsonl_mode {
+                    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(9001), severity: 0, span: types::Span { file: 0, offset: 0, length: 0 }, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+                    return empty_dependencies();
+                }
+                driver_diag::report_code("依赖接口", types::error_code(9001))?;
+                exit(1);
+            }
+            @push(order, @len(candidates) as u32)?;
+        }
+        @push(candidates, @move(loaded))?;
+        arg_index = arg_index + 1;
+    }
+    let direct_count: u32 = @len(order) as u32;
+    let assembled: iface_load::DependencyAssembly = iface_load::assemble_dependencies(&candidates[0..@len(candidates)]:Read, &order:ReadWrite, direct_count, diags)?;
+    if !assembled.valid { return empty_dependencies(); }
+    return Dependencies { candidates: @move(candidates), order: @move(order), assembly: @move(assembled) };
+}

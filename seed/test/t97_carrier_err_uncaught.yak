@@ -1,0 +1,10 @@
+// t97: T!E 返回 Err + ? 传播至顶层未捕获 → trap（RE-4）
+// expected_trap: uncaught error propagation
+enum E { Bad }
+function f(): u32!E {
+    return E::Bad;
+}
+function main(): void {
+    let v: u32 = f()?;
+    return;
+}

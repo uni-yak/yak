@@ -1,0 +1,855 @@
+// 引用侧表、依赖接口身份和 TypeSig 解码。
+import buf;
+import lex;
+import types;
+import ast;
+import diag;
+import resolve;
+import hash;
+import hashmap;
+
+// 接口类型签名的根到叶路径节点上限。
+const SIGNATURE_DEPTH: u32 = 64;
+
+export function signature_depth_limit(): u32 { return SIGNATURE_DEPTH; }
+
+export struct IfaceExport { name_hash: u64, name_off: u32, name_len: u16, kind: u8, flags: u8, export_id: u32, sig_off: u32, sig_len: u32 }
+// 依赖接口的私有名：导入方引用它时按未导出（E4008）而不是不存在（E4002）报告。
+export struct IfacePrivate { name_hash: u64, name_off: u32, name_len: u16, kind: u8 }
+// 签名区间相对接口的 sigs；known 区分无载荷与手工接口未提供类型。
+export struct IfaceEnumMember { enum_export: u32, name_hash: u64, name_off: u32, name_len: u16, variant: u32, sig_off: u32, sig_len: u32, known: bool }
+export struct IfaceStructField { struct_export: u32, name_hash: u64, name_off: u32, name_len: u16, field: u32, sig_off: u32, sig_len: u32 }
+// 依赖接口身份：模块名与接口摘要，用于把导出方的依赖编号重映射到消费方。
+export struct IfaceDependency { module: u8[], digest: u8[] }
+// sigs 保存该单元 type_signatures 节的原始字节；导出记录里的 sig_off/sig_len 指向这里。
+// digest 为空表示接口没有身份表（手工构造），依赖名义类型因此不可映射。
+export struct Iface { module: u8[], names: u8[], sigs: u8[], exports: IfaceExport[], enum_members: IfaceEnumMember[], struct_fields: IfaceStructField[], digest: u8[], dependencies: IfaceDependency[], privates: IfacePrivate[] }
+export struct DependencySet { ifaces: Iface[] }
+
+// 已解析引用 ResolvedRef 的 kind：0=定义(DefId)，1=内置(BuiltinId)，2=导入引用(ImportRef: dep,export)，
+// 3=本地标签(enum def,variant)，4=导入标签(dep,enum export,variant)，
+// 5=内置标签(host BuiltinId,variant id)，6=待宿主类型消歧的内置裸标签候选，
+// 7=待期望类型判定的裸名字（x=NameId，y=暂存诊断序号，z=普通解析错误码）。
+export function pending_value_name(): u8 { return 7u8; }
+// 节点种类 node_kind：0=表达式(Expr)，1=类型(Type)，2=模式(Pattern)，3=CallArg out 槽位（x=实参序号，y=DefId）。
+// 本地定义的直接调用表达式（node_kind=0、kind=0）在 y 中记录 DefKind。
+// 导入成员的直接调用表达式（node_kind=0、kind=2）在 z 中记录接口导出类别。
+export struct ResolvedRef { node_kind: u8, node: u32, kind: u8, x: u32, y: u32, z: u32, span: types::Span }
+export struct BridgeRecord { import_def: u32, name: u32, dependency: u16, export_id: u32, kind: u8, flags: u8 }
+export struct VariantBridge { dependency: u16, enum_export: u32, name: u32, variant: u32 }
+// 导入签名类型槽的 kind：0=void，1=内置标量，2=本地名义，3=依赖名义，
+// 4=类型参数下标，5=定长数组，6=动态数组，7=引用，8=切片，9=可失败，10=函数引用，11=可空。
+// 依赖名义的 a 为消费方类型表中的接口编号、b 为导出编号；加载期保留导出方编号。
+export struct ImportType { kind: u8, a: u32, b: u32, c: u64 }
+export struct FunctionTemplate { valid: bool, arity: u16, dep: u16, param_count: u16, ret_slot: u32, types: ImportType[] }
+// 导出身份独立于字段表，手工接口缺少字段元数据时仍保留类别。
+export struct ImportStruct { dep: u16, export_id: u32 }
+// 枚举类别不依赖成员元数据是否完整。
+export struct ImportEnum { dep: u16, export_id: u32 }
+// 未出现在当前单元的名称编号为零，仍保留以统计完整字段集。
+export struct ImportField { dep: u16, export_id: u32, field: u32, name: u32, root: u32, types: ImportType[] }
+// 已知载荷的导入标签保留类型槽；空槽表表示无载荷。
+export struct ImportVariant { dep: u16, export_id: u32, name: u32, variant: u32, known: bool, root: u32, types: ImportType[] }
+// 导入函数签名事实：同一参数列表的根槽连续，子类型通过槽下标引用。
+// 0 表示该槽为 void 或无法定型的占位；负数语义由 kind 区分，不使用负值。
+export struct ImportSignature {
+    dep: u16,
+    export_id: u32,
+    // 形参个数与返回类型槽位下标（在 types 中）。
+    param_count: u16,
+    ret_slot: u32,
+    // 形参槽位区间起点。
+    param_start: u32,
+    // 类型槽表：每个槽为 (kind, a, b, c)，含义由下方编号约定。
+    types: ImportType[],
+}
+// kind 区分固有编号、本地 DefId 和依赖导出编号；依赖直接与间接可见性不影响标签身份。
+export struct EnumName { kind: u8, dep: u16, id: u32, name: u32 }
+// expr_index / type_index / pattern_index 按节点编号直查 items（1 基），避免后端阶段重复线性扫描。
+export struct RefTable { items: ResolvedRef[], imports: ImportSignature[], variants: ImportVariant[], fields: ImportField[], structs: ImportStruct[], enums: ImportEnum[], expr_index: u32[], type_index: u32[], pattern_index: u32[], enum_names: EnumName[], pending_names: u32, contextual_enum_labels: bool }
+// 依赖名义类型的解码作用域：dependency_count 是当前接口的依赖条目数；
+// source 非零时是导出方在消费方依赖表中的编号；为零时只校验范围。
+export struct ImportScope { source: u32, dependency_count: u32 }
+export struct BridgeTable { items: BridgeRecord[], variants: VariantBridge[] }
+export struct ImportMap { defs: u32[], data: u32[] }
+// 服务身份只在名字解析阶段建立；零表示未登记或签名不匹配。
+// 一至四为标准服务，十六至二十一为宿主服务，五和六保留给内部运行时。
+export struct ForeignService { def: u32, kind: u8 }
+export struct EnumIdentity { dep: u16, id: u32, key: u8[] }
+export struct Resolution { result: resolve::ResolveResult, refs: RefTable, bridges: BridgeTable, services: ForeignService[], enum_identities: EnumIdentity[] }
+
+// 名称排在首位，使同拼写的裸名字判定和完整名义身份共用一张表。
+function enum_label_entry_less(a: EnumName, b: EnumName): bool {
+    if a.name != b.name { return a.name < b.name; }
+    if a.kind != b.kind { return a.kind < b.kind; }
+    if a.dep != b.dep { return a.dep < b.dep; }
+    return a.id < b.id;
+}
+
+function sift_enum_names(refs: &RefTable:ReadWrite, start: u32, end: u32): void {
+    var root: u32 = start;
+    while root < end / 2 {
+        var child: u32 = root * 2 + 1;
+        if child + 1 < end && enum_label_entry_less(refs.enum_names[child], refs.enum_names[child + 1]) { child = child + 1; }
+        if !enum_label_entry_less(refs.enum_names[root], refs.enum_names[child]) { break; }
+        let saved: EnumName = refs.enum_names[root];
+        refs.enum_names[root] = refs.enum_names[child];
+        refs.enum_names[child] = saved;
+        root = child;
+    }
+    return;
+}
+
+// 标签表在收集完本地和接口记录后原地排序，不分配暂存表。
+export function sort_enum_names(refs: &RefTable:ReadWrite): void {
+    var end: u32 = @len(refs.enum_names) as u32;
+    var root: u32 = end / 2;
+    while root != 0 {
+        root = root - 1;
+        sift_enum_names(refs, root, end);
+    }
+    while end > 1 {
+        end = end - 1;
+        let saved: EnumName = refs.enum_names[0];
+        refs.enum_names[0] = refs.enum_names[end];
+        refs.enum_names[end] = saved;
+        sift_enum_names(refs, 0, end);
+    }
+    return;
+}
+
+function enum_name_lower_bound(refs: &RefTable:Read, key: EnumName): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = @len(refs.enum_names) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2;
+        if enum_label_entry_less(refs.enum_names[mid], key) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return lo;
+}
+
+export function has_enum_spelling(refs: &RefTable:Read, name: u32): bool {
+    let key: EnumName = EnumName { kind: 0, dep: 0, id: 0, name: name };
+    let i: u32 = enum_name_lower_bound(refs, key);
+    return i < @len(refs.enum_names) as u32 && refs.enum_names[i].name == name;
+}
+
+export function has_enum_label(refs: &RefTable:Read, key: EnumName): bool {
+    let i: u32 = enum_name_lower_bound(refs, key);
+    return i < @len(refs.enum_names) as u32 && !enum_label_entry_less(key, refs.enum_names[i]);
+}
+
+function append_bytes(dst: &u8[]:ReadWrite, src: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(*dst, src[i])?; i = i + 1; }
+    return;
+}
+function append_key_part(dst: &u8[]:ReadWrite, src: &[u8]): void!AllocError {
+    let size: u32 = @len(src) as u32;
+    @push(*dst, (size & 255) as u8)?;
+    @push(*dst, (size >> 8) as u8)?;
+    append_bytes(dst, src)?;
+    return;
+}
+function enum_identity(module: &[u8], name: &[u8]): u8[]!AllocError {
+    var key: u8[] = [];
+    @push(key, 2u8)?;
+    append_key_part(&key:ReadWrite, module)?;
+    append_key_part(&key:ReadWrite, name)?;
+    @push(key, 0)?;
+    @push(key, 0)?;
+    return key;
+}
+export function enum_key_less(left: &[u8], right: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(left) as u32 && i < @len(right) as u32 {
+        if left[i] != right[i] { return left[i] < right[i]; }
+        i = i + 1;
+    }
+    return @len(left) < @len(right);
+}
+function iface_enum_identity(iface: &Iface:Read, id: u32): u8[]!AllocError {
+    if id == 0 || id > @len(iface.exports) as u32 { return []; }
+    let item: IfaceExport = iface.exports[id - 1];
+    let len: u32 = item.name_len as u32;
+    let off: u32 = item.name_off;
+    if item.export_id != id || item.kind != 2 || len == 0 || off > @len(iface.names) as u32 || len > @len(iface.names) as u32 - off { return []; }
+    return enum_identity(&iface.module[0..@len(iface.module)]:Read, &iface.names[off..off + len]:Read)?;
+}
+export function iface_new(module: &[u8]): Iface!AllocError {
+    var bytes: u8[] = [];
+    append_bytes(&bytes:ReadWrite, module)?;
+    // 手工接口没有摘要与依赖身份，依赖名义类型在消费方无法映射。
+    return Iface { module: bytes, names: [], sigs: [], exports: [], enum_members: [], struct_fields: [], digest: [], dependencies: [], privates: [] };
+}
+export function iface_add_export(iface: &Iface:ReadWrite, name: &[u8], kind: u8): u32!AllocError {
+    let off: u32 = @len(iface.names) as u32;
+    let len: u32 = @len(name) as u32;
+    append_bytes(&iface.names:ReadWrite, name)?;
+    let id: u32 = @len(iface.exports) as u32 + 1;
+    @push(iface.exports, IfaceExport { name_hash: hash::fnv1a(name), name_off: off, name_len: len as u16, kind: kind, flags: 0, export_id: id, sig_off: 0, sig_len: 0 })?;
+    return id;
+}
+export function iface_add_enum_member(iface: &Iface:ReadWrite, enum_export: u32, name: &[u8], variant: u32): void!AllocError {
+    let off: u32 = @len(iface.names) as u32;
+    let len: u32 = @len(name) as u32;
+    append_bytes(&iface.names:ReadWrite, name)?;
+    @push(iface.enum_members, IfaceEnumMember { enum_export: enum_export, name_hash: hash::fnv1a(name), name_off: off, name_len: len as u16, variant: variant, sig_off: 0, sig_len: 0, known: false })?;
+    return;
+}
+export function iface_add_struct_field(iface: &Iface:ReadWrite, struct_export: u32, name: &[u8], field: u32): void!AllocError {
+    let off: u32 = @len(iface.names) as u32;
+    let len: u32 = @len(name) as u32;
+    append_bytes(&iface.names:ReadWrite, name)?;
+    @push(iface.struct_fields, IfaceStructField { struct_export: struct_export, name_hash: hash::fnv1a(name), name_off: off, name_len: len as u16, field: field, sig_off: 0, sig_len: 0 })?;
+    return;
+}
+export function dep_export_kind(deps: &DependencySet:Read, dep: u32, export_id: u32): u8 {
+    if dep == 0 || dep > @len(deps.ifaces) as u32 { return 0; }
+    return iface_export_kind(&deps.ifaces[dep - 1]:Read, export_id);
+}
+
+export function iface_export_kind(target: &Iface:Read, export_id: u32): u8 {
+    if export_id == 0 { return 0; }
+    // 正式接口的导出编号连续，从 1 开始，直接读取记录。
+    if export_id <= @len(target.exports) as u32 && target.exports[export_id - 1].export_id == export_id {
+        return target.exports[export_id - 1].kind;
+    }
+    if @len(target.digest) != 0 { return 0; }
+    // 手工构造的接口可以用稀疏编号验证完整的 ExportId 位宽。
+    var i: u32 = 0;
+    while i < @len(target.exports) as u32 {
+        if target.exports[i].export_id == export_id { return target.exports[i].kind; }
+        i = i + 1;
+    }
+    return 0;
+}
+// ── 导入签名解码 ──
+// 签名池字节作为参数传递，避免视图进入存储位置；泛型作用域覆盖整个签名。
+struct SigCursor { pos: u32, failed: bool, arity: u16 }
+function sig_u8(bytes: &[u8]:Read, cursor: &SigCursor:ReadWrite): u8 {
+    if cursor.failed || cursor.pos >= @len(bytes) as u32 { cursor.failed = true; return 0; }
+    let value: u8 = bytes[cursor.pos];
+    cursor.pos = cursor.pos + 1;
+    return value;
+}
+function sig_u16(bytes: &[u8]:Read, cursor: &SigCursor:ReadWrite): u16 {
+    let lo: u8 = sig_u8(bytes, cursor);
+    let hi: u8 = sig_u8(bytes, cursor);
+    return (lo as u16) | ((hi as u16) << 8);
+}
+function sig_u32(bytes: &[u8]:Read, cursor: &SigCursor:ReadWrite): u32 {
+    let b0: u8 = sig_u8(bytes, cursor);
+    let b1: u8 = sig_u8(bytes, cursor);
+    let b2: u8 = sig_u8(bytes, cursor);
+    let b3: u8 = sig_u8(bytes, cursor);
+    return (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
+}
+function sig_u64(bytes: &[u8]:Read, cursor: &SigCursor:ReadWrite): u64 {
+    let lo: u32 = sig_u32(bytes, cursor);
+    let hi: u32 = sig_u32(bytes, cursor);
+    return (lo as u64) | ((hi as u64) << 32);
+}
+// 追加一个类型槽并返回其下标。
+function import_type_push(slots: &ImportType[]:ReadWrite, kind: u8, a: u32, b: u32, c: u64): u32!AllocError {
+    @push(*slots, ImportType { kind: kind, a: a, b: b, c: c })?;
+    return @len(*slots) as u32 - 1;
+}
+// 按模块名和摘要在直接接口与仅供类型检查的接口中查找身份；返回 1 基接口编号。
+function local_dependency_id(local: &DependencySet:Read, module: &[u8], digest: &[u8]): u32 {
+    var i: u32 = 0;
+    // 消费方类型表仍以 u16 存储依赖编号，不能把超界索引截断成另一个身份。
+    while i < 65535 && i < @len(local.ifaces) as u32 {
+        let candidate: &Iface:Read = &local.ifaces[i]:Read;
+        if @len(candidate.digest) == @len(digest) && @len(candidate.module) == @len(module) {
+            var same: bool = true;
+            var k: u32 = 0;
+            while k < @len(module) as u32 {
+                if candidate.module[k] != module[k] { same = false; break; }
+                k = k + 1;
+            }
+            k = 0;
+            while same && k < @len(digest) as u32 {
+                if candidate.digest[k] != digest[k] { same = false; break; }
+                k = k + 1;
+            }
+            if same { return i + 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 把导出方的依赖编号重映射为消费方编号；缺身份表或目标不匹配时返回 0。
+function remap_dependency(scope: &ImportScope:Read, local: &DependencySet:Read, dep: u32, export_id: u32): u32 {
+    let source: &Iface:Read = &local.ifaces[scope.source - 1]:Read;
+    let identity: &IfaceDependency:Read = &source.dependencies[dep - 1]:Read;
+    if @len(identity.digest) != 32 { return 0; }
+    let mapped: u32 = local_dependency_id(local, &identity.module[0..@len(identity.module)]:Read, &identity.digest[0..@len(identity.digest)]:Read);
+    let kind: u8 = dep_export_kind(local, mapped, export_id);
+    if kind != 2 && kind != 3 { return 0; }
+    return mapped;
+}
+// 位置依次表示普通类型、返回位、顶层参数、顶层引用所指类型、可空载体元素、载体成功位、错误成员、成员存储。
+// scope 提供当前接口的依赖条目数与身份，local 提供消费方依赖集合；加载期只做范围校验。
+function decode_import_type(bytes: &[u8]:Read, cursor: &SigCursor:ReadWrite, slots: &ImportType[]:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, position: u8, depth: u32, scope: &ImportScope:Read, local: &DependencySet:Read): u32!AllocError {
+    // 限制单条路径的节点数，避免不可信签名耗尽解释器或宿主栈。
+    if depth > SIGNATURE_DEPTH { emit(diags, types::error_code(9001), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+    let tag: u8 = sig_u8(bytes, cursor);
+    if cursor.failed { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+    if tag == 1 {
+        // 当前只支持零类型实参及 base 阶段已激活的固有类型。
+        let builtin: u16 = sig_u16(bytes, cursor);
+        let args: u16 = sig_u16(bytes, cursor);
+        if cursor.failed || args != 0 || builtin < 4097 || builtin > 4108 || (builtin == 4107 && position != 1 && position != 5) || (builtin == 4108 && position != 6) { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        if builtin == 4107 { return import_type_push(slots, 0, 0, 0, 0)?; }
+        return import_type_push(slots, 1, builtin as u32, 0, 0)?;
+    }
+    if tag == 2 {
+        // 本地名义类型：导出编号和类型实参数量；当前仅支持零实参。
+        let export_id: u32 = sig_u32(bytes, cursor);
+        let args: u16 = sig_u16(bytes, cursor);
+        if cursor.failed || args != 0 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        return import_type_push(slots, 2, export_id, 0, 0)?;
+    }
+    if tag == 3 {
+        // 依赖名义类型：依赖编号、导出编号与零类型实参。
+        let dep: u16 = sig_u16(bytes, cursor);
+        let export_id: u32 = sig_u32(bytes, cursor);
+        let args: u16 = sig_u16(bytes, cursor);
+        if cursor.failed || dep == 0 || export_id == 0 || args != 0 || dep as u32 > scope.dependency_count { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        // 加载期只保留导出方编号；消费方解码再按身份换成自己的依赖编号。
+        if scope.source == 0 { return import_type_push(slots, 3, dep as u32, export_id, 0)?; }
+        let mapped: u32 = remap_dependency(scope, local, dep as u32, export_id);
+        if mapped == 0 || (position == 6 && dep_export_kind(local, mapped, export_id) != 2) { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        return import_type_push(slots, 3, mapped, export_id, 0)?;
+    }
+    if tag == 4 {
+        let index: u16 = sig_u16(bytes, cursor);
+        if cursor.failed || index >= cursor.arity || position == 6 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        return import_type_push(slots, 4, index as u32, 0, 0)?;
+    }
+    if tag == 5 || tag == 6 {
+        // 定长数组比动态数组多一个非零长度；两种元素均继承成员存储限制。
+        var length: u64 = 0;
+        if tag == 5 {
+            length = sig_u64(bytes, cursor);
+            if cursor.failed || length == 0 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        }
+        var element: u8 = 0;
+        if position == 7 { element = 7; }
+        let elem: u32 = decode_import_type(bytes, cursor, slots, diags, element, depth + 1, scope, local)?;
+        if cursor.failed { return 0; }
+        return import_type_push(slots, tag, elem, 0, length)?;
+    }
+    if tag == 7 {
+        // 引用只能出现在函数或函数引用的顶层参数位。
+        if position != 2 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        // 引用视图：u8 能力 + 元素类型。
+        let cap: u8 = sig_u8(bytes, cursor);
+        if cursor.failed || cap > 2 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        let elem: u32 = decode_import_type(bytes, cursor, slots, diags, 3, depth + 1, scope, local)?;
+        if cursor.failed { return 0; }
+        return import_type_push(slots, 7, cap as u32, elem, 0)?;
+    }
+    if tag == 8 {
+        if position != 2 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        // 切片视图：u8 能力 + 元素类型。
+        let cap: u8 = sig_u8(bytes, cursor);
+        if cursor.failed || cap > 2 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        let elem: u32 = decode_import_type(bytes, cursor, slots, diags, 0, depth + 1, scope, local)?;
+        if cursor.failed { return 0; }
+        return import_type_push(slots, 8, cap as u32, elem, 0)?;
+    }
+    if tag == 9 {
+        // 函数引用：u16 形参数 + 逐形参类型 + 返回类型。
+        let count: u16 = sig_u16(bytes, cursor);
+        if cursor.failed || count as u32 > @len(bytes) as u32 - cursor.pos { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        let first: u32 = @len(*slots) as u32;
+        var i: u32 = 0;
+        // 根槽连续，递归解码产生的子槽不得占据下一个参数的位置。
+        while i < count as u32 { import_type_push(slots, 0, 0, 0, 0)?; i = i + 1; }
+        i = 0;
+        while i < count as u32 {
+            let root: u32 = decode_import_type(bytes, cursor, slots, diags, 2, depth + 1, scope, local)?;
+            if cursor.failed { return 0; }
+            let value: ImportType = (*slots)[root];
+            if value.kind != 7 && value.kind != 8 && value.kind != 10 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+            (*slots)[first + i] = value;
+            i = i + 1;
+        }
+        let ret: u32 = decode_import_type(bytes, cursor, slots, diags, 1, depth + 1, scope, local)?;
+        if cursor.failed { return 0; }
+        return import_type_push(slots, 10, first, count as u32, ret as u64)?;
+    }
+    if tag == 10 {
+        // 可失败载体仅允许在返回位或顶层引用参数所指的位置。
+        if position != 1 && position != 3 && position != 4 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        let success: u32 = decode_import_type(bytes, cursor, slots, diags, 5, depth + 1, scope, local)?;
+        if cursor.failed { return 0; }
+        // 函数静态引用不是可失败载体所需的 owning 成功类型。
+        if (*slots)[success].kind == 10 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        let count: u32 = sig_u32(bytes, cursor);
+        if cursor.failed || count == 0 || count > 65536 || count > @len(bytes) as u32 - cursor.pos { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        let first: u32 = @len(*slots) as u32;
+        var i: u32 = 0;
+        while i < count { import_type_push(slots, 0, 0, 0, 0)?; i = i + 1; }
+        i = 0;
+        while i < count {
+            let root: u32 = decode_import_type(bytes, cursor, slots, diags, 6, depth + 1, scope, local)?;
+            if cursor.failed { return 0; }
+            let value: ImportType = (*slots)[root];
+            // 固有错误枚举当前仅有 AllocError；名义成员在绑定时校验类别与顺序。
+            if (value.kind != 1 && value.kind != 2 && value.kind != 3) || (value.kind == 1 && value.a != 4108) { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+            (*slots)[first + i] = value;
+            i = i + 1;
+        }
+        return import_type_push(slots, 9, success, first, count as u64)?;
+    }
+    if tag == 11 {
+        // 仅返回位或顶层引用所指的最外层可空类型可包含失败载体。
+        var element: u8 = 0;
+        if position == 1 || position == 3 { element = 4; }
+        elseif position == 7 { element = 7; }
+        let elem: u32 = decode_import_type(bytes, cursor, slots, diags, element, depth + 1, scope, local)?;
+        if cursor.failed { return 0; }
+        // 仅显式的失败载体例外可作为可空载荷，其他载体和函数引用不可嵌套。
+        if (*slots)[elem].kind == 10 || (*slots)[elem].kind == 11 { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; cursor.failed = true; return 0; }
+        return import_type_push(slots, 11, elem, 0, 0)?;
+    }
+    emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+    cursor.failed = true;
+    return 0;
+}
+// import 模块路径与 iface.module / 单元模块名的匹配。
+export function module_path_matches(names: &lex::NameTable:Read, pool: &ast::AstPool:Read, import_data: u32, module_bytes: &[u8]): bool {
+    let path_len: u32 = @len(pool.imports[import_data].path) as u32;
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    var module_pos: u32 = 0;
+    var segment: u32 = 0;
+    while segment < path_len {
+        if segment > 0 {
+            if module_pos + 1 >= @len(module_bytes) as u32 { return false; }
+            if module_bytes[module_pos] != 58 || module_bytes[module_pos + 1] != 58 { return false; }
+            module_pos = module_pos + 2;
+        }
+        let name_id: u32 = pool.imports[import_data].path[segment];
+        let entry: lex::NameEntry = names.entries[name_id - 1];
+        var i: u32 = 0;
+        while i < entry.text_len as u32 {
+            if module_pos >= @len(module_bytes) as u32 { return false; }
+            if arena.data[entry.text_off + i] != module_bytes[module_pos] { return false; }
+            module_pos = module_pos + 1;
+            i = i + 1;
+        }
+        segment = segment + 1;
+    }
+    return module_pos == @len(module_bytes) as u32;
+}
+export function imports_module(pool: &ast::AstPool:Read, names: &lex::NameTable:Read, module_bytes: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(pool.imports) as u32 {
+        if module_path_matches(names, pool, i, module_bytes) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+export function iface_module_matches(names: &lex::NameTable:Read, pool: &ast::AstPool:Read, import_data: u32, iface: &Iface:Read): bool {
+    return module_path_matches(names, pool, import_data, &iface.module[0..@len(iface.module)]:Read);
+}
+export function record(refs: &RefTable:ReadWrite, node_kind: u8, node: u32, kind: u8, x: u32, y: u32, z: u32, span: types::Span): void!AllocError {
+    @push(refs.items, ResolvedRef { node_kind: node_kind, node: node, kind: kind, x: x, y: y, z: z, span: span })?;
+    return;
+}
+export function emit(diags: &diag::DiagBuffer:ReadWrite, code: types::ErrorCode, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: code, severity: 0, span: span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+// 原地堆排序；只修改调用方传入的身份临时数组。
+export function sort_identity(heap: &u64[]:ReadWrite): void {
+    let count: u32 = @len(*heap) as u32;
+    var i: u32 = 0;
+    while i < count {
+        let key: u64 = heap[i];
+        var child: u32 = i;
+        while child > 0 {
+            let parent: u32 = (child - 1) / 2;
+            if heap[parent] >= key { break; }
+            heap[child] = heap[parent];
+            child = parent;
+        }
+        heap[child] = key;
+        i = i + 1;
+    }
+    var end: u32 = count;
+    while end > 1 {
+        let largest: u64 = heap[0];
+        end = end - 1;
+        let key: u64 = heap[end];
+        heap[end] = largest;
+        var parent: u32 = 0;
+        while parent < end / 2 {
+            var child: u32 = parent * 2 + 1;
+            if child + 1 < end && heap[child + 1] > heap[child] { child = child + 1; }
+            if heap[child] <= key { break; }
+            heap[parent] = heap[child];
+            parent = child;
+        }
+        heap[parent] = key;
+    }
+    return;
+}
+// 兼容只读调用方，排序副本而不改动原有成员顺序。
+export function unique_identity(keys: &[u64]:Read): bool!AllocError {
+    var copy: u64[] = [];
+    var i: u32 = 0;
+    while i < @len(keys) as u32 { @push(copy, keys[i])?; i = i + 1; }
+    sort_identity(&copy:ReadWrite);
+    i = 1;
+    while i < @len(copy) as u32 {
+        if copy[i - 1] == copy[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+// 同模块、无泛型实参的枚举键先比较 little-endian 名称长度，再比较名称字节。
+export function enum_name_less(left: &[u8], right: &[u8]): bool {
+    let ll: u32 = @len(left) as u32;
+    let rl: u32 = @len(right) as u32;
+    if (ll & 255) != (rl & 255) { return (ll & 255) < (rl & 255); }
+    if ll != rl { return ll < rl; }
+    var i: u32 = 0;
+    while i < ll {
+        if left[i] != right[i] { return left[i] < right[i]; }
+        i = i + 1;
+    }
+    return false;
+}
+export function valid_import_slots(slots: &[ImportType]:Read, exports: &[IfaceExport]:Read): bool!AllocError {
+    let names: u8[] = [];
+    let deps: DependencySet = DependencySet { ifaces: [] };
+    return valid_import_slots_for(slots, exports, &names[0..0]:Read, &deps:Read, 0)?;
+}
+// 独立装载可验证本地相对顺序；绑定阶段按重映射后的声明身份验证完整顺序。
+function valid_import_slots_for(slots: &[ImportType]:Read, exports: &[IfaceExport]:Read, names: &[u8]:Read, deps: &DependencySet:Read, source: u32): bool!AllocError {
+    var s: u32 = 0;
+    while s < @len(slots) as u32 {
+        if slots[s].kind == 2 {
+            let id: u32 = slots[s].a;
+            if id == 0 || id > @len(exports) as u32 { return false; }
+            let target: IfaceExport = exports[id - 1];
+            if target.export_id != id || (target.kind != 2 && target.kind != 3) { return false; }
+        }
+        if slots[s].kind == 3 && (slots[s].a == 0 || slots[s].a > 65535 || slots[s].b == 0) { return false; }
+        if slots[s].kind == 9 {
+            let total: u64 = @len(slots);
+            if slots[s].a as u64 >= total || slots[s].c == 0 || slots[s].c > 65536 || slots[s].b as u64 > total || slots[s].c > total - slots[s].b as u64 { return false; }
+            let success: ImportType = slots[slots[s].a];
+            var identities: u64[] = [];
+            var prior: u32 = 0;
+            var previous_key: u8[] = [];
+            var e: u32 = 0;
+            while e < slots[s].c as u32 {
+                let member: ImportType = slots[slots[s].b + e];
+                if success.kind == member.kind && success.a == member.a && success.b == member.b { return false; }
+                if member.kind == 1 {
+                    if member.a != 4108 || (@len(names) != 0 && e != 0) { return false; }
+                } elseif member.kind == 2 {
+                    if member.a == 0 || member.a > @len(exports) as u32 { return false; }
+                    let item: IfaceExport = exports[member.a - 1];
+                    if item.export_id != member.a || item.kind != 2 { return false; }
+                    if source == 0 && @len(names) != 0 {
+                        let off: u32 = item.name_off;
+                        let len: u32 = item.name_len as u32;
+                        if len == 0 || off > @len(names) as u32 || len > @len(names) as u32 - off { return false; }
+                        if prior != 0 {
+                            let left: IfaceExport = exports[prior - 1];
+                            if !enum_name_less(&names[left.name_off..left.name_off + left.name_len as u32]:Read, &names[off..off + len]:Read) { return false; }
+                        }
+                        prior = member.a;
+                    }
+                } elseif member.kind == 3 {
+                    if member.a == 0 || member.a > 65535 || member.b == 0 { return false; }
+                } else { return false; }
+                if source != 0 && member.kind != 1 {
+                    var dep: u32 = source;
+                    var id: u32 = member.a;
+                    if member.kind == 3 { dep = member.a; id = member.b; }
+                    if dep > @len(deps.ifaces) as u32 { return false; }
+                    let key: u8[] = iface_enum_identity(&deps.ifaces[dep - 1]:Read, id)?;
+                    if @len(key) == 0 || !enum_key_less(&previous_key[0..@len(previous_key)]:Read, &key[0..@len(key)]:Read) { return false; }
+                    previous_key = @move(key);
+                } else {
+                    var identity: u64 = ((member.kind as u64) << 48) | member.a as u64;
+                    if member.kind == 3 { identity = ((member.kind as u64) << 48) | ((member.a as u64) << 32) | member.b as u64; }
+                    @push(identities, identity)?;
+                }
+                e = e + 1;
+            }
+            sort_identity(&identities:ReadWrite);
+            e = 1;
+            while e < @len(identities) as u32 {
+                if identities[e - 1] == identities[e] { return false; }
+                e = e + 1;
+            }
+        }
+        s = s + 1;
+    }
+    return true;
+}
+
+// 容器校验完整消费函数签名；泛型参数只在本签名的元数范围内有效。
+export function valid_function_signature(bytes: &[u8]:Read, exports: &[IfaceExport]:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    // 手工校验没有依赖身份：依赖名义引用按缺少上下文拒绝。
+    return valid_interface_function_signature(bytes, exports, &bytes[0..0]:Read, diags, 0)?;
+}
+// 加载期没有消费方依赖集合，只能校验导出方的依赖编号范围。
+export function valid_interface_function_signature(bytes: &[u8]:Read, exports: &[IfaceExport]:Read, names: &[u8]:Read, diags: &diag::DiagBuffer:ReadWrite, dependency_count: u32): bool!AllocError {
+    let scope: ImportScope = ImportScope { source: 0, dependency_count: dependency_count };
+    let local: DependencySet = DependencySet { ifaces: [] };
+    var cursor: SigCursor = SigCursor { pos: 0, failed: false, arity: 0 };
+    let arity: u16 = sig_u16(bytes, &cursor:ReadWrite);
+    cursor.arity = arity;
+    let count: u16 = sig_u16(bytes, &cursor:ReadWrite);
+    if cursor.failed || count as u32 > @len(bytes) as u32 - cursor.pos { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; return false; }
+    var slots: ImportType[] = [];
+    var i: u32 = 0;
+    while i < count as u32 {
+        decode_import_type(bytes, &cursor:ReadWrite, &slots:ReadWrite, diags, 2, 1, &scope:Read, &local:Read)?;
+        if cursor.failed { return false; }
+        i = i + 1;
+    }
+    decode_import_type(bytes, &cursor:ReadWrite, &slots:ReadWrite, diags, 1, 1, &scope:Read, &local:Read)?;
+    if cursor.failed { return false; }
+    if cursor.pos != @len(bytes) as u32 || !valid_import_slots_for(&slots[0..@len(slots)]:Read, exports, names, &local:Read, 0)? { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; return false; }
+    return true;
+}
+export struct MemberSignature { slots: ImportType[], root: u32, valid: bool }
+
+function invalid_function_template(): FunctionTemplate {
+    return FunctionTemplate { valid: false, arity: 0, dep: 0, param_count: 0, ret_slot: 0, types: [] };
+}
+
+struct FunctionShape { valid: bool, arity: u16, param_count: u16, ret_slot: u32 }
+
+function read_function_template(sigs: &[u8]:Read, scope: &ImportScope:Read, deps: &DependencySet:Read, generics: bool, slots: &ImportType[]:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): FunctionShape!AllocError {
+    let invalid: FunctionShape = FunctionShape { valid: false, arity: 0, param_count: 0, ret_slot: 0 };
+    var cursor: SigCursor = SigCursor { pos: 0, failed: false, arity: 0 };
+    let arity: u16 = sig_u16(sigs, &cursor:ReadWrite);
+    cursor.arity = arity;
+    let param_count: u16 = sig_u16(sigs, &cursor:ReadWrite);
+    if cursor.failed || (arity != 0) != generics || param_count as u32 > @len(sigs) as u32 - cursor.pos {
+        emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+        return invalid;
+    }
+    var p: u32 = 0;
+    // 参数根槽连续，先保留它们，再把递归解码得到的子类型追加到后面。
+    while p < param_count as u32 { import_type_push(slots, 0, 0, 0, 0)?; p = p + 1; }
+    p = 0;
+    while p < param_count as u32 {
+        let root: u32 = decode_import_type(sigs, &cursor:ReadWrite, slots, diags, 2, 1, scope, deps)?;
+        if cursor.failed { return invalid; }
+        let value: ImportType = (*slots)[root];
+        (*slots)[p] = value;
+        p = p + 1;
+    }
+    let ret: u32 = decode_import_type(sigs, &cursor:ReadWrite, slots, diags, 1, 1, scope, deps)?;
+    if cursor.failed { return invalid; }
+    var valid: bool = false;
+    if cursor.pos == @len(sigs) as u32 {
+        if scope.source == 0 {
+            let exports: IfaceExport[] = [];
+            valid = valid_import_slots_for(&(*slots)[0..@len(*slots)]:Read, &exports[0..0]:Read, &sigs[0..0]:Read, deps, 0)?;
+        } else {
+            let index: u32 = scope.source - 1;
+            valid = valid_import_slots_for(&(*slots)[0..@len(*slots)]:Read,
+                &deps.ifaces[index].exports[0..@len(deps.ifaces[index].exports)]:Read,
+                &deps.ifaces[index].names[0..@len(deps.ifaces[index].names)]:Read, deps, scope.source)?;
+        }
+    }
+    if !valid {
+        emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+        return invalid;
+    }
+    return FunctionShape { valid: true, arity: arity, param_count: param_count, ret_slot: ret };
+}
+
+// 显式读取泛型的 TypeSig。接口编号为零时只接受无需声明身份的签名。
+export function read_generic_signature(sigs: &[u8]:Read, deps: &DependencySet:Read, dep: u16, diags: &diag::DiagBuffer:ReadWrite): FunctionTemplate!AllocError {
+    var count: u32 = 0;
+    if dep != 0 {
+        if (dep as u64) > @len(deps.ifaces) {
+            emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+            return invalid_function_template();
+        }
+        count = @len(deps.ifaces[(dep as u32) - 1].dependencies) as u32;
+    }
+    let scope: ImportScope = ImportScope { source: dep as u32, dependency_count: count };
+    var slots: ImportType[] = [];
+    let sig: FunctionShape = read_function_template(sigs, &scope:Read, deps, true, &slots:ReadWrite, diags)?;
+    if !sig.valid { return invalid_function_template(); }
+    return FunctionTemplate { valid: true, arity: sig.arity, dep: dep, param_count: sig.param_count, ret_slot: sig.ret_slot, types: @move(slots) };
+}
+
+// 成员签名必须完整消费，并遵守普通存储位置的类型限制。
+export function decode_member_signature(bytes: &[u8]:Read, exports: &[IfaceExport]:Read, diags: &diag::DiagBuffer:ReadWrite): MemberSignature!AllocError {
+    return decode_interface_member_signature(bytes, exports, &bytes[0..0]:Read, diags, 0)?;
+}
+export function decode_interface_member_signature(bytes: &[u8]:Read, exports: &[IfaceExport]:Read, names: &[u8]:Read, diags: &diag::DiagBuffer:ReadWrite, dependency_count: u32): MemberSignature!AllocError {
+    let scope: ImportScope = ImportScope { source: 0, dependency_count: dependency_count };
+    let local: DependencySet = DependencySet { ifaces: [] };
+    var cursor: SigCursor = SigCursor { pos: 0, failed: false, arity: 0 };
+    var slots: ImportType[] = [];
+    let root: u32 = decode_import_type(bytes, &cursor:ReadWrite, &slots:ReadWrite, diags, 7, 1, &scope:Read, &local:Read)?;
+    if !cursor.failed && (cursor.pos != @len(bytes) as u32 || !valid_import_slots_for(&slots[0..@len(slots)]:Read, exports, names, &local:Read, 0)?) {
+        emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+        cursor.failed = true;
+    }
+    return MemberSignature { slots: slots, root: root, valid: !cursor.failed };
+}
+export function valid_member_signature(bytes: &[u8]:Read, exports: &[IfaceExport]:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    let sig: MemberSignature = decode_member_signature(bytes, exports, diags)?;
+    return sig.valid;
+}
+// 只解码直接导入的可调用签名；传递成员只提供类型规则、布局和析构所需的无名信息。
+// 解码失败报 S-12（7012），且不保存对应签名。
+export function load_import_signatures(refs: &RefTable:ReadWrite, deps: &DependencySet:Read, direct_count: u32, names: &lex::NameTable:Read, tables: &resolve::ResolveTables:Read, imports: &ImportMap:Read, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var selected: bool[] = [];
+    var limit: u32 = @len(deps.ifaces) as u32;
+    if limit > 65535 { limit = 65535; }
+    var dep: u32 = 0;
+    while dep < direct_count && dep < limit { @push(selected, false)?; dep = dep + 1; }
+    var binding: u32 = 0;
+    while binding < @len(imports.defs) as u32 {
+        let id: u16 = tables.defs[imports.defs[binding] - 1].import_dependency;
+        if id != 0 { selected[id as u32 - 1] = true; }
+        binding = binding + 1;
+    }
+    dep = 0;
+    while dep < limit {
+        let visible: bool = dep < direct_count;
+        if visible && !selected[dep] { dep = dep + 1; continue; }
+        // 消费方解码：按该接口自身的依赖身份，把导出方编号换成当前单元的依赖编号。
+        let scope: ImportScope = ImportScope { source: dep + 1, dependency_count: @len(deps.ifaces[dep].dependencies) as u32 };
+        var i: u32 = 0;
+        while i < @len(deps.ifaces[dep].exports) as u32 {
+            let record: IfaceExport = deps.ifaces[dep].exports[i];
+            if record.kind == 3 { @push(refs.structs, ImportStruct { dep: (dep + 1) as u16, export_id: record.export_id })?; }
+            if record.kind == 2 { @push(refs.enums, ImportEnum { dep: (dep + 1) as u16, export_id: record.export_id })?; }
+            if visible && record.kind == 1 && record.sig_len > 0 {
+                let total: u32 = @len(deps.ifaces[dep].sigs) as u32;
+                if record.sig_off > total || record.sig_len > total - record.sig_off { emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?; i = i + 1; continue; }
+                let sigs: &[u8]:Read = &deps.ifaces[dep].sigs[record.sig_off..record.sig_off + record.sig_len]:Read;
+                var slots: ImportType[] = [];
+                let sig: FunctionShape = read_function_template(sigs, &scope:Read, deps, false, &slots:ReadWrite, diags)?;
+                if !sig.valid { i = i + 1; continue; }
+                @push(refs.imports, ImportSignature { dep: (dep + 1) as u16, export_id: record.export_id, param_count: sig.param_count, ret_slot: sig.ret_slot, param_start: 0, types: @move(slots) })?;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < @len(deps.ifaces[dep].enum_members) as u32 {
+            let member: IfaceEnumMember = deps.ifaces[dep].enum_members[i];
+            let name_total: u32 = @len(deps.ifaces[dep].names) as u32;
+            if member.name_off > name_total || member.name_len as u32 > name_total - member.name_off {
+                emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+                i = i + 1; continue;
+            }
+            let text: &[u8] = &deps.ifaces[dep].names[member.name_off..member.name_off + member.name_len as u32];
+            var name: u32 = 0;
+            if visible || refs.contextual_enum_labels { name = hashmap::hashmap_lookup(&names.hash_map:Read, &names.arena:Read, member.name_hash, text); }
+            if refs.contextual_enum_labels && name != 0 {
+                @push(refs.enum_names, EnumName { kind: 3, dep: (dep + 1) as u16, id: member.enum_export, name: name })?;
+            }
+            if !visible { name = 0; }
+            if member.known {
+                var slots: ImportType[] = [];
+                var root: u32 = 0;
+                var valid: bool = true;
+                if member.sig_len != 0 {
+                    let total: u32 = @len(deps.ifaces[dep].sigs) as u32;
+                    if member.sig_off > total || member.sig_len > total - member.sig_off {
+                        emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+                        valid = false;
+                    } else {
+                        let bytes: &[u8]:Read = &deps.ifaces[dep].sigs[member.sig_off..member.sig_off + member.sig_len]:Read;
+                        var cursor: SigCursor = SigCursor { pos: 0, failed: false, arity: 0 };
+                        root = decode_import_type(bytes, &cursor:ReadWrite, &slots:ReadWrite, diags, 7, 1, &scope:Read, deps)?;
+                        if cursor.failed { valid = false; }
+                        elseif cursor.pos != member.sig_len || !valid_import_slots_for(&slots[0..@len(slots)]:Read, &deps.ifaces[dep].exports[0..@len(deps.ifaces[dep].exports)]:Read, &deps.ifaces[dep].names[0..@len(deps.ifaces[dep].names)]:Read, deps, dep + 1)? {
+                            emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+                            valid = false;
+                        }
+                    }
+                }
+                if valid { @push(refs.variants, ImportVariant { dep: (dep + 1) as u16, export_id: member.enum_export, name: name, variant: member.variant, known: true, root: root, types: @move(slots) })?; }
+            } else {
+                @push(refs.variants, ImportVariant { dep: (dep + 1) as u16, export_id: member.enum_export, name: name, variant: member.variant, known: false, root: 0, types: [] })?;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < @len(deps.ifaces[dep].struct_fields) as u32 {
+            let field: IfaceStructField = deps.ifaces[dep].struct_fields[i];
+            if field.field > 65535 {
+                emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+                i = i + 1;
+                continue;
+            }
+            // 手工接口允许缺少字段签名，保留空槽以标记字段集合不完整。
+            if field.sig_len == 0 {
+                @push(refs.fields, ImportField { dep: (dep + 1) as u16, export_id: field.struct_export, field: field.field, name: 0, root: 0, types: [] })?;
+            } else {
+                let total: u32 = @len(deps.ifaces[dep].sigs) as u32;
+                let name_total: u32 = @len(deps.ifaces[dep].names) as u32;
+                if field.sig_off > total || field.sig_len > total - field.sig_off || field.name_off > name_total || field.name_len as u32 > name_total - field.name_off {
+                    emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+                    i = i + 1; continue;
+                }
+                let bytes: &[u8]:Read = &deps.ifaces[dep].sigs[field.sig_off..field.sig_off + field.sig_len]:Read;
+                var cursor: SigCursor = SigCursor { pos: 0, failed: false, arity: 0 };
+                var slots: ImportType[] = [];
+                let root: u32 = decode_import_type(bytes, &cursor:ReadWrite, &slots:ReadWrite, diags, 7, 1, &scope:Read, deps)?;
+                if cursor.failed { i = i + 1; continue; }
+                if cursor.pos != field.sig_len || !valid_import_slots_for(&slots[0..@len(slots)]:Read, &deps.ifaces[dep].exports[0..@len(deps.ifaces[dep].exports)]:Read, &deps.ifaces[dep].names[0..@len(deps.ifaces[dep].names)]:Read, deps, dep + 1)? {
+                    emit(diags, types::error_code(7012), types::Span { file: 0, offset: 0, length: 0 })?;
+                    i = i + 1; continue;
+                }
+                let text: &[u8] = &deps.ifaces[dep].names[field.name_off..field.name_off + field.name_len as u32];
+                var name: u32 = 0;
+                if visible { name = hashmap::hashmap_lookup(&names.hash_map:Read, &names.arena:Read, field.name_hash, text); }
+                @push(refs.fields, ImportField { dep: (dep + 1) as u16, export_id: field.struct_export, field: field.field, name: name, root: root, types: @move(slots) })?;
+            }
+            i = i + 1;
+        }
+        dep = dep + 1;
+    }
+    return;
+}
+export function collect_enum_identities(tables: &resolve::ResolveTables:Read, names: &lex::NameTable:Read, deps: &DependencySet:Read, module: &[u8]): EnumIdentity[]!AllocError {
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    var identities: EnumIdentity[] = [];
+    var i: u32 = 0;
+    while i < @len(tables.defs) as u32 {
+        if tables.defs[i].kind == 2 {
+            let entry: lex::NameEntry = names.entries[tables.defs[i].name - 1];
+            let key: u8[] = enum_identity(module, &arena.data[entry.text_off..entry.text_off + entry.text_len as u32]:Read)?;
+            @push(identities, EnumIdentity { dep: 0, id: i + 1, key: key })?;
+        }
+        i = i + 1;
+    }
+    var dep: u32 = 0;
+    while dep < 65535 && dep < @len(deps.ifaces) as u32 {
+        let iface: &Iface:Read = &deps.ifaces[dep]:Read;
+        i = 0;
+        while i < @len(iface.exports) as u32 {
+            if iface.exports[i].kind == 2 {
+                let key: u8[] = iface_enum_identity(iface, i + 1)?;
+                if @len(key) != 0 { @push(identities, EnumIdentity { dep: (dep + 1) as u16, id: i + 1, key: key })?; }
+            }
+            i = i + 1;
+        }
+        dep = dep + 1;
+    }
+    return identities;
+}

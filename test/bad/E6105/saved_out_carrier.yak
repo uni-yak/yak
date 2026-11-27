@@ -1,0 +1,21 @@
+// expected_code: E6105
+// spec: spec/lang/base.md R-28；spec/lang/type/result.md RE-6
+// 触发：含 out 的可错调用先保存载体，再在绑定上判定。
+
+function fill(x: &u32:Write): void!AllocError {
+    *x = 1u32;
+    return;
+}
+
+function reject_saved(): void!AllocError {
+    out slot: u32;
+    let saved: void!AllocError = fill(out slot);
+    saved?;
+    return;
+}
+
+function main(): void {
+    let outcome: void!AllocError = reject_saved();
+    @drop(outcome);
+    return;
+}

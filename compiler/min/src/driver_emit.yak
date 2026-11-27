@@ -1,0 +1,168 @@
+// 发射并验证单元产物，校验全部通过前不写宿主输出。
+import buf;
+import coff;
+import coff_code;
+import elf;
+import elf_backend;
+import coff_state;
+import diag;
+import host;
+import iface;
+import iface_write;
+import lex;
+import link_names;
+import mir;
+import parse;
+import resolve;
+import resolve_refs;
+import typecheck;
+import ysm;
+import ysm_write;
+import driver_diag;
+import driver_front;
+import types;
+
+foreign exit(code: u8): void;
+foreign write(data: &[u8]): void;
+
+export struct Options { entry_def: u32, is_root: bool, artifact_mode: u8, jsonl: bool, profile: u32 }
+
+// 依赖表按规范 order 逐条编号：dependency_id 取 order 位置 +1，摘要取依赖接口文件自身的
+// content_digest；传递依赖不在本单元的导入表内，因此不进入此表。
+function collect_dependencies(candidates: &[iface::LoadedInterface]:Read, order: &[u32]:Read): ysm::YsmDependency[]!AllocError {
+    var list: ysm::YsmDependency[] = [];
+    var i: u32 = 0;
+    while i < @len(order) as u32 {
+        let loaded: &iface::LoadedInterface:Read = &candidates[order[i]]:Read;
+        var digest: u8[] = [];
+        var k: u32 = 0;
+        while k < @len(loaded.digest) as u32 {
+            @push(digest, loaded.digest[k])?;
+            k = k + 1;
+        }
+        @push(list, ysm::YsmDependency { dependency_id: (i + 1) as u16, interface_digest: @move(digest) })?;
+        i = i + 1;
+    }
+    return @move(list);
+}
+
+// 追加单个候选接口的 content_digest 字节；加载侧已保证成功装载的候选其摘要恰为 32 字节，
+// 此处按实际长度复制，与上面直接依赖表的取法保持一致。
+function append_candidate_digest(flat: &u8[]:ReadWrite, loaded: &iface::LoadedInterface:Read): void!AllocError {
+    var k: u32 = 0;
+    while k < @len(loaded.digest) as u32 {
+        @push(*flat, loaded.digest[k])?;
+        k = k + 1;
+    }
+    return;
+}
+
+// 审计用候选摘要表：按与解析器一致的依赖编号展开，先直接依赖前缀，再传递名义类型后缀，
+// 每个候选固定拼接 32 字节，故第 i 个 32 字节块对应依赖编号 i+1。
+// 与上面只登记直接依赖的表不同，本表不写入 .iface，仅供 YSM 校验传递名义类型签名。
+function collect_candidate_digests(candidates: &[iface::LoadedInterface]:Read, order: &[u32]:Read, targets: &[u32]:Read): u8[]!AllocError {
+    var flat: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(order) as u32 {
+        let candidate: u32 = order[i];
+        append_candidate_digest(&flat:ReadWrite, &candidates[candidate]:Read)?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(targets) as u32 {
+        let candidate: u32 = targets[i];
+        append_candidate_digest(&flat:ReadWrite, &candidates[candidate]:Read)?;
+        i = i + 1;
+    }
+    return flat;
+}
+
+// 单独运行时仍使用相同的导出、依赖摘要、格式验证和校验和。
+function write_ysm(module: &mir::MirModule:Read, candidates: &[iface::LoadedInterface]:Read, order: &[u32]:Read, targets: &[u32]:Read, exported: iface::ExportMap, profile: u16, module_name: &[u8], jsonl_mode: bool): void!AllocError {
+    var ysm_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let ysm_deps: ysm::YsmDependency[] = collect_dependencies(candidates, order)?;
+    // 传递名义类型的签名要按候选摘要核对，故在直接依赖表之外另备一份审计用摘要表；
+    // 该表只进入 YSM 校验输入，不改变 .iface 与 YSM 依赖节的既有字节。
+    let candidate_digests: u8[] = collect_candidate_digests(candidates, order, targets)?;
+    let ysm_facts: ysm::YsmFacts = ysm::YsmFacts { target_profile: profile, statics: [], dependencies: @move(ysm_deps), candidate_digests: @move(candidate_digests), exports: @move(exported) };
+    let ysm_result: ysm::YsmResult = ysm_write::write_module(module, &ysm_facts:Read, &ysm_diags:ReadWrite)?;
+    if !ysm_result.accepted {
+        driver_front::fail(&ysm_diags:ReadWrite, jsonl_mode, module_name)?;
+    }
+    // 仅在完整 YSM 校验通过后发布审计字节。
+    let ysm_bytes: &[u8] = &ysm_result.data[0..@len(ysm_result.data)];
+    host::output_bytes("ysm", ysm_bytes);
+    return;
+}
+
+function fail_artifact(prefix: &[u8], code: types::ErrorCode, span: types::Span, module_name: &[u8],
+    jsonl_mode: bool, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    if jsonl_mode {
+        diag::diagbuf_emit(diags, diag::Diag { code: code, severity: 0, span: span, unit: 0,
+            refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        driver_front::fail(diags, true, module_name)?;
+    } else {
+        driver_diag::report_code(prefix, code)?;
+        exit(1);
+    }
+    return;
+}
+
+function emit_object(module: &mir::MirModule:Read, links: &coff_state::LinkTable:Read, sysv: bool): coff::EmitResult!AllocError {
+    if !sysv { return coff::emit_object(module, links, coff::profile_win64_pe())?; }
+    let object: elf::ObjectResult = elf_backend::emit_object(module, links)?;
+    let raw: &buf::ByteBuf:Read = &object.bytes:Read;
+    let payload: u8[] = @clone(raw.data)?;
+    return coff::EmitResult { ok: object.code == 0, code: types::error_code(object.code),
+        bytes: coff_code::Bytes { data: @move(payload) }, rejection: coff::Rejection { kind: 0, span: types::Span { file: 0, offset: 0, length: 0 } } };
+}
+
+export function emit(parsed: &parse::ParseResult:Read, names: &lex::NameTable:Read, resolution: &resolve_refs::Resolution:Read, checked: &typecheck::TypeCheckResult:Read, layout_data: &iface::LayoutData:Read, module: &mir::MirModule:Read, module_name: &[u8]:Read, candidates: &[iface::LoadedInterface]:Read, order: &[u32]:Read, targets: &[u32]:Read, direct: &[resolve_refs::Iface]:Read, options: Options, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    let profile: u32 = options.profile;
+    let sysv: bool = profile == 65538;
+    let ysm_profile: u16 = (((profile >> 16u32) << 8u32) | (profile & 255u32)) as u16;
+    let exported: iface::ExportMap = iface_write::build_export_map(&parsed.file:Read, &parsed.pool:Read, resolution, names)?;
+    if !options.is_root && options.entry_def != 0 {
+        write("错误：非根单元不得定义入口 main\n");
+        exit(1);
+    }
+    if options.artifact_mode == 2 {
+        write_ysm(module, candidates, order, targets, @move(exported), ysm_profile, module_name, options.jsonl)?;
+        return;
+    }
+    let linked: link_names::LinkBuild = link_names::build_target(module, &exported:Read, module_name, options.entry_def, &resolution.services[0..@len(resolution.services)]:Read, direct, sysv)?;
+    if !linked.ok {
+        fail_artifact("链接符号", linked.code, types::Span { file: 0, offset: 0, length: 0 }, module_name, options.jsonl, diags)?;
+        return;
+    }
+    let emitted: coff::EmitResult = emit_object(module, &linked.table:Read, sysv)?;
+    if !emitted.ok {
+        fail_artifact("对象发射", emitted.code, emitted.rejection.span, module_name, options.jsonl, diags)?;
+        return;
+    }
+    // 每个单元都产出 .iface（module.md 6.1）；全部产物校验通过后才落盘。
+    var facts: u8[] = [];
+    var fact_index: u32 = 0;
+    let resolved: &resolve::ResolveResult:Read = &resolution.result:Read;
+    while fact_index < @len(resolved.tables.defs) as u32 { @push(facts, 0u8)?; fact_index = fact_index + 1; }
+    fact_index = 0;
+    while fact_index < @len(module.functions) as u32 {
+        let def: u32 = module.functions[fact_index].def;
+        if def > 0 && def <= @len(facts) as u32 {
+            facts[def - 1] = 1;
+            if module.functions[fact_index].no_alloc { facts[def - 1] = 2; }
+        }
+        fact_index = fact_index + 1;
+    }
+    let iface_result: iface::InterfaceResult = iface_write::write_target_interface(&parsed.file:Read, &parsed.pool:Read, resolution, names, checked, layout_data, &facts[0..@len(facts)]:Read, module_name, candidates, order, profile, diags)?;
+    if diag::diagbuf_has_error(diags) {
+        driver_front::fail(diags, options.jsonl, module_name)?;
+    }
+    if options.artifact_mode == 1 { write_ysm(module, candidates, order, targets, @move(exported), ysm_profile, module_name, options.jsonl)?; }
+    let iface_bytes: &[u8] = &iface_result.data.bytes[0..@len(iface_result.data.bytes)];
+    host::output_bytes("iface", iface_bytes);
+    let object_data: &coff_code::Bytes:Read = &emitted.bytes:Read;
+    let bytes: &[u8] = &object_data.data[0..@len(object_data.data)];
+    host::output_bytes("obj", bytes);
+    return;
+}

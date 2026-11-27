@@ -1,0 +1,17 @@
+// 导入枚举样例的依赖单元：导出 Choice 与按值返回/消费函数。
+// 根单元按导入变体表完成 match、构造与 Copy 复用。
+export enum Choice { Empty, Small(u32) }
+
+export function make_choice(x: u32): Choice {
+    if x == 0u32 { return Choice::Empty; }
+    return Choice::Small(x);
+}
+
+export function value_of(c: Choice): u32 {
+    var r: u32 = 0u32;
+    match c {
+        Empty => { r = 0u32; },
+        Small(v) => { r = v; }
+    }
+    return r;
+}

@@ -1,0 +1,73 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+import desugar;
+import diag;
+import types;
+foreign assert(condition: bool): void;
+
+function dependency(binding: u32, requires: u32, offset: u32): desugar::InitializerDependency {
+    return desugar::InitializerDependency { binding: binding, requires: requires, span: types::Span { file: 17, offset: offset, length: 1 } };
+}
+
+function orders_dependencies(): void!AllocError {
+    let edges: [desugar::InitializerDependency; 5] = [dependency(0, 2, 10), dependency(0, 1, 12), dependency(2, 3, 20),
+        dependency(1, 3, 30), dependency(0, 2, 14)];
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let plan: desugar::InitializerPlan = desugar::plan_initializers(5, &edges[0..5]:Read, &diagnostics:ReadWrite)?;
+    assert(plan.ok && @len(plan.order) == 5 && diag::diagbuf_count(&diagnostics:Read) == 0);
+    assert(plan.order[0] == 3 && plan.order[1] == 2 && plan.order[2] == 1 && plan.order[3] == 0 && plan.order[4] == 4);
+    let empty: desugar::InitializerPlan = desugar::plan_initializers(0, &edges[0..0]:Read, &diagnostics:ReadWrite)?;
+    assert(empty.ok && @len(empty.order) == 0);
+    return;
+}
+
+function rejects_cycles(): void!AllocError {
+    let edges: [desugar::InitializerDependency; 4] = [dependency(1, 2, 10), dependency(1, 3, 12),
+        dependency(2, 1, 20), dependency(3, 1, 30)];
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let plan: desugar::InitializerPlan = desugar::plan_initializers(4, &edges[0..4]:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E3006 spec/lang/sugar.md#SU-6
+    assert(!plan.ok && @len(plan.order) == 0 && diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 3006);
+    assert(diagnostics.diags[0].span.file == 17 && diagnostics.diags[0].span.offset == 20 && diagnostics.diags[0].span.length == 1);
+
+    let self_edge: [desugar::InitializerDependency; 1] = [dependency(1, 1, 44)];
+    diagnostics = diag::diagbuf_new();
+    let self: desugar::InitializerPlan = desugar::plan_initializers(2, &self_edge[0..1]:Read, &diagnostics:ReadWrite)?;
+    assert(!self.ok && @len(self.order) == 0 && diag::diagbuf_count(&diagnostics:Read) == 1);
+    assert(diagnostics.diags[0].code.raw == 3006 && diagnostics.diags[0].span.offset == 44);
+
+    diagnostics = diag::diagbuf_new();
+    let invalid: desugar::InitializerPlan = desugar::plan_initializers(1, &self_edge[0..1]:Read, &diagnostics:ReadWrite)?;
+    assert(!invalid.ok && @len(invalid.order) == 0 && diag::diagbuf_count(&diagnostics:Read) == 1);
+    assert(diagnostics.diags[0].code.raw == 4002 && diagnostics.diags[0].span.offset == 44);
+    return;
+}
+
+function orders_deep_graph(): void!AllocError {
+    var edges: desugar::InitializerDependency[] = [];
+    var i: u32 = 0;
+    while i < 2047 {
+        @push(edges, dependency(i, i + 1, i))?;
+        i = i + 1;
+    }
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let plan: desugar::InitializerPlan = desugar::plan_initializers(2048, &edges[0..@len(edges)]:Read, &diagnostics:ReadWrite)?;
+    assert(plan.ok && @len(plan.order) == 2048 && diag::diagbuf_count(&diagnostics:Read) == 0);
+    i = 0;
+    while i < 2048 { assert(plan.order[i] == 2047 - i); i = i + 1; }
+    return;
+}
+
+function main(): void {
+    orders_dependencies()?;
+    rejects_cycles()?;
+    orders_deep_graph()?;
+    return;
+}

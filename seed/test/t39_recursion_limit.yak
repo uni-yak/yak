@@ -1,0 +1,10 @@
+// t39: 递归深度保护（应 trap）
+// expected_trap: recursion depth
+function deep(n: u32): u32 {
+    return deep(n + 1);
+}
+
+function main(): void {
+    let r: u32 = deep(0);
+    return;
+}

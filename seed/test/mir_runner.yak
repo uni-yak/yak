@@ -1,0 +1,1080 @@
+// 标量与载体的 MIR 执行器和结构校验，供多个测试共用。
+// 本模块不含入口函数，因此可以作为依赖模块被导入。
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+const NONE: u32 = 4294967295u32;
+export struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+struct Graph { reachable: bool[], dom: bool[], def_block: u32[], def_pos: u32[] }
+// 标量、枚举、成功载体、错误载体分别使用不同标签，错误保留原始枚举类型。
+export struct Value { tag: u8, value_type_id: u32, bits: u64, payload_type: u32, variant: u32 }
+export struct Execution { trace: u64, foreign_calls: u32, steps: u32, trapped: bool }
+struct Frame { values: Value[], ready: bool[], memory: u8[], base: u32[], size: u32[], is_place: bool[], types: u32[], pool_base: u32 }
+
+export function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    if @len(r.diagnostics) != 0 { write(src); }
+    assert(@len(r.diagnostics) == 0);
+    // 走带静态池的入口：字符串字面量的字节与静态下标必须随 AST 进入检查与中端。
+    let p: parse::ParseResult = parse::parse_lexed(&r:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    return Loaded { parsed: p, lexed: r };
+}
+function same_type(a: typecheck::TypeEntry, b: typecheck::TypeEntry): void {
+    assert(a.kind == b.kind && a.builtin == b.builtin && a.def == b.def);
+    assert(a.dep == b.dep && a.export_id == b.export_id && a.elem == b.elem);
+    assert(a.cap == b.cap && a.length == b.length && a.success == b.success);
+    assert(a.members_start == b.members_start && a.members_count == b.members_count);
+    return;
+}
+function same_tables(a: &typecheck::TypeTable:Read, b: &typecheck::TypeTable:Read, x: &typecheck::FuncTable:Read, y: &typecheck::FuncTable:Read): void {
+    assert(@len(a.entries) == @len(b.entries) && @len(a.members) == @len(b.members));
+    var i: u32 = 0;
+    while i < @len(a.entries) as u32 { same_type(a.entries[i], b.entries[i]); i = i + 1; }
+    i = 0;
+    while i < @len(a.members) as u32 { assert(a.members[i] == b.members[i]); i = i + 1; }
+    assert(@len(x.items) == @len(y.items));
+    i = 0;
+    while i < @len(x.items) as u32 {
+        assert(x.items[i].def == y.items[i].def && x.items[i].ret == y.items[i].ret && x.items[i].service == y.items[i].service);
+        assert(@len(x.items[i].params) == @len(y.items[i].params));
+        var j: u32 = 0;
+        while j < @len(x.items[i].params) as u32 { assert(x.items[i].params[j] == y.items[i].params[j]); j = j + 1; }
+        i = i + 1;
+    }
+    return;
+}
+// 检查阶段的类型表与 MIR 模块类型表对比：MIR 必须持有独立深拷贝，
+// 且只允许在自己的尾部追加内部地址（u64）及清理活性槽（bool）的内建类型。
+function check_copy(tc: &typecheck::TypeCheckResult:ReadWrite, module: &mir::MirModule:Read): void {
+    let base: u32 = @len(tc.types.entries) as u32;
+    assert(@len(module.types.entries) as u32 >= base);
+    var i: u32 = 0;
+    while i < base { same_type(tc.types.entries[i], module.types.entries[i]); i = i + 1; }
+    while i < @len(module.types.entries) as u32 {
+        let extra: typecheck::TypeEntry = module.types.entries[i];
+        assert(extra.kind == 1 && (extra.builtin == 4100 || extra.builtin == 4105));
+        i = i + 1;
+    }
+    assert(@len(tc.types.members) == @len(module.types.members));
+    assert(@len(tc.funcs.items) == @len(module.signatures.items));
+    if @len(tc.types.entries) > 0 {
+        let old: u8 = module.types.entries[0].kind;
+        tc.types.entries[0].kind = 255;
+        assert(module.types.entries[0].kind == old);
+    }
+    if @len(tc.types.members) > 0 {
+        let old: u32 = module.types.members[0];
+        tc.types.members[0] = NONE;
+        assert(module.types.members[0] == old);
+    }
+    if @len(tc.funcs.items) > 0 {
+        let old: u32 = module.signatures.items[0].ret;
+        tc.funcs.items[0].ret = 0;
+        assert(module.signatures.items[0].ret == old);
+        let service: u8 = module.signatures.items[0].service;
+        tc.funcs.items[0].service = 255;
+        assert(module.signatures.items[0].service == service);
+        if @len(tc.funcs.items[0].params) > 0 {
+            let param: u32 = module.signatures.items[0].params[0];
+            tc.funcs.items[0].params[0] = 0;
+            assert(module.signatures.items[0].params[0] == param);
+        }
+    }
+    return;
+}
+export function compile_result(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let loaded: Loaded = load(src, file)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", diags)?;
+    var tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, diags)?;
+    let result: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &tc:Read, diags)?;
+    if result.accepted { check_copy(&tc:ReadWrite, &result.module:Read); }
+    else { assert(@len(result.module.functions) == 0 && result.rejection.kind != 0); }
+    return result;
+}
+export function accepted(src: &[u8], file: u16): mir::MirResult!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile_result(src, file, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0);
+    assert(result.accepted && result.rejection.kind == 0);
+    validate(&result.module:Read)?;
+    return result;
+}
+export function compile(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    return compile_result(src, file, diags)?;
+}
+export function valid_type(module: &mir::MirModule:Read, id: u32): bool {
+    return id > 0 && id <= @len(module.types.entries) as u32;
+}
+export function builtin(module: &mir::MirModule:Read, id: u32): u16 {
+    assert(valid_type(module, id));
+    return module.types.entries[id - 1].builtin;
+}
+export function type_for(module: &mir::MirModule:Read, bid: u16): u32 {
+    var i: u32 = 0;
+    while i < @len(module.types.entries) as u32 {
+        if module.types.entries[i].builtin == bid { return i + 1; }
+        i = i + 1;
+    }
+    assert(false);
+    return 0;
+}
+function local_type(f: &mir::MirFunction:Read, id: u32): u32 {
+    assert(id > 0 && id <= @len(f.locals) as u32);
+    return f.locals[id - 1].value_type_id;
+}
+function signature_for(module: &mir::MirModule:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(module.signatures.items) as u32 {
+        if module.signatures.items[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    assert(false);
+    return 0;
+}
+function function_for(module: &mir::MirModule:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        if module.functions[i].def == def { return i; }
+        i = i + 1;
+    }
+    assert(false);
+    return 0;
+}
+function validate_types(module: &mir::MirModule:Read): void {
+    var i: u32 = 0;
+    while i < @len(module.types.entries) as u32 {
+        let t: typecheck::TypeEntry = module.types.entries[i];
+        assert(t.kind <= 11);
+        if t.kind == 1 { assert(t.builtin >= 4097 && t.builtin <= 4108); }
+        if t.kind == 2 { assert(t.def > 0); }
+        if t.kind >= 4 && t.kind <= 10 { assert(valid_type(module, t.elem)); }
+        if t.kind == 9 { assert(valid_type(module, t.success)); assert(module.types.entries[t.elem - 1].kind == 11); }
+        assert(t.members_start <= @len(module.types.members) as u32);
+        assert(t.members_count <= @len(module.types.members) as u32 - t.members_start);
+        var j: u32 = 0;
+        while j < t.members_count { assert(valid_type(module, module.types.members[t.members_start + j])); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(module.signatures.items) as u32 {
+        assert(module.signatures.items[i].def > 0 && valid_type(module, module.signatures.items[i].ret));
+        var j: u32 = 0;
+        while j < @len(module.signatures.items[i].params) as u32 { assert(valid_type(module, module.signatures.items[i].params[j])); j = j + 1; }
+        i = i + 1;
+    }
+    return;
+}
+function edge(f: &mir::MirFunction:Read, from: u32, to: u32): bool {
+    let t: mir::MirTerminator = f.blocks[from].terminator;
+    if t.op == 192 { return t.b == to; }
+    if t.op == 193 || t.op == 162 { return t.b == to || t.c == to; }
+    if t.op == 177 {
+        var i: u32 = 0;
+        while i < t.c { if f.arms[t.b + i].block as u32 == to { return true; } i = i + 1; }
+        return false;
+    }
+    return false;
+}
+function graph_new(f: &mir::MirFunction:Read): Graph!AllocError {
+    var g: Graph = Graph { reachable: [], dom: [], def_block: [], def_pos: [] };
+    var i: u32 = 0;
+    let n: u32 = @len(f.blocks) as u32;
+    while i < n { @push(g.reachable, i == f.entry as u32)?; i = i + 1; }
+    i = 0;
+    while i < n * n { @push(g.dom, true)?; i = i + 1; }
+    i = 0;
+    while i <= @len(f.locals) as u32 { @push(g.def_block, NONE)?; @push(g.def_pos, 0)?; i = i + 1; }
+    return g;
+}
+function graph_reach(f: &mir::MirFunction:Read, g: &Graph:ReadWrite): void {
+    let n: u32 = @len(f.blocks) as u32;
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var a: u32 = 0;
+        while a < n {
+            if g.reachable[a] {
+                var b: u32 = 0;
+                while b < n {
+                    if edge(f, a, b) && !g.reachable[b] { g.reachable[b] = true; changed = true; }
+                    b = b + 1;
+                }
+            }
+            a = a + 1;
+        }
+    }
+    return;
+}
+function graph_dom(f: &mir::MirFunction:Read, g: &Graph:ReadWrite): void {
+    let n: u32 = @len(f.blocks) as u32;
+    var d: u32 = 0;
+    while d < n { g.dom[f.entry as u32 * n + d] = d == f.entry as u32; d = d + 1; }
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var b: u32 = 0;
+        while b < n {
+            if b != f.entry as u32 && g.reachable[b] {
+                d = 0;
+                while d < n {
+                    var value: bool = true;
+                    var p: u32 = 0;
+                    while p < n {
+                        if g.reachable[p] && edge(f, p, b) { value = value && g.dom[p * n + d]; }
+                        p = p + 1;
+                    }
+                    value = value || d == b;
+                    if g.dom[b * n + d] != value { g.dom[b * n + d] = value; changed = true; }
+                    d = d + 1;
+                }
+            }
+            b = b + 1;
+        }
+    }
+    return;
+}
+function define(f: &mir::MirFunction:Read, g: &Graph:ReadWrite, id: u32, block: u32, pos: u32): void {
+    assert(id > 0 && id <= @len(f.locals) as u32);
+    assert(f.locals[id - 1].kind <= 1 && g.def_block[id] == NONE);
+    g.def_block[id] = block;
+    g.def_pos[id] = pos;
+    return;
+}
+function use(f: &mir::MirFunction:Read, g: &Graph:Read, id: u32, block: u32, pos: u32): void {
+    assert(id > 0 && id <= @len(f.locals) as u32 && f.locals[id - 1].kind <= 1);
+    let defined: u32 = g.def_block[id];
+    assert(defined != NONE);
+    if defined == block { assert(g.def_pos[id] < pos); }
+    else { assert(g.dom[block * @len(f.blocks) as u32 + defined]); }
+    return;
+}
+// 操作数可能是聚合存储槽（kind==2，帧建立即存在）或普通值局部（须满足 SSA 支配）。
+function operand(f: &mir::MirFunction:Read, g: &Graph:ReadWrite, id: u32, block: u32, pos: u32): void {
+    if f.locals[id - 1].kind == 2 { place(f, id); return; }
+    use(f, g, id, block, pos);
+    return;
+}
+function place(f: &mir::MirFunction:Read, id: u32): void {
+    assert(id > 0 && id <= @len(f.locals) as u32 && f.locals[id - 1].kind == 2);
+    return;
+}
+function definitions(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, g: &Graph:ReadWrite): void {
+    var i: u32 = 0;
+    assert(@len(f.params) == @len(module.signatures.items[f.signature - 1].params));
+    while i < @len(f.params) as u32 {
+        define(f, g, f.params[i], f.entry as u32, 0);
+        assert(local_type(f, f.params[i]) == module.signatures.items[f.signature - 1].params[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(f.blocks) as u32 {
+        if f.blocks[i].payload != 0 { define(f, g, f.blocks[i].payload, i, 0); }
+        var j: u32 = 0;
+        while j < f.blocks[i].inst_count {
+            let inst: mir::MirInst = f.insts[f.blocks[i].inst_start + j];
+            if inst.a != 0 { define(f, g, inst.a, i, j + 1); assert(local_type(f, inst.a) == inst.value_type_id); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while i <= @len(f.locals) as u32 {
+        if f.locals[i - 1].kind <= 1 { assert(g.def_block[i] != NONE); }
+        i = i + 1;
+    }
+    return;
+}
+function is_binary(op: u8): bool {
+    return op >= 16 && op <= 20 || op >= 22 && op <= 24 || op >= 32 && op <= 36 || op >= 48 && op <= 53;
+}
+function error_member(module: &mir::MirModule:Read, set: u32, candidate: u32): bool {
+    if set == candidate { return true; }
+    let t: typecheck::TypeEntry = module.types.entries[set - 1];
+    var i: u32 = 0;
+    while i < t.members_count {
+        if module.types.members[t.members_start + i] == candidate { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function validate_call(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, g: &Graph:Read, inst: mir::MirInst, block: u32, pos: u32): void {
+    let sig: u32 = signature_for(module, inst.b);
+    assert(inst.c == 0 && inst.args_count == @len(module.signatures.items[sig - 1].params) as u32);
+    var i: u32 = 0;
+    while i < inst.args_count {
+        let arg: u32 = f.args[inst.args_start + i];
+        use(f, g, arg, block, pos);
+        assert(local_type(f, arg) == module.signatures.items[sig - 1].params[i]);
+        i = i + 1;
+    }
+    assert(inst.value_type_id == module.signatures.items[sig - 1].ret);
+    assert((inst.a == 0) == (module.types.entries[inst.value_type_id - 1].kind == 0));
+    if mir::is_local_call(inst.op) { let target: u32 = function_for(module, inst.b); assert(module.functions[target].signature == sig); }
+    return;
+}
+function validate_carrier(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, g: &Graph:Read, inst: mir::MirInst, block: u32, pos: u32): void {
+    let t: typecheck::TypeEntry = module.types.entries[inst.value_type_id - 1];
+    if inst.op == 176 {
+        assert(t.kind == 2 || t.kind == 1 && t.builtin == 4108);
+        assert(inst.b == inst.value_type_id && inst.value <= 4294967295u64);
+        if inst.value != 0 { use(f, g, inst.value as u32, block, pos); }
+        return;
+    }
+    assert(t.kind == 9);
+    if inst.op == 160 {
+        assert(inst.c == t.elem);
+        if module.types.entries[t.success - 1].kind == 0 { assert(inst.b == 0); }
+        else { use(f, g, inst.b, block, pos); assert(local_type(f, inst.b) == t.success); }
+    } else {
+        assert(inst.op == 161 && inst.c == t.success);
+        use(f, g, inst.b, block, pos);
+        let source: u32 = local_type(f, inst.b);
+        if module.types.entries[source - 1].kind == 11 {
+            let from: typecheck::TypeEntry = module.types.entries[source - 1];
+            var i: u32 = 0;
+            while i < from.members_count { assert(error_member(module, t.elem, module.types.members[from.members_start + i])); i = i + 1; }
+        } else { assert(error_member(module, t.elem, source)); }
+    }
+    return;
+}
+function validate_inst(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, g: &Graph:ReadWrite, inst: mir::MirInst, block: u32, pos: u32): void {
+    if inst.op != 115 { assert(valid_type(module, inst.value_type_id)); }
+    assert(inst.args_start <= @len(f.args) as u32 && inst.args_count <= @len(f.args) as u32 - inst.args_start);
+    if inst.op == 1 {
+        assert(inst.a > 0 && inst.b == builtin(module, inst.value_type_id) as u32 && inst.c == 0);
+    } elseif inst.op == 2 {
+        assert(inst.a > 0 && builtin(module, inst.value_type_id) == 4105 && inst.value <= 1);
+    } elseif is_binary(inst.op) {
+        use(f, g, inst.b, block, pos); use(f, g, inst.c, block, pos);
+        assert(local_type(f, inst.b) == local_type(f, inst.c));
+        if inst.op >= 48 && inst.op <= 53 { assert(builtin(module, inst.value_type_id) == 4105); }
+        else { assert(inst.value_type_id == local_type(f, inst.b)); }
+    } elseif inst.op == 21 || inst.op == 64 || inst.op == 112 || inst.op == 113 {
+        use(f, g, inst.b, block, pos); assert(inst.a > 0);
+        if inst.op == 64 { assert(inst.c == inst.value_type_id); }
+        else { assert(inst.c == 0 && inst.value_type_id == local_type(f, inst.b)); }
+    } elseif inst.op == 80 {
+        operand(f, g, inst.b, block, pos);
+        assert(inst.a > 0 && inst.c == 0);
+    } elseif inst.op == 115 {
+        // 条件析构的附加操作数是布尔存储位，不用于输出槽位。
+        operand(f, g, inst.b, block, pos);
+        if inst.c != 0 {
+            operand(f, g, inst.c, block, pos);
+            assert(f.locals[inst.c - 1].kind == 2 && f.locals[inst.b - 1].kind != 3);
+            assert(builtin(module, local_type(f, inst.c)) == 4105);
+        }
+        assert(inst.a == 0 && inst.value_type_id == 0 && inst.value == 0 && inst.args_count == 0);
+        assert(module.types.entries[local_type(f, inst.b) - 1].kind != 5);
+    } elseif inst.op == 146 {
+        // call_builtin（mir.md 4.10）：目前只有 @len，读切片胖指针块高 8 字节的长度字，结果为 u64。
+        assert(inst.b == 20486);
+        assert(inst.args_count == 1 && inst.c == 0);
+        operand(f, g, f.args[inst.args_start], block, pos);
+        assert(inst.a > 0);
+        assert(builtin(module, inst.value_type_id) == 4100);
+        assert(module.types.entries[local_type(f, f.args[inst.args_start]) - 1].kind == 5);
+    } elseif inst.op == 81 {
+        operand(f, g, inst.b, block, pos); operand(f, g, inst.c, block, pos);
+        assert(inst.a == 0 && inst.value_type_id == local_type(f, inst.c));
+    } elseif inst.op == 3 {
+        // const_bytes：结果必须是 16 字节胖指针块，静态索引界内且条目类型与指令类型一致。
+        assert(inst.a > 0 && inst.c == 0 && inst.value == 0 && inst.args_count == 0);
+        assert(inst.b < @len(module.statics) as u32);
+        let view: mir::MirStatic = module.statics[inst.b];
+        assert(view.value_type_id == inst.value_type_id);
+        assert(module.types.entries[inst.value_type_id - 1].kind == 5);
+        assert(view.offset <= @len(module.static_bytes) as u32);
+        assert(view.length <= @len(module.static_bytes) as u32 - view.offset);
+    } elseif inst.op == 4 {
+        // const_aggregate：条目类型必须是定长数组或名义枚举（&[u8] 不在此域内），
+        // 结果类型与条目类型相同，指令 byte_len 与条目长度相同且落在池内。
+        assert(inst.a > 0 && inst.c == 0 && inst.args_count == 0);
+        assert(inst.b < @len(module.statics) as u32);
+        let entry: mir::MirStatic = module.statics[inst.b];
+        let entry_kind: u8 = module.types.entries[entry.value_type_id - 1].kind;
+        assert(entry_kind == 7 || entry_kind == 2);
+        assert(entry.value_type_id == inst.value_type_id);
+        assert(inst.value == entry.length as u64 && inst.value >= 1);
+        assert(entry.offset <= @len(module.static_bytes) as u32);
+        assert(entry.length <= @len(module.static_bytes) as u32 - entry.offset);
+    }
+    elseif inst.op == 128 || inst.op == 129 {
+        // 借用必须读取已定义的 place，结果是对应能力的普通引用。
+        operand(f, g, inst.b, block, pos);
+        let ref_type: typecheck::TypeEntry = module.types.entries[inst.value_type_id - 1];
+        assert(inst.a > 0 && inst.c == 0 && inst.value == 0 && inst.args_count == 0);
+        assert(ref_type.kind == 4 && ref_type.cap == inst.op - 128 && valid_type(module, ref_type.elem));
+    }
+    elseif inst.op == 82 || inst.op == 83 {
+        // 取址类指令：结果是地址局部，源局部必须已定义且是聚合存储槽。
+        assert(inst.a > 0 && builtin(module, inst.value_type_id) == 4100);
+        operand(f, g, inst.b, block, pos);
+        if inst.op == 83 { operand(f, g, inst.c, block, pos); assert(mir::projection_stride(inst) >= 1); }
+    } elseif inst.op == 96 || inst.op == 97 {
+        // 聚合构造：分量经参数表给出，按声明序逐个校验为已定义的标量。
+        assert(inst.a > 0 && inst.args_count > 0);
+        var p: u32 = 0;
+        while p < inst.args_count { use(f, g, f.args[inst.args_start + p], block, pos); p = p + 1; }
+    } elseif mir::is_local_call(inst.op) || mir::is_foreign_call(inst.op) { validate_call(module, f, g, inst, block, pos); }
+    elseif inst.op == 160 || inst.op == 161 || inst.op == 176 { validate_carrier(module, f, g, inst, block, pos); }
+    else { assert(false); }
+    return;
+}
+function validate_term(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, g: &Graph:Read, block: u32): void {
+    let t: mir::MirTerminator = f.blocks[block].terminator;
+    let n: u32 = @len(f.blocks) as u32;
+    let pos: u32 = f.blocks[block].inst_count + 1;
+    if t.op == 192 { assert(t.a == 0 && t.b < n && t.c == 0); }
+    elseif t.op == 193 { use(f, g, t.a, block, pos); assert(builtin(module, local_type(f, t.a)) == 4105 && t.b < n && t.c < n); }
+    elseif t.op == 194 {
+        let ret: u32 = module.signatures.items[f.signature - 1].ret;
+        if module.types.entries[ret - 1].kind == 0 { assert(t.a == 0); }
+        else { use(f, g, t.a, block, pos); assert(local_type(f, t.a) == ret); }
+        assert(t.b == 0 && t.c == 0);
+    } elseif t.op == 162 {
+        use(f, g, t.a, block, pos); assert(t.b < n && t.c < n && t.b != t.c);
+        let carrier: typecheck::TypeEntry = module.types.entries[local_type(f, t.a) - 1];
+        assert(carrier.kind == 9 && f.blocks[t.c].payload != 0);
+        assert(local_type(f, f.blocks[t.c].payload) == carrier.elem);
+        if module.types.entries[carrier.success - 1].kind == 0 { assert(f.blocks[t.b].payload == 0); }
+        else { assert(local_type(f, f.blocks[t.b].payload) == carrier.success); }
+    } elseif t.op == 177 {
+        use(f, g, t.a, block, pos);
+        let value_type_id: u32 = local_type(f, t.a);
+        let entry: typecheck::TypeEntry = module.types.entries[value_type_id - 1];
+        var total: u32 = 0;
+        if entry.kind == 2 {
+            var i: u32 = 0;
+            while i < @len(module.enums.items) as u32 {
+                if module.enums.items[i].def == entry.def { total = @len(module.enums.items[i].payloads) as u32; }
+                i = i + 1;
+            }
+        } elseif entry.kind == 1 && entry.builtin == 4108 { total = 1; }
+        assert(total > 0 && t.c == total && t.b + t.c <= @len(f.arms) as u32);
+        var k: u32 = 0;
+        while k < t.c {
+            assert(f.arms[t.b + k].variant as u32 == k);
+            assert(f.arms[t.b + k].block as u32 < n);
+            var expected: u32 = 0;
+            if entry.kind == 2 {
+                var ei: u32 = 0;
+                while ei < @len(module.enums.items) as u32 {
+                    if module.enums.items[ei].def == entry.def { expected = module.enums.items[ei].payloads[k]; }
+                    ei = ei + 1;
+                }
+            }
+            let got: u32 = f.blocks[f.arms[t.b + k].block as u32].payload;
+            if expected == 0 { assert(got == 0); }
+            else { assert(got != 0 && local_type(f, got) == expected); }
+            k = k + 1;
+        }
+    } else { assert(t.op == 195 || t.op == 196); }
+    return;
+}
+function validate_function(module: &mir::MirModule:Read, f: &mir::MirFunction:Read): void!AllocError {
+    assert(f.signature > 0 && f.signature <= @len(module.signatures.items) as u32);
+    assert(module.signatures.items[f.signature - 1].def == f.def);
+    assert(@len(f.blocks) > 0 && f.entry < @len(f.blocks) as u16);
+    if f.has_trap_target { assert(f.trap_target < @len(f.blocks) as u16); }
+    var i: u32 = 0;
+    while i < @len(f.locals) as u32 {
+        assert(f.locals[i].id == i + 1 && valid_type(module, f.locals[i].value_type_id));
+        assert(f.locals[i].kind <= 3 && f.locals[i].state == 0);
+        i = i + 1;
+    }
+    var cursor: u32 = 0;
+    i = 0;
+    while i < @len(f.blocks) as u32 {
+        assert(f.blocks[i].id == i as u16 && f.blocks[i].inst_start == cursor);
+        assert(f.blocks[i].inst_count <= @len(f.insts) as u32 - cursor);
+        cursor = cursor + f.blocks[i].inst_count;
+        let t: mir::MirTerminator = f.blocks[i].terminator;
+        if t.op == 192 || t.op == 193 || t.op == 162 { assert(t.b < @len(f.blocks) as u32); }
+        if t.op == 193 || t.op == 162 { assert(t.c < @len(f.blocks) as u32); }
+        if t.op == 177 {
+            assert(t.b + t.c <= @len(f.arms) as u32);
+            var k: u32 = 0;
+            while k < t.c { assert(f.arms[t.b + k].block < @len(f.blocks) as u16); k = k + 1; }
+        }
+        i = i + 1;
+    }
+    assert(cursor == @len(f.insts) as u32);
+    var g: Graph = graph_new(f)?;
+    graph_reach(f, &g:ReadWrite); graph_dom(f, &g:ReadWrite); definitions(module, f, &g:ReadWrite);
+    var trap_blocks: bool[] = [];
+    i = 0;
+    while i < @len(f.blocks) as u32 { @push(trap_blocks, false)?; i = i + 1; }
+    if f.has_trap_target {
+        assert(f.blocks[f.trap_target].inst_count == 0);
+        trap_blocks[f.trap_target] = true;
+    }
+    i = 0;
+    while i < @len(f.blocks) as u32 {
+        if g.reachable[i] {
+            var j: u32 = 0;
+            while j < f.blocks[i].inst_count {
+                let inst: mir::MirInst = f.insts[f.blocks[i].inst_start + j];
+                validate_inst(module, f, &g:ReadWrite, inst, i, j + 1);
+                if inst.trap != 0 {
+                    let target: u32 = inst.trap - 1;
+                    assert(mir::has_trap_edge(inst.op) && target < @len(f.blocks) as u32);
+                    assert(!g.reachable[target] && !trap_blocks[target]);
+                    trap_blocks[target] = true;
+                    // 清理块只可使用触发陷阱前已定义的局部。
+                    var k: u32 = 0;
+                    while k < f.blocks[target].inst_count {
+                        let drop: mir::MirInst = f.insts[f.blocks[target].inst_start + k];
+                        assert(drop.op == 115 && drop.trap == 0);
+                        validate_inst(module, f, &g:ReadWrite, drop, i, j + 1);
+                        k = k + 1;
+                    }
+                }
+                j = j + 1;
+            }
+        } else { assert(f.blocks[i].payload == 0 && f.blocks[i].terminator.op == 195); }
+        validate_term(module, f, &g:Read, i);
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(f.blocks) as u32 { assert(g.reachable[i] != trap_blocks[i]); i = i + 1; }
+    return;
+}
+export function validate(module: &mir::MirModule:Read): void!AllocError {
+    validate_types(module);
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 { validate_function(module, &module.functions[i]:Read)?; i = i + 1; }
+    return;
+}
+function same_inst(a: mir::MirInst, b: mir::MirInst): void {
+    assert(a.op == b.op && a.a == b.a && a.b == b.b && a.c == b.c);
+    assert(a.value == b.value && a.value_type_id == b.value_type_id && a.args_start == b.args_start && a.args_count == b.args_count && a.trap == b.trap);
+    return;
+}
+function same_function(a: &mir::MirFunction:Read, b: &mir::MirFunction:Read): void {
+    assert(a.def == b.def && a.signature == b.signature && a.declared_no_alloc == b.declared_no_alloc && a.no_alloc == b.no_alloc);
+    assert(a.entry == b.entry && a.has_trap_target == b.has_trap_target && a.trap_target == b.trap_target);
+    assert(@len(a.locals) == @len(b.locals) && @len(a.blocks) == @len(b.blocks) && @len(a.insts) == @len(b.insts));
+    assert(@len(a.args) == @len(b.args) && @len(a.params) == @len(b.params));
+    var i: u32 = 0;
+    while i < @len(a.locals) as u32 {
+        assert(a.locals[i].id == b.locals[i].id && a.locals[i].value_type_id == b.locals[i].value_type_id);
+        assert(a.locals[i].kind == b.locals[i].kind && a.locals[i].state == b.locals[i].state);
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(a.blocks) as u32 {
+        assert(a.blocks[i].id == b.blocks[i].id && a.blocks[i].inst_start == b.blocks[i].inst_start && a.blocks[i].inst_count == b.blocks[i].inst_count);
+        assert(a.blocks[i].payload == b.blocks[i].payload);
+        assert(a.blocks[i].terminator.op == b.blocks[i].terminator.op && a.blocks[i].terminator.a == b.blocks[i].terminator.a);
+        assert(a.blocks[i].terminator.b == b.blocks[i].terminator.b && a.blocks[i].terminator.c == b.blocks[i].terminator.c);
+        i = i + 1;
+    }
+    assert(@len(a.arms) == @len(b.arms));
+    i = 0;
+    while i < @len(a.arms) as u32 {
+        assert(a.arms[i].variant == b.arms[i].variant && a.arms[i].block == b.arms[i].block);
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(a.insts) as u32 { same_inst(a.insts[i], b.insts[i]); i = i + 1; }
+    i = 0;
+    while i < @len(a.args) as u32 { assert(a.args[i] == b.args[i]); i = i + 1; }
+    i = 0;
+    while i < @len(a.params) as u32 { assert(a.params[i] == b.params[i]); i = i + 1; }
+    return;
+}
+export function same_module(a: &mir::MirModule:Read, b: &mir::MirModule:Read): void {
+    same_tables(&a.types:Read, &b.types:Read, &a.signatures:Read, &b.signatures:Read);
+    assert(@len(a.functions) == @len(b.functions));
+    var i: u32 = 0;
+    while i < @len(a.functions) as u32 { same_function(&a.functions[i]:Read, &b.functions[i]:Read); i = i + 1; }
+    return;
+}
+export function scalar(value_type_id: u32, bits: u64): Value { return Value { tag: 0, value_type_id: value_type_id, bits: bits, payload_type: 0, variant: 0 }; }
+export function execution_new(): Execution { return Execution { trace: 0, foreign_calls: 0, steps: 0, trapped: false }; }
+// 聚合类型的字节尺寸：结构体按字段表累加（与 layout.yak 的算法一致），定长数组按元素宽度乘长度。
+function layout_size(module: &mir::MirModule:Read, value_type_id: u32): u32 {
+    let entry: typecheck::TypeEntry = module.types.entries[value_type_id - 1];
+    if entry.kind == 1 { return byte_width(module, value_type_id); }
+    if entry.kind == 7 {
+        var width: u32 = 8;
+        if entry.elem != 0 { let laid: u32 = layout_size(module, entry.elem); if laid < 8 { width = laid; } }
+        return width * entry.length as u32;
+    }
+    // 切片胖指针按 16 字节承载：低 8 字节指针、高 8 字节长度，与发射器槽布局一致。
+    if entry.kind == 5 { return 16; }
+    if entry.kind != 2 { return 8; }
+    var total: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(module.fields.items) as u32 {
+        if module.fields.items[i].def == entry.def {
+            let laid: u32 = field_storage_width(module, module.fields.items[i].type_id);
+            var width: u32 = laid;
+            var align: u32 = width;
+            if align > 8 { align = 8; }
+            if total % align != 0 { total = (total / align + 1) * align; }
+            total = total + width;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+// 字段在聚合体内的字节占用：标量取真实宽度，聚合才取完整布局尺寸。
+function field_storage_width(module: &mir::MirModule:Read, value_type_id: u32): u32 {
+    if is_aggregate(&module.types:Read, value_type_id) { return layout_size(module, value_type_id); }
+    return byte_width(module, value_type_id);
+}
+// 标量按内建宽度取字节数；聚合按布局尺寸，单值读写时不超过 8 字节。
+function byte_width(module: &mir::MirModule:Read, value_type_id: u32): u32 {
+    let entry: typecheck::TypeEntry = module.types.entries[value_type_id - 1];
+    if entry.kind == 1 {
+        if entry.builtin == 4097 || entry.builtin == 4101 || entry.builtin == 4105 { return 1; }
+        if entry.builtin == 4098 || entry.builtin == 4102 { return 2; }
+        if entry.builtin == 4099 || entry.builtin == 4103 || entry.builtin == 4106 || entry.builtin == 4108 { return 4; }
+        return 8;
+    }
+    var laid: u32 = layout_size(module, value_type_id);
+    if laid > 8 { laid = 8; }
+    if laid == 0 { laid = 8; }
+    return laid;
+}
+// 结构体第 index 个字段的字节偏移，按字段声明序累加（与 layout 算法一致）。
+// 关键顺序：先按本字段对齐要求上取整，再判定是否已到目标下标返回；
+// 若先返回再对齐，偏移会漏掉本字段自身的对齐填充。
+function field_offset(module: &mir::MirModule:Read, def: u32, index: u32): u32 {
+    var total: u32 = 0;
+    var seen: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(module.fields.items) as u32 {
+        if module.fields.items[i].def == def {
+            var width: u32 = field_storage_width(module, module.fields.items[i].type_id);
+            var align: u32 = width;
+            if align > 8 { align = 8; }
+            if align != 0 && total % align != 0 { total = (total / align + 1) * align; }
+            if seen == index { return total; }
+            total = total + width;
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+function width_mask(module: &mir::MirModule:Read, value_type_id: u32): u64 {
+    let b: u16 = builtin(module, value_type_id);
+    if b == 4097 || b == 4101 { return 255; }
+    if b == 4098 || b == 4102 { return 65535; }
+    if b == 4099 || b == 4103 || b == 4106 { return 4294967295; }
+    return 18446744073709551615u64;
+}
+function is_signed(module: &mir::MirModule:Read, value_type_id: u32): bool {
+    let b: u16 = builtin(module, value_type_id);
+    return b >= 4101 && b <= 4104;
+}
+function signed_value(module: &mir::MirModule:Read, v: Value): i64 {
+    let b: u16 = builtin(module, v.value_type_id);
+    if b == 4101 { return ((v.bits as u8) as i8) as i64; }
+    if b == 4102 { return ((v.bits as u16) as i16) as i64; }
+    if b == 4103 { return ((v.bits as u32) as i32) as i64; }
+    return v.bits as i64;
+}
+// 存储槽局部的值落在帧内存里，其余局部仍按值直接保存。
+function value_read(frame: &Frame:Read, id: u32): Value {
+    assert(id > 0 && id < @len(frame.values) as u32);
+    // 聚合局部读成地址：后续由 load / 字段取址按字节解释，不折叠成单个标量。
+    if frame.is_place[id] { return scalar(frame.types[id], frame.base[id] as u64); }
+    return frame.values[id];
+}
+function value_write(frame: &Frame:ReadWrite, id: u32, value: Value): void {
+    assert(id > 0 && id < @len(frame.values) as u32);
+    if frame.is_place[id] { frame.types[id] = value.value_type_id; mem_write(frame, frame.base[id], frame.size[id], value.bits); frame.ready[id] = true; return; }
+    frame.values[id] = value; frame.ready[id] = true;
+    return;
+}
+function compare(module: &mir::MirModule:Read, op: u8, a: Value, b: Value): bool {
+    if op == 48 { return a.tag == b.tag && a.bits == b.bits && a.payload_type == b.payload_type && a.variant == b.variant; }
+    if op == 49 { return a.tag != b.tag || a.bits != b.bits || a.payload_type != b.payload_type || a.variant != b.variant; }
+    if is_signed(module, a.value_type_id) {
+        let x: i64 = signed_value(module, a); let y: i64 = signed_value(module, b);
+        if op == 50 { return x < y; } if op == 51 { return x <= y; }
+        if op == 52 { return x > y; } return x >= y;
+    }
+    if op == 50 { return a.bits < b.bits; } if op == 51 { return a.bits <= b.bits; }
+    if op == 52 { return a.bits > b.bits; } return a.bits >= b.bits;
+}
+function arithmetic(module: &mir::MirModule:Read, op: u8, value_type_id: u32, a: Value, b: Value): Value {
+    var bits: u64 = 0;
+    if op >= 48 && op <= 53 { if compare(module, op, a, b) { bits = 1; } return scalar(value_type_id, bits); }
+    if op == 19 || op == 20 { assert(b.bits != 0); }
+    if is_signed(module, a.value_type_id) && op >= 16 && op <= 21 {
+        let x: i64 = signed_value(module, a); let y: i64 = signed_value(module, b);
+        if op == 16 { bits = (x + y) as u64; } elseif op == 17 { bits = (x - y) as u64; }
+        elseif op == 18 { bits = (x * y) as u64; } elseif op == 19 { bits = (x / y) as u64; }
+        elseif op == 20 { bits = (x % y) as u64; } else { bits = (-x) as u64; }
+    } elseif op == 16 { bits = a.bits + b.bits; } elseif op == 17 { bits = a.bits - b.bits; }
+    elseif op == 18 { bits = a.bits * b.bits; } elseif op == 19 { bits = a.bits / b.bits; }
+    elseif op == 20 { bits = a.bits % b.bits; } elseif op == 22 { bits = @wrap_add(a.bits, b.bits); }
+    elseif op == 23 { bits = @wrap_sub(a.bits, b.bits); } elseif op == 24 { bits = @wrap_mul(a.bits, b.bits); }
+    elseif op == 32 { bits = a.bits & b.bits; } elseif op == 33 { bits = a.bits | b.bits; }
+    elseif op == 34 { bits = a.bits ^ b.bits; } elseif op == 35 { bits = a.bits << b.bits; }
+    elseif op == 36 {
+        if is_signed(module, a.value_type_id) { bits = (signed_value(module, a) >> b.bits) as u64; }
+        else { bits = a.bits >> b.bits; }
+    } else { assert(false); }
+    return scalar(value_type_id, bits & width_mask(module, value_type_id));
+}
+// 每个局部按真实尺寸在帧内存里占一块：标量与地址 8 字节，聚合按布局尺寸取整到 8 的倍数。
+function frame_new(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, inputs: &[Value]): Frame!AllocError {
+    var frame: Frame = Frame { values: [], ready: [], memory: [], base: [], size: [], is_place: [], types: [], pool_base: 0 };
+    var i: u32 = 0;
+    while i <= @len(f.locals) as u32 { @push(frame.values, scalar(0, 0))?; @push(frame.ready, false)?; @push(frame.base, 0)?; @push(frame.size, 0)?; @push(frame.is_place, false)?; @push(frame.types, 0)?; i = i + 1; }
+    var offset: u32 = 0;
+    i = 0;
+    while i < @len(f.locals) as u32 {
+        var bytes: u32 = byte_width(module, f.locals[i].value_type_id);
+        // 存储槽与聚合局部都占一块内存：聚合值按字节布局承载，不能用单个标量值表示。
+        if is_place_local(module, f.locals[i].kind, f.locals[i].value_type_id) {
+            frame.is_place[i + 1] = true;
+            var laid: u32 = layout_size(module, f.locals[i].value_type_id);
+            if laid > bytes { bytes = laid; }
+        }
+        frame.base[i + 1] = offset;
+        frame.size[i + 1] = bytes;
+        offset = offset + bytes;
+        i = i + 1;
+    }
+    // 只读静态池接在局部区之后（向上对齐到 8），构造时即断言两块互不重叠；
+    // 池字节按模块静态池逐字节复制，运行期只读，与发射器的 .rdata 语义一致。
+    var pool_base: u32 = offset;
+    if pool_base % 8 != 0 { pool_base = (pool_base / 8 + 1) * 8; }
+    assert(pool_base >= offset);
+    i = 0;
+    while i < offset { @push(frame.memory, 0)?; i = i + 1; }
+    i = offset;
+    while i < pool_base { @push(frame.memory, 0)?; i = i + 1; }
+    frame.pool_base = pool_base;
+    i = 0;
+    while i < @len(module.static_bytes) as u32 {
+        @push(frame.memory, module.static_bytes[i])?;
+        i = i + 1;
+    }
+    // 池区必须完整落在帧内存尾部，且起始不早于局部区末尾（零重叠断言）。
+    assert(frame.pool_base >= offset);
+    assert(frame.pool_base + @len(module.static_bytes) as u32 == @len(frame.memory) as u32);
+    assert(@len(inputs) == @len(f.params));
+    i = 0;
+    while i < @len(f.params) as u32 { assert(inputs[i].value_type_id == local_type(f, f.params[i])); value_write(&frame:ReadWrite, f.params[i], inputs[i]); i = i + 1; }
+    return frame;
+}
+// 局部是否按内存块承载：存储槽恒为块；名义结构体与定长数组也是块；
+// 切片按 16 字节胖指针块承载；枚举名义类型与内建枚举仍是标量值。
+function is_place_local(module: &mir::MirModule:Read, kind: u8, value_type_id: u32): bool {
+    if kind == 2 { return true; }
+    let entry: typecheck::TypeEntry = module.types.entries[value_type_id - 1];
+    // 枚举名义类型是带标签的标量值，不进内存块；结构体与定长数组才按块承载。
+    if entry.kind == 2 && is_enum_def(module, entry.def) { return false; }
+    if is_aggregate(&module.types:Read, value_type_id) { return true; }
+    // 切片值局部与切片参数统一按胖指针块承载（低 8 字节指针、高 8 字节长度）。
+    if entry.kind == 5 { return true; }
+    return false;
+}
+// 按内存块承载的类型：结构体与定长数组按字节块表示，不折叠成单个标量。
+function is_aggregate(types: &typecheck::TypeTable:Read, value_type_id: u32): bool {
+    if value_type_id == 0 || value_type_id > @len(types.entries) as u32 { return false; }
+    let entry: typecheck::TypeEntry = types.entries[value_type_id - 1];
+    // 只有结构体与定长数组按块承载；枚举名义类型与内建枚举仍是标量值。
+    return entry.kind == 2 || entry.kind == 7;
+}
+// 名义 DefId 是否属于枚举：枚举值带标签与 payload，按标量值承载。
+function is_enum_def(module: &mir::MirModule:Read, def: u32): bool {
+    var i: u32 = 0;
+    while i < @len(module.enums.items) as u32 {
+        if module.enums.items[i].def == def { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+// 整块拷贝：聚合值在局部之间搬运时按内存块复制。
+function mem_copy(frame: &Frame:ReadWrite, dst: u32, src: u32, count: u32): void {
+    var i: u32 = 0;
+    while i < count {
+        assert(dst + i < @len(frame.memory) as u32 && src + i < @len(frame.memory) as u32);
+        frame.memory[dst + i] = frame.memory[src + i];
+        i = i + 1;
+    }
+    return;
+}
+// 读内存：按小端把 width 字节拼成 u64。
+function mem_read(frame: &Frame:Read, at: u32, width: u32): u64 {
+    var acc: u64 = 0;
+    var i: u32 = 0;
+    while i < width {
+        assert(at + i < @len(frame.memory) as u32);
+        var shift: u64 = i as u64 * 8u64;
+        if shift < 64u64 { acc = acc | (frame.memory[at + i] as u64 << shift); }
+        i = i + 1;
+    }
+    return acc;
+}
+// 写内存：按小端写入 width 字节，其余位截断。
+function mem_write(frame: &Frame:ReadWrite, at: u32, width: u32, bits: u64): void {
+    var i: u32 = 0;
+    while i < width {
+        assert(at + i < @len(frame.memory) as u32);
+        var shift: u64 = i as u64 * 8u64;
+        if shift >= 64u64 { frame.memory[at + i] = 0; }
+        else { frame.memory[at + i] = ((bits >> shift) & 255u64) as u8; }
+        i = i + 1;
+    }
+    return;
+}
+function invoke_call(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, frame: &Frame:Read, inst: mir::MirInst, state: &Execution:ReadWrite, depth: u32): Value!AllocError {
+    var args: Value[] = [];
+    var i: u32 = 0;
+    while i < inst.args_count { @push(args, value_read(frame, f.args[inst.args_start + i]))?; i = i + 1; }
+    if mir::is_local_call(inst.op) { return execute(module, function_for(module, inst.b), &args[0..@len(args)]:Read, state, depth + 1)?; }
+    assert(mir::is_foreign_call(inst.op));
+    state.foreign_calls = state.foreign_calls + 1;
+    if inst.args_count == 0 { state.trace = state.trace + 1; return scalar(inst.value_type_id, 0); }
+    assert(inst.args_count == 1 && args[0].tag == 0);
+    state.trace = state.trace * 10 + args[0].bits;
+    return scalar(inst.value_type_id, args[0].bits);
+}
+function execute_inst(module: &mir::MirModule:Read, f: &mir::MirFunction:Read, frame: &Frame:ReadWrite, inst: mir::MirInst, state: &Execution:ReadWrite, depth: u32): void!AllocError {
+    var result: Value = scalar(inst.value_type_id, 0);
+    if inst.op == 1 || inst.op == 2 { result.bits = inst.value; }
+    elseif is_binary(inst.op) || inst.op == 21 {
+        let a: Value = value_read(frame, inst.b);
+        var b: Value = scalar(a.value_type_id, 0);
+        if inst.c != 0 { b = value_read(frame, inst.c); }
+        result = arithmetic(module, inst.op, inst.value_type_id, a, b);
+    } elseif inst.op == 64 {
+        let a: Value = value_read(frame, inst.b);
+        var bits: u64 = a.bits;
+        if is_signed(module, a.value_type_id) { bits = signed_value(module, a) as u64; }
+        result.bits = bits & width_mask(module, inst.value_type_id);
+    } elseif inst.op == 112 || inst.op == 113 {
+        // move / copy：聚合值按内存块搬运，标量按值搬运。
+        if frame.is_place[inst.a] && frame.is_place[inst.b] { mem_copy(frame, frame.base[inst.a], frame.base[inst.b], frame.size[inst.a]); return; }
+        result = value_read(frame, inst.b);
+    }
+    elseif inst.op == 3 {
+        // const_bytes：把 &[u8] 视图组装成胖指针块——低 8 字节指向帧内池区，高 8 字节是长度。
+        // 与发射器同义：不复制字节，只登记位置与长度。
+        assert(inst.a > 0 && inst.c == 0 && inst.value == 0 && inst.args_count == 0);
+        assert(inst.b < @len(module.statics) as u32);
+        let view: mir::MirStatic = module.statics[inst.b];
+        assert(view.value_type_id == inst.value_type_id && frame.is_place[inst.a] && frame.size[inst.a] == 16);
+        mem_write(frame, frame.base[inst.a], 8, (frame.pool_base + view.offset) as u64);
+        mem_write(frame, frame.base[inst.a] + 8, 8, view.length as u64);
+        frame.types[inst.a] = inst.value_type_id;
+        frame.ready[inst.a] = true;
+        return;
+    }
+    elseif inst.op == 4 {
+        // const_aggregate：把静态池里的聚合常量镜像整块复制进目标聚合槽。
+        // 参考运行器把定长数组按内存块承载，故端到端执行覆盖 kind7；
+        // 名义枚举在本运行器里是带标签的标量值（无聚合块），其字节镜像证据
+        // 由 MIR 指令形态与 COFF 数据节承担，这里显式不执行，绝不伪造取值。
+        assert(inst.a > 0 && inst.c == 0 && inst.args_count == 0);
+        assert(inst.b < @len(module.statics) as u32);
+        let entry: mir::MirStatic = module.statics[inst.b];
+        assert(inst.value == entry.length as u64 && entry.value_type_id == inst.value_type_id);
+        assert(module.types.entries[inst.value_type_id - 1].kind == 7);
+        assert(frame.is_place[inst.a]);
+        assert(inst.value as u32 <= frame.size[inst.a]);
+        mem_copy(frame, frame.base[inst.a], frame.pool_base + entry.offset, inst.value as u32);
+        frame.types[inst.a] = inst.value_type_id;
+        frame.ready[inst.a] = true;
+        return;
+    }
+    elseif inst.op == 82 || inst.op == 83 {
+        // 直接从聚合槽取址；间接投影沿用上一级已经计算的地址。
+        var base: u32 = 0;
+        if mir::projection_base(inst) == 0 { assert(frame.is_place[inst.b]); base = frame.base[inst.b]; }
+        else { let address: Value = value_read(frame, inst.b); base = address.bits as u32; }
+        if inst.op == 82 { result = scalar(inst.value_type_id, (base + inst.c) as u64); }
+        else {
+            let idx: Value = value_read(frame, inst.c);
+            let bits: u64 = idx.bits & width_mask(module, idx.value_type_id);
+            result = scalar(inst.value_type_id, (base + bits as u32 * mir::projection_stride(inst)) as u64);
+        }
+    }
+    elseif inst.op == 80 {
+        // load 的地址操作数是聚合存储槽自身，直接取该槽的基址。
+        var src: Value = scalar(inst.value_type_id, 0);
+        if frame.is_place[inst.b] { src.bits = frame.base[inst.b] as u64; }
+        else { src = value_read(frame, inst.b); }
+        if frame.is_place[inst.a] { mem_copy(frame, frame.base[inst.a], src.bits as u32, frame.size[inst.a]); return; }
+        result = scalar(inst.value_type_id, mem_read(frame, src.bits as u32, byte_width(module, inst.value_type_id)));
+    } elseif inst.op == 115 {
+        // 此执行器不管理动态分配；结构检查仍验证条件析构的布尔操作数。
+        assert(inst.a == 0);
+        return;
+    } elseif inst.op == 146 {
+        // call_builtin：目前只有 @len，从切片胖指针块高 8 字节（块内偏移 8）装载长度字。
+        assert(inst.b == 20486 && inst.args_count == 1);
+        let src: u32 = f.args[inst.args_start];
+        assert(frame.is_place[src]);
+        result = scalar(inst.value_type_id, mem_read(frame, frame.base[src] + 8, 8));
+    } elseif inst.op == 81 {
+        // store 的地址操作数同样是聚合存储槽自身。
+        var dst: Value = scalar(inst.value_type_id, 0);
+        if frame.is_place[inst.b] { dst.bits = frame.base[inst.b] as u64; }
+        else { dst = value_read(frame, inst.b); }
+        if frame.is_place[inst.c] { mem_copy(frame, dst.bits as u32, frame.base[inst.c], frame.size[inst.c]); return; }
+        let src: Value = value_read(frame, inst.c);
+        mem_write(frame, dst.bits as u32, byte_width(module, inst.value_type_id), src.bits);
+        return;
+    }
+    elseif inst.op == 96 || inst.op == 97 {
+        // 聚合构造：把各分量按字段/元素偏移写入目标聚合局部的内存块。
+        assert(frame.is_place[inst.a]);
+        var p: u32 = 0;
+        while p < inst.args_count {
+            var at: u32 = frame.base[inst.a];
+            if inst.op == 96 { at = at + field_offset(module, module.types.entries[inst.value_type_id - 1].def, p); }
+            else { at = at + p * byte_width(module, local_type(f, f.args[inst.args_start + p])); }
+            let item: Value = value_read(frame, f.args[inst.args_start + p]);
+            mem_write(frame, at, byte_width(module, item.value_type_id), item.bits);
+            p = p + 1;
+        }
+        return;
+    }
+    elseif mir::is_local_call(inst.op) || mir::is_foreign_call(inst.op) { result = invoke_call(module, f, frame, inst, state, depth)?; if state.trapped { return; } }
+    elseif inst.op == 176 {
+        result.tag = 1; result.variant = inst.c; result.payload_type = inst.value_type_id;
+        if inst.value != 0 { let payload: Value = value_read(frame, inst.value as u32); result.bits = payload.bits; }
+    }
+    elseif inst.op == 160 {
+        result.tag = 2;
+        if inst.b != 0 { let payload: Value = value_read(frame, inst.b); result.bits = payload.bits; result.payload_type = payload.value_type_id; }
+    } elseif inst.op == 161 {
+        let payload: Value = value_read(frame, inst.b);
+        result.tag = 3; result.bits = payload.bits; result.variant = payload.variant;
+        if payload.payload_type != 0 { result.payload_type = payload.payload_type; } else { result.payload_type = payload.value_type_id; }
+    } else { assert(false); }
+    if inst.a != 0 { result.value_type_id = inst.value_type_id; value_write(frame, inst.a, result); }
+    return;
+}
+function dispatch(f: &mir::MirFunction:Read, frame: &Frame:ReadWrite, t: mir::MirTerminator): u32 {
+    let carrier: Value = value_read(frame, t.a);
+    assert(carrier.tag == 2 || carrier.tag == 3);
+    var target: u32 = t.b;
+    if carrier.tag == 3 { target = t.c; }
+    let payload: u32 = f.blocks[target].payload;
+    if payload != 0 {
+        var v: Value = scalar(local_type(f, payload), carrier.bits);
+        if carrier.tag == 3 { v.tag = 1; v.payload_type = carrier.payload_type; v.variant = carrier.variant; }
+        value_write(frame, payload, v);
+    }
+    return target;
+}
+// enum_dispatch：按 scrutinee 的 VariantId 查臂表并跳转；臂表已按升序覆盖全部变体。
+function dispatch_enum(f: &mir::MirFunction:Read, frame: &Frame:ReadWrite, t: mir::MirTerminator): u32 {
+    let value: Value = value_read(frame, t.a);
+    assert(value.tag == 1);
+    var target: u32 = f.arms[t.b].block as u32;
+    var k: u32 = 0;
+    while k < t.c {
+        if f.arms[t.b + k].variant as u32 == value.variant { target = f.arms[t.b + k].block as u32; }
+        k = k + 1;
+    }
+    // 臂载荷是进入目标块时隐式定义的局部：把枚举值的标量载荷写进去。
+    let payload: u32 = f.blocks[target].payload;
+    if payload != 0 {
+        var v: Value = scalar(local_type(f, payload), value.bits);
+        value_write(frame, payload, v);
+    }
+    return target;
+}
+// trapped 为真时返回值无效，调用方只能读取陷阱状态。
+export function execute(module: &mir::MirModule:Read, index: u32, inputs: &[Value], state: &Execution:ReadWrite, depth: u32): Value!AllocError {
+    assert(depth < 64 && index < @len(module.functions) as u32);
+    if state.trapped { return scalar(0, 0); }
+    let f: &mir::MirFunction:Read = &module.functions[index]:Read;
+    var frame: Frame = frame_new(module, f, inputs)?;
+    var block: u32 = f.entry as u32;
+    while true {
+        state.steps = state.steps + 1; assert(state.steps < 2000);
+        assert(block < @len(f.blocks) as u32);
+        var i: u32 = 0;
+        var jump_trap: bool = false;
+        while i < f.blocks[block].inst_count {
+            let inst: mir::MirInst = f.insts[f.blocks[block].inst_start + i];
+            if inst.op == 83 {
+                let idx: Value = value_read(&frame:Read, inst.c);
+                var array: u32 = mir::projection_base(inst);
+                if array == 0 { array = local_type(f, inst.b); }
+                let bits: u64 = idx.bits & width_mask(module, idx.value_type_id);
+                if (is_signed(module, idx.value_type_id) && signed_value(module, idx) < 0) || bits >= module.types.entries[array - 1].length {
+                    assert(f.has_trap_target);
+                    block = f.trap_target as u32;
+                    if inst.trap != 0 { block = inst.trap - 1; }
+                    jump_trap = true;
+                    break;
+                }
+            }
+            execute_inst(module, f, &frame:ReadWrite, inst, state, depth)?;
+            if state.trapped { return scalar(0, 0); }
+            i = i + 1;
+        }
+        if jump_trap { continue; }
+        let t: mir::MirTerminator = f.blocks[block].terminator;
+        if t.op == 195 { state.trapped = true; return scalar(0, 0); }
+        if t.op == 194 { if t.a == 0 { return scalar(module.signatures.items[f.signature - 1].ret, 0); } return value_read(&frame:Read, t.a); }
+        if t.op == 192 { block = t.b; }
+        elseif t.op == 193 { let condition: Value = value_read(&frame:Read, t.a); if condition.bits != 0 { block = t.b; } else { block = t.c; } }
+        elseif t.op == 162 { block = dispatch(f, &frame:ReadWrite, t); }
+        elseif t.op == 177 { block = dispatch_enum(f, &frame:ReadWrite, t); }
+        else { assert(false); }
+    }
+    return scalar(0, 0);
+}
+export function run0(module: &mir::MirModule:Read, index: u32): Value!AllocError {
+    let args: Value[] = [];
+    var state: Execution = execution_new();
+    let result: Value = execute(module, index, &args[0..0]:Read, &state:ReadWrite, 0)?;
+    assert(!state.trapped);
+    return result;
+}
+export function run1(module: &mir::MirModule:Read, index: u32, bits: u64): Value!AllocError {
+    let f: &mir::MirFunction:Read = &module.functions[index]:Read;
+    var args: Value[] = [];
+    @push(args, scalar(local_type(f, f.params[0]), bits))?;
+    var state: Execution = execution_new();
+    let result: Value = execute(module, index, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(!state.trapped);
+    return result;
+}
+export function op_count(f: &mir::MirFunction:Read, op: u8): u32 {
+    var count: u32 = 0; var i: u32 = 0;
+    while i < @len(f.insts) as u32 { if f.insts[i].op == op { count = count + 1; } i = i + 1; }
+    return count;
+}
+export function term_count(f: &mir::MirFunction:Read, op: u8): u32 {
+    var count: u32 = 0; var i: u32 = 0;
+    while i < @len(f.blocks) as u32 { if f.blocks[i].terminator.op == op { count = count + 1; } i = i + 1; }
+    return count;
+}
+export function expect0(module: &mir::MirModule:Read, index: u32, bits: u64): void!AllocError {
+    let actual: Value = run0(module, index)?;
+    assert(actual.tag == 0 && actual.bits == bits);
+    return;
+}
+export function expect1(module: &mir::MirModule:Read, index: u32, input: u64, bits: u64): void!AllocError {
+    let actual: Value = run1(module, index, input)?;
+    assert(actual.tag == 0 && actual.bits == bits);
+    return;
+}

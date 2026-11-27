@@ -1,0 +1,15 @@
+// t78: @move 入参后使用源 → OW-1 trap
+// expected_trap: use of moved/dropped
+struct Point {
+    x: u32,
+    y: u32,
+}
+function sink(p: Point): void {
+    return;
+}
+function main(): void {
+    let p: Point = Point { x: 1, y: 2 };
+    sink(@move(p));
+    let q: Point = p;
+    return;
+}

@@ -1,0 +1,15 @@
+// expected_code: E6004
+// spec: spec/lang/base.md R-5; spec/lang/owner.md OW-2
+// 经复制别名重借用时，原引用与其别名共享同一暂停状态。
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var value: u32 = 7u32;
+    let exclusive: &u32:ReadWrite = &value:ReadWrite;
+    let alias_ref: &u32:ReadWrite = @copy(exclusive);
+    if true {
+        let shared: &u32 = &*alias_ref;
+        assert(*exclusive == 7u32);
+        assert(*shared == 7u32);
+    }
+}

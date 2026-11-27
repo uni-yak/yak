@@ -1,0 +1,127 @@
+// 模块图：由 import 项建立单元依赖边，检测重名 / 自导入 / 循环，
+// 并输出依赖优先的确定性拓扑序；接口二进制由后续 .iface 组件补齐。
+import buf;
+import types;
+import lex;
+import ast;
+import diag;
+
+const MODULE_MISSING: u32 = 4294967295u32;
+
+export struct ModuleImport { name: u8[], span: types::Span }
+export struct ModuleUnit { name: u8[], file_id: u16, imports: ModuleImport[] }
+export struct ModuleTable { units: ModuleUnit[] }
+export struct ModuleEdge { from: u32, to: u32, span: types::Span }
+export struct ModuleGraph { order: u32[], edges: ModuleEdge[], states: u8[] }
+
+function emit(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+
+// 图只需要规范导入路径和真实源位置，不持有函数体及词法表。
+export function collect_imports(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read): ModuleImport[]!AllocError {
+    var imports: ModuleImport[] = [];
+    var item: u64 = 0;
+    while item < @len(file.items) {
+        if file.items[item].kind == 5 {
+            let id: u32 = file.items[item].data;
+            var name: u8[] = [];
+            var part: u64 = 0;
+            while part < @len(pool.imports[id].path) {
+                if part != 0 { @push(name, 58u8)?; @push(name, 58u8)?; }
+                let entry: lex::NameEntry = names.entries[pool.imports[id].path[part] - 1];
+                let arena: &buf::ByteBuf:Read = &names.arena:Read;
+                var i: u32 = 0;
+                while i < entry.text_len as u32 {
+                    @push(name, arena.data[entry.text_off + i])?;
+                    i = i + 1;
+                }
+                part = part + 1;
+            }
+            @push(imports, ModuleImport { name: @move(name), span: file.items[item].span })?;
+        }
+        item = item + 1;
+    }
+    return imports;
+}
+
+function same_name(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u64 = 0;
+    while i < @len(a) {
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+function duplicate_name(table: &ModuleTable:Read, index: u32): bool {
+    var i: u32 = 0;
+    while i < index {
+        if same_name(&table.units[i].name[0..@len(table.units[i].name)], &table.units[index].name[0..@len(table.units[index].name)]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function resolve_unit(table: &ModuleTable:Read, name: &[u8]): u32 {
+    var i: u32 = 0;
+    while i < @len(table.units) as u32 {
+        if same_name(&table.units[i].name[0..@len(table.units[i].name)], name) { return i; }
+        i = i + 1;
+    }
+    return MODULE_MISSING;
+}
+function file_span(table: &ModuleTable:Read, index: u32): types::Span {
+    return types::Span { file: table.units[index].file_id, offset: 0, length: 0 };
+}
+function visit(table: &ModuleTable:Read, graph: &ModuleGraph:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, index: u32): void!AllocError {
+    if graph.states[index] == 2 { return; }
+    if graph.states[index] == 1 {
+        emit(diags, 4005, file_span(table, index))?;
+        return;
+    }
+    graph.states[index] = 1;
+    var i: u32 = 0;
+    while i < @len(graph.edges) as u32 {
+        if graph.edges[i].from == index {
+            let target: u32 = graph.edges[i].to;
+            if target != MODULE_MISSING && target != index { visit(table, graph, diags, target)?; }
+        }
+        i = i + 1;
+    }
+    graph.states[index] = 2;
+    @push(graph.order, index)?;
+    return;
+}
+export function build_graph(table: &ModuleTable:Read, diags: &diag::DiagBuffer:ReadWrite): ModuleGraph!AllocError {
+    var graph: ModuleGraph = ModuleGraph { order: [], edges: [], states: [] };
+    var i: u32 = 0;
+    while i < @len(table.units) as u32 {
+        @push(graph.states, 0)?;
+        if duplicate_name(table, i) { emit(diags, 4003, file_span(table, i))?; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(table.units) as u32 {
+        var item: u32 = 0;
+        while item < @len(table.units[i].imports) as u32 {
+            let span: types::Span = table.units[i].imports[item].span;
+            let target: u32 = resolve_unit(table, &table.units[i].imports[item].name[0..@len(table.units[i].imports[item].name)]);
+            if target == MODULE_MISSING {
+                emit(diags, 4002, span)?;
+            } elseif target == i {
+                emit(diags, 4007, span)?;
+            }
+            @push(graph.edges, ModuleEdge { from: i, to: target, span: span })?;
+            item = item + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(table.units) as u32 {
+        visit(table, &graph:ReadWrite, diags, i)?;
+        i = i + 1;
+    }
+    // DFS 后序中依赖先于依赖方，直接作为拓扑序返回。
+    return graph;
+}

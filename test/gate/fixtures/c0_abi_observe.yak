@@ -1,0 +1,8 @@
+foreign assert(ok: bool): void;
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    let message: [u8; 3] = [65u8, 66u8, 67u8];
+    assert(true);
+    write(&message[0..3]);
+}

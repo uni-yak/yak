@@ -1,0 +1,27 @@
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+foreign write(data: &[u8]): void;
+
+struct Record { values: u32[], marker: u64 }
+
+function exercise(): void!AllocError {
+    var record: Record = Record { values: [], marker: 23 };
+    @push(record.values, 1)?;
+    @push(record.values, 3)?;
+    @push(record.values, 5)?;
+    @push(record.values, 7)?;
+    @push(record.values, 9)?;
+    let copied: Record = @clone(record)?;
+    assert(copied.values.len == 5 && copied.values[4] == 9 && copied.marker == 23);
+    record.values[0] = 77;
+    assert(record.values[0] == 77 && copied.values[0] == 1);
+    write("sysv-values-ok");
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = exercise();
+    @drop(result);
+    assert(false);
+}

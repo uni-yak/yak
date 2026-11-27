@@ -1,0 +1,882 @@
+// 核验视图的词法活跃区间及控制流合流后的借用来源。
+import typecheck;
+import mir;
+
+const NONE: u32 = 4294967295u32;
+const ENTRY_POS: u32 = 4294967293u32;
+
+struct BorrowEdge { source: u32, user: u32, next_source: u32, next_user: u32 }
+// 每个 (局部, 块) 最多记录一条最大指令位置（以及可选的块入口 view_end 哨兵）。
+struct UseSite { block: u32, pos: u32, next: u32 }
+
+struct BorrowOrigins {
+    sources: u32[], users: u32[], edges: BorrowEdge[], loan: bool[], exclusive: bool[],
+    slot_source: u32[], sites: u32[], has_slots: bool,
+}
+
+// 全函数一次预计算摘要：避免每个借用点重复全表扫描指令、局部和跨模块辅助判定。
+// inst_flags 位定义：
+//   0x01=读首操作数(b!=0)  0x02=首操作数为写/排他模式  0x04=读次操作数(c)
+//   0x08=读 value 作为局部(op 130/176)  0x10=交接 b(非视图)  0x20=交接 c(非视图)
+//   0x40=交接 value(非视图)  0x80=视图槽读写指令
+struct BorrowIndex {
+    stored_to_slot: bool[], use_head: u32[], use_sites: UseSite[],
+    inst_flags: u8[], block_has_view_end: bool[],
+}
+
+// 跨借用点复用的工作区；每次验证结束后仅按 touched 精确清零。
+struct LoanScratch {
+    flags: u8[], seen: u32[],
+    live_in: u32[], live_out: u32[], has_use: u32[], max_use: u32[],
+    touched: u32[], derived: u32[], sources: u32[], users: u32[],
+    stamp: u32, exclusive: bool, reborrow: bool, precise: bool,
+}
+
+function view_type(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !mir::valid_type(tt, id) { return false; }
+    let kind: u8 = tt.entries[id - 1].kind;
+    return kind == 4 || kind == 5;
+}
+
+function view_slot(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, ins: mir::MirInst): bool {
+    return (ins.op == 80 || ins.op == 81) && ctx.locals[ins.b - 1].kind == 2 && view_type(tt, ins.value_type_id);
+}
+
+// 按块升序构建每局部使用点链表；同块指令位置递增，就地更新为该块最大位置。
+function record_use(index: &BorrowIndex:ReadWrite, local: u32, block: u32, pos: u32): void!AllocError {
+    if local == 0 { return; }
+    let slot: u32 = local - 1;
+    let head: u32 = index.use_head[slot];
+    if pos != ENTRY_POS && head != 0 {
+        let top: UseSite = index.use_sites[head - 1];
+        if top.block == block && top.pos != ENTRY_POS {
+            if pos > top.pos { index.use_sites[head - 1].pos = pos; }
+            return;
+        }
+    } elseif pos == ENTRY_POS && head != 0 {
+        let top: UseSite = index.use_sites[head - 1];
+        if top.block == block && top.pos == ENTRY_POS { return; }
+    }
+    let id: u32 = @len(index.use_sites) as u32 + 1;
+    @push(index.use_sites, UseSite { block: block, pos: pos, next: head })?;
+    index.use_head[slot] = id;
+    return;
+}
+
+function build_borrow_index(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read): BorrowIndex!AllocError {
+    var index: BorrowIndex = BorrowIndex {
+        stored_to_slot: [], use_head: [], use_sites: [],
+        inst_flags: [], block_has_view_end: [],
+    };
+    let local_count: u32 = @len(ctx.locals) as u32;
+    var i: u32 = 0;
+    while i < local_count {
+        @push(index.stored_to_slot, false)?;
+        @push(index.use_head, 0u32)?;
+        i = i + 1;
+    }
+    let inst_count: u32 = @len(ctx.insts) as u32;
+    i = 0;
+    while i < inst_count { @push(index.inst_flags, 0u8)?; i = i + 1; }
+    let block_count: u32 = @len(ctx.blocks) as u32;
+    var b: u32 = 0;
+    while b < block_count {
+        var has_ve: bool = false;
+        var at: u32 = ctx.blocks[b].entry_view_ends;
+        if at != 0 { has_ve = true; }
+        while at != 0 {
+            let row: mir::MirViewEnd = ctx.view_ends[at - 1];
+            record_use(&index:ReadWrite, row.local, b, ENTRY_POS)?;
+            at = row.next;
+        }
+        let start: u32 = ctx.blocks[b].inst_start;
+        let block_end: u32 = start + ctx.blocks[b].inst_count;
+        i = start;
+        while i < block_end {
+            let ins: mir::MirInst = ctx.insts[i];
+            if ins.view_ends != 0 {
+                has_ve = true;
+                at = ins.view_ends;
+                while at != 0 {
+                    let row: mir::MirViewEnd = ctx.view_ends[at - 1];
+                    record_use(&index:ReadWrite, row.local, b, i)?;
+                    at = row.next;
+                }
+            }
+            let op: u8 = ins.op;
+            var flags: u8 = 0;
+            if view_slot(ctx, tt, ins) {
+                flags = 128u8;
+                if op == 81 {
+                    index.stored_to_slot[ins.c - 1] = true;
+                    record_use(&index:ReadWrite, ins.c, b, i)?;
+                }
+            } else {
+                if ins.b != 0 && mir::reads_first(op) {
+                    flags = flags | 1u8;
+                    if op == 81 || op == 112 || op == 115 || op == 129 || op == 178
+                        || (op == 130 && tt.entries[ins.value_type_id - 1].cap == 1) {
+                        flags = flags | 2u8;
+                    }
+                    record_use(&index:ReadWrite, ins.b, b, i)?;
+                }
+                if mir::reads_second(op) {
+                    flags = flags | 4u8;
+                    record_use(&index:ReadWrite, ins.c, b, i)?;
+                }
+                if op == 130 || op == 176 {
+                    flags = flags | 8u8;
+                    record_use(&index:ReadWrite, ins.value as u32, b, i)?;
+                }
+                if (op == 112 || op == 115 || op == 160 || op == 161) && ins.b != 0
+                    && !view_type(tt, ctx.locals[ins.b - 1].value_type_id) {
+                    flags = flags | 16u8;
+                    record_use(&index:ReadWrite, ins.b, b, i)?;
+                } elseif (op == 81 || op == 178 || op == 209) && ins.c != 0
+                    && !view_type(tt, ctx.locals[ins.c - 1].value_type_id) {
+                    flags = flags | 32u8;
+                    record_use(&index:ReadWrite, ins.c, b, i)?;
+                } elseif op == 176 && (ins.value as u32) != 0
+                    && !view_type(tt, ctx.locals[(ins.value as u32) - 1].value_type_id) {
+                    flags = flags | 64u8;
+                    record_use(&index:ReadWrite, ins.value as u32, b, i)?;
+                }
+                var p: u32 = 0;
+                while p < ins.args_count {
+                    record_use(&index:ReadWrite, ctx.args[ins.args_start + p], b, i)?;
+                    p = p + 1;
+                }
+            }
+            index.inst_flags[i] = flags;
+            i = i + 1;
+        }
+        let end: mir::MirTerminator = ctx.blocks[b].terminator;
+        if end.op == 162 || end.op == 177 || end.op == 193 || end.op == 194 || end.op == 197 {
+            record_use(&index:ReadWrite, end.a, b, block_end)?;
+        }
+        @push(index.block_has_view_end, has_ve)?;
+        b = b + 1;
+    }
+    return index;
+}
+
+// 只取每条来路中最后一次写槽，覆盖关闭的分支或循环回边。首次扫描可以从块中间开始。
+function reaching_views(ctx: &mir::MirFunction:Read, heads: &[u32], preds: &mir::DomPredecessor[]:Read,
+    slot: u32, block: u32, before: u32, retained: bool): u32[]!AllocError {
+    var result: u32[] = [];
+    var seen: bool[] = [];
+    var queue: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(ctx.blocks) as u32 { @push(seen, false)?; i = i + 1; }
+    var at: u32 = block;
+    var stop: u32 = before;
+    var read: u32 = 0;
+    while true {
+        let start: u32 = ctx.blocks[at].inst_start;
+        var found: bool = false;
+        i = stop;
+        while i > start {
+            i = i - 1;
+            if ctx.insts[i].op == 81 && ctx.insts[i].b == slot {
+                @push(result, ctx.insts[i].c)?;
+                if !retained || ctx.insts[i].opens_view_slot { found = true; break; }
+            }
+        }
+        if !found {
+            var edge: u32 = heads[at];
+            while edge != 0 {
+                let pred: mir::DomPredecessor = (*preds)[edge - 1];
+                if !seen[pred.origin] { seen[pred.origin] = true; @push(queue, pred.origin)?; }
+                edge = pred.next;
+            }
+        }
+        if read >= @len(queue) as u32 { break; }
+        at = queue[read];
+        stop = ctx.blocks[at].inst_start + ctx.blocks[at].inst_count;
+        read = read + 1;
+    }
+    return result;
+}
+
+function connect_borrow(origins: &BorrowOrigins:ReadWrite, user: u32, source: u32): void!AllocError {
+    let id: u32 = @len(origins.edges) as u32 + 1;
+    @push(origins.edges, BorrowEdge { source: source, user: user,
+        next_source: origins.sources[user - 1], next_user: origins.users[source - 1] })?;
+    origins.sources[user - 1] = id;
+    origins.users[source - 1] = id;
+    return;
+}
+
+// 投影和 SSA 复制保留来源；可变视图先按每个 load 实际可达的 store 建边。
+function borrow_origins(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, heads: &[u32], preds: &mir::DomPredecessor[]:Read): BorrowOrigins!AllocError {
+    var result: BorrowOrigins = BorrowOrigins { sources: [], users: [], edges: [], loan: [], exclusive: [], slot_source: [], sites: [], has_slots: false };
+    var i: u32 = 0;
+    while i < @len(ctx.locals) as u32 {
+        @push(result.sources, 0)?; @push(result.users, 0)?; @push(result.loan, false)?;
+        @push(result.exclusive, false)?; @push(result.slot_source, 0)?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.params) as u32 {
+        let local: u32 = ctx.params[i];
+        let id: u32 = ctx.locals[local - 1].value_type_id;
+        if view_type(tt, id) && tt.entries[id - 1].cap == 1 {
+            result.loan[local - 1] = true;
+            result.exclusive[local - 1] = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.insts) as u32 {
+        let ins: mir::MirInst = ctx.insts[i];
+        if ins.op == 81 && view_slot(ctx, tt, ins) {
+            result.has_slots = true;
+            let slot: u32 = ins.b - 1;
+            if result.slot_source[slot] == 0 { result.slot_source[slot] = ins.c; }
+            elseif result.slot_source[slot] != ins.c { result.slot_source[slot] = NONE; }
+        }
+        i = i + 1;
+    }
+    var b: u32 = 0;
+    while b < @len(ctx.blocks) as u32 {
+        i = ctx.blocks[b].inst_start;
+        let end: u32 = i + ctx.blocks[b].inst_count;
+        while i < end {
+            let ins: mir::MirInst = ctx.insts[i];
+            let op: u8 = ins.op;
+            if op == 128 || op == 129 || op == 130 {
+                connect_borrow(&result:ReadWrite, ins.a, ins.b)?;
+                result.loan[ins.a - 1] = true;
+                result.exclusive[ins.a - 1] = tt.entries[ins.value_type_id - 1].cap == 1;
+                @push(result.sites, i)?;
+            } elseif op == 82 || op == 83 || ((op == 112 || op == 113) && view_type(tt, ins.value_type_id)) {
+                connect_borrow(&result:ReadWrite, ins.a, ins.b)?;
+            } elseif op == 80 && view_slot(ctx, tt, ins) {
+                let source: u32 = result.slot_source[ins.b - 1];
+                if source == NONE {
+                    let reaching: u32[] = reaching_views(ctx, heads, preds, ins.b, b, i, false)?;
+                    var j: u32 = 0;
+                    while j < @len(reaching) as u32 { connect_borrow(&result:ReadWrite, ins.a, reaching[j])?; j = j + 1; }
+                } elseif source != 0 { connect_borrow(&result:ReadWrite, ins.a, source)?; }
+            }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    return result;
+}
+
+function new_scratch(local_count: u32, block_count: u32, has_slots: bool): LoanScratch!AllocError {
+    var scratch: LoanScratch = LoanScratch {
+        flags: [], seen: [], live_in: [], live_out: [], has_use: [], max_use: [],
+        touched: [], derived: [], sources: [], users: [],
+        stamp: 0u32, exclusive: false, reborrow: false, precise: has_slots,
+    };
+    var i: u32 = 0;
+    while i < local_count {
+        @push(scratch.flags, 0u8)?;
+        @push(scratch.seen, 0u32)?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < block_count {
+        @push(scratch.live_in, 0u32)?;
+        @push(scratch.live_out, 0u32)?;
+        @push(scratch.has_use, 0u32)?;
+        @push(scratch.max_use, 0u32)?;
+        i = i + 1;
+    }
+    return scratch;
+}
+
+function set_flag(scratch: &LoanScratch:ReadWrite, local: u32, bits: u8): bool!AllocError {
+    let idx: u32 = local - 1;
+    let old: u8 = scratch.flags[idx];
+    let updated: u8 = old | bits;
+    if updated == old { return false; }
+    if old == 0 { @push(scratch.touched, local)?; }
+    if (old & 1u8) == 0 && (updated & 1u8) != 0 { @push(scratch.derived, local)?; }
+    scratch.flags[idx] = updated;
+    return true;
+}
+
+function reset_scratch(scratch: &LoanScratch:ReadWrite): void {
+    var i: u32 = 0;
+    let n: u32 = @len(scratch.touched) as u32;
+    while i < n {
+        scratch.flags[scratch.touched[i] - 1] = 0u8;
+        i = i + 1;
+    }
+    scratch.touched = [];
+    scratch.derived = [];
+    scratch.sources = [];
+    scratch.users = [];
+    return;
+}
+
+// 位 0 表示经过当前借用，位 1 表示可直接到达重叠宿主。循来源和使用边各取闭包。
+function fill_lineage(origins: &BorrowOrigins:Read, scratch: &LoanScratch:ReadWrite, created: mir::MirInst): void!AllocError {
+    scratch.stamp = scratch.stamp + 1u32;
+    let mark: u32 = scratch.stamp;
+    scratch.exclusive = origins.exclusive[created.a - 1];
+    scratch.reborrow = false;
+    scratch.precise = origins.has_slots;
+    @push(scratch.sources, created.b)?;
+    scratch.seen[created.b - 1] = mark;
+    var i: u32 = 0;
+    while i < @len(scratch.sources) as u32 {
+        let id: u32 = scratch.sources[i];
+        if id != created.a {
+            if origins.loan[id - 1] { scratch.reborrow = true; }
+            var link: u32 = origins.sources[id - 1];
+            if link == 0 {
+                let added: bool = set_flag(scratch, id, 2u8)?;
+                if added { @push(scratch.users, id)?; }
+            }
+            while link != 0 {
+                let edge: BorrowEdge = origins.edges[link - 1];
+                if scratch.seen[edge.source - 1] != mark {
+                    scratch.seen[edge.source - 1] = mark;
+                    @push(scratch.sources, edge.source)?;
+                }
+                link = edge.next_source;
+            }
+        }
+        i = i + 1;
+    }
+    let self_added: bool = set_flag(scratch, created.a, 1u8)?;
+    if self_added { @push(scratch.users, created.a)?; }
+    i = 0;
+    while i < @len(scratch.users) as u32 {
+        let id: u32 = scratch.users[i];
+        let flags: u8 = scratch.flags[id - 1];
+        var link: u32 = origins.users[id - 1];
+        while link != 0 {
+            let edge: BorrowEdge = origins.edges[link - 1];
+            if edge.user != created.a && set_flag(scratch, edge.user, flags)? {
+                @push(scratch.users, edge.user)?;
+            }
+            link = edge.next_user;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// 仅检查当前指令是否与活跃借用冲突（已知 mask == 1，无需维护需求位图）。
+function inst_conflicts(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, target: &LoanScratch:Read,
+    ins: mir::MirInst, iflags: u8): bool {
+    let excl: bool = target.exclusive;
+    if (iflags & 128u8) != 0 {
+        if !excl || ins.op == 80 { return false; }
+        return ins.c != 0 && (target.flags[ins.c - 1] & 2u8) != 0;
+    }
+    if (iflags & 1u8) != 0 && ins.b != 0 && (target.flags[ins.b - 1] & 2u8) != 0 {
+        if excl || ((iflags & 2u8) != 0 && target.reborrow) { return true; }
+    }
+    if excl {
+        if (iflags & 4u8) != 0 && ins.c != 0 && (target.flags[ins.c - 1] & 2u8) != 0 { return true; }
+        if (iflags & 8u8) != 0 {
+            let v: u32 = ins.value as u32;
+            if v != 0 && (target.flags[v - 1] & 2u8) != 0 { return true; }
+        }
+    }
+    if (iflags & 16u8) != 0 && ins.b != 0 && (target.flags[ins.b - 1] & 2u8) != 0 { return true; }
+    if (iflags & 32u8) != 0 && ins.c != 0 && (target.flags[ins.c - 1] & 2u8) != 0 { return true; }
+    if (iflags & 64u8) != 0 {
+        let v: u32 = ins.value as u32;
+        if v != 0 && (target.flags[v - 1] & 2u8) != 0 { return true; }
+    }
+    var p: u32 = 0;
+    while p < ins.args_count {
+        let arg: u32 = ctx.args[ins.args_start + p];
+        if (target.flags[arg - 1] & 2u8) != 0 {
+            if excl { return true; }
+            let ty: typecheck::TypeEntry = tt.entries[ctx.locals[arg - 1].value_type_id - 1];
+            if (ty.kind == 4 || ty.kind == 5) && ty.cap == 1 && target.reborrow { return true; }
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+function need_value(need: &u64[]:ReadWrite, local: u32, bound: bool): void {
+    let index: u32 = local - 1;
+    var word: u64 = (index / 64) as u64;
+    if bound { word = word + @len(*need) / 2u64; }
+    (*need)[word] = (*need)[word] | (1u64 << ((index % 64) as u64));
+    return;
+}
+
+function forget_value(need: &u64[]:ReadWrite, local: u32, bound: bool): void {
+    let index: u32 = local - 1;
+    let bit: u64 = 1u64 << ((index % 64) as u64);
+    var at: u64 = (index / 64) as u64;
+    if bound { at = at + @len(*need) / 2u64; }
+    let word: u64 = (*need)[at];
+    (*need)[at] = word - (word & bit);
+    return;
+}
+
+function loan_access(target: &LoanScratch:Read, need: &u64[]:ReadWrite, local: u32, mode: u8): bool {
+    if local == 0 { return false; }
+    let flags: u8 = target.flags[local - 1];
+    if flags == 0 { return false; }
+    if (flags & 1u8) != 0 {
+        if target.precise { need_value(need, local, false); }
+        else { (*need)[0] = 1; }
+    }
+    // 共享子借用允许同源读取；父视图写入及新的排他借用必须等待它结束。
+    return (flags & 2u8) != 0 && (target.exclusive || (mode != 0 && target.reborrow));
+}
+
+// 结束标记只延长存活区间；它不是一次内存读取，也不会与同源视图冲突。
+function keep_lexical_views(ctx: &mir::MirFunction:Read, origins: &BorrowOrigins:Read, target: &LoanScratch:Read,
+    need: &u64[]:ReadWrite, head: u32): void {
+    var at: u32 = head;
+    while at != 0 {
+        let entry: mir::MirViewEnd = ctx.view_ends[at - 1];
+        if origins.slot_source[entry.local - 1] != 0 { need_value(need, entry.local, true); }
+        elseif (target.flags[entry.local - 1] & 1u8) != 0 {
+            if target.precise { need_value(need, entry.local, false); }
+            else { (*need)[0] = 1; }
+        }
+        at = entry.next;
+    }
+    return;
+}
+
+function loan_accesses(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, target: &LoanScratch:Read,
+    need: &u64[]:ReadWrite, ins: mir::MirInst, iflags: u8): bool {
+    let op: u8 = ins.op;
+    if target.precise && ins.a != 0 && (target.flags[ins.a - 1] & 1u8) != 0 { forget_value(need, ins.a, false); }
+    // 读槽需要槽的当前值；写槽截断旧值，同时读取赋入的新视图。
+    if (iflags & 128u8) != 0 {
+        if op == 80 {
+            if (target.flags[ins.a - 1] & 1u8) != 0 { need_value(need, ins.b, false); }
+            return false;
+        }
+        forget_value(need, ins.b, false);
+        if ins.opens_view_slot { forget_value(need, ins.b, true); }
+        return loan_access(target, need, ins.c, 0);
+    }
+    var conflict: bool = false;
+    if (iflags & 1u8) != 0 {
+        conflict = loan_access(target, need, ins.b, (iflags >> 1u8) & 1u8);
+    }
+    if (iflags & 4u8) != 0 && loan_access(target, need, ins.c, 0) { conflict = true; }
+    if (iflags & 8u8) != 0 && loan_access(target, need, ins.value as u32, 0) { conflict = true; }
+    if (iflags & 16u8) != 0 && loan_access(target, need, ins.b, 1) { conflict = true; }
+    if (iflags & 32u8) != 0 && loan_access(target, need, ins.c, 1) { conflict = true; }
+    if (iflags & 64u8) != 0 && loan_access(target, need, ins.value as u32, 1) { conflict = true; }
+    var p: u32 = 0;
+    while p < ins.args_count {
+        let arg: u32 = ctx.args[ins.args_start + p];
+        if target.flags[arg - 1] != 0 {
+            let ty: typecheck::TypeEntry = tt.entries[ctx.locals[arg - 1].value_type_id - 1];
+            var mode: u8 = 0;
+            if (ty.kind == 4 || ty.kind == 5) && ty.cap == 1 { mode = 1; }
+            if loan_access(target, need, arg, mode) { conflict = true; }
+        }
+        p = p + 1;
+    }
+    return conflict;
+}
+
+// 保存每条路径仍需访问的具体局部，写槽只截断对该槽旧值的依赖。
+function merge_borrow_needs(need: &u64[]:ReadWrite, entries: &u64[]:Read, block: u32): void {
+    let words: u64 = @len(*need);
+    let start: u64 = (block as u64) * words;
+    var i: u64 = 0;
+    while i < words { (*need)[i] = (*need)[i] | (*entries)[start + i]; i = i + 1; }
+    return;
+}
+
+function borrow_needed(ctx: &mir::MirFunction:Read, origins: &BorrowOrigins:Read, target: &LoanScratch:Read,
+    need: &u64[]:Read, heads: &[u32], preds: &mir::DomPredecessor[]:Read, block: u32, before: u32): bool!AllocError {
+    if !target.precise { return (*need)[0] != 0; }
+    let width: u32 = (@len(*need) / 2u64) as u32;
+    var word: u32 = 0;
+    while word < @len(*need) as u32 {
+        let bits: u64 = (*need)[word];
+        if bits != 0 {
+            let retained: bool = word >= width;
+            var index: u32 = (word % width) * 64;
+            var rest: u64 = bits;
+            while rest != 0 {
+                if (rest & 1u64) != 0 {
+                    let source: u32 = origins.slot_source[index];
+                    if source == 0 { return true; }
+                    if source != NONE && !retained {
+                        if (target.flags[source - 1] & 1u8) != 0 { return true; }
+                    } else {
+                        let reaching: u32[] = reaching_views(ctx, heads, preds, index + 1, block, before, retained)?;
+                        var j: u32 = 0;
+                        while j < @len(reaching) as u32 {
+                            if (target.flags[reaching[j] - 1] & 1u8) != 0 { return true; }
+                            j = j + 1;
+                        }
+                    }
+                }
+                rest = rest >> 1u64;
+                index = index + 1;
+            }
+        }
+        word = word + 1;
+    }
+    return false;
+}
+
+function visit_borrow_successor(reached: &bool[]:ReadWrite, queue: &u32[]:ReadWrite, block: u32): void!AllocError {
+    if !(*reached)[block] { (*reached)[block] = true; @push(*queue, block)?; }
+    return;
+}
+
+function view_end_contains(ctx: &mir::MirFunction:Read, head: u32, local: u32): bool {
+    var at: u32 = head;
+    while at != 0 {
+        let row: mir::MirViewEnd = ctx.view_ends[at - 1];
+        if row.local == local { return true; }
+        at = row.next;
+    }
+    return false;
+}
+
+function expression_limit(ctx: &mir::MirFunction:Read, block: u32, local: u32): u32 {
+    if view_end_contains(ctx, ctx.blocks[block].entry_view_ends, local) { return ctx.blocks[block].inst_start; }
+    var i: u32 = ctx.blocks[block].inst_start;
+    let end: u32 = i + ctx.blocks[block].inst_count;
+    while i < end {
+        if ctx.insts[i].view_ends != 0 && view_end_contains(ctx, ctx.insts[i].view_ends, local) { return i + 1; }
+        i = i + 1;
+    }
+    return NONE;
+}
+
+// 借用可以沿其创建分支进入合流；SSA 支配性仅用于检查直接值引用。
+function borrow_reachable(ctx: &mir::MirFunction:Read, owner: u32, limits: &u32[]:Read): bool[]!AllocError {
+    var reached: bool[] = [];
+    var queue: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(ctx.blocks) as u32 { @push(reached, false)?; i = i + 1; }
+    visit_borrow_successor(&reached:ReadWrite, &queue:ReadWrite, owner)?;
+    i = 0;
+    while i < @len(queue) as u32 {
+        let block: u32 = queue[i];
+        i = i + 1;
+        if @len(*limits) != 0 && (*limits)[block] != NONE { continue; }
+        let end: mir::MirTerminator = ctx.blocks[block].terminator;
+        if end.op == 162 || end.op == 192 || end.op == 193 {
+            visit_borrow_successor(&reached:ReadWrite, &queue:ReadWrite, end.b)?;
+        }
+        if end.op == 162 || end.op == 193 {
+            visit_borrow_successor(&reached:ReadWrite, &queue:ReadWrite, end.c)?;
+        }
+        if end.op == 177 {
+            var arm: u32 = 0;
+            while arm < end.c {
+                visit_borrow_successor(&reached:ReadWrite, &queue:ReadWrite, ctx.arms[end.b + arm].block as u32)?;
+                arm = arm + 1;
+            }
+        }
+    }
+    return reached;
+}
+
+function build_view_limits(ctx: &mir::MirFunction:Read, index: &BorrowIndex:Read, local: u32, stays: bool): u32[]!AllocError {
+    var limits: u32[] = [];
+    if @len(ctx.view_ends) != 0 && stays {
+        let block_count: u32 = @len(ctx.blocks) as u32;
+        var b: u32 = 0;
+        while b < block_count {
+            if index.block_has_view_end[b] { @push(limits, expression_limit(ctx, b, local))?; }
+            else { @push(limits, NONE)?; }
+            b = b + 1;
+        }
+    }
+    return limits;
+}
+
+// 非槽位单比特快速路径：返回 0 表示借用冲突，1 表示已确认安全，2 表示存在陷阱使用需回退到完整不动点。
+function verify_fast_loan(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, index: &BorrowIndex:Read,
+    target: &LoanScratch:ReadWrite, site: u32, owner: u32, created_a: u32, stays: bool, paths: bool,
+    dom: &[u32], heads: &[u32], preds: &mir::DomPredecessor[]:Read): u8!AllocError {
+    let mark: u32 = target.stamp;
+    let derived_count: u32 = @len(target.derived) as u32;
+    var bfs: u32[] = [];
+    var live_blocks: u32[] = [];
+    var any_use: bool = false;
+    var any_trap_use: bool = false;
+    var has_other_block: bool = false;
+    var d: u32 = 0;
+    while d < derived_count {
+        var edge: u32 = index.use_head[target.derived[d] - 1];
+        while edge != 0 {
+            let row: UseSite = index.use_sites[edge - 1];
+            let b: u32 = row.block;
+            any_use = true;
+            if row.pos == ENTRY_POS {
+                if ctx.blocks[b].terminator.op == 195 { any_trap_use = true; }
+                if target.live_in[b] != mark {
+                    target.live_in[b] = mark;
+                    @push(bfs, b)?;
+                }
+            } else {
+                if target.has_use[b] != mark {
+                    target.has_use[b] = mark;
+                    target.max_use[b] = row.pos;
+                    if target.live_out[b] != mark {
+                        @push(live_blocks, b)?;
+                        if b != owner { has_other_block = true; }
+                    }
+                } elseif row.pos > target.max_use[b] {
+                    target.max_use[b] = row.pos;
+                }
+                if ctx.blocks[b].terminator.op == 195 { any_trap_use = true; }
+                elseif b != owner || row.pos < site {
+                    if target.live_in[b] != mark {
+                        target.live_in[b] = mark;
+                        @push(bfs, b)?;
+                    }
+                }
+            }
+            edge = row.next;
+        }
+        d = d + 1;
+    }
+    if !any_use { return 1; }
+    if any_trap_use { return 2; }
+    var q: u32 = 0;
+    while q < @len(bfs) as u32 {
+        let b: u32 = bfs[q];
+        q = q + 1;
+        var pe: u32 = heads[b];
+        while pe != 0 {
+            let pred: mir::DomPredecessor = (*preds)[pe - 1];
+            let orig: u32 = pred.origin;
+            if target.live_out[orig] != mark {
+                target.live_out[orig] = mark;
+                if target.has_use[orig] != mark {
+                    @push(live_blocks, orig)?;
+                    if orig != owner { has_other_block = true; }
+                }
+                if orig != owner && target.live_in[orig] != mark {
+                    target.live_in[orig] = mark;
+                    @push(bfs, orig)?;
+                }
+            }
+            pe = pred.next;
+        }
+    }
+    var limits: u32[] = [];
+    var reached: bool[] = [];
+    if has_other_block {
+        limits = build_view_limits(ctx, index, created_a, stays)?;
+        if paths { reached = borrow_reachable(ctx, owner, &limits:Read)?; }
+    }
+    var lb: u32 = 0;
+    let live_count: u32 = @len(live_blocks) as u32;
+    while lb < live_count {
+        let block: u32 = live_blocks[lb];
+        lb = lb + 1;
+        if block != owner {
+            if paths { if !reached[block] { continue; } }
+            elseif !mir::dominates(dom, owner, block) { continue; }
+        }
+        let start: u32 = ctx.blocks[block].inst_start;
+        let block_end: u32 = start + ctx.blocks[block].inst_count;
+        var lo: u32 = start;
+        if block == owner { lo = site + 1; }
+        var hi: u32 = block_end;
+        if target.live_out[block] != mark { hi = target.max_use[block]; }
+        var limit: u32 = NONE;
+        if @len(limits) != 0 { limit = limits[block]; }
+        elseif @len(ctx.view_ends) != 0 && stays && index.block_has_view_end[block] {
+            limit = expression_limit(ctx, block, created_a);
+        }
+        if limit != NONE {
+            if limit <= lo { continue; }
+            if limit - 1 < hi { hi = limit - 1; }
+        }
+        if hi < lo { continue; }
+        if hi == block_end {
+            let end: mir::MirTerminator = ctx.blocks[block].terminator;
+            if end.op == 162 || end.op == 177 || end.op == 193 || end.op == 194 || end.op == 197 {
+                if end.a != 0 && target.exclusive && (target.flags[end.a - 1] & 2u8) != 0 { return 0; }
+            }
+            if block_end == lo { continue; }
+            hi = block_end - 1;
+        }
+        var i: u32 = lo;
+        while i <= hi {
+            if inst_conflicts(ctx, tt, &*target:Read, ctx.insts[i], index.inst_flags[i]) { return 0; }
+            i = i + 1;
+        }
+    }
+    return 1;
+}
+
+function verify_fixpoint_loan(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, origins: &BorrowOrigins:Read,
+    index: &BorrowIndex:Read, target: &LoanScratch:Read, site: u32, owner: u32, created_a: u32, stays: bool,
+    paths: bool, postorder: &[u32], dom: &[u32], heads: &[u32], preds: &mir::DomPredecessor[]:Read): bool!AllocError {
+    let block_count: u32 = @len(ctx.blocks) as u32;
+    let limits: u32[] = build_view_limits(ctx, index, created_a, stays)?;
+    var reached: bool[] = [];
+    if paths { reached = borrow_reachable(ctx, owner, &limits:Read)?; }
+    var words: u64 = 1;
+    if target.precise { words = 2u64 * ((@len(ctx.locals) + 63u64) / 64u64); }
+    var entries: u64[] = [];
+    var need: u64[] = [];
+    var w: u64 = 0;
+    while w < words { @push(need, 0u64)?; w = w + 1; }
+    w = 0;
+    while w < (block_count as u64) * words { @push(entries, 0u64)?; w = w + 1; }
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        // 失败清理块没有正常后继，先计算其需求，再按 DFS 后序合并普通后继。
+        var b: u32 = 0;
+        while b < block_count + @len(postorder) as u32 {
+            var block: u32 = b;
+            let ordered: bool = b >= block_count;
+            if ordered { block = postorder[b - block_count]; }
+            b = b + 1;
+            let end: mir::MirTerminator = ctx.blocks[block].terminator;
+            if !ordered && end.op != 195 { continue; }
+            w = 0;
+            while w < words { need[w] = 0; w = w + 1; }
+            if end.op == 162 || end.op == 192 || end.op == 193 { merge_borrow_needs(&need:ReadWrite, &entries:Read, end.b); }
+            if end.op == 162 || end.op == 193 { merge_borrow_needs(&need:ReadWrite, &entries:Read, end.c); }
+            if end.op == 177 {
+                var arm: u32 = 0;
+                while arm < end.c {
+                    merge_borrow_needs(&need:ReadWrite, &entries:Read, ctx.arms[end.b + arm].block as u32);
+                    arm = arm + 1;
+                }
+            }
+            let start: u32 = ctx.blocks[block].inst_start;
+            var i: u32 = start + ctx.blocks[block].inst_count;
+            var limit: u32 = NONE;
+            if @len(limits) != 0 { limit = limits[block]; }
+            var active_here: bool = false;
+            if ordered {
+                if paths { active_here = reached[block]; }
+                else { active_here = mir::dominates(dom, owner, block); }
+            }
+            if end.op == 162 || end.op == 177 || end.op == 193 || end.op == 194 || end.op == 197 {
+                let conflict: bool = loan_access(target, &need:ReadWrite, end.a, 0);
+                if conflict && active_here && i < limit
+                    && borrow_needed(ctx, origins, target, &need:Read, heads, preds, block, i)? { return false; }
+            }
+            while i > start {
+                i = i - 1;
+                let ins: mir::MirInst = ctx.insts[i];
+                if ins.view_ends != 0 { keep_lexical_views(ctx, origins, target, &need:ReadWrite, ins.view_ends); }
+                if i == site {
+                    if target.precise { forget_value(&need:ReadWrite, created_a, false); }
+                    else { need[0] = 0; }
+                    continue;
+                }
+                if ins.trap != 0 { merge_borrow_needs(&need:ReadWrite, &entries:Read, ins.trap - 1); }
+                let conflict: bool = loan_accesses(ctx, tt, target, &need:ReadWrite, ins, index.inst_flags[i]);
+                if conflict && active_here && i < limit && (block != owner || i > site)
+                    && borrow_needed(ctx, origins, target, &need:Read, heads, preds, block, i)? { return false; }
+            }
+            let entry_ends: u32 = ctx.blocks[block].entry_view_ends;
+            if entry_ends != 0 { keep_lexical_views(ctx, origins, target, &need:ReadWrite, entry_ends); }
+            let entry: u64 = (block as u64) * words;
+            w = 0;
+            while w < words {
+                let combined: u64 = entries[entry + w] | need[w];
+                if combined != entries[entry + w] { entries[entry + w] = combined; changed = true; }
+                w = w + 1;
+            }
+        }
+    }
+    return true;
+}
+
+// 逆后序反向传播涵盖分支、回边和指令失败清理边；定义位置撤销对该结果的需求。
+function verify_one_loan_inner(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, origins: &BorrowOrigins:Read,
+    index: &BorrowIndex:Read, target: &LoanScratch:ReadWrite, site: u32, postorder: &[u32], defs: &[u32],
+    dom: &[u32], heads: &[u32], preds: &mir::DomPredecessor[]:Read): bool!AllocError {
+    let created: mir::MirInst = ctx.insts[site];
+    fill_lineage(origins, target, created)?;
+    if !target.exclusive && !target.reborrow { return true; }
+    let owner: u32 = defs[created.a - 1];
+    let derived_count: u32 = @len(target.derived) as u32;
+    var stays: bool = true;
+    var any_stored: bool = false;
+    var d: u32 = 0;
+    while d < derived_count {
+        let u: u32 = target.derived[d];
+        if ctx.locals[u - 1].kind == 0 { stays = false; }
+        if index.stored_to_slot[u - 1] {
+            stays = false;
+            any_stored = true;
+        }
+        d = d + 1;
+    }
+    // 派生借用不写入任何视图槽时，槽位位图对本次借用无影响，可精确降为单比特区间检查。
+    if !any_stored { target.precise = false; }
+    let paths: bool = target.precise || @len(ctx.view_ends) != 0;
+    if !target.precise {
+        let fast: u8 = verify_fast_loan(ctx, tt, index, target, site, owner, created.a, stays, paths, dom, heads, preds)?;
+        if fast != 2 { return fast == 1; }
+    }
+    return verify_fixpoint_loan(ctx, tt, origins, index, &*target:Read, site, owner, created.a, stays, paths, postorder, dom, heads, preds)?;
+}
+
+function verify_one_loan(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, origins: &BorrowOrigins:Read,
+    index: &BorrowIndex:Read, scratch: &LoanScratch:ReadWrite, site: u32, postorder: &[u32], defs: &[u32],
+    dom: &[u32], heads: &[u32], preds: &mir::DomPredecessor[]:Read): bool!AllocError {
+    let ok: bool = verify_one_loan_inner(ctx, tt, origins, index, scratch, site, postorder, defs, dom, heads, preds)?;
+    reset_scratch(scratch);
+    return ok;
+}
+
+export function verify_borrows(ctx: &mir::MirFunction:Read, tt: &typecheck::TypeTable:Read, postorder: &[u32],
+    defs: &[u32], dom: &[u32], heads: &[u32], preds: &mir::DomPredecessor[]:Read): bool!AllocError {
+    let end_count: u32 = @len(ctx.view_ends) as u32;
+    var point: u32 = 0;
+    while point < end_count {
+        let entry: mir::MirViewEnd = ctx.view_ends[point];
+        if entry.next > point || (entry.local == 0 || entry.local > @len(ctx.locals) as u32) || !view_type(tt, ctx.locals[entry.local - 1].value_type_id) { return false; }
+        point = point + 1;
+    }
+    point = 0;
+    while point < @len(ctx.blocks) as u32 {
+        if ctx.blocks[point].entry_view_ends > end_count { return false; }
+        point = point + 1;
+    }
+    point = 0;
+    while point < @len(ctx.insts) as u32 {
+        let ins: mir::MirInst = ctx.insts[point];
+        if ins.view_ends > end_count || (ins.opens_view_slot && (ins.op != 81 || !view_slot(ctx, tt, ins))) { return false; }
+        point = point + 1;
+    }
+    var needs_check: bool = false;
+    var i: u32 = 0;
+    while i < @len(ctx.params) as u32 && !needs_check {
+        let id: u32 = ctx.locals[ctx.params[i] - 1].value_type_id;
+        needs_check = view_type(tt, id) && tt.entries[id - 1].cap == 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.insts) as u32 {
+        let ins: mir::MirInst = ctx.insts[i];
+        if ins.op == 129 || (ins.op == 130 && tt.entries[ins.value_type_id - 1].cap == 1)
+            || (needs_check && (ins.op == 128 || ins.op == 130)) { break; }
+        i = i + 1;
+    }
+    if i == @len(ctx.insts) as u32 { return true; }
+    let origins: BorrowOrigins = borrow_origins(ctx, tt, heads, preds)?;
+    let index: BorrowIndex = build_borrow_index(ctx, tt)?;
+    var scratch: LoanScratch = new_scratch(@len(ctx.locals) as u32, @len(ctx.blocks) as u32, origins.has_slots)?;
+    i = 0;
+    while i < @len(origins.sites) as u32 {
+        if !verify_one_loan(ctx, tt, &origins:Read, &index:Read, &scratch:ReadWrite, origins.sites[i], postorder, defs, dom, heads, preds)? { return false; }
+        i = i + 1;
+    }
+    return true;
+}

@@ -1,0 +1,12 @@
+// input: src=fixtures/bytes.bin
+// output: dst
+// expected_file_hex: dst=00ff0d0a
+foreign file_read(name: &[u8], offset: u64, buffer: &[u8]:ReadWrite): u32;
+foreign file_write(name: &[u8], data: &[u8]): void;
+foreign assert(cond: bool): void;
+function main(): void {
+    var bytes: u8[] = [0, 0, 0, 0];
+    assert(file_read("src", 0, &bytes[0..4]:ReadWrite) == 4);
+    assert(bytes[0] == 0); assert(bytes[1] == 255);
+    file_write("dst", &bytes[0..4]);
+}

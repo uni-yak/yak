@@ -1,0 +1,18 @@
+// t20: struct 嵌套 + 函数返回 struct + assert
+foreign assert(cond: bool): void;
+
+struct Vec2 {
+    x: u32,
+    y: u32,
+}
+
+function make_vec(a: u32, b: u32): Vec2 {
+    return Vec2 { x: a, y: b };
+}
+
+function main(): void {
+    let v: Vec2 = make_vec(10, 20);
+    assert(v.x == 10);
+    assert(v.y == 20);
+    return;
+}

@@ -1,0 +1,19 @@
+// 同样是两个字节，固有符号编号也不能作为诊断记录的错误码。
+import diag;
+import types;
+
+struct BuiltinId { raw: u16 }
+
+function check(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let id: BuiltinId = BuiltinId { raw: 4002u16 };
+    diag::diagbuf_emit(&diags:ReadWrite, diag::Diag { code: id, severity: 0,
+        span: types::Span { file: 0, offset: 3, length: 1 }, unit: 0,
+        refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = check();
+    @drop(result);
+}

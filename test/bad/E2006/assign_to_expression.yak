@@ -1,0 +1,4 @@
+// expected_code: E2006
+// spec: spec/lang/parse.md P-6
+// 触发：算术表达式不是可写左值。
+function main(): void { (1 + 2) = 3; return; }

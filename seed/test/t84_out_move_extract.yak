@@ -1,0 +1,14 @@
+// t84: out 槽位填充 owning 值 + @move 提取（owner.md 4.3）
+foreign assert(cond: bool): void;
+function make_arr(out a: u32[]): void {
+    a = [7, 8, 9];
+    return;
+}
+function main(): void {
+    out arr: u32[];
+    make_arr( out arr);
+    let v: u32[] = @move( out arr);
+    assert(@len(v) == 3);
+    assert(v[0] == 7);
+    return;
+}

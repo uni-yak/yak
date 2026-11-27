@@ -1,0 +1,10 @@
+// t72: 多个 Read 引用并存（ref.md：Read 可建立多个）
+foreign assert(cond: bool): void;
+function main(): void {
+    let x: u32 = 7;
+    let r1: &u32 = &x;
+    let r2: &u32 = &x;
+    assert(*r1 == 7);
+    assert(*r2 == 7);
+    return;
+}

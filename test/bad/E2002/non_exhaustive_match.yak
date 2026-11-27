@@ -1,0 +1,7 @@
+// expected_code: E2002
+// spec: spec/lang/parse.md P-2
+// 触发：只有一个分支，遗漏枚举的第二个标签。
+enum Choice { A, B }
+function bad(e: Choice): void { match e { A => { return; } } }
+
+function main(): void { return; }

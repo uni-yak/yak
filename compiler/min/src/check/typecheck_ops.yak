@@ -1,0 +1,340 @@
+// 表达式类型推导的叶子校验与成员/转换/比较/引用收口辅助。
+import typecheck;
+import typecheck_shape;
+import type_import;
+import resolve_refs;
+import diag;
+import ast;
+import types;
+
+const BUILTIN_U64: u16 = 4100;
+const BUILTIN_BOOL: u16 = 4105;
+const TK_VOID: u8 = 0;
+const TK_BUILTIN: u8 = 1;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FN_REF: u8 = 8;
+const TK_FALLIBLE: u8 = 9;
+const TK_NULLABLE: u8 = 10;
+const TK_ERROR_SET: u8 = 11;
+
+export function incompatible_array(kind: u8): bool {
+    return kind == TK_VOID || kind == TK_BUILTIN || kind == TK_LOCAL || kind == TK_IMPORTED || kind == TK_REF || kind == TK_SLICE || kind == TK_FN_REF || kind == TK_ERROR_SET;
+}
+
+// 裸名字仍以普通的缺名诊断兜底；只有期望枚举的名义身份和标签名都相同才改判。
+export function reject_bare_enum_label(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, item: resolve_refs::ResolvedRef, name: u32, expected: u32): bool!AllocError {
+    if !refs.contextual_enum_labels || expected == 0 { return false; }
+    let host: typecheck::TypeEntry = tt.entries[expected - 1];
+    let kind: u8 = host.kind;
+    var id: u32 = host.def;
+    if kind == TK_BUILTIN { id = host.builtin as u32; }
+    elseif kind == TK_IMPORTED { id = host.export_id; }
+    elseif kind != TK_LOCAL { return false; }
+    // 标签身份查询独立于本地等值配额；结构体的名义键不会命中标签表。
+    if !resolve_refs::has_enum_label(refs, resolve_refs::EnumName { kind: kind, dep: host.dep, id: id, name: name }) { return false; }
+    let code: types::ErrorCode = types::error_code(5806);
+    if item.kind == resolve_refs::pending_value_name() {
+        let pending: u32 = shape.pending_names_base + item.y;
+        if pending < diag::diagbuf_count(diags) { diags.diags[pending].code = code; }
+    } else {
+        typecheck::emit(diags, code, item.span)?;
+    }
+    return true;
+}
+
+// 可错返回的错误成员同样能为裸标签提供期望类型。
+export function reject_bare_return_error(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, value: u32, errorset: u32): bool!AllocError {
+    if !refs.contextual_enum_labels || errorset == 0 || value >= @len(pool.exprs) as u32 { return false; }
+    var expr: u32 = value;
+    let call: bool = pool.exprs[value].kind == 22;
+    if call { expr = pool.calls[pool.exprs[value].data as u32].callee; }
+    if pool.exprs[expr].kind != 0 { return false; }
+    let index: u32 = typecheck::ref_index(refs, 0, expr);
+    if index == 0 { return false; }
+    let item: resolve_refs::ResolvedRef = refs.items[index - 1];
+    if call && item.kind != resolve_refs::pending_value_name() { return false; }
+    let set: typecheck::TypeEntry = tt.entries[errorset - 1];
+    var i: u32 = 0;
+    while i < set.members_count {
+        let member: u32 = tt.members[set.members_start + i];
+        if reject_bare_enum_label(shape, tt, refs, diags, item, pool.exprs[expr].data as u32, member)? { return true; }
+        if shape.stop != 0 { return false; }
+        i = i + 1;
+    }
+    return false;
+}
+
+export function projection_type(tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, member: ast::MemberExpr, value: u32): u32!AllocError {
+    if !member.optional || value == 0 { return value; }
+    if !typecheck::nullable_payload_allowed(tt, value) {
+        typecheck::emit(diags, types::error_code(5813), member.span)?;
+        return 0;
+    }
+    return typecheck::intern_nullable(tt, value)?;
+}
+
+export function check_call_arg_result(tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, arg_kind: u8, arg_span: types::Span, actual: u32, formal: u32, target: u32, implicit_access: bool): void!AllocError {
+    if arg_kind == 2 && typecheck::borrowed_text(tt, actual) {
+        typecheck::emit(diags, types::error_code(6204), arg_span)?;
+        return;
+    }
+    if !implicit_access && typecheck::write_ref_target(tt, actual) != 0 {
+        typecheck::emit(diags, types::error_code(9202), arg_span)?;
+    } elseif typecheck::write_ref_target(tt, formal) != 0 {
+        var code: u16 = 6101;
+        if typecheck::write_ref_target(tt, actual) != 0 { code = 6102; }
+        typecheck::emit(diags, types::error_code(code), arg_span)?;
+    } elseif actual != target {
+        var code: u16 = 5001;
+        if actual != 0 && formal != 0 {
+            let from: typecheck::TypeEntry = tt.entries[actual - 1];
+            let into: typecheck::TypeEntry = tt.entries[formal - 1];
+            if (into.kind == TK_REF || into.kind == TK_SLICE) && into.kind == from.kind &&
+                into.elem == from.elem && into.cap > from.cap { code = 6008; }
+        }
+        typecheck_shape::check_assignable(tt, diags, actual, formal, arg_span, types::error_code(code))?;
+    }
+    return;
+}
+
+export function infer_ident_ref(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, defs: &typecheck::DefTypeTable:Read, enums: &typecheck::EnumTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, kind: u8, data: u32, span: types::Span, expected: u32): u32!AllocError {
+    let index: u32 = typecheck::ref_index(refs, 0, expr);
+    if index == 0 { return 0; }
+    if kind == 0 && reject_bare_enum_label(shape, tt, refs, diags, refs.items[index - 1], data, expected)? { return 0; }
+    let ref_kind: u8 = refs.items[index - 1].kind;
+    if ref_kind == 0 { return typecheck::def_type(defs, refs.items[index - 1].x); }
+    if ref_kind == 1 { return typecheck_shape::body_intern(shape, tt, TK_BUILTIN, refs.items[index - 1].x as u32, 0)?; }
+    if ref_kind == 2 { return 0; }
+    if ref_kind == 3 {
+        let payload: u32 = typecheck::enum_payload_with_order(enums, refs.items[index - 1].x, refs.items[index - 1].y, shape.ordered_enums);
+        if payload != 0 && payload != 4294967295u32 { typecheck::emit(diags, types::error_code(5804), span)?; }
+        return typecheck_shape::body_intern(shape, tt, TK_LOCAL, refs.items[index - 1].x, 0)?;
+    }
+    if ref_kind == 4 {
+        let dep: u16 = refs.items[index - 1].x as u16;
+        let export_id: u32 = refs.items[index - 1].y;
+        let variant: u32 = refs.items[index - 1].z;
+        var i: u32 = 0;
+        while i < @len(refs.variants) as u32 {
+            if refs.variants[i].known && refs.variants[i].dep == dep && refs.variants[i].export_id == export_id && refs.variants[i].variant == variant {
+                if @len(refs.variants[i].types) != 0 { typecheck::emit(diags, types::error_code(5804), span)?; }
+                break;
+            }
+            i = i + 1;
+        }
+        return typecheck_shape::body_intern(shape, tt, TK_IMPORTED, dep as u32, export_id as u64)?;
+    }
+    if ref_kind == 5 { return typecheck_shape::body_intern(shape, tt, TK_BUILTIN, refs.items[index - 1].x as u32, 0)?; }
+    return 0;
+}
+
+export function infer_literal_expr(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, expr: u32, kind: u8, span: types::Span, expected: u32): u32!AllocError {
+    if kind == 5 && pool.text_syntax && typecheck::borrowed_text(tt, expected) { return expected; }
+    if pool.union_syntax && typecheck::plain_union_type(tt, expected) && kind == 2 && pool.exprs[expr].integer_suffix == 0 {
+        // 未定型的零不能默认选择联合标签；有后缀的零仍可注入其具体成员。
+        var code: u16 = 5005;
+        if pool.exprs[expr].data == 0 { code = 5818; }
+        typecheck::emit(diags, types::error_code(code), span)?;
+        return 0;
+    }
+    return typecheck_shape::literal_type(shape, tt, pool, expr, expected)?;
+}
+
+export function check_compare_result(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, op: u8, left_id: u32, right_id: u32, left: u32, right: u32, span: types::Span): u32!AllocError {
+    // 比较结果为 bool，外层不能为两个整数操作数提供宽度。
+    if left == 0 && right == 0 && pool.exprs[left_id].kind == 2 && pool.exprs[right_id].kind == 2 {
+        typecheck::emit(diags, types::error_code(5005), pool.exprs[left_id].span)?;
+        typecheck::emit(diags, types::error_code(5005), pool.exprs[right_id].span)?;
+    }
+    if left != 0 && right != 0 && !typecheck::same_type(left, right) { typecheck::emit(diags, types::error_code(5001), span)?; }
+    elseif op != 1 && op != 2 && left != 0 && right != 0 && !typecheck::is_ordered_type(tt, left) { typecheck::emit(diags, types::error_code(5001), span)?; }
+    elseif (op == 1 || op == 2) && left != 0 && left <= @len(tt.entries) as u32 {
+        let entry: typecheck::TypeEntry = tt.entries[left - 1];
+        let has_fields: bool = entry.kind == TK_LOCAL && typecheck_shape::equality_has_fields(fields, entry.def, shape);
+        if shape.stop != 0u8 { return 0; }
+        if entry.kind == TK_REF || entry.kind == TK_SLICE || entry.kind == TK_FIXED_ARRAY || entry.kind == TK_DYN_ARRAY || has_fields || type_import::imported_struct(refs, entry) { typecheck::emit(diags, types::error_code(5001), span)?; }
+        else {
+            let uncomparable: bool = (entry.kind == TK_LOCAL && typecheck_shape::enum_uncomparable_payload(tt, enums, fields, refs, entry.def, shape)?) || type_import::imported_uncomparable_payload(refs, entry)?;
+            if shape.stop != 0u8 { return 0; }
+            if uncomparable { typecheck::emit(diags, types::error_code(5809), span)?; }
+        }
+    }
+    return typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_BOOL as u32, 0)?;
+}
+
+export function check_addr_of_result(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, expr_types: &typecheck::ExprTypeTable:Read, tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, data: u32, operand: u32, value: u32, span: types::Span): u32!AllocError {
+    let cap: u8 = pool.unaries[data].capability as u8;
+    if cap == 2 { typecheck::emit(diags, types::error_code(6101), span)?; return 0; }
+    if pool.text_syntax && typecheck::owned_text(tt, value) {
+        if cap != 0 { typecheck::emit(diags, types::error_code(6101), span)?; return 0; }
+        return typecheck::intern_text(tt, true)?;
+    }
+    if cap == 1 && typecheck::expr_array_property(tt, expr_types, pool, operand) != 0 {
+        typecheck::emit(diags, types::error_code(2006), span)?;
+        return 0;
+    }
+    // 取区间直接产生胖指针，不再把切片包成单元素引用。
+    if pool.exprs[operand].kind == 27 {
+        if value == 0 { return 0; }
+        let view: typecheck::TypeEntry = tt.entries[value - 1];
+        let range: ast::SliceExpr = pool.slices[pool.exprs[operand].data as u32];
+        let object: u32 = expr_types.items[range.object];
+        if object != 0 {
+            let base: typecheck::TypeEntry = tt.entries[object - 1];
+            if cap == 1 && (base.kind == TK_REF || base.kind == TK_SLICE) && base.cap == 0 {
+                typecheck::emit(diags, types::error_code(6008), span)?;
+                return 0;
+            }
+        }
+        return typecheck_shape::body_intern(shape, tt, TK_SLICE, cap as u32, view.elem as u64)?;
+    }
+    return typecheck_shape::body_intern(shape, tt, TK_REF, cap as u32, value as u64)?;
+}
+
+export function check_question_result(tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, ret_type: u32, value: u32, span: types::Span): u32!AllocError {
+    if value == 0 { return 0; }
+    if pool.union_syntax && typecheck::plain_union_type(tt, value) {
+        typecheck::emit(diags, types::error_code(5819), span)?;
+        return 0;
+    }
+    if pool.option_syntax && tt.entries[value - 1].kind == TK_NULLABLE {
+        typecheck::emit(diags, types::error_code(5815), span)?;
+        return 0;
+    }
+    if tt.entries[value - 1].kind != TK_FALLIBLE { typecheck::emit(diags, types::error_code(6007), span)?; return 0; }
+    if ret_type == 0 || ret_type > @len(tt.entries) as u32 { typecheck::emit(diags, types::error_code(6007), span)?; return 0; }
+    if tt.entries[ret_type - 1].kind != TK_FALLIBLE { typecheck::emit(diags, types::error_code(6007), span)?; return 0; }
+    if !typecheck::error_set_subset(tt, tt.entries[value - 1].elem, tt.entries[ret_type - 1].elem) {
+        typecheck::emit(diags, types::error_code(6007), span)?;
+    }
+    return tt.entries[value - 1].success;
+}
+
+export function resolve_member_host(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, expr_types: &typecheck::ExprTypeTable:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, fields: &typecheck::FieldTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, data: u32, member: ast::MemberExpr, object_type: u32, span: types::Span): u32!AllocError {
+    var host: u32 = object_type;
+    if member.optional {
+        host = typecheck::nullable_payload(tt, object_type);
+        if host == 0 { typecheck::emit(diags, types::error_code(5814), member.span)?; return 0; }
+    }
+    if tt.entries[host - 1].kind == TK_REF { host = tt.entries[host - 1].elem; }
+    if host == 0 || host > @len(tt.entries) as u32 { return 0; }
+    if pool.option_syntax && member.tag_name && tt.entries[host - 1].kind == TK_NULLABLE {
+        typecheck::emit(diags, types::error_code(5816), member.span)?;
+        return 0;
+    }
+    if pool.union_syntax && (member.tag_name || member.payload_name) && typecheck::plain_union_type(tt, host) {
+        typecheck::emit(diags, types::error_code(5818), member.span)?;
+        return 0;
+    }
+    if tt.entries[host - 1].kind == TK_REF {
+        let target: u32 = typecheck_shape::nested_projection_host(shape, tt, host);
+        if shape.stop != 0u8 { return 0; }
+        if target != 0 {
+            let entry: typecheck::TypeEntry = tt.entries[target - 1];
+            let name: u32 = pool.members[data].name;
+            var field: u32 = 0;
+            if entry.kind == TK_LOCAL {
+                let selected: typecheck_shape::FieldSelection = typecheck_shape::projection_field(shape, fields, entry.def, name);
+                field = selected.value_type_id;
+            }
+            elseif entry.kind == TK_IMPORTED { field = type_import::import_field(refs, entry.dep, entry.export_id, name); }
+            if shape.stop != 0u8 { return 0; }
+            if field != 0 {
+                typecheck::emit(diags, types::error_code(6010), pool.exprs[pool.members[data].object].span)?;
+                return 0;
+            }
+        }
+        typecheck::emit(diags, types::error_code(5001), span)?;
+        return 0;
+    }
+    let host_entry: typecheck::TypeEntry = tt.entries[host - 1];
+    while @len(expr_types.members) as u32 <= data { @push(expr_types.members, 0)?; }
+    expr_types.members[data] = 0;
+    if host_entry.kind == TK_LOCAL {
+        let selected: typecheck_shape::FieldSelection = typecheck_shape::projection_field(shape, fields, host_entry.def, pool.members[data].name);
+        expr_types.members[data] = selected.ordinal;
+        return projection_type(tt, diags, member, selected.value_type_id)?;
+    }
+    if host_entry.kind == TK_DYN_ARRAY || host_entry.kind == TK_SLICE {
+        let property: u8 = typecheck::array_property(tt, host, member.property);
+        if property == 0 {
+            typecheck::emit(diags, types::error_code(5001), span)?;
+            return 0;
+        }
+        expr_types.members[data] = property as u32;
+        let value: u32 = typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_U64 as u32, 0)?;
+        return projection_type(tt, diags, member, value)?;
+    }
+    if tt.entries[host - 1].kind == TK_IMPORTED {
+        let dep: u16 = tt.entries[host - 1].dep;
+        let index: u32 = type_import::import_field(refs, dep, tt.entries[host - 1].export_id, pool.members[data].name);
+        if index != 0 {
+            let field: &resolve_refs::ImportField:Read = &refs.fields[index - 1]:Read;
+            expr_types.members[data] = field.field + 1;
+            let value: u32 = type_import::import_slot_type(tt, &field.types[0..@len(field.types)]:Read, field.root, dep)?;
+            return projection_type(tt, diags, member, value)?;
+        }
+        var count: u32 = 0;
+        var complete: bool = true;
+        var f: u32 = 0;
+        while f < @len(refs.fields) as u32 {
+            if refs.fields[f].dep == dep && refs.fields[f].export_id == tt.entries[host - 1].export_id {
+                count = count + 1;
+                if @len(refs.fields[f].types) == 0 { complete = false; }
+            }
+            f = f + 1;
+        }
+        if count != 0 && complete { typecheck::emit(diags, types::error_code(5001), span)?; }
+    }
+    return 0;
+}
+
+export function check_index_host(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, data: u32, object_type: u32, idx_expr: u32, index_value: u32): u32!AllocError {
+    if index_value != 0 && !typecheck::is_integer_type(tt, index_value) { typecheck::emit(diags, types::error_code(5001), pool.exprs[idx_expr].span)?; }
+    var host: u32 = object_type;
+    if tt.entries[host - 1].kind == TK_REF { host = tt.entries[host - 1].elem; }
+    if host == 0 || host > @len(tt.entries) as u32 { return 0; }
+    let object_kind: u8 = tt.entries[host - 1].kind;
+    if typecheck_shape::indexable_host(object_kind) { return tt.entries[host - 1].elem; }
+    if object_kind == TK_REF {
+        let target: u32 = typecheck_shape::nested_projection_host(shape, tt, host);
+        if shape.stop != 0u8 { return 0; }
+        if target != 0 && typecheck_shape::indexable_host(tt.entries[target - 1].kind) {
+            typecheck::emit(diags, types::error_code(6010), pool.exprs[pool.indices[data].object].span)?;
+            return 0;
+        }
+    }
+    typecheck::emit(diags, types::error_code(5001), pool.exprs[pool.indices[data].object].span)?;
+    return 0;
+}
+
+export function check_cast_result(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, enums: &typecheck::EnumTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, data: u32, cast_operand: u32, target: u32): u32!AllocError {
+    if pool.text_syntax && target != 0 && (typecheck::owned_text(tt, cast_operand) || typecheck::borrowed_text(tt, cast_operand)) {
+        let view: typecheck::TypeEntry = tt.entries[target - 1];
+        if view.kind == TK_SLICE && view.cap == 0 && view.elem != 0 && tt.entries[view.elem - 1].kind == TK_BUILTIN && tt.entries[view.elem - 1].builtin == 4097 { return target; }
+    }
+    if pool.option_syntax && typecheck::nullable_payload(tt, cast_operand) != 0 {
+        typecheck::emit(diags, types::error_code(5816), pool.casts[data].span)?;
+        return 0;
+    }
+    if pool.union_syntax && typecheck::plain_union_type(tt, cast_operand) {
+        typecheck::emit(diags, types::error_code(5818), pool.casts[data].span)?;
+        return 0;
+    }
+    if cast_operand != 0 && target != 0 {
+        // 整数与枚举的边界使用专有码；同一枚举类型也不允许显式转换。
+        let from_int: bool = typecheck::is_integer_type(tt, cast_operand);
+        let to_int: bool = typecheck::is_integer_type(tt, target);
+        let enum_integer: bool = (from_int && !to_int && typecheck_shape::cast_is_enum(shape, tt, enums, refs, target)) || (to_int && !from_int && typecheck_shape::cast_is_enum(shape, tt, enums, refs, cast_operand));
+        let same_enum: bool = cast_operand == target && typecheck_shape::cast_is_enum(shape, tt, enums, refs, target);
+        if shape.stop != 0u8 { return 0; }
+        if enum_integer { typecheck::emit(diags, types::error_code(5808), pool.casts[data].span)?; }
+        elseif same_enum || !typecheck::cast_allowed(tt, cast_operand, target) { typecheck::emit(diags, types::error_code(5001), pool.casts[data].span)?; }
+    }
+    return target;
+}

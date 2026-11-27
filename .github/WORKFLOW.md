@@ -1,0 +1,68 @@
+# Yak GitHub Actions
+
+| 工作流 | 执行入口 | 作用 |
+| --- | --- | --- |
+| [仓库检查](workflows/repository-checks.yml) | PR、合并队列和 `main` | 规格结构、生成物、契约和 CI 交接自测。将实际显示的 `仓库检查通过` 检查添加到分支规则。 |
+| [Seed 解释器回归](workflows/seed-regression.yml) | 相关路径推送或手动触发 | 在 Windows 隔离源树中用 GCC、Clang 各重建两次，运行 Seed 和链接回归。 |
+| [编译器冷启动与自举](workflows/compiler-bootstrap.yml) | 手动触发或由完整验收调用 | Linux 锁定环境校验冻结 Seed，运行构建门禁和三遍自举，封存同一 C2/C3 的工具对与运行时摘要。 |
+| [Windows x64 构建与验收](workflows/build-windows-x64.yml) | 手动指定同提交候选运行，或由完整验收调用 | Windows UCRT64 原生验证 PE、平台用例及语言服务，生成 Windows ZIP。 |
+| [Linux x86-64 构建与验收](workflows/build-linux-x64.yml) | 手动指定同提交候选运行，或由完整验收调用 | Linux 原生验证 ELF、两次清冷构建和独立语言服务，生成包含静态 ELF 和归属标记的 tar.gz。 |
+| [发布与验收归档](workflows/release.yml) | 维护者从 `main` 手动触发 | `probe` 盘点远端 runner，`verify` 运行完整验收并归档，`draft` 核对指定验收运行和受保护标签后生成草稿。 |
+
+## 远端环境
+
+- 静态检查与发布汇总使用 GitHub 托管的 `ubuntu-26.04`。静态检查通过 `actions/setup-python` 使用 Python 3.14.8，发布汇总使用镜像的 `python3`。环境盘点使用仓库已配置的 runner，未配置时使用 GitHub 托管的 `ubuntu-26.04` 和 `windows-2025`。盘点结果见作业摘要和 `runner-environment-linux-x64`、`runner-environment-win-x64` 归档。
+- 完整验收的 `YAK_LINUX_RUNNER`、`YAK_WINDOWS_RUNNER` 取自 GitHub 已登记的项目专用受信 runner 标签。把 runner 组限制到受信工作流。GitHub 标准镜像的工具版本与当前锁定环境有差异。
+- Linux 和 Windows 的工具版本以 [versions.lock](../versions.lock) 为准。Linux 冷启动需要锁定的 MinGW GCC、Binutils、Clang，并预置锁定 ELF 工具链。Windows 的 MSYS2 位于 `C:/msys64`，登录 Shell 为 UCRT64，且使用锁定的原生 Windows Python。准备镜像时把版本装齐，作业启动后由仓库入口对账。
+- Linux 冷启动用仓库令牌和 GitHub CLI 从同仓库 Release 读取冻结 Seed。标签为 `seed-<完整 SHA-256>`，摘要取 [seed/frozen.txt](../seed/frozen.txt) 的末条，附件名为 `yak-seed.exe`。下载后校验摘要，再装入隔离源树的 `seed/out/yak-seed.exe`。已有 HTTPS 镜像时可用 `YAK_SEED_URL` 覆盖来源。Linux 上的 PE 启动器默认是 `wine`，ELF 由宿主直启。
+- 验收在各自 runner 的标准安装目录和 `PATH` 查找 VS Code 与 Neovim。特殊安装路径可由 `YAK_LINUX_NVIM`、`YAK_LINUX_CODE`、`YAK_WINDOWS_NVIM` 和 `YAK_WINDOWS_CODE` 覆盖。预置 Node、npm 和运行编辑器所需的桌面环境。Linux 使用 Xvfb 和 D-Bus，Windows runner 用户需要可启动 VS Code 的会话。编辑器版本和路径进入回执，客户端依赖由夹具的包锁控制。
+- `main` 由仓库规则保护。需要合入前验收时，维护者将已审提交放到只有可信维护者能写入的受保护 `ci/verify/<名称>` 分支，从 `main` 调用 `verify` 并填写 `review_ref`。此用法归档分支上确切的提交。用于发布的验收直接在 `main` 上运行。
+
+### 设置 Actions 仓库变量
+
+在 [GitHub Actions 变量页](https://github.com/uni-yak/yak/settings/variables/actions) 选择 **Variables → New repository variable**。用以下 PowerShell 命令查看 GitHub 已登记的 runner 和预期的 Seed 附件。
+
+```powershell
+$yakCiRepo = 'uni-yak/yak'
+gh api "repos/$yakCiRepo/actions/runners" --paginate --jq '.runners[] | {name, os, status, labels: [.labels[].name]}'
+$yakCiSeedSha = (Get-Content -LiteralPath seed/frozen.txt -Tail 1) -split '\s+' | Select-Object -First 1
+gh release view "seed-$yakCiSeedSha" --repo $yakCiRepo --json tagName,assets
+gh variable list --repo $yakCiRepo
+```
+
+runner 注册后，将以下两个示例标签替换为清单中的实际标签，再写入仓库变量。
+
+```powershell
+gh variable set YAK_LINUX_RUNNER --repo uni-yak/yak --body 'yak-linux-x64'
+gh variable set YAK_WINDOWS_RUNNER --repo uni-yak/yak --body 'yak-windows-x64'
+```
+
+编辑器、Seed 镜像、Wine 和并发数都支持覆盖。编辑器路径取自对应平台的环境盘点结果。Wine 值可填命令名或可执行文件路径。并发数接受 1 到 8，默认 3。只运行需要修改的命令。
+
+```powershell
+gh variable set YAK_LINUX_CODE --repo uni-yak/yak --body $yakLinuxCode
+gh variable set YAK_LINUX_NVIM --repo uni-yak/yak --body $yakLinuxNvim
+gh variable set YAK_WINDOWS_CODE --repo uni-yak/yak --body $yakWindowsCode
+gh variable set YAK_WINDOWS_NVIM --repo uni-yak/yak --body $yakWindowsNvim
+gh variable set YAK_SEED_URL --repo uni-yak/yak --body $yakSeedMirrorUrl
+gh variable set YAK_CI_WINE --repo uni-yak/yak --body 'wine'
+gh variable set YAK_LINUX_CASE_JOBS --repo uni-yak/yak --body '3'
+gh variable set YAK_WINDOWS_CASE_JOBS --repo uni-yak/yak --body '3'
+```
+
+### Actions 产物位置
+
+自举作业上传 `bootstrap-candidate`，里面包含同一候选的编译器、扫描器和摘要。平台作业先下载到本次工作区的 `test/gate/tmp/ci-candidate/`，再分别上传 `delivery-win-x64` 和 `delivery-linux-x64`。发布草稿从指定验收运行下载 `release-ready`，其中包含两份分发包、构建清单和 `SHA256SUMS`。
+
+## 耗时与重跑
+
+本地可用 `git config core.hooksPath .githooks` 启用 [pre-commit](../.githooks/pre-commit)。钩子只读暂存区，检查源码的 UTF-8 无 BOM 与 LF 换行。负例和 Seed 的 Yak 夹具可以保留故意写入的异常字节。
+钩子在 Git 索引中需使用可执行模式 `100755`，供 Linux 检出后直接执行。
+
+PR 静态检查上限 8 分钟，同一引用的新提交取消旧检查。完整验收先核对配置，再做静态检查和一次自举。两个平台收到同一候选后并行，分别核对 C2/C3 的终端结果，并对候选额外校验 JSONL。普通用例默认每平台最多并发 3 个，共用构建锁的模块图用例按序执行。可用 `YAK_WINDOWS_CASE_JOBS` 与 `YAK_LINUX_CASE_JOBS` 按 runner 容量配置 1 至 8 个。Linux LSP 的两次清冷构建用于字节比对，回滚专项复用首次构建产物作为对照。自举、Windows 和 Linux 作业分别设 180、90、120 分钟的初始超时。归档记录各门禁与各语料用例的耗时。
+
+平台失败后优先重跑失败作业，成功的自举候选仍可下载。单独复验某个平台时，可填写同提交的成功自举运行编号。草稿作业直接下载指定验收运行的资产，核对内容并续传同摘要的草稿包。
+
+## 发布
+
+在 GitHub 对 `refs/tags/v*` 启用禁止删除和改写的标签规则。维护者先完成 `verify`，再创建指向该提交的 `vX.Y.Z` 或 `vX.Y.Z-rc.N` 标签。以 `draft` 模式传入标签和验收运行编号。工作流校验标签保护、提交、同一候选、两目标逐例结果及所有资产摘要，上传平台包、`SHA256SUMS` 和构建清单。变更说明取自上一已发布版本至本次提交。审核后在 GitHub 发布页面公开草稿。原始日志、诊断和固定点产物在 Actions 归档中保留 90 天。

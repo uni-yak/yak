@@ -1,0 +1,7 @@
+// expected_trap: borrow: ReadWrite requires var place (OW-5)
+function write(value: &u32:ReadWrite): void { *value = 0u32; }
+function main(): void {
+    var data: u32[] = [6u32];
+    var view: &[u32] = &data[0u32..1u32];
+    write(view[0u32]);
+}

@@ -1,0 +1,54 @@
+// expected_exit: 0
+// expected_stdout:
+// spec: spec/lang/owner.md 3.2–3.6
+foreign assert(condition: bool): void;
+
+function rebound(flag: bool): u32 {
+    var first: u32 = 5;
+    var second: u32 = 11;
+    var view: &u32:ReadWrite = &first:ReadWrite;
+    let alternate: &u32:ReadWrite = &second:ReadWrite;
+    if flag { view = @copy(alternate); }
+    *view = *view + 1u32;
+    return *view;
+}
+
+function copied(flag: bool): u32 {
+    var first: u32 = 5;
+    var second: u32 = 11;
+    var spare: u32 = 50;
+    var view: &u32:ReadWrite = &first:ReadWrite;
+    let alternate: &u32:ReadWrite = &second:ReadWrite;
+    var other: &u32:ReadWrite = &spare:ReadWrite;
+    if flag { view = @copy(alternate); }
+    other = @copy(view);
+    *other = *other + 2u32;
+    assert(*view == *other);
+    return *view;
+}
+
+function slices(flag: bool): u8 {
+    var first: [u8; 2] = [2u8, 3u8];
+    var second: [u8; 2] = [5u8, 7u8];
+    var view: &[u8]:ReadWrite = &first[0..2]:ReadWrite;
+    if flag { view = &second[0..2]:ReadWrite; }
+    view[0] = view[0] + view[1];
+    return view[0];
+}
+
+function same_root(flag: bool): u8 {
+    var first: [u8; 2] = [2u8, 3u8];
+    var second: [u8; 2] = [5u8, 7u8];
+    var view: &[u8]:ReadWrite = &first[0..2]:ReadWrite;
+    if flag { view = &second[0..2]:ReadWrite; }
+    else { view = &second[0..1]:ReadWrite; }
+    view[0] = view[0] + 1u8;
+    return view[0];
+}
+
+function main(): void {
+    assert(rebound(false) == 6 && rebound(true) == 12);
+    assert(copied(false) == 7 && copied(true) == 13);
+    assert(slices(false) == 5u8 && slices(true) == 12u8);
+    assert(same_root(false) == 6u8 && same_root(true) == 6u8);
+}

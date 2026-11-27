@@ -1,0 +1,2 @@
+// expected_trap: view or carrier in storage position
+function main(): void { let value: i64 = 1; let values: (&i64)[] = [&value]; }

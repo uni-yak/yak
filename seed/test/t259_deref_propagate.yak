@@ -1,0 +1,29 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+function index(ok: bool): u32!Failure {
+    if !ok { return Failure::Bad; }
+    return 0;
+}
+function read(ok: bool): i32!Failure {
+    var values: i32[] = [42];
+    return *(&values[index(ok)?]);
+}
+function push(ok: bool): i32!Failure {
+    var values: i32[][] = [[1]];
+    @push(values[index(ok)?], 7);
+    return values[0][1];
+}
+function forbidden(): i32 { assert(false); return 0; }
+function assign(ok: bool): i32!Failure {
+    var values: i32[][] = [[1]];
+    values[index(ok)?][0] = forbidden();
+    return 0;
+}
+function recover(e: &Failure): i32 { return 99; }
+function main(): void {
+    assert(read(false).catch(&recover) == 99);
+    assert(read(true).catch(&recover) == 42);
+    assert(push(false).catch(&recover) == 99);
+    assert(push(true).catch(&recover) == 7);
+    assert(assign(false).catch(&recover) == 99);
+}

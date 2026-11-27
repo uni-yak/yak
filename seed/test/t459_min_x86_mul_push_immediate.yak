@@ -1,0 +1,82 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 符号扩展的边界对 IMUL 和 PUSH 都是 −128 至 127。
+    let mul_word: [u8; 28] = [0x66, 0x6b, 0xc1, 0x7f, 0x66, 0x6b, 0xc1, 0x80,
+        0x66, 0x69, 0xc1, 0x80, 0x00, 0x66, 0x69, 0xc1, 0x7f, 0xff, 0x66, 0x69, 0xc1, 0x7f, 0x00, 0x66, 0x69, 0xc1, 0x80, 0xff];
+    encoding(&mul_word[0..4]:Read, 0)?;
+    encoding(&mul_word[4..8]:Read, 0)?;
+    encoding(&mul_word[8..13]:Read, 0)?;
+    encoding(&mul_word[13..18]:Read, 0)?;
+    encoding(&mul_word[18..23]:Read, 7103)?;
+    encoding(&mul_word[23..28]:Read, 7103)?;
+    encoding(&mul_word[23..27]:Read, 7101)?;
+
+    let mul_dword: [u8; 30] = [0x6b, 0xc1, 0x7f, 0x6b, 0xc1, 0x80,
+        0x69, 0xc1, 0x80, 0x00, 0x00, 0x00, 0x69, 0xc1, 0x7f, 0xff, 0xff, 0xff, 0x69, 0xc1, 0x7f, 0x00, 0x00, 0x00, 0x69, 0xc1, 0x80, 0xff, 0xff, 0xff];
+    encoding(&mul_dword[0..3]:Read, 0)?;
+    encoding(&mul_dword[3..6]:Read, 0)?;
+    encoding(&mul_dword[6..12]:Read, 0)?;
+    encoding(&mul_dword[12..18]:Read, 0)?;
+    encoding(&mul_dword[18..24]:Read, 7103)?;
+    encoding(&mul_dword[24..30]:Read, 7103)?;
+    encoding(&mul_dword[24..29]:Read, 7101)?;
+
+    let mul_qword: [u8; 36] = [0x4d, 0x6b, 0xc1, 0x7f, 0x4d, 0x6b, 0xc1, 0x80,
+        0x4d, 0x69, 0xc1, 0x80, 0x00, 0x00, 0x00, 0x4d, 0x69, 0xc1, 0x7f, 0xff, 0xff, 0xff, 0x4d, 0x69, 0xc1, 0x7f, 0x00, 0x00, 0x00, 0x4d, 0x69, 0xc1, 0x80, 0xff, 0xff, 0xff];
+    encoding(&mul_qword[0..4]:Read, 0)?;
+    encoding(&mul_qword[4..8]:Read, 0)?;
+    encoding(&mul_qword[8..15]:Read, 0)?;
+    encoding(&mul_qword[15..22]:Read, 0)?;
+    encoding(&mul_qword[22..29]:Read, 7103)?;
+    encoding(&mul_qword[29..36]:Read, 7103)?;
+    encoding(&mul_qword[29..35]:Read, 7101)?;
+
+    let push_word: [u8; 22] = [0x66, 0x6a, 0x7f, 0x66, 0x6a, 0x80,
+        0x66, 0x68, 0x80, 0x00, 0x66, 0x68, 0x7f, 0xff, 0x66, 0x68, 0x7f, 0x00, 0x66, 0x68, 0x80, 0xff];
+    encoding(&push_word[0..3]:Read, 0)?;
+    encoding(&push_word[3..6]:Read, 0)?;
+    encoding(&push_word[6..10]:Read, 0)?;
+    encoding(&push_word[10..14]:Read, 0)?;
+    encoding(&push_word[14..18]:Read, 7103)?;
+    encoding(&push_word[18..22]:Read, 7103)?;
+    encoding(&push_word[18..21]:Read, 7101)?;
+
+    let push_qword: [u8; 24] = [0x6a, 0x7f, 0x6a, 0x80,
+        0x68, 0x80, 0x00, 0x00, 0x00, 0x68, 0x7f, 0xff, 0xff, 0xff, 0x68, 0x7f, 0x00, 0x00, 0x00, 0x68, 0x80, 0xff, 0xff, 0xff];
+    encoding(&push_qword[0..2]:Read, 0)?;
+    encoding(&push_qword[2..4]:Read, 0)?;
+    encoding(&push_qword[4..9]:Read, 0)?;
+    encoding(&push_qword[9..14]:Read, 0)?;
+    encoding(&push_qword[14..19]:Read, 7103)?;
+    encoding(&push_qword[19..24]:Read, 7103)?;
+    encoding(&push_qword[19..23]:Read, 7101)?;
+
+    // 内存源先读取 SIB 与非零位移，再检查立即数；使用 R12 基址。
+    let memory: [u8; 16] = [0x49, 0x6b, 0x44, 0x24, 8, 0x80,
+        0x49, 0x69, 0x44, 0x24, 8, 0x80, 0xff, 0xff, 0xff, 0xc3];
+    encoding(&memory[0..6]:Read, 0)?;
+    encoding(&memory[6..16]:Read, 7103)?;
+    encoding(&memory[6..14]:Read, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

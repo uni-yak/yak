@@ -1,0 +1,421 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Yak",
+  "scopeName": "source.yak",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#chars"
+    },
+    {
+      "include": "#annotations-and-primitives"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#capability-modifiers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#booleans"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#builtin-types"
+    },
+    {
+      "include": "#qualified-paths"
+    },
+    {
+      "include": "#hash-names"
+    },
+    {
+      "include": "#function-calls"
+    },
+    {
+      "include": "#type-names"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.yak",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.yak",
+          "match": "//.*$"
+        },
+        {
+          "include": "#block-comment"
+        }
+      ]
+    },
+    "block-comment": {
+      "name": "comment.block.yak",
+      "begin": "/\\*",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.comment.begin.yak"
+        }
+      },
+      "end": "\\*/",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.comment.end.yak"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#block-comment"
+        }
+      ]
+    },
+    "string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.unicode.yak",
+          "match": "\\\\u\\{[0-9A-Fa-f]{1,6}\\}"
+        },
+        {
+          "name": "constant.character.escape.yak",
+          "match": "\\\\[nrt0\\\\'\"]"
+        },
+        {
+          "name": "invalid.illegal.escape.yak",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "byte-string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.hex.yak",
+          "match": "\\\\x[0-9A-Fa-f]{2}"
+        },
+        {
+          "include": "#string-escapes"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.raw.yak",
+          "begin": "r(###)\"",
+          "end": "\"\\1"
+        },
+        {
+          "name": "string.quoted.raw.yak",
+          "begin": "r(##)\"",
+          "end": "\"\\1"
+        },
+        {
+          "name": "string.quoted.raw.yak",
+          "begin": "r(#)\"",
+          "end": "\"\\1"
+        },
+        {
+          "name": "string.quoted.raw.yak",
+          "begin": "r\"",
+          "end": "\""
+        },
+        {
+          "name": "string.quoted.double.bytes.yak",
+          "begin": "b\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "include": "#byte-string-escapes"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.yak",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.yak"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.yak"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#string-escapes"
+            }
+          ]
+        },
+        {
+          "name": "string.template.yak",
+          "begin": "`",
+          "end": "`",
+          "patterns": [
+            {
+              "name": "constant.character.escape.yak",
+              "match": "\\\\[\\\\`]|\\{\\{|\\}\\}"
+            }
+          ]
+        }
+      ]
+    },
+    "chars": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.byte.yak",
+          "begin": "b'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.hex.yak",
+              "match": "\\\\x[0-9A-Fa-f]{2}"
+            },
+            {
+              "name": "constant.character.escape.yak",
+              "match": "\\\\[nrt0\\\\'\"]"
+            },
+            {
+              "name": "invalid.illegal.escape.yak",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.yak",
+          "begin": "'",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.char.begin.yak"
+            }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.char.end.yak"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#string-escapes"
+            }
+          ]
+        }
+      ]
+    },
+    "annotations-and-primitives": {
+      "patterns": [
+        {
+          "name": "storage.type.annotation.yak",
+          "match": "@(?:inline|align)\\b"
+        },
+        {
+          "name": "support.function.builtin.yak",
+          "match": "@(?:move|copy|clone|drop|push|len|wrap_add|wrap_sub|wrap_mul|size_of|align_of|offset_of|is_null|panic|breakpoint)\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(function|foreign)\\s+(#[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.function.yak"
+            },
+            "2": {
+              "name": "entity.name.function.yak"
+            }
+          }
+        },
+        {
+          "match": "\\b(struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.yak"
+            },
+            "2": {
+              "name": "entity.name.type.yak"
+            }
+          }
+        },
+        {
+          "match": "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.const.yak"
+            },
+            "2": {
+              "name": "variable.other.constant.yak"
+            }
+          }
+        },
+        {
+          "match": "\\b(import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.yak"
+            },
+            "2": {
+              "name": "entity.name.namespace.yak"
+            }
+          }
+        }
+      ]
+    },
+    "capability-modifiers": {
+      "patterns": [
+        {
+          "match": "(:)(ReadWrite|Read|Write)\\b",
+          "captures": {
+            "1": {
+              "name": "punctuation.separator.colon.yak"
+            },
+            "2": {
+              "name": "storage.modifier.capability.yak"
+            }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.yak",
+          "match": "\\b(?:if|else|elseif|while|break|continue|return|match|for|in|loop)\\b"
+        },
+        {
+          "name": "keyword.other.yak",
+          "match": "\\b(?:function|let|var|const|struct|enum|import|export|foreign|out|as)\\b"
+        },
+        {
+          "name": "keyword.other.reserved.yak",
+          "match": "\\b(?:unsafe|interface|impl|implements|is|type|never)\\b"
+        }
+      ]
+    },
+    "booleans": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.yak",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.yak",
+          "match": "\\bnull\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.yak",
+          "match": "\\b0x[0-9A-Fa-f]+(?:[ui](?:8|16|32|64))?\\b"
+        },
+        {
+          "name": "constant.numeric.binary.yak",
+          "match": "\\b0b[01]+(?:[ui](?:8|16|32|64))?\\b"
+        },
+        {
+          "name": "constant.numeric.octal.yak",
+          "match": "\\b0o[0-7]+(?:[ui](?:8|16|32|64))?\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.yak",
+          "match": "\\b[0-9]+(?:[ui](?:8|16|32|64))?\\b"
+        }
+      ]
+    },
+    "builtin-types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.yak",
+          "match": "\\b(?:u8|u16|u32|u64|i8|i16|i32|i64|bool|char|void|string|f32|f64|ptr|cptr)\\b"
+        },
+        {
+          "name": "support.type.builtin.yak",
+          "match": "\\b(?:AllocError|OutOfMemory|Copy|Clone|Drop|Error)\\b"
+        }
+      ]
+    },
+    "qualified-paths": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(::)",
+          "captures": {
+            "1": {
+              "name": "entity.name.namespace.yak"
+            },
+            "2": {
+              "name": "punctuation.separator.path.yak"
+            }
+          }
+        }
+      ]
+    },
+    "hash-names": {
+      "patterns": [
+        {
+          "name": "entity.name.function.hash.yak",
+          "match": "#[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "function-calls": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.call.yak"
+            }
+          }
+        }
+      ]
+    },
+    "type-names": {
+      "patterns": [
+        {
+          "name": "entity.name.type.yak",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.yak",
+          "match": "::|=>|\\.\\.=|\\.\\.|\\?\\.|\\?\\?|==|!=|<=|>=|&&|\\|\\||<<|>>|[+\\-*/%<>=!&|^?]"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.yak",
+          "match": "[,;:.]"
+        }
+      ]
+    }
+  }
+}

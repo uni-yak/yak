@@ -1,0 +1,774 @@
+// 词法参考组件。默认扫描入口使用 base 闭集，字面量扫描可由调用方显式选择。
+import buf;
+import hashmap;
+import hash;
+import types;
+import lextables;
+
+const SCAN_LITERALS: u8 = 1;
+const SCAN_CLOSED_RANGES: u8 = 2;
+const SCAN_OPTION: u8 = 4;
+const SCAN_UNION: u8 = 8;
+const SCAN_TEXT: u8 = 16;
+
+export struct Token {
+    kind: u8,
+    span: types::Span,
+    payload: u64,
+    integer_suffix: u8,
+}
+export struct NameEntry { text_off: u32, text_len: u16, hash: u64, builtin_id: u16, variant_name: u32 }
+export struct NameTable {
+    arena: buf::ByteBuf, entries: NameEntry[], hash_map: hashmap::HashMap,
+    source_bytes: u64, source_names: u64, variant_names: u32[],
+}
+export struct StaticEntry { offset: u32, length: u32 }
+export struct TemplateEntry { first: u32, count: u32 }
+// 文本片段指向静态池；插值片段保留不含外层花括号的源码范围。
+export struct TemplatePiece { expression: bool, span: types::Span, static_index: u32 }
+export struct LexDiagnostic { code: types::ErrorCode, span: types::Span }
+export struct LexResult {
+    tokens: Token[], names: NameTable,
+    statics: StaticEntry[], static_bytes: u8[], diagnostics: LexDiagnostic[],
+    templates: TemplateEntry[], template_pieces: TemplatePiece[],
+    resource_status: u8,
+}
+
+function new_result(): LexResult {
+    return LexResult {
+        tokens: [], names: NameTable { arena: buf::buf_new(), entries: [], hash_map: hashmap::hashmap_new(), source_bytes: 0, source_names: 0, variant_names: [] },
+        statics: [], static_bytes: [], diagnostics: [], templates: [], template_pieces: [], resource_status: 0u8,
+    };
+}
+function fail(r: &LexResult:ReadWrite, file: u16, off: u32, len: u32, code: u16): void!AllocError {
+    @push(r.diagnostics, LexDiagnostic { code: types::error_code(code), span: types::Span { file: file, offset: off, length: len } })?;
+    return;
+}
+function emit(r: &LexResult:ReadWrite, file: u16, start: u32, end: u32, kind: u8, value: u64, suffix: u8): void!AllocError {
+    if end - start > 65535 { fail(r, file, start, 65535, 1020)?; return; }
+    @push(r.tokens, Token { kind: kind,
+        span: types::Span { file: file, offset: start, length: end - start },
+        payload: value, integer_suffix: suffix,
+    })?;
+    return;
+}
+function ident_start(b: u8): bool {
+    return b == 95 || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+function digit(b: u8): bool { return b >= 48 && b <= 57; }
+function ident_cont(b: u8): bool { return ident_start(b) || digit(b); }
+function digit_value(b: u8): u64 {
+    if digit(b) { return (b - 48) as u64; }
+    if b >= 65 && b <= 70 { return (b - 65 + 10) as u64; }
+    if b >= 97 && b <= 102 { return (b - 97 + 10) as u64; }
+    return 255;
+}
+
+// 0 表示非法 UTF-8；调用方必须先检查 pos。
+function utf8_width(src: &[u8], pos: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    let b: u8 = src[pos];
+    if b < 128 { return 1; }
+    var width: u32 = 0;
+    if b >= 194 && b <= 223 { width = 2; }
+    elseif b >= 224 && b <= 239 { width = 3; }
+    elseif b >= 240 && b <= 244 { width = 4; }
+    else { return 0; }
+    if n - pos < width { return 0; }
+    var i: u32 = 1;
+    while i < width {
+        if src[pos + i] < 128 || src[pos + i] > 191 { return 0; }
+        i = i + 1;
+    }
+    if b == 224 && src[pos + 1] < 160 { return 0; }
+    if b == 237 && src[pos + 1] >= 160 { return 0; }
+    if b == 240 && src[pos + 1] < 144 { return 0; }
+    if b == 244 && src[pos + 1] >= 144 { return 0; }
+    return width;
+}
+function decode_scalar(src: &[u8], pos: u32, width: u32): u32 {
+    if width == 1 { return src[pos] as u32; }
+    var value: u32 = (src[pos] & 31) as u32;
+    if width == 3 { value = (src[pos] & 15) as u32; }
+    if width == 4 { value = (src[pos] & 7) as u32; }
+    var i: u32 = 1;
+    while i < width { value = value * 64 + (src[pos + i] & 63) as u32; i = i + 1; }
+    return value;
+}
+function validate_source(src: &[u8], file: u16, r: &LexResult:ReadWrite, whole_file: bool): void!AllocError {
+    let n: u32 = @len(src) as u32;
+    var pos: u32 = 0;
+    while pos < n {
+        // 连续非 CR 的 ASCII 字节无需进入多字节 UTF-8 与 BOM 校验。
+        while pos + 4 <= n {
+            let b0: u8 = src[pos];
+            let b1: u8 = src[pos + 1];
+            let b2: u8 = src[pos + 2];
+            let b3: u8 = src[pos + 3];
+            if b0 < 128 && b0 != 13 && b1 < 128 && b1 != 13 && b2 < 128 && b2 != 13 && b3 < 128 && b3 != 13 {
+                pos = pos + 4;
+                continue;
+            }
+            break;
+        }
+        if pos >= n { break; }
+        let b: u8 = src[pos];
+        if b < 128 {
+            if b == 13 && (pos + 1 >= n || src[pos + 1] != 10) { fail(r, file, pos, 1, 1017)?; return; }
+            pos = pos + 1;
+            continue;
+        }
+        let width: u32 = utf8_width(src, pos);
+        if width == 0 { fail(r, file, pos, 1, 1001)?; return; }
+        if decode_scalar(src, pos, width) == 65279 { fail(r, file, pos, 3, 1001)?; return; }
+        pos = pos + width;
+    }
+    if !whole_file { return; }
+    if n == 0 { fail(r, file, 0, 0, 1018)?; return; }
+    if src[n - 1] != 10 { fail(r, file, n, 0, 1018)?; return; }
+    var previous: u32 = n - 1;
+    if previous > 0 && src[previous - 1] == 13 { previous = previous - 1; }
+    if previous > 0 && src[previous - 1] == 10 { fail(r, file, previous, 1, 1018)?; }
+    return;
+}
+export function lookup_name(names: &NameTable:Read, text: &[u8]): u32 {
+    if names.hash_map.cap != 0 { return hashmap::hashmap_lookup(&names.hash_map:Read, &names.arena:Read, hash::fnv1a(text), text); }
+    // 手工构造的名称表可以没有哈希索引；和正常索引一样返回一基编号。
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    var i: u32 = 0;
+    while i < @len(names.entries) as u32 {
+        let entry: NameEntry = names.entries[i];
+        if entry.text_len as u32 == @len(text) as u32 {
+            var j: u32 = 0;
+            while j < @len(text) as u32 && arena.data[entry.text_off + j] == text[j] { j = j + 1; }
+            if j == @len(text) as u32 { return i + 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function intern_name(r: &LexResult:ReadWrite, src: &[u8], off: u32, len: u16, work: &hashmap::ProbeBudget:ReadWrite): u32!AllocError {
+    let bytes: &[u8] = &src[off..(off + len as u32)];
+    let h: u64 = hash::fnv1a(bytes);
+    var found: u32 = 0;
+    if work.limited { found = hashmap::hashmap_lookup_metered(&r.names.hash_map:Read, &r.names.arena:Read, h, bytes, work); }
+    else { found = hashmap::hashmap_lookup(&r.names.hash_map:Read, &r.names.arena:Read, h, bytes); }
+    if work.stopped { return 0; }
+    if found != 0 { return found; }
+    let text_off: u32 = buf::buf_len(&r.names.arena:Read);
+    let id: u32 = (@len(r.names.entries) as u32) + 1u32;
+    if work.limited {
+        let row: hashmap::Slot = hashmap::Slot { hash: h, name_off: text_off, name_len: len, value: id, occupied: true };
+        if !hashmap::hashmap_insert_metered(&r.names.hash_map:ReadWrite, row, work)? { return 0; }
+    }
+    buf::buf_push_bytes(&r.names.arena:ReadWrite, bytes)?;
+    let variant: u32 = lextables::builtin_variant_name(src, off, len as u32);
+    if variant != 0 {
+        while (@len(r.names.variant_names) as u32) < variant { @push(r.names.variant_names, 0)?; }
+        r.names.variant_names[variant - 1] = id;
+    }
+    @push(r.names.entries, NameEntry { text_off: text_off, text_len: len, hash: h,
+        builtin_id: lextables::name_builtin(src, off, len as u32), variant_name: variant })?;
+    if !work.limited { hashmap::hashmap_insert(&r.names.hash_map:ReadWrite, h, text_off, len, id)?; }
+    return id;
+}
+function scan_name(src: &[u8], start: u32, prefix: u8, file: u16, r: &LexResult:ReadWrite, limit: u32, work: &hashmap::ProbeBudget:ReadWrite, profile: u8): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    var off: u32 = start;
+    if prefix != 0 { off = off + 1; }
+    if off >= n || !ident_start(src[off]) {
+        var code: u16 = 1016;
+        if prefix == 64 { code = 1011; }
+        fail(r, file, start, 1, code)?; return n;
+    }
+    var end: u32 = off + 1;
+    while end < n {
+        let ch: u8 = src[end];
+        if (ch >= 97 && ch <= 122) || ch == 95 || (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) {
+            end = end + 1;
+        } else { break; }
+    }
+    if end - start > 65535 { fail(r, file, start, 65535, 1020)?; return n; }
+    let len: u32 = end - off;
+    if limit != 0u32 && len > limit { r.resource_status = 2u8; return n; }
+    let kw: u8 = lextables::keyword(src, off, len);
+    let reserved: bool = lextables::reserved(src, off, len);
+    let wildcard: bool = len == 1 && src[off] == 95;
+    if prefix == 64 {
+        let bid: u16 = lextables::builtin(src, off, len);
+        if bid == 0 { fail(r, file, start, end - start, 1011)?; }
+        elseif !lextables::builtin_is_base(bid) { fail(r, file, start, end - start, 3008)?; }
+        else { emit(r, file, start, end, 8, bid as u64, 0)?; }
+        return end;
+    }
+    if prefix == 35 && (kw != 255 || reserved || wildcard) { fail(r, file, start, end - start, 1016)?; return end; }
+    if reserved {
+        if (profile & SCAN_UNION) != 0 && len == 2 && src[off] == 105 && src[off + 1] == 115 { emit(r, file, start, end, 7, 37, 0)?; return end; }
+        var code: u16 = 3008;
+        if len == 4 && src[off] == 110 && src[off + 1] == 117 && src[off + 2] == 108 && src[off + 3] == 108 {
+            if (profile & SCAN_OPTION) != 0 { emit(r, file, start, end, 15, 0, 0)?; return end; }
+            code = 1008;
+        }
+        fail(r, file, start, end - start, code)?; return end;
+    }
+    if (profile & SCAN_TEXT) != 0 && prefix == 0 && len == 6 && src[off] == 115 && src[off + 1] == 116 &&
+        src[off + 2] == 114 && src[off + 3] == 105 && src[off + 4] == 110 && src[off + 5] == 103 {
+        emit(r, file, start, end, 16, 0, 0)?;
+        return end;
+    }
+    if wildcard { emit(r, file, start, end, 10, 0, 0)?; }
+    elseif kw == 14 { emit(r, file, start, end, 3, 1, 0)?; }
+    elseif kw == 15 { emit(r, file, start, end, 3, 0, 0)?; }
+    elseif kw != 255 { emit(r, file, start, end, 6, kw as u64, 0)?; }
+    else {
+        // 用户名不能包含紧贴名称字符的 @；关键字与独立原语仍按各自的记号读取。
+        if end + 1 < n && src[end] == 64 && ident_cont(src[end + 1]) {
+            fail(r, file, end, 1, 1003)?;
+            return n;
+        }
+        let id: u32 = intern_name(r, src, off, len as u16, work)?;
+        if id == 0 { r.resource_status = 3u8; return n; }
+        var kind: u8 = 0;
+        if prefix == 35 { kind = 1; }
+        emit(r, file, start, end, kind, id as u64, 0)?;
+    }
+    return end;
+}
+function integer_suffix(src: &[u8], pos: u32, end: u32): u8 {
+    let len: u32 = end - pos;
+    if len != 2 && len != 3 { return 255; }
+    var base: u8 = 0;
+    if src[pos] == 105 { base = 4; }
+    elseif src[pos] != 117 { return 255; }
+    if len == 2 && src[pos + 1] == 56 { return base + 1; }
+    if len == 3 {
+        if src[pos + 1] == 49 && src[pos + 2] == 54 { return base + 2; }
+        if src[pos + 1] == 51 && src[pos + 2] == 50 { return base + 3; }
+        if src[pos + 1] == 54 && src[pos + 2] == 52 { return base + 4; }
+    }
+    return 255;
+}
+function scan_integer(src: &[u8], start: u32, file: u16, r: &LexResult:ReadWrite): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    var pos: u32 = start;
+    var radix: u64 = 10;
+    if pos + 1 < n && src[pos] == 48 {
+        let p: u8 = src[pos + 1];
+        if p == 120 { radix = 16; pos = pos + 2; }
+        elseif p == 98 { radix = 2; pos = pos + 2; }
+        elseif p == 111 { radix = 8; pos = pos + 2; }
+    }
+    let digits_start: u32 = pos;
+    var value: u64 = 0;
+    while pos < n && digit_value(src[pos]) < radix {
+        let d: u64 = digit_value(src[pos]);
+        if value > (18446744073709551615u64 - d) / radix { fail(r, file, start, 1, 1004)?; return n; }
+        value = value * radix + d; pos = pos + 1;
+    }
+    if pos == digits_start { fail(r, file, start, 1, 1021)?; return n; }
+    var suffix: u8 = 0;
+    if pos < n && ident_cont(src[pos]) {
+        let suffix_start: u32 = pos;
+        while pos < n && ident_cont(src[pos]) { pos = pos + 1; }
+        suffix = integer_suffix(src, suffix_start, pos);
+        if suffix == 255 { fail(r, file, suffix_start, 1, 1021)?; return n; }
+    }
+    if pos + 1 < n && src[pos] == 46 && digit(src[pos + 1]) { fail(r, file, start, 1, 1007)?; return n; }
+    var limit: u64 = 18446744073709551615u64;
+    if suffix == 1 { limit = 255; }
+    elseif suffix == 2 { limit = 65535; }
+    elseif suffix == 3 { limit = 4294967295; }
+    // 有符号 MIN 的幅值需要外层一元负号表达式配合。
+    elseif suffix == 5 { limit = 128; }
+    elseif suffix == 6 { limit = 32768; }
+    elseif suffix == 7 { limit = 2147483648; }
+    elseif suffix == 8 { limit = 9223372036854775808u64; }
+    if value > limit { fail(r, file, start, 1, 1004)?; return n; }
+    emit(r, file, start, pos, 2, value, suffix)?; return pos;
+}
+function append_scalar(bytes: &u8[]:ReadWrite, value: u32): void!AllocError {
+    if value < 128 { @push(*bytes, value as u8)?; }
+    elseif value < 2048 {
+        @push(*bytes, (192u32 + value / 64u32) as u8)?; @push(*bytes, (128u32 + value % 64u32) as u8)?;
+    } elseif value < 65536 {
+        @push(*bytes, (224u32 + value / 4096u32) as u8)?;
+        @push(*bytes, (128u32 + (value / 64u32) % 64u32) as u8)?; @push(*bytes, (128u32 + value % 64u32) as u8)?;
+    } else {
+        @push(*bytes, (240u32 + value / 262144u32) as u8)?;
+        @push(*bytes, (128u32 + (value / 4096u32) % 64u32) as u8)?;
+        @push(*bytes, (128u32 + (value / 64u32) % 64u32) as u8)?; @push(*bytes, (128u32 + value % 64u32) as u8)?;
+    }
+    return;
+}
+function append_literal_bytes(bytes: &u8[]:ReadWrite, src: &[u8], start: u32, end: u32): void!AllocError {
+    var i: u32 = start;
+    while i < end { @push(*bytes, src[i])?; i = i + 1; }
+    return;
+}
+
+function scan_literal(src: &[u8], start: u32, file: u16, r: &LexResult:ReadWrite, byte_mode: bool): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    var open: u32 = start;
+    if byte_mode { open = open + 1; }
+    let quote: u8 = src[open];
+    var pos: u32 = open + 1;
+    var bytes: u8[] = [];
+    var plain_start: u32 = pos;
+    var count: u32 = 0;
+    var scalar: u32 = 0;
+    while pos < n && src[pos] != quote {
+        if src[pos] == 10 || src[pos] == 13 { fail(r, file, pos, 1, 1005)?; return n; }
+        if src[pos] == 92 {
+            let escape: u32 = pos;
+            pos = pos + 1;
+            if pos >= n { fail(r, file, escape, 1, 1022)?; return n; }
+            let c: u8 = src[pos];
+            var raw_byte: bool = false;
+            if c == 110 { scalar = 10; }
+            elseif c == 114 { scalar = 13; }
+            elseif c == 116 { scalar = 9; }
+            elseif c == 48 { scalar = 0; }
+            elseif c == 92 || c == 39 || c == 34 { scalar = c as u32; }
+            elseif c == 120 && byte_mode {
+                if n - pos < 3 || digit_value(src[pos + 1]) >= 16 || digit_value(src[pos + 2]) >= 16 {
+                    fail(r, file, escape, 1, 1006)?; return n;
+                }
+                scalar = (digit_value(src[pos + 1]) * 16 + digit_value(src[pos + 2])) as u32;
+                pos = pos + 2;
+                raw_byte = true;
+            }
+            elseif c == 117 {
+                if byte_mode && quote == 39 { fail(r, file, escape, 2, 1012)?; return n; }
+                pos = pos + 1;
+                if pos >= n || src[pos] != 123 { fail(r, file, escape, 1, 1006)?; return n; }
+                pos = pos + 1;
+                let hex_start: u32 = pos;
+                scalar = 0;
+                while pos < n && digit_value(src[pos]) < 16 && pos - hex_start < 6 {
+                    scalar = scalar * 16 + digit_value(src[pos]) as u32; pos = pos + 1;
+                }
+                if pos == hex_start || pos >= n || src[pos] != 125 || scalar > 1114111 || (scalar >= 55296 && scalar <= 57343) {
+                    fail(r, file, escape, 1, 1006)?; return n;
+                }
+            } else { fail(r, file, escape, 1, 1006)?; return n; }
+            pos = pos + 1;
+            if quote == 34 {
+                append_literal_bytes(&bytes:ReadWrite, src, plain_start, escape)?;
+                if raw_byte { @push(bytes, scalar as u8)?; }
+                else { append_scalar(&bytes:ReadWrite, scalar)?; }
+                plain_start = pos;
+            }
+        } elseif quote == 39 {
+            let width: u32 = utf8_width(src, pos);
+            if byte_mode && width != 1 { fail(r, file, pos, width, 1012)?; return n; }
+            scalar = decode_scalar(src, pos, width); pos = pos + width;
+        } else {
+            // 全源已验证为 UTF-8；字符串的普通字节不必往返转换为标量。
+            pos = pos + 1;
+        }
+        if quote == 39 {
+            count = count + 1;
+            if count > 1 {
+                if byte_mode { fail(r, file, start, pos - start, 1012)?; }
+                else { fail(r, file, start, 1, 1022)?; }
+                return n;
+            }
+        }
+    }
+    if byte_mode && quote == 39 && pos < n && count == 0 { fail(r, file, start, pos - start + 1, 1012)?; return n; }
+    if pos >= n || (quote == 39 && count != 1) { fail(r, file, start, 1, 1022)?; return n; }
+    pos = pos + 1;
+    if quote == 39 {
+        var kind: u8 = 4;
+        if byte_mode { kind = 11; }
+        emit(r, file, start, pos, kind, scalar as u64, 0)?;
+    }
+    else {
+        let id: u64 = @len(r.statics) as u64;
+        let off: u32 = @len(r.static_bytes) as u32;
+        // 未结束或有错的字面量不写静态池；末段直接从源切片复制。
+        append_literal_bytes(&r.static_bytes:ReadWrite, &bytes[0..@len(bytes)]:Read, 0u32, @len(bytes) as u32)?;
+        append_literal_bytes(&r.static_bytes:ReadWrite, src, plain_start, pos - 1u32)?;
+        let length: u32 = @len(r.static_bytes) as u32 - off;
+        @push(r.statics, StaticEntry { offset: off, length: length })?;
+        var kind: u8 = 5;
+        if byte_mode { kind = 12; }
+        emit(r, file, start, pos, kind, id, 0)?;
+    }
+    return pos;
+}
+function two_char(a: u8, b: u8): u8 {
+    if a == 58 && b == 58 { return 0; }
+    if a == 61 && b == 61 { return 1; }
+    if a == 33 && b == 61 { return 2; }
+    if a == 60 && b == 61 { return 3; }
+    if a == 62 && b == 61 { return 4; }
+    if a == 38 && b == 38 { return 5; }
+    if a == 124 && b == 124 { return 6; }
+    if a == 60 && b == 60 { return 7; }
+    if a == 62 && b == 62 { return 8; }
+    if a == 61 && b == 62 { return 9; }
+    if a == 46 && b == 46 { return 10; }
+    return 255;
+}
+function one_char(b: u8): u8 {
+    if b == 43 { return 11; }
+    if b == 45 { return 12; }
+    if b == 42 { return 13; }
+    if b == 47 { return 14; }
+    if b == 37 { return 15; }
+    if b == 60 { return 16; }
+    if b == 62 { return 17; }
+    if b == 33 { return 18; }
+    if b == 38 { return 19; }
+    if b == 124 { return 20; }
+    if b == 94 { return 21; }
+    if b == 61 { return 22; }
+    if b == 46 { return 23; }
+    if b == 58 { return 24; }
+    if b == 63 { return 25; }
+    if b == 40 { return 26; }
+    if b == 41 { return 27; }
+    if b == 123 { return 28; }
+    if b == 125 { return 29; }
+    if b == 91 { return 30; }
+    if b == 93 { return 31; }
+    if b == 44 { return 32; }
+    if b == 59 { return 33; }
+    return 255;
+}
+function scan_operator(src: &[u8], start: u32, file: u16, r: &LexResult:ReadWrite, closed_ranges: bool, nullable: bool): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    if start + 1 < n {
+        if src[start] == 63 && (src[start + 1] == 46 || src[start + 1] == 63) {
+            if !nullable { fail(r, file, start, 2, 3008)?; return n; }
+            var op: u64 = 35;
+            if src[start + 1] == 63 { op = 36; }
+            emit(r, file, start, start + 2, 7, op, 0)?;
+            return start + 2;
+        }
+        if start + 2 < n && src[start] == 46 && src[start + 1] == 46 && src[start + 2] == 61 {
+            if !closed_ranges { fail(r, file, start, 3, 3008)?; return n; }
+            emit(r, file, start, start + 3, 7, 34, 0)?;
+            return start + 3;
+        }
+        let op: u8 = two_char(src[start], src[start + 1]);
+        if op != 255 { emit(r, file, start, start + 2, 7, op as u64, 0)?; return start + 2; }
+    }
+    let op: u8 = one_char(src[start]);
+    if op == 255 { fail(r, file, start, 1, 1016)?; return n; }
+    emit(r, file, start, start + 1, 7, op as u64, 0)?; return start + 1;
+}
+// 返回未闭合块注释的起点，或返回下一处可扫描的源码位置。
+function comment_end(src: &[u8], start: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    let block: bool = src[start + 1] == 42;
+    var pos: u32 = start + 2;
+    if !block { while pos < n && src[pos] != 10 { pos = pos + 1; } return pos; }
+    var depth: u32 = 1;
+    while pos + 1 < n {
+        if src[pos] == 47 && src[pos + 1] == 42 { depth = depth + 1; pos = pos + 2; }
+        elseif src[pos] == 42 && src[pos + 1] == 47 {
+            depth = depth - 1; pos = pos + 2;
+            if depth == 0 { return pos; }
+        } else { pos = pos + 1; }
+    }
+    return start;
+}
+function skip_comment(src: &[u8], start: u32, file: u16, r: &LexResult:ReadWrite): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    if start + 2 < n && src[start + 1] == src[start + 2] { fail(r, file, start, 3, 1002)?; return n; }
+    let end: u32 = comment_end(src, start);
+    if end == start { fail(r, file, start, 2, 1019)?; return n; }
+    return end;
+}
+
+// 仅零至三个井号紧随引号构成前缀。返回引号位置，零表示普通名称。
+function raw_open(src: &[u8], pos: u32): u32 {
+    var end: u32 = pos + 1;
+    while end < @len(src) as u32 && src[end] == 35 && end - pos <= 3 { end = end + 1; }
+    if end < @len(src) as u32 && src[end] == 34 { return end; }
+    return 0;
+}
+
+// 引号后的整个井号序列必须与开头等长。未匹配的引号属于内容。
+function raw_close(src: &[u8], start: u32, hashes: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    var pos: u32 = start;
+    while pos < n {
+        if src[pos] == 34 {
+            var end: u32 = pos + 1;
+            while end < n && src[end] == 35 { end = end + 1; }
+            if end - pos - 1 == hashes { return pos; }
+            pos = end;
+        } else { pos = pos + 1; }
+    }
+    return n;
+}
+
+function scan_raw(src: &[u8], start: u32, open: u32, file: u16, r: &LexResult:ReadWrite): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    let hashes: u32 = open - start - 1;
+    let close: u32 = raw_close(src, open + 1, hashes);
+    if close == n { fail(r, file, start, open - start + 1, 1013)?; return n; }
+    let end: u32 = close + hashes + 1;
+    if end - start > 65535 { fail(r, file, start, 65535, 1020)?; return n; }
+    let id: u32 = @len(r.statics) as u32;
+    let offset: u32 = @len(r.static_bytes) as u32;
+    var i: u32 = open + 1;
+    while i < close {
+        // 源码窗口保留物理偏移，字面量载荷统一把 CRLF 归一为 LF。
+        if src[i] != 13 { @push(r.static_bytes, src[i])?; }
+        i = i + 1;
+    }
+    let size: u32 = @len(r.static_bytes) as u32 - offset;
+    @push(r.statics, StaticEntry { offset: offset, length: size })?;
+    emit(r, file, start, end, 13, id as u64, 0)?;
+    return end;
+}
+
+// 插值定位只越过普通引号的范围，内部的转义与表达式由片段入口验证。
+function quote_boundary(src: &[u8], open: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    var pos: u32 = open + 1;
+    while pos < n {
+        let b: u8 = src[pos];
+        if b == src[open] { return pos + 1; }
+        if b == 10 || b == 13 { return pos; }
+        if b == 92 && pos + 1 < n && src[pos + 1] != 10 && src[pos + 1] != 13 { pos = pos + 2; }
+        else { pos = pos + 1; }
+    }
+    return n;
+}
+
+// 栈项为当前插值花括号深度；零表示嵌套模板正处于文本区。
+// 交替嵌套的模板和插值只增长显式栈，扫描调用栈深度恒定。
+function hole_close(src: &[u8], from: u32): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    var depths: u32[] = [1];
+    var level: u32 = 0;
+    var pos: u32 = from;
+    while pos < n {
+        let b: u8 = src[pos];
+        let depth: u32 = depths[level];
+        if depth == 0 {
+            if b == 96 { level = level - 1; pos = pos + 1; }
+            elseif b == 92 && pos + 1 < n && (src[pos + 1] == 92 || src[pos + 1] == 96) { pos = pos + 2; }
+            elseif (b == 123 || b == 125) && pos + 1 < n && src[pos + 1] == b { pos = pos + 2; }
+            else {
+                if b == 123 { depths[level] = 1; }
+                pos = pos + 1;
+            }
+        } elseif b == 125 {
+            if level == 0 && depth == 1 { return pos; }
+            depths[level] = depth - 1;
+            pos = pos + 1;
+        } elseif b == 123 { depths[level] = depth + 1; pos = pos + 1; }
+        elseif b == 96 {
+            level = level + 1;
+            if (level as u64) == @len(depths) { @push(depths, 0u32)?; }
+            else { depths[level] = 0; }
+            pos = pos + 1;
+        } elseif b == 34 || b == 39 { pos = quote_boundary(src, pos); }
+        elseif b == 47 && pos + 1 < n && (src[pos + 1] == 47 || src[pos + 1] == 42) {
+            let end: u32 = comment_end(src, pos);
+            if end == pos { return n; }
+            pos = end;
+        } else {
+            var open: u32 = 0;
+            if b == 114 { open = raw_open(src, pos); }
+            if open != 0 {
+                let hashes: u32 = open - pos - 1;
+                let close: u32 = raw_close(src, open + 1, hashes);
+                if close == n { return n; }
+                pos = close + hashes + 1;
+            } else {
+                pos = pos + 1;
+                if ident_cont(b) || b == 35 || b == 64 {
+                    while pos < n && ident_cont(src[pos]) { pos = pos + 1; }
+                }
+            }
+        }
+    }
+    return n;
+}
+
+function template_text(r: &LexResult:ReadWrite, text: &[u8], file: u16, start: u32, end: u32): void!AllocError {
+    if start == end { return; }
+    let id: u32 = @len(r.statics) as u32;
+    let offset: u32 = @len(r.static_bytes) as u32;
+    let size: u32 = @len(text) as u32;
+    append_literal_bytes(&r.static_bytes:ReadWrite, text, 0, size)?;
+    @push(r.statics, StaticEntry { offset: offset, length: size })?;
+    @push(r.template_pieces, TemplatePiece { expression: false, span: types::Span { file: file, offset: start, length: end - start }, static_index: id })?;
+    return;
+}
+
+function scan_template(src: &[u8], start: u32, file: u16, r: &LexResult:ReadWrite): u32!AllocError {
+    let n: u32 = @len(src) as u32;
+    let first: u32 = @len(r.template_pieces) as u32;
+    var pos: u32 = start + 1;
+    var segment: u32 = pos;
+    var text: u8[] = [];
+    while pos < n {
+        let b: u8 = src[pos];
+        if b == 96 {
+            let end: u32 = pos + 1;
+            if end - start > 65535 { fail(r, file, start, 65535, 1020)?; return n; }
+            template_text(r, &text[0..@len(text)]:Read, file, segment, pos)?;
+            let id: u32 = @len(r.templates) as u32;
+            let count: u32 = (@len(r.template_pieces) as u32) - first;
+            @push(r.templates, TemplateEntry { first: first, count: count })?;
+            emit(r, file, start, end, 14, id as u64, 0)?;
+            return end;
+        }
+        if b == 92 {
+            if pos + 1 >= n || (src[pos + 1] != 92 && src[pos + 1] != 96) { fail(r, file, pos, 1, 1006)?; return n; }
+            @push(text, src[pos + 1])?;
+            pos = pos + 2;
+        } elseif (b == 123 || b == 125) && pos + 1 < n && src[pos + 1] == b {
+            @push(text, b)?;
+            pos = pos + 2;
+        } elseif b == 123 {
+            let finish: u32 = hole_close(src, pos + 1)?;
+            if finish == n { fail(r, file, pos, 1, 1015)?; return n; }
+            template_text(r, &text[0..@len(text)]:Read, file, segment, pos)?;
+            @push(r.template_pieces, TemplatePiece { expression: true, span: types::Span { file: file, offset: pos + 1, length: finish - pos - 1 }, static_index: 0 })?;
+            text = [];
+            pos = finish + 1;
+            segment = pos;
+        } elseif b == 125 { fail(r, file, pos, 1, 1016)?; return n; }
+        else {
+            if b != 13 { @push(text, b)?; }
+            pos = pos + 1;
+        }
+    }
+    fail(r, file, start, 1, 1014)?;
+    return n;
+}
+export function lex_token_limit_exceeded(status: u8): bool { return status == 1u8; }
+export function lex_name_limit_exceeded(status: u8): bool { return status == 2u8; }
+export function lex_intern_limit_exceeded(status: u8): bool { return status == 3u8; }
+
+// 零代表不限制；EOF 不计入源码 token，空白与注释不会花掉名额。
+function scan_source(src: &[u8], file: u16, token_limit: u32, name_limit: u32, intern_limit: u64,
+    whole_file: bool, profile: u8): LexResult!AllocError {
+    var r: LexResult = new_result();
+    var work: hashmap::ProbeBudget = hashmap::probe_budget(intern_limit);
+    if @len(src) > 4294967295u64 { fail(&r:ReadWrite, file, 0, 0, 1020)?; return r; }
+    validate_source(src, file, &r:ReadWrite, whole_file)?;
+    let n: u32 = @len(src) as u32;
+    var pos: u32 = 0;
+    let literals: bool = (profile & SCAN_LITERALS) != 0;
+    while pos < n && @len(r.diagnostics) == 0 {
+        var b: u8 = src[pos];
+        if b == 32 || b == 10 || b == 9 || b == 13 {
+            pos = pos + 1;
+            while pos < n {
+                let w: u8 = src[pos];
+                if w == 32 || w == 10 || w == 9 || w == 13 { pos = pos + 1; } else { break; }
+            }
+            continue;
+        }
+        if b == 47 && pos + 1 < n && (src[pos + 1] == 47 || src[pos + 1] == 42) { pos = skip_comment(src, pos, file, &r:ReadWrite)?; continue; }
+        if token_limit != 0u32 && @len(r.tokens) >= token_limit as u64 {
+            r.resource_status = 1u8;
+            break;
+        }
+        var raw: u32 = 0;
+        if b == 114 && pos + 1 < n && (src[pos + 1] == 34 || src[pos + 1] == 35) { raw = raw_open(src, pos); }
+        // 完整前缀为单个词法单位；仅显式字面量入口启用对应扫描。
+        if b == 98 && pos + 1 < n && (src[pos + 1] == 34 || src[pos + 1] == 39) {
+            if literals { pos = scan_literal(src, pos, file, &r:ReadWrite, true)?; }
+            else { fail(&r:ReadWrite, file, pos, 1, 3008)?; }
+        } elseif raw != 0 {
+            if literals { pos = scan_raw(src, pos, raw, file, &r:ReadWrite)?; }
+            else { fail(&r:ReadWrite, file, pos, 1, 3008)?; }
+        } elseif b == 96 {
+            if literals { pos = scan_template(src, pos, file, &r:ReadWrite)?; }
+            else { fail(&r:ReadWrite, file, pos, 1, 3008)?; }
+        }
+        elseif ident_start(b) { pos = scan_name(src, pos, 0, file, &r:ReadWrite, name_limit, &work:ReadWrite, profile)?; }
+        elseif b == 35 || b == 64 { pos = scan_name(src, pos, b, file, &r:ReadWrite, name_limit, &work:ReadWrite, profile)?; }
+        elseif digit(b) { pos = scan_integer(src, pos, file, &r:ReadWrite)?; }
+        elseif b == 34 || b == 39 { pos = scan_literal(src, pos, file, &r:ReadWrite, false)?; }
+        else { pos = scan_operator(src, pos, file, &r:ReadWrite, (profile & SCAN_CLOSED_RANGES) != 0, (profile & SCAN_OPTION) != 0)?; }
+    }
+    if work.stopped {
+        var empty: LexResult = new_result();
+        empty.resource_status = 3u8;
+        return empty;
+    }
+    if @len(r.diagnostics) == 0 && r.resource_status == 0u8 { emit(&r:ReadWrite, file, n, n, 9, 0, 0)?; }
+    else {
+        r.tokens = [];
+        if literals { r.statics = []; r.static_bytes = []; r.templates = []; r.template_pieces = []; }
+    }
+    // 源码词法结果记录本地名称区的边界，接口桥接时只读核对。
+    r.names.source_bytes = @len(r.names.arena.data);
+    r.names.source_names = @len(r.names.entries);
+    return r;
+}
+
+export function lex_scan_budgeted(src: &[u8], file: u16, token_limit: u32, name_limit: u32, intern_limit: u64): LexResult!AllocError {
+    return scan_source(src, file, token_limit, name_limit, intern_limit, true, 0u8)?;
+}
+
+export function lex_scan_limited(src: &[u8], file: u16, token_limit: u32, name_limit: u32): LexResult!AllocError {
+    return lex_scan_budgeted(src, file, token_limit, name_limit, 0u64)?;
+}
+
+export function lex_scan(src: &[u8], file: u16): LexResult!AllocError {
+    return lex_scan_budgeted(src, file, 0u32, 0u32, 0u64)?;
+}
+
+// 按扩展字面量语法扫描源文件。字节、字节串、原始串和模板记号号段为 11 至 14。
+export function lex_scan_literals(src: &[u8], file: u16): LexResult!AllocError {
+    return scan_source(src, file, 0, 0, 0, true, SCAN_LITERALS)?;
+}
+
+// 仅为显式使用闭区间降级的调用方追加运算符 34，已有运算符编号不变。
+export function lex_scan_closed_ranges(src: &[u8], file: u16): LexResult!AllocError {
+    return scan_source(src, file, 0, 0, 0, true, SCAN_CLOSED_RANGES)?;
+}
+
+// 可空前端单独选择 null、?. 与 ?? 的扩展记号。
+export function lex_scan_nullable(src: &[u8], file: u16): LexResult!AllocError {
+    return scan_source(src, file, 0, 0, 0, true, SCAN_OPTION)?;
+}
+
+// 普通联合前端同时保留可空操作，供类型阶段给出接收者专用诊断。
+export function lex_scan_plain_union(src: &[u8], file: u16): LexResult!AllocError {
+    return scan_source(src, file, 0, 0, 0, true, SCAN_OPTION | SCAN_UNION)?;
+}
+
+export function lex_scan_text(src: &[u8], file: u16): LexResult!AllocError {
+    return scan_source(src, file, 0, 0, 0, true, SCAN_TEXT)?;
+}
+
+// 插值片段无需补写文件末尾换行。记号、错误与嵌套模板范围始终指向原文件。
+export function lex_scan_literal_fragment(src: &[u8], file: u16, start: u32, end: u32): LexResult!AllocError {
+    if start > end || (end as u64) > @len(src) {
+        var invalid: LexResult = new_result();
+        fail(&invalid:ReadWrite, file, start, 0, 1016)?;
+        return invalid;
+    }
+    var result: LexResult = scan_source(&src[start..end]:Read, file, 0, 0, 0, false, SCAN_LITERALS)?;
+    var i: u32 = 0;
+    while i < @len(result.tokens) as u32 {
+        result.tokens[i].span.offset = result.tokens[i].span.offset + start;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(result.diagnostics) as u32 {
+        result.diagnostics[i].span.offset = result.diagnostics[i].span.offset + start;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(result.template_pieces) as u32 {
+        result.template_pieces[i].span.offset = result.template_pieces[i].span.offset + start;
+        i = i + 1;
+    }
+    return result;
+}

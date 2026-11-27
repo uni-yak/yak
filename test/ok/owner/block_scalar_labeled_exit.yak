@@ -1,0 +1,25 @@
+// expected_exit: 0
+// expected_stdout:
+// spec: spec/lang/owner.md 3.2–3.5
+// 通过外层标签离开借用作用域后，后续迭代和循环出口都可访问原位置。
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var counter: u32 = 0u32;
+    outer: while counter < 2u32 {
+        while true {
+            let step: &u32:ReadWrite = &counter:ReadWrite;
+            *step = *step + 1u32;
+            continue outer;
+        }
+    }
+    stop: while true {
+        while true {
+            let step: &u32:ReadWrite = &counter:ReadWrite;
+            *step = 3u32;
+            break stop;
+        }
+    }
+    counter = counter + 1u32;
+    assert(counter == 4u32);
+}

@@ -1,0 +1,19 @@
+// t60: match 全覆盖无通配符
+// expected_stdout: green
+foreign write(data: &[u8]): void;
+
+enum Light {
+    Red,
+    Yellow,
+    Green,
+}
+
+function main(): void {
+    let l: Light = Light::Green;
+    match l {
+        Red => { write("red\n"); },
+        Yellow => { write("yellow\n"); },
+        Green => { write("green\n"); },
+    }
+    return;
+}

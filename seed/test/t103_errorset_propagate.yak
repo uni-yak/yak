@@ -1,0 +1,23 @@
+// t103: 多成员 ErrorSet —— N_RETURN 按集合第 2 成员包装 Err，? 传播至顶层（result.md）
+// expected_trap: uncaught error propagation
+enum IoError {
+    Unavailable,
+}
+enum ParseError {
+    Invalid,
+}
+function load(ready: &bool, valid: &bool): u32!(IoError | ParseError) {
+    if !*ready {
+        return IoError::Unavailable;
+    }
+    if !*valid {
+        return ParseError::Invalid;
+    }
+    return 8080;
+}
+function main(): void {
+    let t: bool = true;
+    let f: bool = false;
+    let n: u32 = load(&t, &f)?;   // ready=true 跳过 IoError；valid=false → ParseError（集合第 2 项）
+    return;
+}

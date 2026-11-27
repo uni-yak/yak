@@ -1,0 +1,179 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+import buf;
+import lex;
+import diag;
+import pipeline;
+import consteval;
+import typecheck;
+import typecheck_driver;
+import typecheck_body;
+import typecheck_shape;
+import parse;
+import resolve_refs;
+import resolve_unit;
+foreign assert(cond: bool): void;
+
+function check_body(parsed: &parse::ParseResult:Read, res: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, shape: &typecheck_shape::BodyInferenceBudget:ReadWrite): typecheck::TypeCheckResult!AllocError {
+    var intern: typecheck::InternBudget = typecheck::intern_budget(0u32);
+    var lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(0u32);
+    var material: consteval::MaterialBudget = consteval::material_budget(0u32);
+    var fold: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var probe: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var scan: typecheck_driver::IntegerScanBudget = typecheck_driver::integer_scan_budget(0u32);
+    return typecheck_driver::typecheck_unit_with_body_budget(&parsed.file:Read, &parsed.pool:Read, res, diags, &intern:ReadWrite, &lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe:ReadWrite, &scan:ReadWrite, shape, false)?;
+}
+
+// 17 行中的四个 out 槽位查找各读取 2、4、3、4 行。
+function small_steps(): void!AllocError {
+    let src: &[u8] = "function fill(a: &u32:Write, b: &u32:Write): void { *a = 1u32; *b = 2u32; }\nfunction f(): void { out x: u32; out y: u32; fill(out x, out y); }\nfunction g(): void { out x: u32; out y: u32; fill(out x, out y); }\n";
+    let lexed: lex::LexResult = lex::lex_scan(src, 117u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 117u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var name_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let res: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &name_diags:ReadWrite)?;
+    assert(name_diags.count == 0u32);
+    assert(@len(res.refs.items) == 17 && res.refs.items[12].node_kind == 1u8 && res.refs.items[13].node_kind == 3u8);
+    assert(res.refs.items[13].x == 0u32 && res.refs.items[14].x == 1u32 && res.refs.items[15].x == 0u32 && res.refs.items[16].x == 1u32);
+    var limit: u32 = 1u32;
+    while limit <= 14u32 {
+        var diags: diag::DiagBuffer = diag::diagbuf_new();
+        var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, 0u32, limit, 0u32, 0u32);
+        let checked: typecheck::TypeCheckResult = check_body(&parsed:Read, &res:Read, &diags:ReadWrite, &shape:ReadWrite)?;
+        assert(typecheck_shape::body_out_exceeded(&shape:Read) == (limit < 13u32));
+        assert(diags.count == 0u32);
+        if limit < 13u32 { assert(@len(checked.expr_types.items) == 0 && shape.out_remaining == 0u32); }
+        else { assert(@len(checked.expr_types.items) == @len(parsed.pool.exprs) && shape.out_remaining == limit - 13u32); }
+        limit = limit + 1u32;
+    }
+    return;
+}
+
+// 134 个 out 槽都在引用表尾。330 行需 1000 步；额外一条被调用引用增至 1001 步。
+function boundary(over: bool, bad: bool): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function fill4(a: &u32:Write, b: &u32:Write, c: &u32:Write, d: &u32:Write): void { *a = 1u32; *b = 2u32; *c = 3u32; *d = 4u32; }\nfunction fill2(a: &u32:Write, b: &u32:Write): void { *a = 1u32; *b = 2u32; }\nfunction noop(): void {}\nfunction pad(): void { ")?;
+    var pad: u32 = 0u32;
+    while pad < 99u32 { buf::buf_push_bytes(&text:ReadWrite, "noop(); ")?; pad = pad + 1u32; }
+    if over { buf::buf_push_bytes(&text:ReadWrite, "noop(); ")?; }
+    buf::buf_push_bytes(&text:ReadWrite, "}\n")?;
+    let suffixes: &[u8] = "abcdefgh";
+    var i: u32 = 0u32;
+    while i < @len(suffixes) as u32 {
+        buf::buf_push_bytes(&text:ReadWrite, "function f")?;
+        buf::buf_push_u8(&text:ReadWrite, suffixes[i])?;
+        buf::buf_push_bytes(&text:ReadWrite, "(): void { out a: u32; out b: u32; out c: u32; out d: u32; ")?;
+        buf::buf_push_bytes(&text:ReadWrite, "if true { fill4(out a, out b, out c, out d); } elseif true { fill4(out a, out b, out c, out d); } elseif true { fill4(out a, out b, out c, out d); } else { fill4(out a, out b, out c, out d); } }\n")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "function last(): void { ")?;
+    if bad { buf::buf_push_bytes(&text:ReadWrite, "out a: bool; ")?; }
+    else { buf::buf_push_bytes(&text:ReadWrite, "out a: u32; ")?; }
+    buf::buf_push_bytes(&text:ReadWrite, "out b: u32; out c: u32; out d: u32; out e: u32; out f: u32; fill4(out a, out b, out c, out d); fill2(out e, out f); }\n")?;
+    let src: &[u8] = &text.data[0..text.pos]:Read;
+    if !bad {
+        let lexed: lex::LexResult = lex::lex_scan(src, 118u16)?;
+        let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 118u16)?;
+        var diags: diag::DiagBuffer = diag::diagbuf_new();
+        let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+        let res: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+        var rows: u32 = 330u32;
+        if over { rows = rows + 1u32; }
+        assert(@len(res.refs.items) as u32 == rows);
+        assert(res.refs.items[rows - 135u32].node_kind == 1u8 && res.refs.items[rows - 134u32].node_kind == 3u8);
+        var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, 0u32, 1001u32, 0u32, 0u32);
+        let checked: typecheck::TypeCheckResult = check_body(&parsed:Read, &res:Read, &diags:ReadWrite, &shape:ReadWrite)?;
+        assert(!typecheck_shape::body_out_exceeded(&shape:Read) && diags.count == 0u32);
+        assert(@len(checked.expr_types.items) == @len(parsed.pool.exprs));
+        if over { assert(shape.out_remaining == 0u32); }
+        else { assert(shape.out_remaining == 1u32); }
+    }
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(src, 118u16)?;
+    if over {
+        assert(pipeline::analysis_out_ref_exceeded(doc.status));
+        assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    } elseif bad {
+        assert(pipeline::analysis_rejected(doc.status));
+        assert(doc.diagnostics.count == 1u32 && doc.diagnostics.diags[0].code.raw == 5001u16);
+    } else { assert(pipeline::analysis_checked(doc.status) && doc.diagnostics.count == 0u32); }
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(src, 118u16, &batch:ReadWrite)?;
+    assert(ok == !bad);
+    if bad { assert(batch.count == 1u32 && batch.diags[0].code.raw == 5001u16); }
+    else { assert(batch.count == 0u32); }
+    return;
+}
+
+// 混合实参间的 out 序号不连续；子块的同名槽位不能覆写函数槽位。
+function owner_slots(src: &[u8], expected: u16): void!AllocError {
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(src, 119u16)?;
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(src, 119u16, &batch:ReadWrite)?;
+    assert(ok == (expected == 0u16) && doc.diagnostics.count == batch.count);
+    if expected == 0u16 {
+        assert(pipeline::analysis_checked(doc.status) && batch.count == 0u32);
+    } else {
+        assert(pipeline::analysis_rejected(doc.status) && batch.count == 1u32);
+        let a: diag::Diag = doc.diagnostics.diags[0];
+        let b: diag::Diag = batch.diags[0];
+        assert(a.code.raw == expected && a.code.raw == b.code.raw && a.severity == b.severity && a.unit == b.unit);
+        assert(a.span.file == b.span.file && a.span.offset == b.span.offset && a.span.length == b.span.length);
+    }
+    return;
+}
+
+function owner_cases(): void!AllocError {
+    owner_slots("function fill(a: &u32:Write, flag: bool, b: &u32:Write): void!AllocError { if flag {} *a = 1u32; *b = 2u32; return; }\nfunction f(): void!AllocError { out x: u32; out y: u32; out z: u32; if true { out x: u32; fill(out x, true, out y)?; let v: u32 = @move(x); @drop(v); } let w: u32 = @move(y); @drop(w); fill(out x, false, out z)?; let v: u32 = @move(x); @drop(v); let w2: u32 = @move(z); @drop(w2); return; }\n", 0u16)?;
+    owner_slots("function fill(a: &u32:Write, flag: bool, b: &u32:Write): void { if flag {} *a = 1u32; *b = 2u32; }\nfunction f(): void { out x: u32; fill(out x, true, out x); }\n", 6102u16)?;
+    owner_slots("function fill(a: &u32:Write): void!AllocError { *a = 1u32; return; }\nfunction f(): void!AllocError { out x: u32; let result: void!AllocError = fill(out x); result?; return; }\n", 6105u16)?;
+    return;
+}
+
+function main(): void {
+    owner_cases()?;
+    small_steps()?;
+    boundary(false, false)?;
+    boundary(false, true)?;
+    boundary(true, false)?;
+    boundary(true, true)?;
+    return;
+}

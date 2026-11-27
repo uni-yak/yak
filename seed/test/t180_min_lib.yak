@@ -1,0 +1,28 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+import buf; import hash; import hashmap;
+foreign assert(cond: bool): void;
+function main(): void {
+    var bytes: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&bytes:ReadWrite, "hello")?;
+    assert(buf::buf_len(&bytes) == 5);
+    assert(buf::buf_pos(&bytes) == 5);
+    buf::buf_rewind(&bytes:ReadWrite);
+    assert(buf::buf_read_u8(&bytes:ReadWrite) == 104);
+    assert(buf::buf_pos(&bytes) == 1);
+    let input: buf::ByteBuf = buf::buf_from("AB")?;
+    assert(buf::buf_pos(&input) == 0);
+    assert(buf::buf_get(&bytes, 1) == 101);
+    assert(hash::fnv1a("hello") == 11831194018420276491);
+    var map: hashmap::HashMap = hashmap::hashmap_new();
+    hashmap::hashmap_insert(&map:ReadWrite, hash::fnv1a("hello"), 0, 5, 7)?;
+    assert(hashmap::hashmap_lookup(&map, &bytes, hash::fnv1a("hello"), "hello") == 7);
+    // 相同哈希的前缀名称必须继续探测，不能误命中较长名称。
+    var collision: hashmap::HashMap = hashmap::hashmap_new();
+    hashmap::hashmap_insert(&collision:ReadWrite, 42, 0, 5, 1)?;
+    hashmap::hashmap_insert(&collision:ReadWrite, 42, 0, 2, 2)?;
+    assert(hashmap::hashmap_lookup(&collision, &bytes, 42, "he") == 2);
+    assert(hashmap::hashmap_lookup(&collision, &bytes, 42, "hel") == 0);
+    assert(hashmap::hashmap_lookup(&collision, &bytes, 42, "hello") == 1);
+}

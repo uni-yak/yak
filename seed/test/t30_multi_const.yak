@@ -1,0 +1,13 @@
+// t30: 多 const 声明 + 算术表达式 + assert
+foreign assert(cond: bool): void;
+
+const A: u32 = 100;
+const B: u32 = 200;
+const C: u32 = A + B;
+
+function main(): void {
+    let x: u32 = C * 2;
+    assert(C == 300);
+    assert(x == 600);
+    return;
+}

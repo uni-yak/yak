@@ -1,0 +1,168 @@
+// 对象容器夹具：机器码手工给定，验证的不是指令选择或后端降级。
+import elf;
+import buf;
+import host;
+foreign assert(cond: bool): void;
+
+function copy_bytes(bytes: &[u8]): u8[]!AllocError {
+    var output: u8[] = [];
+    var i: u64 = 0;
+    while i < @len(bytes) { @push(output, bytes[i])?; i = i + 1; }
+    return @move(output);
+}
+
+function symbol(link: u32, name: &[u8], section: u16, kind: u8, visible: bool, size: u64): elf::Symbol!AllocError {
+    let bytes: u8[] = copy_bytes(name)?;
+    return elf::Symbol { link: link, name: @move(bytes), section: section, kind: kind, public: visible, value: 0, size: size };
+}
+
+function sample(): elf::ObjectInput!AllocError {
+    // 调用外部函数，再取本对象只读数据的首字节相加。
+    let code: [u8; 26] = [72, 131, 236, 8, 232, 0, 0, 0, 0, 72, 131, 196, 8, 72, 141, 13, 0, 0, 0, 0, 15, 182, 9, 1, 200, 195];
+    let readonly: [u8; 16] = [7, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let writable: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let text: u8[] = copy_bytes(&code[0..26]:Read)?;
+    let rodata: u8[] = copy_bytes(&readonly[0..16]:Read)?;
+    let data: u8[] = copy_bytes(&writable[0..12]:Read)?;
+    var input: elf::ObjectInput = elf::ObjectInput { sections: [], symbols: [], relocations: [], small_mode: true };
+    @push(input.sections, elf::Section { index: 1, flags: 6, bytes: @move(text) })?;
+    @push(input.sections, elf::Section { index: 2, flags: 2, bytes: @move(rodata) })?;
+    @push(input.sections, elf::Section { index: 3, flags: 3, bytes: @move(data) })?;
+    let start: elf::Symbol = symbol(7, "text_here", 1, 0, false, 0)?;
+    let payload: elf::Symbol = symbol(11, "payload", 2, 0, false, 3)?;
+    let entry: elf::Symbol = symbol(17, "yak$entry", 1, 2, true, 26)?;
+    let external: elf::Symbol = symbol(29, "elf_probe_external", 0, 2, true, 0)?;
+    let abs: elf::Symbol = symbol(35, "elf_probe_abs", 3, 0, true, 8)?;
+    let compact: elf::Symbol = symbol(40, "elf_probe_small", 3, 0, true, 4)?;
+    @push(input.symbols, @move(start))?;
+    @push(input.symbols, @move(payload))?;
+    @push(input.symbols, @move(entry))?;
+    @push(input.symbols, @move(external))?;
+    @push(input.symbols, @move(abs))?;
+    @push(input.symbols, @move(compact))?;
+    input.symbols[5].value = 8;
+    @push(input.relocations, elf::Relocation { section: 1, offset: 5, target: 29, kind: 4, width: 4, addend: 0i64 - 4i64 })?;
+    @push(input.relocations, elf::Relocation { section: 1, offset: 16, target: 11, kind: 2, width: 4, addend: 0i64 - 4i64 })?;
+    @push(input.relocations, elf::Relocation { section: 2, offset: 8, target: 17, kind: 1, width: 8, addend: 0 })?;
+    @push(input.relocations, elf::Relocation { section: 3, offset: 0, target: 11, kind: 1, width: 8, addend: 2 })?;
+    @push(input.relocations, elf::Relocation { section: 3, offset: 8, target: 29, kind: 10, width: 4, addend: 0 })?;
+    return @move(input);
+}
+
+function refused(input: &elf::ObjectInput:Read, code: u16): void!AllocError {
+    let result: elf::ObjectResult = elf::emit_object(input)?;
+    let bytes: &buf::ByteBuf:Read = &result.bytes:Read;
+    assert(result.code == code && @len(bytes.data) == 0u64 && bytes.pos == 0u32);
+    return;
+}
+
+function negative_cases(): void!AllocError {
+    var input: elf::ObjectInput = sample()?;
+    input.sections[2].index = 4;
+    let section: elf::ObjectResult = elf::emit_object(&input:Read)?;
+    // rejection_spec: E8019 spec/target/elf.md#EL-2
+    assert(section.code == 8019 && @len(section.bytes.data) == 0 && section.bytes.pos == 0);
+    input.sections[2].index = 3;
+    input.sections[0].flags = 7;
+    refused(&input:Read, 8019)?;
+    input.sections[0].flags = 6;
+    input.symbols[1].link = 6;
+    let order: elf::ObjectResult = elf::emit_object(&input:Read)?;
+    // rejection_spec: E8021 spec/target/elf.md#EL-4
+    assert(order.code == 8021 && @len(order.bytes.data) == 0 && order.bytes.pos == 0);
+    input.symbols[1].link = 7;
+    refused(&input:Read, 8003)?;
+    input.symbols[1].link = 11;
+    input.symbols[0].public = true;
+    refused(&input:Read, 8021)?;
+    input.symbols[0].public = false;
+    input.symbols[3].public = false;
+    refused(&input:Read, 8002)?;
+    input.symbols[3].public = true;
+    input.relocations[0].width = 8;
+    let relocation: elf::ObjectResult = elf::emit_object(&input:Read)?;
+    // rejection_spec: E8020 spec/target/elf.md#EL-3
+    assert(relocation.code == 8020 && @len(relocation.bytes.data) == 0 && relocation.bytes.pos == 0);
+    input.relocations[0].width = 4;
+    input.relocations[0].kind = 99;
+    refused(&input:Read, 8020)?;
+    input.relocations[0].kind = 4;
+    input.relocations[1].offset = 25;
+    refused(&input:Read, 8020)?;
+    input.relocations[1].offset = 8;
+    refused(&input:Read, 8020)?;
+    input.relocations[1].offset = 16;
+    input.relocations[1].target = 13;
+    refused(&input:Read, 8002)?;
+    input.relocations[1].target = 7;
+    input.relocations[1].addend = 0i64 - 2147483648i64;
+    refused(&input:Read, 8020)?;
+    input.relocations[1].addend = 0;
+    input.relocations[1].target = 11;
+    input.small_mode = false;
+    refused(&input:Read, 8020)?;
+    return;
+}
+
+function check_header(): void!AllocError {
+    let input: elf::ObjectInput = sample()?;
+    var result: elf::ObjectResult = elf::emit_object(&input:Read)?;
+    assert(result.code == 0);
+    let size: u64 = @len(result.bytes.data);
+    assert(elf::validate_header(&result.bytes.data[0..size]:Read) == 0);
+    assert(elf::validate_header(&result.bytes.data[0..63]:Read) == 8018);
+    result.bytes.data[4] = 1;
+    assert(elf::validate_header(&result.bytes.data[0..size]:Read) == 8018);
+    result.bytes.data[4] = 2;
+    result.bytes.data[19] = 1;
+    assert(elf::validate_header(&result.bytes.data[0..size]:Read) == 8018);
+    result.bytes.data[19] = 0;
+    result.bytes.data[31] = 1;
+    let status: u16 = elf::validate_header(&result.bytes.data[0..size]:Read);
+    // rejection_spec: E8018 spec/target/elf.md#EL-1
+    assert(status == 8018);
+    return;
+}
+
+// 局部目标位于节内 0，重定位位于 16；最终位移是加数减 16。
+function check_pc32_boundary(): void!AllocError {
+    var input: elf::ObjectInput = sample()?;
+    input.relocations[1].target = 7;
+    input.relocations[1].addend = (0i64 - 2147483648i64) + 16i64;
+    accepted(&input:Read)?;
+    input.relocations[1].addend = (0i64 - 2147483648i64) + 15i64;
+    refused(&input:Read, 8020)?;
+    input.relocations[1].addend = 2147483647i64 + 16i64;
+    accepted(&input:Read)?;
+    input.relocations[1].addend = 2147483647i64 + 17i64;
+    refused(&input:Read, 8020)?;
+    return;
+}
+
+function accepted(input: &elf::ObjectInput:Read): void!AllocError {
+    let result: elf::ObjectResult = elf::emit_object(input)?;
+    let bytes: &buf::ByteBuf:Read = &result.bytes:Read;
+    assert(result.code == 0 && @len(bytes.data) != 0u64);
+    return;
+}
+
+function exercise(completed: &bool:ReadWrite): void!AllocError {
+    negative_cases()?;
+    check_pc32_boundary()?;
+    check_header()?;
+    let input: elf::ObjectInput = sample()?;
+    let result: elf::ObjectResult = elf::emit_object(&input:Read)?;
+    let bytes: &buf::ByteBuf:Read = &result.bytes:Read;
+    assert(result.code == 0 && @len(bytes.data) != 0u64);
+    host::output_bytes("obj", &bytes.data[0..@len(bytes.data)]:Read);
+    *completed = true;
+    return;
+}
+
+function main(): void {
+    var completed: bool = false;
+    let result: void!AllocError = exercise(&completed:ReadWrite);
+    @drop(result);
+    assert(completed);
+    return;
+}

@@ -1,0 +1,175 @@
+// 仅用于 LSP 位置；源码是否满足 Yak 词法仍由编译器判定。
+// 支持位置编码协商：0 为 UTF-16（默认），1 为 UTF-8，2 为 UTF-32。
+import utf8;
+
+const TEXT_LIMIT: u64 = 4194304;
+const LINE_LIMIT: u64 = 65536;
+const CHECKPOINT_STRIDE: u32 = 256;
+
+const ENC_UTF16: u8 = 0;
+const ENC_UTF8: u8 = 1;
+const ENC_UTF32: u8 = 2;
+
+export function enc_utf16(): u8 { return ENC_UTF16; }
+export function enc_utf8(): u8 { return ENC_UTF8; }
+export function enc_utf32(): u8 { return ENC_UTF32; }
+
+export struct Position { line: u32, character: u32 }
+export struct PositionResult { valid: bool, position: Position }
+export struct OffsetResult { valid: bool, offset: u32 }
+export struct Range { start: Position, end: Position }
+export struct RangeResult { valid: bool, range: Range }
+
+// 导出索引的名义字段类型供模块接口编码，调用方只使用查询函数。
+export struct Line { start: u32, end: u32, units: u32, first: u32, limit: u32 }
+export struct Checkpoint { offset: u32, units: u32 }
+// 状态：0 为可用，1 为非法 UTF-8，2 为文本或行数超限。
+export struct Index { status: u8, encoding: u8, bytes: u32, lines: Line[], marks: Checkpoint[] }
+
+function failed(status: u8, encoding: u8): Index {
+    return Index { status: status, encoding: encoding, bytes: 0, lines: [], marks: [] };
+}
+
+function units_for(value: u32, width: u32, encoding: u8): u32 {
+    if encoding == ENC_UTF8 { return width; }
+    if encoding == ENC_UTF32 { return 1u32; }
+    if value >= 65536u32 { return 2u32; }
+    return 1u32;
+}
+
+// 调用方把索引与同版文本一起保存，不以相同长度代替版本一致性。
+export function build(src: &[u8]): Index!AllocError {
+    return build_encoded(src, ENC_UTF16)?;
+}
+
+export function build_encoded(src: &[u8], encoding: u8): Index!AllocError {
+    let enc: u8 = encoding;
+    if enc > ENC_UTF32 { return failed(2u8, ENC_UTF16); }
+    let size: u64 = @len(src);
+    if size > TEXT_LIMIT { return failed(2u8, enc); }
+    let bytes: u32 = size as u32;
+    var index: Index = Index { status: 0, encoding: enc, bytes: bytes, lines: [], marks: [] };
+    var at: u32 = 0;
+    var start: u32 = 0;
+    var units: u32 = 0;
+    var mark: u32 = 0;
+    var first: u32 = 0;
+    while at < bytes {
+        let byte: u8 = src[at];
+        if byte == 10u8 || byte == 13u8 {
+            // 分隔符之后还至少有一行，先检查再追加。
+            if @len(index.lines) >= LINE_LIMIT - 1u64 { return failed(2u8, enc); }
+            let limit: u32 = @len(index.marks) as u32;
+            @push(index.lines, Line { start: start, end: at, units: units, first: first, limit: limit })?;
+            at = at + 1u32;
+            if byte == 13u8 && at < bytes && src[at] == 10u8 { at = at + 1u32; }
+            start = at;
+            mark = at;
+            first = limit;
+            units = 0;
+        } else {
+            let scalar: utf8::Scalar = utf8::decode(src, at);
+            if scalar.width == 0u32 { return failed(1u8, enc); }
+            if at - mark >= CHECKPOINT_STRIDE {
+                @push(index.marks, Checkpoint { offset: at, units: units })?;
+                mark = at;
+            }
+            units = units + units_for(scalar.value, scalar.width, enc);
+            at = at + scalar.width;
+        }
+    }
+    let limit: u32 = @len(index.marks) as u32;
+    @push(index.lines, Line { start: start, end: bytes, units: units, first: first, limit: limit })?;
+    return @move(index);
+}
+
+function matching(index: &Index:Read, src: &[u8]): bool {
+    return index.status == 0u8 && @len(src) == (index.bytes as u64) && @len(index.lines) > 0u64;
+}
+
+function no_position(): PositionResult {
+    return PositionResult { valid: false, position: Position { line: 0, character: 0 } };
+}
+
+function no_offset(): OffsetResult { return OffsetResult { valid: false, offset: 0 }; }
+
+function find_line(index: &Index:Read, offset: u32): u32 {
+    var low: u32 = 0;
+    var high: u32 = @len(index.lines) as u32;
+    while high - low > 1u32 {
+        let mid: u32 = low + (high - low) / 2u32;
+        if index.lines[mid].start <= offset { low = mid; }
+        else { high = mid; }
+    }
+    return low;
+}
+
+// 找行内不超过目标的最后一个检查点；行首作为隐含的检查点。
+function checkpoint(index: &Index:Read, line: Line, target: u32, by_units: bool): Checkpoint {
+    var low: u32 = line.first;
+    var high: u32 = line.limit;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2u32;
+        let item: Checkpoint = index.marks[mid];
+        var value: u32 = item.offset;
+        if by_units { value = item.units; }
+        if value <= target { low = mid + 1u32; }
+        else { high = mid; }
+    }
+    if low == line.first { return Checkpoint { offset: line.start, units: 0 }; }
+    return index.marks[low - 1u32];
+}
+
+export function to_position(index: &Index:Read, src: &[u8], offset: u32): PositionResult {
+    if !matching(index, src) || offset > index.bytes { return no_position(); }
+    let row: u32 = find_line(index, offset);
+    let line: Line = index.lines[row];
+    if offset > line.end { return no_position(); }
+    if offset == line.end {
+        return PositionResult { valid: true, position: Position { line: row, character: line.units } };
+    }
+    let mark: Checkpoint = checkpoint(index, line, offset, false);
+    var at: u32 = mark.offset;
+    var units: u32 = mark.units;
+    while at < offset {
+        let scalar: utf8::Scalar = utf8::decode(src, at);
+        if scalar.width == 0u32 || scalar.width > offset - at { return no_position(); }
+        units = units + units_for(scalar.value, scalar.width, index.encoding);
+        at = at + scalar.width;
+    }
+    return PositionResult { valid: true, position: Position { line: row, character: units } };
+}
+
+export function to_offset(index: &Index:Read, src: &[u8], row: u32, character: u32): OffsetResult {
+    if !matching(index, src) || (row as u64) >= @len(index.lines) { return no_offset(); }
+    let line: Line = index.lines[row];
+    if character >= line.units { return OffsetResult { valid: true, offset: line.end }; }
+    let mark: Checkpoint = checkpoint(index, line, character, true);
+    var at: u32 = mark.offset;
+    var units: u32 = mark.units;
+    while units < character {
+        let scalar: utf8::Scalar = utf8::decode(src, at);
+        if scalar.width == 0u32 || scalar.width > line.end - at { return no_offset(); }
+        let step: u32 = units_for(scalar.value, scalar.width, index.encoding);
+        if step > character - units { return no_offset(); }
+        units = units + step;
+        at = at + scalar.width;
+    }
+    return OffsetResult { valid: true, offset: at };
+}
+
+function no_range(): RangeResult {
+    let zero: Position = Position { line: 0, character: 0 };
+    return RangeResult { valid: false, range: Range { start: zero, end: zero } };
+}
+
+// 零文件编号不作来源证据，真实文件的零宽范围则保留。
+export function span_range(index: &Index:Read, src: &[u8], file: u16, expected_file: u16, offset: u32, length: u32): RangeResult {
+    if file == 0u16 || file != expected_file { return no_range(); }
+    if offset > index.bytes || length > index.bytes - offset { return no_range(); }
+    let start: PositionResult = to_position(index, src, offset);
+    if !start.valid { return no_range(); }
+    let end: PositionResult = to_position(index, src, offset + length);
+    if !end.valid { return no_range(); }
+    return RangeResult { valid: true, range: Range { start: start.position, end: end.position } };
+}

@@ -1,0 +1,5 @@
+// input: src=fixtures/input.txt
+// output: dst
+// expected_file: dst=BC
+foreign file_size(name: &[u8]): u64; foreign file_read(name: &[u8], offset: u64, buffer: &[u8]:ReadWrite): u32; foreign file_write(name: &[u8], data: &[u8]): void; foreign assert(cond: bool): void;
+function main(): void { assert(file_size("src") == 3); var b: u8[] = [0, 0]; assert(file_read("src", 1, &b[0..2]:ReadWrite) == 2); file_write("dst", &b[0..2]); }

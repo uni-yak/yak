@@ -1,0 +1,6 @@
+// t53: 未定义函数调用（应 trap）
+// expected_trap: function not found
+function main(): void {
+    let r: u32 = undefined_func(42);
+    return;
+}

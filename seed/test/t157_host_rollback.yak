@@ -1,0 +1,4 @@
+// expected_trap: unregistered file name
+// output: dst
+foreign file_write(name: &[u8], data: &[u8]): void;
+function main(): void { file_write("dst", "first"); file_write("missing", "second"); }

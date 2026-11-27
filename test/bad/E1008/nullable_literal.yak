@@ -1,0 +1,7 @@
+// expected_code: E1008
+// spec: spec/lang/lex.md L-8
+// 触发：base 期书写可空类型与 null 字面量。
+function main(): void {
+    let x: u32? = null;
+    return;
+}

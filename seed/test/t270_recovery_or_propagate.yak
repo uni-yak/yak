@@ -1,0 +1,27 @@
+foreign assert(cond: bool): void;
+enum FirstError { Bad, }
+enum LaterError { Bad, }
+
+function first(ok: bool): u32!FirstError {
+    if !ok { return FirstError::Bad; }
+    return 7u32;
+}
+function later(ok: bool): u32!LaterError {
+    if !ok { return LaterError::Bad; }
+    return 11u32;
+}
+function forbidden(): u32 { assert(false); return 0u32; }
+
+function run(first_ok: bool, later_ok: bool): u32!(FirstError | LaterError) {
+    return first(first_ok).or(later(later_ok)?);
+}
+function skip(): u32!FirstError { return first(true).or(forbidden()); }
+function recover_first(e: &FirstError): u32 { return 91u32; }
+function recover_later(e: &LaterError): u32 { return 92u32; }
+
+function main(): void {
+    assert(run(true, false).catch(FirstError => &recover_first, LaterError => &recover_later) == 7u32);
+    assert(run(false, true).catch(FirstError => &recover_first, LaterError => &recover_later) == 11u32);
+    assert(run(false, false).catch(FirstError => &recover_first, LaterError => &recover_later) == 92u32);
+    assert(skip().catch(&recover_first) == 7u32);
+}

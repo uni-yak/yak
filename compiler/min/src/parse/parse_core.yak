@@ -1,0 +1,240 @@
+// 共享解析器游标、token 前瞻、Span、诊断与恢复辅助。
+import buf;
+import lex;
+import types;
+
+// 解析诊断使用 spec/proc/error.def 的码位：
+//   2001 P-1  产生式不匹配             2006 P-6  赋值目标不是可写位置
+//   2007 P-7  out 初始化器             2008 P-8  缺少初始化器
+//   2009 P-9  非法位置的视图
+//   2014 P-14 重复 / 通配臂            2015 P-15 callable 位之外的 HashName
+//   5006 C-1  非法 const 初始器 / 类型 5007 C-2  非法定长数组常量
+//   5811 RE-8 非法位置的 fallible      5812 RE-9 裸 carrier 后缀组合
+//   6101 R-13 非槽位通道声明 Write      6104 R-25 out 槽位类型非法
+//   9201 F-2  foreign 类型非法
+//   9204 F-5  export foreign           3008 R-24 仅 full 层的形态（含类型位 T?）
+
+export struct ParseDiagnostic { code: types::ErrorCode, span: types::Span }
+// cap_* 保存本文件中出现的能力名 Read / Write / ReadWrite 的 NameId。
+// 未出现时为 0；is_capability 据此拒绝任何能力后缀。
+export struct Parser { tokens: lex::Token[], pos: u32, file: u16, diagnostics: ParseDiagnostic[], cap_read: u32, cap_write: u32, cap_readwrite: u32, float_f32: u32, float_f64: u32, len_name: u32, cap_name: u32, carrier_methods: [u32; 4], union_on_name: u32, tag_name: u32, payload_name: u32, string_name: u32, diagnostic_limit: u32, diagnostics_truncated: bool, depth_limit: u32, depth: u32, depth_exceeded: bool, match_path_remaining: u32, match_path_limited: bool, match_path_exceeded: bool, recovery_remaining: u32, recovery_limited: bool, recovery_exceeded: bool, syntax_profile: u8 }
+
+export function option_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 4u8) != 0u8; }
+export function union_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 8u8) != 0u8; }
+export function text_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 16u8) != 0u8; }
+
+// 超限后停止读取 token；上层只展开调用，不再生成恢复诊断。
+export function enter_depth(p: &Parser:ReadWrite): bool {
+    if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return false; }
+    if p.depth >= p.depth_limit {
+        p.depth_exceeded = true;
+        p.pos = @len(p.tokens) as u32;
+        return false;
+    }
+    p.depth = p.depth + 1u32;
+    return true;
+}
+export function leave_depth(p: &Parser:ReadWrite): void {
+    p.depth = p.depth - 1u32;
+    return;
+}
+
+// 模式判重逐步扣费；首个未获配额的比较不读取候选行或路径分段。
+export function charge_match_path(p: &Parser:ReadWrite): bool {
+    if p.match_path_remaining == 0u32 {
+        p.match_path_exceeded = true;
+        p.pos = @len(p.tokens) as u32;
+        return false;
+    }
+    p.match_path_remaining = p.match_path_remaining - 1u32;
+    return true;
+}
+
+export function span_at(p: &Parser:Read, index: u32): types::Span {
+    if index >= @len(p.tokens) as u32 { return types::Span { file: p.file, offset: 0, length: 0 }; }
+    return p.tokens[index].span;
+}
+// 聚合节点可跨过多个 token；长度以 u32 精确记录，不再在 65535 字节截断。
+export function span_through(p: &Parser:Read, start: u32, last_index: u32): types::Span {
+    let first: types::Span = span_at(p, start);
+    if last_index < start || last_index >= @len(p.tokens) as u32 { return first; }
+    let last: types::Span = span_at(p, last_index);
+    if last.offset < first.offset { return first; }
+    var length: u64 = (last.offset - first.offset) as u64 + last.length as u64;
+    if length > 4294967295u64 { length = 4294967295u64; }
+    return types::Span { file: p.file, offset: first.offset, length: length as u32 };
+}
+// 从 start 到 end - 1 的 Span（end 为当前游标）。
+export function span_range(p: &Parser:Read, start: u32, end: u32): types::Span {
+    if end <= start { return span_at(p, start); }
+    return span_through(p, start, end - 1);
+}
+export function fail_code(p: &Parser:ReadWrite, index: u32, code: types::ErrorCode): void!AllocError {
+    let span: types::Span = span_at(p, index);
+    fail_span(p, span, code)?;
+    return;
+}
+export function fail_span(p: &Parser:ReadWrite, span: types::Span, code: types::ErrorCode): void!AllocError {
+    if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return; }
+    if p.diagnostic_limit != 0u32 && @len(p.diagnostics) >= (p.diagnostic_limit as u64) {
+        p.diagnostics_truncated = true;
+        return;
+    }
+    @push(p.diagnostics, ParseDiagnostic { code: code, span: span })?;
+    return;
+}
+export function fail(p: &Parser:ReadWrite, index: u32): void!AllocError {
+    if is_op_at(p, index, 10) || is_op_at(p, index, 34) { fail_code(p, index, types::error_code(1010))?; }
+    else { fail_code(p, index, types::error_code(2001))?; }
+    return;
+}
+export function is_kind(p: &Parser:Read, kind: u8): bool {
+    if p.pos >= @len(p.tokens) as u32 { return false; }
+    return p.tokens[p.pos].kind == kind;
+}
+export function is_builtin(p: &Parser:Read, id: u16): bool {
+    if !is_kind(p, 8) { return false; }
+    return p.tokens[p.pos].payload == id as u64;
+}
+export function is_keyword(p: &Parser:Read, id: u8): bool {
+    if !is_kind(p, 6) { return false; }
+    return p.tokens[p.pos].payload == id as u64;
+}
+export function is_op(p: &Parser:Read, id: u8): bool {
+    if !is_kind(p, 7) { return false; }
+    return p.tokens[p.pos].payload == id as u64;
+}
+export function is_kind_at(p: &Parser:Read, index: u32, kind: u8): bool {
+    if index >= @len(p.tokens) as u32 { return false; }
+    return p.tokens[index].kind == kind;
+}
+export function is_op_at(p: &Parser:Read, index: u32, id: u8): bool {
+    if !is_kind_at(p, index, 7) { return false; }
+    return p.tokens[index].payload == id as u64;
+}
+export function is_keyword_at(p: &Parser:Read, index: u32, id: u8): bool {
+    if !is_kind_at(p, index, 6) { return false; }
+    return p.tokens[index].payload == id as u64;
+}
+export function advance(p: &Parser:ReadWrite): void {
+    if p.pos < @len(p.tokens) as u32 { p.pos = p.pos + 1; }
+    return;
+}
+export function name_equals(names: &lex::NameTable:Read, id: u32, text: &[u8]): bool {
+    if id == 0 || id > @len(names.entries) as u32 { return false; }
+    let entry: lex::NameEntry = names.entries[id - 1];
+    if entry.text_len as u32 != @len(text) as u32 { return false; }
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    var i: u32 = 0;
+    while i < @len(text) as u32 {
+        if arena.data[entry.text_off + i] != text[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+// 已 intern 名字的 NameId（1 基）；本文件未出现时返回 0。
+export function find_name(names: &lex::NameTable:Read, text: &[u8]): u32 {
+    return lex::lookup_name(names, text);
+}
+export function is_capability(p: &Parser:Read, id: u32): bool {
+    if id == 0 { return false; }
+    return id == p.cap_read || id == p.cap_write || id == p.cap_readwrite;
+}
+// 能力后缀统一规范为 TypeSig.cap：0=Read、1=ReadWrite、2=Write；无后缀为 0。
+export function capability_code(p: &Parser:Read, id: u32): u32 {
+    if id == p.cap_read { return 0; }
+    if id == p.cap_readwrite { return 1; }
+    if id == p.cap_write { return 2; }
+    return 4294967295u32;
+}
+export function take_callable_name(p: &Parser:ReadWrite): u32!AllocError {
+    if !is_kind(p, 0) && !is_kind(p, 1) { fail(p, p.pos)?; return 0; }
+    let value: u32 = p.tokens[p.pos].payload as u32;
+    advance(p);
+    return value;
+}
+export function take_ident(p: &Parser:ReadWrite): u32!AllocError {
+    if is_kind(p, 1) {
+        fail_code(p, p.pos, types::error_code(2015))?;
+        let value: u32 = p.tokens[p.pos].payload as u32;
+        advance(p);
+        return value;
+    }
+    if !is_kind(p, 0) { fail(p, p.pos)?; return 0; }
+    let value: u32 = p.tokens[p.pos].payload as u32;
+    advance(p);
+    return value;
+}
+export function expect_op(p: &Parser:ReadWrite, id: u8): void!AllocError {
+    if !is_op(p, id) { fail(p, p.pos)?; return; }
+    advance(p);
+    return;
+}
+export function is_item_start(p: &Parser:Read): bool {
+    if !is_kind(p, 6) { return false; }
+    let keyword: u8 = p.tokens[p.pos].payload as u8;
+    return keyword == 0 || keyword == 3 || keyword == 12 || keyword == 13 || keyword == 16 || keyword == 17 || keyword == 18;
+}
+export function is_stmt_start(p: &Parser:Read): bool {
+    if is_builtin(p, 20484) { return true; }
+    if !is_kind(p, 6) { return false; }
+    let keyword: u8 = p.tokens[p.pos].payload as u8;
+    return keyword == 1 || keyword == 2 || keyword == 3 || keyword == 4 || keyword == 7 || keyword == 8 || keyword == 9 || keyword == 10 || keyword == 11 || keyword == 19;
+}
+// 每次实际跳过非 EOF token 前扣一步；停止时只移动游标，不消费该 token。
+export function recover_advance(p: &Parser:ReadWrite): void {
+    if p.pos >= @len(p.tokens) as u32 { return; }
+    if p.recovery_limited && !is_kind(p, 9) {
+        if p.recovery_remaining == 0u32 {
+            p.recovery_exceeded = true;
+            p.pos = @len(p.tokens) as u32;
+            return;
+        }
+        p.recovery_remaining = p.recovery_remaining - 1u32;
+    }
+    advance(p);
+    return;
+}
+export function recover_to_item(p: &Parser:ReadWrite): void {
+    recover_advance(p);
+    while p.pos < @len(p.tokens) as u32 {
+        if is_kind(p, 9) { return; }
+        if is_item_start(p) { return; }
+        recover_advance(p);
+    }
+    return;
+}
+function diagnostic_less(a: ParseDiagnostic, b: ParseDiagnostic): bool {
+    if a.span.offset != b.span.offset { return a.span.offset < b.span.offset; }
+    if a.span.length != b.span.length { return a.span.length < b.span.length; }
+    return a.code.raw < b.code.raw;
+}
+export function normalize_diagnostics(p: &Parser:ReadWrite): void!AllocError {
+    var i: u32 = 1;
+    while i < @len(p.diagnostics) as u32 {
+        let key: ParseDiagnostic = p.diagnostics[i];
+        var j: u32 = i;
+        while j > 0 && diagnostic_less(key, p.diagnostics[j - 1]) {
+            p.diagnostics[j] = p.diagnostics[j - 1];
+            j = j - 1;
+        }
+        p.diagnostics[j] = key;
+        i = i + 1;
+    }
+    var kept: ParseDiagnostic[] = [];
+    i = 0;
+    while i < @len(p.diagnostics) as u32 {
+        let current: ParseDiagnostic = p.diagnostics[i];
+        var duplicate: bool = false;
+        if @len(kept) > 0 {
+            let previous: ParseDiagnostic = kept[@len(kept) as u32 - 1];
+            let prior_code: types::ErrorCode = previous.code;
+            let next_code: types::ErrorCode = current.code;
+            duplicate = prior_code.raw == next_code.raw && previous.span.file == current.span.file && previous.span.offset == current.span.offset && previous.span.length == current.span.length;
+        }
+        if !duplicate { @push(kept, current)?; }
+        i = i + 1;
+    }
+    p.diagnostics = kept;
+    return;
+}

@@ -1,0 +1,22 @@
+// t48: 递归结果assert（真实assert）
+foreign assert(cond: bool): void;
+
+function fact(n: u32): u32 {
+    if n <= 1 {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+function fib(n: u32): u32 {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+function main(): void {
+    assert(fact(5) == 120);
+    assert(fib(10) == 55);
+    return;
+}

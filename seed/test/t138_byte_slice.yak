@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { let s: &[u8] = "ABC"; assert(s[1] == 66); }

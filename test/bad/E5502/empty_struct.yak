@@ -1,0 +1,6 @@
+// expected_code: E5502
+// spec: spec/lang/layout.md#LY-2
+// 触发：构造零大小的可存储结构体类型。
+struct Empty {}
+
+function main(): void { return; }

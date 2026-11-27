@@ -1,0 +1,12 @@
+// t109: .unwrap() Ok → T（S-9.4）
+foreign assert(cond: bool): void;
+enum E { Bad, }
+function maybe(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function main(): void {
+    let a: u32 = maybe(7).unwrap();
+    assert(a == 7);
+    return;
+}

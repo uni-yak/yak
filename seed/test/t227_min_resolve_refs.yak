@@ -1,0 +1,307 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import resolve;
+import resolve_scope;
+foreign assert(cond: bool): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    return Loaded { parsed: parsed, lexed: r };
+}
+function error_case(src: &[u8], expected: u16): void!AllocError {
+    let item: Loaded = load(src, 320)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var errors: diag::DiagBuffer = diag::diagbuf_new();
+    let result: resolve_refs::Resolution = resolve_unit::resolve_unit(&item.parsed.file:Read, &item.parsed.pool:Read, &item.lexed.names:Read, &deps:Read, "", &errors:ReadWrite)?;
+    if expected == 0 { assert(diag::diagbuf_count(&errors:Read) == 0); }
+    else { assert(diag::diagbuf_count(&errors:Read) == 1); assert(errors.diags[0].code.raw == expected); }
+    return;
+}
+function cached_builtin_variant(): void!AllocError {
+    var item: Loaded = load("function f(): AllocError { return AllocError::OutOfMemory; }\n", 321)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    assert(@len(item.lexed.names.variant_names) == 1 && item.lexed.names.variant_names[0] != 0);
+    let name: u32 = item.lexed.names.variant_names[0];
+    let offset: u32 = item.lexed.names.entries[name - 1].text_off;
+    // 改坏驻留后的原始拼写，保留词法绑定。解析仍须只使用标签编号。
+    item.lexed.names.arena.data[offset] = 88;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let accepted: resolve_refs::Resolution = resolve_unit::resolve_unit(&item.parsed.file:Read, &item.parsed.pool:Read, &item.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0 && @len(accepted.refs.items) == 2);
+    assert(accepted.refs.items[0].kind == 5 && accepted.refs.items[0].x == 4108 && accepted.refs.items[0].y == 0);
+    item.lexed.names.arena.data[offset] = 79;
+    item.lexed.names.entries[name - 1].variant_name = 4294967295u32;
+    let rejected: resolve_refs::Resolution = resolve_unit::resolve_unit(&item.parsed.file:Read, &item.parsed.pool:Read, &item.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    // rejection_spec: E7019 spec/lang/symbol.md#S-19
+    assert(diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == 7019 && @len(rejected.refs.items) == 1 && rejected.refs.items[0].kind == 1);
+    return;
+}
+function cached_import_bridge(): void!AllocError {
+    var dep: resolve_refs::Iface = resolve_refs::iface_new("dep")?;
+    let exported: u32 = resolve_refs::iface_add_export(&dep:ReadWrite, "run", 1)?;
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    @push(deps.ifaces, dep)?;
+    let item: Loaded = load("import dep; function use(): void { dep::run(); dep::run(); }\n", 322)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var first: resolve_refs::Resolution = resolve_unit::resolve_unit(&item.parsed.file:Read, &item.parsed.pool:Read, &item.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(first.bridges.items) == 1);
+    let cached: resolve_refs::BridgeRecord = first.bridges.items[0];
+    let imports: resolve_refs::ImportMap = resolve_refs::ImportMap { defs: [cached.import_def], data: [0u32] };
+    var bridges: resolve_refs::BridgeTable = resolve_refs::BridgeTable { items: [cached], variants: [] };
+    var base: resolve::ResolveResult = resolve::reserve_module(&item.parsed.file:Read, &item.parsed.pool:Read, &diags:ReadWrite)?;
+    base.tables.defs[cached.import_def - 1].import_dependency = cached.dependency;
+    var work: resolve::LookupBudget = resolve::lookup_budget(0, 0);
+    // 保留接口记录，移去首轮桥接所用的名称字节，复验只读取编号。
+    deps.ifaces[0].names = [];
+    first.refs.items = [];
+    resolve_scope::resolve_items(&base.tables:ReadWrite, &work:ReadWrite, &first.refs:ReadWrite, &bridges:ReadWrite, &diags:ReadWrite,
+        &item.parsed.pool:Read, &item.lexed.names:Read, &deps:Read, &imports:Read, &item.parsed.file:Read)?;
+    assert(!diags.has_error && @len(bridges.items) == 1);
+    assert(@len(first.refs.items) == 3 && first.refs.items[1].y == exported && first.refs.items[2].y == exported);
+    assert(first.refs.items[1].z == 1 && first.refs.items[2].z == 1);
+    return;
+}
+function main(): void {
+    cached_builtin_variant()?;
+    cached_import_bridge()?;
+    // ── 局部引用、内置类型与已解析侧表 ──
+    let l1: Loaded = load("function f(a: i32): i32 { let b: i32 = a; return b; }\n", 300)?;
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let r1: resolve_refs::Resolution = resolve_unit::resolve_unit(&l1.parsed.file:Read, &l1.parsed.pool:Read, &l1.lexed.names:Read, &deps:Read, "", &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+    assert(@len(r1.refs.items) == 5);
+    var i: u32 = 0;
+    var saw_a: bool = false;
+    var saw_b: bool = false;
+    var saw_builtin: bool = false;
+    while i < @len(r1.refs.items) as u32 {
+        if r1.refs.items[i].kind == 0 && r1.refs.items[i].x == 2 { saw_a = true; }
+        if r1.refs.items[i].kind == 0 && r1.refs.items[i].x == 3 { saw_b = true; }
+        if r1.refs.items[i].kind == 1 { saw_builtin = true; }
+        i = i + 1;
+    }
+    assert(saw_a);
+    assert(saw_b);
+    assert(saw_builtin);
+    assert(r1.result.tables.defs[1].used);
+    assert(r1.result.tables.defs[2].used);
+
+    // ── N-2：未解析名字 ──
+    let l2: Loaded = load("function f(): void { return missing; }\n", 301)?;
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: resolve_refs::Resolution = resolve_unit::resolve_unit(&l2.parsed.file:Read, &l2.parsed.pool:Read, &l2.lexed.names:Read, &deps:Read, "", &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 1);
+    assert(d2.diags[0].code.raw == 4002);
+
+    // ── N-4：前向引用（普通绑定）──
+    let l3: Loaded = load("function f(): void { let x: i32 = y; let y: i32 = 1; return; }\n", 302)?;
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: resolve_refs::Resolution = resolve_unit::resolve_unit(&l3.parsed.file:Read, &l3.parsed.pool:Read, &l3.lexed.names:Read, &deps:Read, "", &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 2);
+    assert(d3.diags[0].code.raw == 4004);
+    assert(d3.diags[1].code.raw == 4009);
+
+    // ── callable header：后声明函数的直接调用允许 ──
+    let l4: Loaded = load("function f(): void { g(); assert(true); return; } function g(): void { return; } foreign assert(cond: bool): void;\n", 303)?;
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: resolve_refs::Resolution = resolve_unit::resolve_unit(&l4.parsed.file:Read, &l4.parsed.pool:Read, &l4.lexed.names:Read, &deps:Read, "", &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 0);
+    var ordinary: bool = false;
+    var service: bool = false;
+    i = 0;
+    while i < @len(r4.refs.items) as u32 {
+        let item: resolve_refs::ResolvedRef = r4.refs.items[i];
+        if item.node_kind == 0 && item.kind == 0 {
+            if item.x == 2 && item.y == 1 { ordinary = true; }
+            if item.x == 3 && item.y == 5 { service = true; }
+        }
+        i = i + 1;
+    }
+    assert(ordinary && service);
+
+    // ── callable header 不适用于取地址 ──
+    let l5: Loaded = load("function f(): void { let p: &function(): void = &g; return; } function g(): void { return; }\n", 304)?;
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: resolve_refs::Resolution = resolve_unit::resolve_unit(&l5.parsed.file:Read, &l5.parsed.pool:Read, &l5.lexed.names:Read, &deps:Read, "", &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 2);
+    assert(d5.diags[0].code.raw == 4004);
+    assert(d5.diags[1].code.raw == 4009);
+
+    // ── N-9：未使用参数 / 局部 ──
+    let l6: Loaded = load("function f(a: i32): void { let x: i32 = 1; return; }\n", 305)?;
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let r6: resolve_refs::Resolution = resolve_unit::resolve_unit(&l6.parsed.file:Read, &l6.parsed.pool:Read, &l6.lexed.names:Read, &deps:Read, "", &d6:ReadWrite)?;
+    assert(diag::diagbuf_count(&d6:Read) == 2);
+    assert(d6.diags[0].code.raw == 4009);
+    assert(d6.diags[1].code.raw == 4009);
+
+    // ── 内置类型与 as 目标 ──
+    let l7: Loaded = load("function f(x: u32): u8 { let y: u8 = x as u8; return y; }\n", 306)?;
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let r7: resolve_refs::Resolution = resolve_unit::resolve_unit(&l7.parsed.file:Read, &l7.parsed.pool:Read, &l7.lexed.names:Read, &deps:Read, "", &d7:ReadWrite)?;
+    assert(diag::diagbuf_count(&d7:Read) == 0);
+
+    // ── N-7：自导入 ──
+    let l8: Loaded = load("import unit; function f(): void { return; }\n", 307)?;
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let r8: resolve_refs::Resolution = resolve_unit::resolve_unit(&l8.parsed.file:Read, &l8.parsed.pool:Read, &l8.lexed.names:Read, &deps:Read, "unit", &d8:ReadWrite)?;
+    assert(diag::diagbuf_count(&d8:Read) == 2);
+    assert(d8.diags[0].code.raw == 4007);
+    assert(d8.diags[1].code.raw == 4009);
+
+    // ── 跨单元 import bridge：函数、enum 类型、标签构造与 pattern ──
+    var dep: resolve_refs::Iface = resolve_refs::iface_new("dep")?;
+    let dep_run: u32 = resolve_refs::iface_add_export(&dep:ReadWrite, "run", 1)?;
+    let dep_e: u32 = resolve_refs::iface_add_export(&dep:ReadWrite, "E", 2)?;
+    let dep_s: u32 = resolve_refs::iface_add_export(&dep:ReadWrite, "S", 3)?;
+    resolve_refs::iface_add_enum_member(&dep:ReadWrite, dep_e, "V", 0)?;
+    var dep_set: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    @push(dep_set.ifaces, dep)?;
+    let l9: Loaded = load("import dep; function f(): void { dep::run(); let e: dep::E = dep::E::V; match e { dep::E::V => { return; }, _ => { return; } } }\n", 308)?;
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let r9: resolve_refs::Resolution = resolve_unit::resolve_unit(&l9.parsed.file:Read, &l9.parsed.pool:Read, &l9.lexed.names:Read, &dep_set:Read, "", &d9:ReadWrite)?;
+    assert(diag::diagbuf_count(&d9:Read) == 0);
+    assert(@len(r9.bridges.items) == 2);
+    assert(@len(r9.bridges.variants) == 1);
+    var import_refs: u32 = 0;
+    var variant_refs: u32 = 0;
+    var i9: u32 = 0;
+    while i9 < @len(r9.refs.items) as u32 {
+        if r9.refs.items[i9].kind == 2 { import_refs = import_refs + 1; }
+        if r9.refs.items[i9].kind == 4 { variant_refs = variant_refs + 1; }
+        i9 = i9 + 1;
+    }
+    assert(import_refs >= 2);
+    assert(variant_refs == 2);
+    assert(r9.result.tables.defs[0].import_dependency == 1);
+    // 重复模块身份不得静默绑定第一个接口。
+    var ambiguous: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    @push(ambiguous.ifaces, resolve_refs::iface_new("dep")?)?;
+    @push(ambiguous.ifaces, resolve_refs::iface_new("other")?)?;
+    @push(ambiguous.ifaces, resolve_refs::iface_new("dep")?)?;
+    var ambiguous_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let ambiguous_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&l9.parsed.file:Read, &l9.parsed.pool:Read, &l9.lexed.names:Read, &ambiguous:Read, "", &ambiguous_diags:ReadWrite)?;
+    assert(ambiguous_result.result.tables.defs[0].import_dependency == 0);
+    assert(ambiguous_diags.diags[0].code.raw == 4003);
+    assert(ambiguous_diags.diags[0].span.offset == l9.parsed.file.items[0].span.offset);
+    assert(@len(ambiguous_result.bridges.items) == 0);
+    var ordered: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    @push(ordered.ifaces, resolve_refs::iface_new("other")?)?;
+    @push(ordered.ifaces, resolve_refs::iface_new("dep")?)?;
+    let ordered_input: Loaded = load("import dep; function f(): void { dep::missing(); }\n", 324)?;
+    var ordered_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let ordered_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&ordered_input.parsed.file:Read, &ordered_input.parsed.pool:Read, &ordered_input.lexed.names:Read, &ordered:Read, "", &ordered_diags:ReadWrite)?;
+    assert(ordered_result.result.tables.defs[0].import_dependency == 2);
+    assert(diag::diagbuf_count(&ordered_diags:Read) == 1);
+    assert(ordered_diags.diags[0].code.raw == 4002);
+    // 接口集合位置可达 65535，但不可截断更大的编号。
+    var many: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var n: u32 = 0;
+    while n < 65534 {
+        @push(many.ifaces, resolve_refs::iface_new("")?)?;
+        n = n + 1;
+    }
+    @push(many.ifaces, resolve_refs::iface_new("dep")?)?;
+    var limit_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let limit_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&ordered_input.parsed.file:Read, &ordered_input.parsed.pool:Read, &ordered_input.lexed.names:Read, &many:Read, "", &limit_diags:ReadWrite)?;
+    assert(limit_result.result.tables.defs[0].import_dependency == 65535);
+    assert(limit_diags.diags[0].code.raw == 4002);
+    many.ifaces[65534].module = [];
+    @push(many.ifaces, resolve_refs::iface_new("dep")?)?;
+    var first_overflow_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let first_overflow: resolve_refs::Resolution = resolve_unit::resolve_unit(&ordered_input.parsed.file:Read, &ordered_input.parsed.pool:Read, &ordered_input.lexed.names:Read, &many:Read, "", &first_overflow_diags:ReadWrite)?;
+    assert(first_overflow.result.tables.defs[0].import_dependency == 0);
+    assert(first_overflow_diags.diags[0].code.raw == 9001);
+    assert(first_overflow_diags.diags[0].span.offset == ordered_input.parsed.file.items[0].span.offset);
+    assert(@len(first_overflow.bridges.items) == 0);
+    many.ifaces[65535].module = [];
+    @push(many.ifaces, resolve_refs::iface_new("dep")?)?;
+    var overflow_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let overflow_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&ordered_input.parsed.file:Read, &ordered_input.parsed.pool:Read, &ordered_input.lexed.names:Read, &many:Read, "", &overflow_diags:ReadWrite)?;
+    assert(overflow_result.result.tables.defs[0].import_dependency == 0);
+    assert(overflow_diags.diags[0].code.raw == 9001);
+    assert(overflow_diags.diags[0].span.offset == ordered_input.parsed.file.items[0].span.offset);
+    assert(@len(overflow_result.bridges.items) == 0);
+    // 当前候选集合可包含非直接依赖，前置匹配不应因集合长度而截断。
+    many.ifaces[65536].module = [];
+    many.ifaces[0] = resolve_refs::iface_new("dep")?;
+    var early_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let early_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&ordered_input.parsed.file:Read, &ordered_input.parsed.pool:Read, &ordered_input.lexed.names:Read, &many:Read, "", &early_diags:ReadWrite)?;
+    assert(early_result.result.tables.defs[0].import_dependency == 1);
+    assert(diag::diagbuf_count(&early_diags:Read) == 1 && early_diags.diags[0].code.raw == 4002);
+    let imported_enum: Loaded = load("import dep; function f(): void!dep::E { return; }\n", 321)?;
+    var enum_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let enum_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&imported_enum.parsed.file:Read, &imported_enum.parsed.pool:Read, &imported_enum.lexed.names:Read, &dep_set:Read, "", &enum_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&enum_diags:Read) == 0);
+    let imported_struct: Loaded = load("import dep; function f(): void!dep::S { return; }\n", 322)?;
+    var struct_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let struct_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&imported_struct.parsed.file:Read, &imported_struct.parsed.pool:Read, &imported_struct.lexed.names:Read, &dep_set:Read, "", &struct_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&struct_diags:Read) == 1);
+    assert(struct_diags.diags[0].code.raw == 5807);
+    let imported_overlap: Loaded = load("import dep; function f(): dep::E!dep::E { return dep::E::V; }\n", 323)?;
+    var overlap_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let overlap_result: resolve_refs::Resolution = resolve_unit::resolve_unit(&imported_overlap.parsed.file:Read, &imported_overlap.parsed.pool:Read, &imported_overlap.lexed.names:Read, &dep_set:Read, "", &overlap_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&overlap_diags:Read) == 1);
+    assert(overlap_diags.diags[0].code.raw == 5802);
+
+    // ── 内置 enum 标签：AllocError::OutOfMemory ──
+    let l10: Loaded = load("function f(): AllocError { return AllocError::OutOfMemory; }\n", 309)?;
+    var d10: diag::DiagBuffer = diag::diagbuf_new();
+    let r10: resolve_refs::Resolution = resolve_unit::resolve_unit(&l10.parsed.file:Read, &l10.parsed.pool:Read, &l10.lexed.names:Read, &deps:Read, "", &d10:ReadWrite)?;
+    assert(diag::diagbuf_count(&d10:Read) == 0);
+    var saw_builtin_variant: bool = false;
+    var i10: u32 = 0;
+    while i10 < @len(r10.refs.items) as u32 {
+        if r10.refs.items[i10].kind == 5 && r10.refs.items[i10].x == 4108 && r10.refs.items[i10].y == 0 { saw_builtin_variant = true; }
+        i10 = i10 + 1;
+    }
+    assert(saw_builtin_variant);
+
+    // 类型位置只接受类型定义，命中其他定义时不得回退为内建类型。
+    error_case("function g(): void { return; } struct S { x: g }\n", 4002)?;
+    error_case("enum E { X } struct S { x: E::X }\n", 4002)?;
+    error_case("struct S { x: AllocError::OutOfMemory }\n", 4002)?;
+    error_case("function f(u32: bool): void { let x: u32 = 1; @drop(x); @drop(u32); }\n", 4002)?;
+    error_case("const c: u32 = 1; struct S { x: c } function f(): u32 { return c; }\n", 4002)?;
+    error_case("function g(): void { return; } function h(): void!g { return; }\n", 4002)?;
+    error_case("enum E { X } struct S { x: E }\n", 0)?;
+    error_case("struct S { x: u32 } function f(s: S): void { s; }\n", 0)?;
+    // 错误成员必须是枚举，未知名称仍只报告名称解析错误。
+    error_case("function f(): void!u32 { return; }\n", 5807)?;
+    error_case("struct S { x: u32 } function f(): void!S { return; }\n", 5807)?;
+    error_case("enum E { X } function f(): void!(E | bool) { return; }\n", 5807)?;
+    error_case("function f(): void!Missing { return; }\n", 4002)?;
+    error_case("enum E { X } function f(): void!(E | AllocError) { return; }\n", 0)?;
+    // 成功类型与错误成员相同会使构造语义不明确。
+    error_case("enum E { X } function f(): E!E { return E::X; }\n", 5802)?;
+    error_case("enum E { X } function f(): E!(AllocError | E) { return E::X; }\n", 5802)?;
+    error_case("function f(): AllocError!AllocError { return AllocError::OutOfMemory; }\n", 5802)?;
+    error_case("enum E { X } function f(): E!(E | E) { return E::X; }\n", 5802)?;
+    error_case("enum E { X } function f(): Missing!E { return E::X; }\n", 4002)?;
+    error_case("enum E { X } enum F { Y } function f(): E!F { return E::X; }\n", 0)?;
+    return;
+}

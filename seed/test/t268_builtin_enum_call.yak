@@ -1,0 +1,54 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+foreign assert(cond: bool): void;
+function check(src: &[u8], count: u32): void!AllocError {
+    let tokens: lex::LexResult = lex::lex_scan(src, 1)?;
+    assert(@len(tokens.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_file(&tokens.tokens[0..@len(tokens.tokens)]:Read, &tokens.names:Read, 1)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &tokens.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let result: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == count);
+    if count != 0 { assert(diags.diags[0].code.raw == 5804); }
+    return;
+}
+function run(): void!AllocError {
+    // 无载荷标签的括号形式与实参数量无关，均应按构造形态拒绝。
+    check("function f(): void!AllocError { return AllocError::OutOfMemory(); }\n", 1)?;
+    check("function f(): void!AllocError { return AllocError::OutOfMemory(1u32); }\n", 1)?;
+    check("enum E { Empty } function f(): E { return E::Empty; }\n", 0)?;
+    return;
+}
+function main(): void { run()?; }

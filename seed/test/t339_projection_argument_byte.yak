@@ -1,0 +1,7 @@
+foreign assert(cond: bool): void;
+function read(value: &u8): u8 { return *value; }
+function main(): void {
+    let text: &[u8] = "AB";
+    assert(read(text[1u32]) == 66u8);
+    assert(read("AB"[0u32]) == 65u8);
+}

@@ -1,0 +1,8 @@
+// expected_code: E5806
+// spec: spec/lang/type/enum.md EN-4
+// 触发：已知返回类型为枚举时省略带载荷标签的类型前缀。
+enum Record { Empty, Payload(u16) }
+
+function make(): Record { return Payload(7u16); }
+
+function main(): void { return; }

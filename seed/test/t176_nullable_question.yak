@@ -1,0 +1,2 @@
+// expected_trap: ? on non-carrier
+function main(): void { let a: i64? = 1; a?; }

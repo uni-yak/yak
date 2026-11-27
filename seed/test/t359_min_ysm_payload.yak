@@ -1,0 +1,178 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: ysm=../../compiler/min/src/ysm/ysm.yak
+// module: ysm_validate=../../compiler/min/src/ysm/ysm_validate.yak
+// module: ysm_write=../../compiler/min/src/ysm/ysm_write.yak
+// module: ysm_write_sig=../../compiler/min/src/ysm/ysm_write_sig.yak
+// module: runner=mir_runner.yak
+import diag;
+import iface;
+import mir;
+import ysm;
+import ysm_write;
+import runner;
+foreign assert(cond: bool): void;
+
+// 本地名义类型出现在签名中，事实必须提供导出映射（与 t240 的往返用例一致）。
+function make_facts(m: &mir::MirModule:Read): ysm::YsmFacts {
+    var defs: u32[] = [];
+    var exports: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(m.functions) as u32 {
+        @push(defs, m.functions[i].def)?;
+        @push(exports, @len(exports) as u32 + 1)?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(m.enums.items) as u32 {
+        @push(defs, m.enums.items[i].def)?;
+        @push(exports, @len(exports) as u32 + 1)?;
+        i = i + 1;
+    }
+    return ysm::YsmFacts { target_profile: 7, statics: [], dependencies: [], candidate_digests: [],
+        exports: iface::ExportMap { defs: @move(defs), exports: @move(exports) } };
+}
+function write_once(m: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read): u8[]!AllocError {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: ysm::YsmResult = ysm_write::write_module(m, facts, &d:ReadWrite)?;
+    if !r.accepted || diag::diagbuf_count(&d:Read) != 0 { diag::diagbuf_print_terminal(&d:Read)?; }
+    assert(r.accepted && diag::diagbuf_count(&d:Read) == 0);
+    // 结构体字段不得部分移动：逐元素复制到新数组。
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(r.data) as u32 { @push(bytes, r.data[i])?; i = i + 1; }
+    return bytes;
+}
+
+// 162 双载荷：`?` 的成功臂与错误臂各有一个臂载荷局部，写出/读回必须逐块保真。
+function carrier_payload_roundtrip(): void!AllocError {
+    let src: &[u8] = "enum E { Bad } function base(x: u32): u32!E { if x == 0 { return E::Bad; } return x; } function chain(x: u32): u32!E { let a: u32 = base(x)?; return a + 1; }\n";
+    let r: mir::MirResult = runner::accepted(src, 1307)?;
+    let facts: ysm::YsmFacts = make_facts(&r.module:Read);
+    let a: u8[] = write_once(&r.module:Read, &facts:Read)?;
+    let b: u8[] = write_once(&r.module:Read, &facts:Read)?;
+    assert(@len(a) == @len(b));
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        assert(a[i] == b[i]);
+        i = i + 1;
+    }
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&a[0..@len(a) as u32]:Read, &d:ReadWrite)?;
+    assert(loaded.accepted && diag::diagbuf_count(&d:Read) == 0);
+    var nonzero: u32 = 0;
+    var fi: u32 = 0;
+    while fi < @len(r.module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &r.module.functions[fi]:Read;
+        let lf: ysm::YsmFunctionRecord = loaded.file.functions[fi];
+        var bi: u32 = 0;
+        while bi < @len(f.blocks) as u32 {
+            let want: u32 = f.blocks[bi].payload;
+            let got: u32 = loaded.file.blocks[lf.block_start + bi].payload;
+            assert(want == got);
+            if want != 0 { nonzero = nonzero + 1; }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    // 至少成功臂与错误臂各出现一次非零载荷。
+    assert(nonzero >= 2);
+    return;
+}
+
+// 旧 format 3 必须按 Y-2（7024）拒绝，不得被当作 format 4 解析。
+function reject_old_format(): void!AllocError {
+    let src: &[u8] = "function f(): u32 { return 1; }\n";
+    let r: mir::MirResult = runner::accepted(src, 1308)?;
+    let facts: ysm::YsmFacts = make_facts(&r.module:Read);
+    let data: u8[] = write_once(&r.module:Read, &facts:Read)?;
+    var copy: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(data) as u32 {
+        @push(copy, data[i])?;
+        i = i + 1;
+    }
+    copy[4] = 3;
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&copy[0..@len(copy) as u32]:Read, &d:ReadWrite)?;
+    assert(!loaded.accepted);
+    assert(loaded.code.raw == 7024);
+    return;
+}
+
+// 177 臂载荷：Code(v) 绑定臂的载荷局部必须写入 YSM，读回逐块一致。
+function enum_payload_roundtrip(): void!AllocError {
+    let src: &[u8] = "enum E { Empty, Code(u32) } function pick(x: u32): u32 { var e: E = E::Empty; if x != 0u32 { e = E::Code(x); } var r: u32 = 0u32; match e { Empty => { r = 7u32; }, Code(v) => { r = v + 1u32; } } return r; }\n";
+    let r: mir::MirResult = runner::accepted(src, 1309)?;
+    let facts: ysm::YsmFacts = make_facts(&r.module:Read);
+    let data: u8[] = write_once(&r.module:Read, &facts:Read)?;
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&data[0..@len(data) as u32]:Read, &d:ReadWrite)?;
+    assert(loaded.accepted && diag::diagbuf_count(&d:Read) == 0);
+    var nonzero: u32 = 0;
+    var fi: u32 = 0;
+    while fi < @len(r.module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &r.module.functions[fi]:Read;
+        let lf: ysm::YsmFunctionRecord = loaded.file.functions[fi];
+        var bi: u32 = 0;
+        while bi < @len(f.blocks) as u32 {
+            assert(f.blocks[bi].payload == loaded.file.blocks[lf.block_start + bi].payload);
+            if f.blocks[bi].payload != 0 { nonzero = nonzero + 1; }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    // 至少有一个绑定臂（Code(v)）带非零载荷。
+    assert(nonzero >= 1);
+    return;
+}
+
+function main(): void {
+    carrier_payload_roundtrip()?;
+    enum_payload_roundtrip()?;
+    reject_old_format()?;
+    return;
+}

@@ -1,0 +1,7 @@
+// t85: 读未填充 out 槽位 → trap（OW-8）
+// expected_trap: read of unfilled out slot
+function main(): void {
+    out r: u32;
+    let v: u32 = r;
+    return;
+}

@@ -1,0 +1,18 @@
+import c0_slice_leaf;
+import c0_slice_mid;
+foreign assert(cond: bool): void;
+
+function local_read(tokens: &[c0_slice_mid::Token]): u64 {
+    assert(@len(tokens) == 2);
+    let span: c0_slice_leaf::Span = tokens[1].span;
+    return c0_slice_mid::read(tokens, 0) + span.offset as u64;
+}
+
+function main(): void {
+    let tokens: [c0_slice_mid::Token; 2] = [
+        c0_slice_mid::make(11, 23),
+        c0_slice_mid::make(47, 59)
+    ];
+    assert(local_read(&tokens[0..2]) == 81u64);
+    assert(c0_slice_mid::read(&tokens[0..2], 1) == 106u64);
+}

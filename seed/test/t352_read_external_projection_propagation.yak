@@ -1,0 +1,21 @@
+// mem_limit: 150000
+foreign assert(cond: bool): void;
+enum Fault { Failed }
+struct Item { data: u32[] }
+function fail(): u32!Fault { return Fault::Failed; }
+function use(data: &u32[], extra: u32): u32 { return data[0u32] + extra; }
+function attempt(view: &[Item]:ReadWrite): u32!Fault {
+    return use(@copy(view)[0u32].data, fail()?);
+}
+function recover(error: &Fault): u32 { return 9u32; }
+function main(): void {
+    var items: Item[] = [Item { data: [0u32] }];
+    var view: &[Item]:ReadWrite = &items[0u32..1u32]:ReadWrite;
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(attempt(view).catch(&recover) == 9u32);
+        view[0u32].data[0u32] = i;
+        assert(view[0u32].data[0u32] == i);
+        i = i + 1u32;
+    }
+}

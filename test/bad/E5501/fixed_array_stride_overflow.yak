@@ -1,0 +1,6 @@
+// expected_code: E5501
+// spec: spec/lang/layout.md#LY-1、spec/lang/type/array.md#LY-1
+// 触发：定长数组的长度可表示，但长度乘以八字节步长超出 u64。
+struct TooLarge { values: [u64; 2305843009213693952] }
+
+function main(): void { return; }

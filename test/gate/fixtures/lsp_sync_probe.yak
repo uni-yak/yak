@@ -1,0 +1,61 @@
+// 定向门禁：断言来自真实管道帧的事件，不增加任何线上测试方法。
+import session;
+import documents;
+import positions;
+import json_string;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function inspect(state: &session::State:Read, event: &documents::Event:Read, seq: u32): void {
+    let tickets: [u8; 16] = [0u8, 0u8, 0u8, 0u8, 1u8, 4u8, 4u8, 3u8, 5u8, 1u8, 0u8, 0u8, 2u8, 1u8, 0u8, 0u8];
+    assert(seq < 16u32 && event.status == tickets[seq]);
+    let masked: documents::Ticket = documents::Ticket { slot: 0, generation: 1, version: -1, analysis_epoch: 0 };
+    if seq < 4u32 { assert(state.store.used == 0u32 && state.store.active == 0u32); }
+    elseif seq < 9u32 {
+        assert(state.store.used == 3u32 && state.store.active == 1u32 && documents::is_current(&state.store:Read, masked));
+        if seq == 4u32 { assert(event.ticket.generation == 1u64 && event.ticket.version == -1i32); }
+    } elseif seq < 12u32 {
+        let updated: documents::Ticket = documents::Ticket { slot: 0, generation: 1, version: 1, analysis_epoch: 0 };
+        assert(state.store.used == 8u32 && state.store.active == 1u32 && documents::is_current(&state.store:Read, updated));
+        assert(!documents::is_current(&state.store:Read, masked));
+        if seq == 9u32 {
+            assert(event.ticket.generation == 1u64 && event.ticket.version == 1i32);
+            let text: &json_string::Decoded:Read = &state.store.slots[0].snapshot.text:Read;
+            let index: &positions::Index:Read = &state.store.slots[0].snapshot.index:Read;
+            let pos: positions::PositionResult = positions::to_position(index, &text.data[0..8]:Read, 7u32);
+            assert(pos.valid && pos.position.line == 0u32 && pos.position.character == 3u32);
+        }
+    } elseif seq == 12u32 {
+        let uri: &json_string::Decoded:Read = &event.closed_uri:Read;
+        assert(uri.ok && @len(uri.data) == @len("file:///C:/Yak%20Work/中.yak"));
+        assert(state.store.used == 0u32 && state.store.active == 0u32 && state.store.slots[0].generation == 0u64);
+    } else {
+        let fresh: documents::Ticket = documents::Ticket { slot: 0, generation: 2, version: -1, analysis_epoch: 0 };
+        assert(state.store.used == 2u32 && state.store.active == 1u32 && documents::is_current(&state.store:Read, fresh));
+        assert(!documents::is_current(&state.store:Read, masked));
+        if seq == 13u32 { assert(event.ticket.generation == 2u64 && event.ticket.version == -1i32); }
+        if seq >= 14u32 { assert(state.phase == 3u8); }
+    }
+    return;
+}
+
+function serve(): u8!AllocError {
+    var state: session::State = session::create(8u32);
+    var seq: u32 = 0;
+    while true {
+        let step: session::Step = session::advance(&state:ReadWrite)?;
+        if step.status != 3u8 {
+            if step.status == 0u8 { assert(seq == 16u32); }
+            exit(step.status);
+        }
+        inspect(&state:Read, &step.event:Read, seq);
+        seq = seq + 1u32;
+    }
+    return 1;
+}
+
+function main(): void {
+    let failed: u8!AllocError = serve();
+    @drop(failed);
+    exit(1);
+}

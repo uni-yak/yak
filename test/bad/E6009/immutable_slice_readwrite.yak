@@ -1,0 +1,10 @@
+// expected_code: E6009
+// spec: spec/lang/base.md R-15；spec/lang/owner.md OW-5
+// 触发：通过不可变数组请求可写切片。
+foreign read(dst: &[u8]:ReadWrite): u32;
+function main(): void {
+    let data: [u8; 1] = [1u8];
+    let n: u32 = read(&data[0..1]:ReadWrite);
+    if n == 0 { return; }
+    return;
+}

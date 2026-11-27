@@ -1,0 +1,19 @@
+foreign assert(condition: bool): void;
+
+function equal(first: &u32, second: &u32): bool {
+    return *first == *second;
+}
+
+function add(first: &u32:ReadWrite, second: &u32:ReadWrite): void {
+    *first = *first + *second;
+}
+
+function main(): void {
+    var left: u32 = 7u32;
+    var right: u32 = 8u32;
+    let lref: &u32:ReadWrite = &left:ReadWrite;
+    let rref: &u32:ReadWrite = &right:ReadWrite;
+    assert(equal(lref, lref));
+    add(lref, rref);
+    assert(*lref == 15u32 && *rref == 8u32);
+}

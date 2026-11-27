@@ -1,0 +1,13 @@
+// expected_code: E6004
+// spec: spec/lang/base.md R-5；spec/lang/owner.md OW-2
+// 触发：同一调用的首个实参独占借用，第二个实参直接读原位置。
+function take(r: &u32:ReadWrite, n: u32): void {
+    *r = n;
+    return;
+}
+
+function main(): void {
+    var value: u32 = 1;
+    take(&value:ReadWrite, value);
+    return;
+}

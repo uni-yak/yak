@@ -1,0 +1,3 @@
+// expected_trap: enum: payload constructor required
+enum E { Value(i64), }
+function main(): void { let value: E = E::Value; }

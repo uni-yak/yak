@@ -1,0 +1,13 @@
+// t79: 通过引用自动解引用字段（ref.md：r.f 自动解引用一层）
+foreign assert(cond: bool): void;
+struct Point {
+    x: u32,
+    y: u32,
+}
+function main(): void {
+    let p: Point = Point { x: 1, y: 2 };
+    let r: &Point = &p;
+    assert(r.x == 1);
+    assert(r.y == 2);
+    return;
+}

@@ -1,0 +1,273 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: ysm=../../compiler/min/src/ysm/ysm.yak
+// module: ysm_validate=../../compiler/min/src/ysm/ysm_validate.yak
+// module: ysm_write=../../compiler/min/src/ysm/ysm_write.yak
+// module: ysm_write_sig=../../compiler/min/src/ysm/ysm_write_sig.yak
+// module: runner=mir_runner.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import iface;
+import mir;
+import mir_lower;
+import mir_verify;
+import layout;
+import ysm;
+import ysm_validate;
+import ysm_write;
+import runner;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// 读小端 u16。
+function u16_at(data: &[u8], offset: u32): u16 {
+    return (data[offset] as u16) | ((data[offset + 1] as u16) << 8);
+}
+// 读小端 u32。
+function u32_at(data: &[u8], offset: u32): u32 {
+    return (data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24);
+}
+// 空依赖事实；调用方按需补静态、依赖与候选摘要。
+function empty_facts(): ysm::YsmFacts {
+    return ysm::YsmFacts {
+        target_profile: 7,
+        statics: [],
+        dependencies: [],
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+}
+// 目录项偏移：第 index 项的 offset 字段。
+function section_off(data: &[u8], index: u32): u32 {
+    return u32_at(data, 64 + index * 16 + 4);
+}
+// 序列化并断言成功，返回写出的字节；失败场景用 write_failed。
+function write_ok(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read): u8[]!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(module, facts, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error);
+    var copy: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(result.data) as u32 {
+        @push(copy, result.data[i])?;
+        i = i + 1;
+    }
+    return @move(copy);
+}
+// 序列化必须被拒绝，返回拒绝码。
+function write_failed(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read): u16!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(module, facts, &diags:ReadWrite)?;
+    assert(!result.accepted && @len(result.data) == 0 && diags.has_error);
+    return result.code.raw;
+}
+// 读回并校验指令流，断言头部格式。
+function read_ok(data: &[u8]:Read, version: u16): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(data, &diags:ReadWrite)?;
+    assert(loaded.accepted && !diags.has_error);
+    assert(loaded.file.header.version == version);
+    assert(ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)? == 0);
+    return;
+}
+
+// 私有 struct 形参没有 ExportId，必须用 0x0E local_def，而不是 E4008/E7026。
+function private_signature(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("struct Hidden { v: u32 } function f(x: Hidden): u32 { return x.v; }\n", 1400)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = empty_facts();
+    let data: u8[] = write_ok(m, &facts:Read)?;
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 4) == 6);
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 6) == 1);
+    let type_off: u32 = section_off(&data[0..@len(data) as u32]:Read, 0);
+    // 函数签名布局：flags:u16、param_count:u16，随后是首个形参类型。
+    assert(u16_at(&data[0..@len(data) as u32]:Read, type_off + 2) == 1);
+    assert(data[type_off + 4] == 14);
+    read_ok(&data[0..@len(data) as u32]:Read, 6)?;
+    return;
+}
+
+// 传递名义类型依赖编号超过直接依赖数，必须带候选摘要并写 0x0F。
+function transitive_nominal(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1401)?;
+    let imported: u32 = @len(result.module.types.entries) as u32 + 1;
+    @push(result.module.types.entries, typecheck::TypeEntry { kind: 3, builtin: 0, def: 0, dep: 2, export_id: 1, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    @push(result.module.imported_layouts.items, layout::ImportedLayout { dep: 2, export_id: 1, size: 4, align: 4 })?;
+    // 函数返回改为传递导入名义类型，迫使类型进入公开签名。
+    result.module.signatures.items[0].ret = imported;
+    var deps: ysm::YsmDependency[] = [];
+    var direct: u8[] = [];
+    var k: u32 = 0;
+    while k < 32 { @push(direct, k as u8)?; k = k + 1; }
+    @push(deps, ysm::YsmDependency { dependency_id: 1, interface_digest: @move(direct) })?;
+    var candidates: u8[] = [];
+    k = 0;
+    while k < 64 {
+        if k < 32 { @push(candidates, 0u8)?; } else { @push(candidates, (k - 32 + 64) as u8)?; }
+        k = k + 1;
+    }
+    let facts: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: [],
+        dependencies: @move(deps),
+        candidate_digests: @move(candidates),
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+    let data: u8[] = write_ok(&result.module:Read, &facts:Read)?;
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 4) == 6);
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 6) == 1);
+    let type_off: u32 = section_off(&data[0..@len(data) as u32]:Read, 0);
+    // f 的签名 flags=0、param_count=0，返回类型紧接其后。
+    assert(data[type_off + 4] == 15);
+    // 0x0F 后是 32 字节候选摘要；候选表第 dep-1 块对应依赖编号 dep，第二块首字节为 64。
+    assert(data[type_off + 5] == 64);
+    read_ok(&data[0..@len(data) as u32]:Read, 6)?;
+    return;
+}
+
+// op115 的可选 bool 守卫在 format 6 中必须写入并在读回时扫描。
+function drop_guard(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1402)?;
+    assert(@len(result.module.functions) == 1);
+    assert(@len(result.module.functions[0].blocks) == 1);
+    let bool_id: u32 = runner::type_for(&result.module:Read, 4105);
+    let lc: u32 = @len(result.module.functions[0].locals) as u32;
+    let guard: u32 = lc + 1;
+    @push(result.module.functions[0].locals, mir::MirLocal { id: guard, value_type_id: bool_id, kind: 2, state: 0 })?;
+    @push(result.module.functions[0].insts, mir::MirInst { op: 115, a: 0, b: 1, c: guard, value: 0, value_type_id: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false })?;
+    result.module.functions[0].blocks[0].inst_count = result.module.functions[0].blocks[0].inst_count + 1;
+    let facts: ysm::YsmFacts = empty_facts();
+    let data: u8[] = write_ok(&result.module:Read, &facts:Read)?;
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 4) == 6);
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 6) == 1);
+    let inst_off: u32 = section_off(&data[0..@len(data) as u32]:Read, 5);
+    let inst_len: u32 = u32_at(&data[0..@len(data) as u32]:Read, 64 + 5 * 16 + 8);
+    var pos: u32 = inst_off;
+    var found: u32 = 0;
+    while pos < inst_off + inst_len {
+        if data[pos] == 115 {
+            assert(u32_at(&data[0..@len(data) as u32]:Read, pos + 1) == 1);
+            assert(u32_at(&data[0..@len(data) as u32]:Read, pos + 5) == guard);
+            found = pos + 1;
+            pos = inst_off + inst_len;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    assert(found != 0);
+    read_ok(&data[0..@len(data) as u32]:Read, 6)?;
+    return;
+}
+
+// 守卫局部编号越界必须返回 Y-4/7026，且不留下字节。
+function drop_guard_out_of_range(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1403)?;
+    let bool_id: u32 = runner::type_for(&result.module:Read, 4105);
+    let lc: u32 = @len(result.module.functions[0].locals) as u32;
+    @push(result.module.functions[0].locals, mir::MirLocal { id: lc + 1, value_type_id: bool_id, kind: 2, state: 0 })?;
+    @push(result.module.functions[0].insts, mir::MirInst { op: 115, a: 0, b: 1, c: lc + 2, value: 0, value_type_id: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false })?;
+    result.module.functions[0].blocks[0].inst_count = result.module.functions[0].blocks[0].inst_count + 1;
+    let facts: ysm::YsmFacts = empty_facts();
+    assert(write_failed(&result.module:Read, &facts:Read)? == 7026);
+    return;
+}
+
+// 守卫局部不是 bool 也必须拒绝。
+function drop_guard_not_bool(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1404)?;
+    @push(result.module.functions[0].insts, mir::MirInst { op: 115, a: 0, b: 1, c: 1, value: 0, value_type_id: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false })?;
+    result.module.functions[0].blocks[0].inst_count = result.module.functions[0].blocks[0].inst_count + 1;
+    let facts: ysm::YsmFacts = empty_facts();
+    assert(write_failed(&result.module:Read, &facts:Read)? == 7026);
+    return;
+}
+
+// 无扩展形态的普通模块仍保持 format 4、flags=0。
+function plain_stays_v4(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1405)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = empty_facts();
+    let data: u8[] = write_ok(m, &facts:Read)?;
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 4) == 4);
+    assert(u16_at(&data[0..@len(data) as u32]:Read, 6) == 0);
+    read_ok(&data[0..@len(data) as u32]:Read, 4)?;
+    return;
+}
+
+// 私有类型使镜像进入格式 6；没有私有清理边的除法也须写零后缀。
+function private_signature_with_fallback_trap(): void!AllocError {
+    let result: mir::MirResult = runner::accepted("struct Hidden { v: u32 } function f(x: Hidden, y: u32): u32 { return x.v / y; }\n", 1406)?;
+    let m: &mir::MirModule:Read = &result.module:Read;
+    var checked: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(m.functions[0].insts) as u32 {
+        let inst: mir::MirInst = m.functions[0].insts[i];
+        if mir::has_trap_edge(inst.op) { checked = checked + 1; assert(inst.trap == 0); }
+        i = i + 1;
+    }
+    assert(checked > 0);
+    let facts: ysm::YsmFacts = empty_facts();
+    let data: u8[] = write_ok(m, &facts:Read)?;
+    read_ok(&data[0..@len(data) as u32]:Read, 6)?;
+    return;
+}
+
+function main(): void {
+    private_signature()?;
+    private_signature_with_fallback_trap()?;
+    transitive_nominal()?;
+    drop_guard()?;
+    drop_guard_out_of_range()?;
+    drop_guard_not_bool()?;
+    plain_stays_v4()?;
+    write("t375 ok\n");
+    return;
+}

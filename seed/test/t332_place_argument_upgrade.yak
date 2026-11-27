@@ -1,0 +1,7 @@
+// expected_trap: borrow: ReadWrite requires var place (OW-5)
+function write(value: &u32:ReadWrite): void { *value = 7u32; }
+function main(): void {
+    var count: u32 = 3u32;
+    let ref: &u32 = &count;
+    write(*ref);
+}

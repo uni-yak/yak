@@ -1,0 +1,7 @@
+// expected_code: E5002
+// expected_diagnostics: E5002 E5002
+// spec: spec/lang/base.md#R-9
+// 触发：在函数形参中使用两种尚未激活的裸浮点类型。
+function reject(first: f32, second: f64): void { return; }
+
+function main(): void { return; }

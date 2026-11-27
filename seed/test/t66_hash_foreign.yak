@@ -1,0 +1,8 @@
+// t66: # foreign 声明
+foreign #write(data: &[u8]): void;
+// expected_stdout: hash foreign ok
+
+function main(): void {
+    write("hash foreign ok\n");
+    return;
+}

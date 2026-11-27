@@ -1,0 +1,438 @@
+// 语句、块、控制流、模式与参数列表解析。
+import lex;
+import types;
+import ast;
+import parse_core;
+import type_parser;
+import position;
+import parse_expr;
+
+const ALLOW_BATCH_DROP: u8 = 1;
+const CLASSIFY_IF_LET: u8 = 2;
+
+function span_at(p: &parse_core::Parser:Read, index: u32): types::Span { return parse_core::span_at(p, index); }
+function fail_code(p: &parse_core::Parser:ReadWrite, index: u32, code: types::ErrorCode): void!AllocError { parse_core::fail_code(p, index, code)?; return; }
+function fail(p: &parse_core::Parser:ReadWrite, index: u32): void!AllocError { parse_core::fail(p, index)?; return; }
+function is_kind(p: &parse_core::Parser:Read, kind: u8): bool { return parse_core::is_kind(p, kind); }
+function is_builtin(p: &parse_core::Parser:Read, id: u16): bool { return parse_core::is_builtin(p, id); }
+function is_keyword(p: &parse_core::Parser:Read, id: u8): bool { return parse_core::is_keyword(p, id); }
+function is_op(p: &parse_core::Parser:Read, id: u8): bool { return parse_core::is_op(p, id); }
+function is_kind_at(p: &parse_core::Parser:Read, index: u32, kind: u8): bool { return parse_core::is_kind_at(p, index, kind); }
+function is_op_at(p: &parse_core::Parser:Read, index: u32, id: u8): bool { return parse_core::is_op_at(p, index, id); }
+function is_keyword_at(p: &parse_core::Parser:Read, index: u32, id: u8): bool { return parse_core::is_keyword_at(p, index, id); }
+function advance(p: &parse_core::Parser:ReadWrite): void { parse_core::advance(p); return; }
+function take_ident(p: &parse_core::Parser:ReadWrite): u32!AllocError { return parse_core::take_ident(p)?; }
+function expect_op(p: &parse_core::Parser:ReadWrite, id: u8): void!AllocError { parse_core::expect_op(p, id)?; return; }
+function parse_type(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError { return type_parser::parse_type(p, pool)?; }
+
+function parse_if_branch(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): ast::IfBranch!AllocError {
+    let start: u32 = p.pos;
+    var span: types::Span = span_at(p, start);
+    var binding_span: types::Span = span;
+    var binding: u32 = 0;
+    advance(p);
+    if is_keyword(p, 1) {
+        span = parse_core::span_through(p, start, p.pos);
+        if (p.syntax_profile & CLASSIFY_IF_LET) == 0 { parse_core::fail_span(p, span, types::error_code(3008))?; }
+        advance(p);
+        binding_span = span_at(p, p.pos);
+        binding = take_ident(p)?;
+        expect_op(p, 22)?;
+    }
+    let condition: u32 = parse_expr::parse_expr(p, pool, 1, false)?;
+    let body: u32 = parse_block(p, pool)?;
+    return ast::IfBranch { condition: condition, body: body, span: span, reserved_binding: binding, binding_span: binding_span };
+}
+
+function parse_if(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    var branches: ast::IfBranch[] = [];
+    @push(branches, parse_if_branch(p, pool)?)?;
+    while is_keyword(p, 6) {
+        @push(branches, parse_if_branch(p, pool)?)?;
+    }
+    var else_body: u32 = 4294967295u32;
+    if is_keyword(p, 5) {
+        advance(p);
+        if is_keyword(p, 4) { fail(p, p.pos)?; }
+        else { else_body = parse_block(p, pool)?; }
+    }
+    let id: u32 = @len(pool.ifs) as u32;
+    @push(pool.ifs, ast::IfStmt { branches: branches, else_body: else_body, span: span_at(p, start) })?;
+    return id;
+}
+
+function parse_while(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, label: u32): u32!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let condition: u32 = parse_expr::parse_expr(p, pool, 1, false)?;
+    let body: u32 = parse_block(p, pool)?;
+    let id: u32 = @len(pool.whiles) as u32;
+    @push(pool.whiles, ast::WhileStmt { label: label, condition: condition, body: body, span: span_at(p, start) })?;
+    return id;
+}
+
+function parse_pattern(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    var kind: u8 = 0;
+    var path: u32[] = [];
+    var binding: u32 = 0;
+    if is_kind(p, 10) {
+        kind = 1;
+        advance(p);
+    } else {
+        if !is_kind(p, 0) && !is_kind(p, 1) { fail(p, p.pos)?; return 4294967295u32; }
+        @push(path, take_ident(p)?)?;
+        while is_op(p, 0) {
+            advance(p);
+            @push(path, take_ident(p)?)?;
+        }
+        if is_op(p, 26) {
+            advance(p);
+            binding = take_ident(p)?;
+            expect_op(p, 27)?;
+        }
+    }
+    let id: u32 = @len(pool.patterns) as u32;
+    @push(pool.patterns, ast::MatchPattern { kind: kind, path: path, binding: binding, span: span_at(p, start) })?;
+    return id;
+}
+
+function same_pattern_path(pool: &ast::AstPool:Read, a: u32, b: u32): bool {
+    if a >= @len(pool.patterns) as u32 || b >= @len(pool.patterns) as u32 { return false; }
+    let left_len: u32 = @len(pool.patterns[a].path) as u32;
+    let right_len: u32 = @len(pool.patterns[b].path) as u32;
+    if left_len != right_len { return false; }
+    var i: u32 = 0;
+    while i < left_len {
+        if pool.patterns[a].path[i] != pool.patterns[b].path[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function same_pattern_path_limited(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, a: u32, b: u32): bool {
+    if a >= @len(pool.patterns) as u32 || b >= @len(pool.patterns) as u32 { return false; }
+    let left_len: u32 = @len(pool.patterns[a].path) as u32;
+    let right_len: u32 = @len(pool.patterns[b].path) as u32;
+    if left_len != right_len { return false; }
+    var i: u32 = 0;
+    while i < left_len {
+        if !parse_core::charge_match_path(p) { return false; }
+        if pool.patterns[a].path[i] != pool.patterns[b].path[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function sync_members(p: &parse_core::Parser:ReadWrite): void {
+    while p.pos < @len(p.tokens) as u32 && !is_op(p, 32) && !is_op(p, 29) && !is_kind(p, 9) { parse_core::recover_advance(p); }
+    if is_op(p, 32) { parse_core::recover_advance(p); }
+    return;
+}
+
+function sync_arm(p: &parse_core::Parser:ReadWrite): void {
+    parse_core::recover_advance(p);
+    sync_members(p);
+    return;
+}
+
+function parse_match(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let scrutinee: u32 = parse_expr::parse_expr(p, pool, 1, false)?;
+    var arms: ast::MatchArm[] = [];
+    if !is_op(p, 28) {
+        fail(p, p.pos)?;
+    } else {
+        advance(p);
+        var seen: u32[] = [];
+        var saw_wildcard: bool = false;
+        while p.pos < @len(p.tokens) as u32 && !is_op(p, 29) && !is_kind(p, 9) {
+            let arm_start: u32 = p.pos;
+            let pattern: u32 = parse_pattern(p, pool)?;
+            if pattern != 4294967295u32 && pattern < @len(pool.patterns) as u32 {
+                if pool.patterns[pattern].kind == 1 {
+                    if saw_wildcard { fail_code(p, arm_start, types::error_code(2014))?; }
+                    saw_wildcard = true;
+                } else {
+                    if saw_wildcard { fail_code(p, arm_start, types::error_code(2014))?; }
+                    var j: u32 = 0;
+                    let limited: bool = p.match_path_limited;
+                    while j < @len(seen) as u32 {
+                        var same: bool = false;
+                        if limited {
+                            if !parse_core::charge_match_path(p) { return 0u32; }
+                            same = same_pattern_path_limited(p, pool, seen[j], pattern);
+                            if p.match_path_exceeded { return 0u32; }
+                        } else {
+                            same = same_pattern_path(pool, seen[j], pattern);
+                        }
+                        if same {
+                            fail_code(p, arm_start, types::error_code(2014))?;
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                }
+                @push(seen, pattern)?;
+            }
+            if !is_op(p, 9) {
+                fail(p, p.pos)?;
+                sync_arm(p);
+                if p.recovery_exceeded { return 0u32; }
+                continue;
+            }
+            advance(p);
+            let body: u32 = parse_block(p, pool)?;
+            if p.match_path_exceeded || p.recovery_exceeded { return 0u32; }
+            @push(arms, ast::MatchArm { pattern: pattern, body: body, span: span_at(p, arm_start) })?;
+            if is_op(p, 32) {
+                advance(p);
+                if is_op(p, 29) { break; }
+            } elseif !is_op(p, 29) {
+                fail(p, p.pos)?;
+                sync_arm(p);
+                if p.recovery_exceeded { return 0u32; }
+            }
+        }
+        expect_op(p, 29)?;
+    }
+    let id: u32 = @len(pool.matches) as u32;
+    @push(pool.matches, ast::MatchStmt { scrutinee: scrutinee, arms: arms, span: span_at(p, start) })?;
+    return id;
+}
+
+// ── 参数与语句 ──
+export function parse_params(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, names: &lex::NameTable:Read, is_foreign: bool): ast::Param[]!AllocError {
+    var params: ast::Param[] = [];
+    if is_op(p, 27) { return params; }
+    while true {
+        // `move x: T` 已从参数形态移除（base.md 5.2 / parse.md 3.2）。
+        // 在 `move` token 处报一条明确的 P-1，并按普通 `x: T` 参数恢复。
+        if !is_foreign && is_kind(p, 0) && is_kind_at(p, p.pos + 1, 0) && is_op_at(p, p.pos + 2, 24) {
+            if parse_core::name_equals(names, p.tokens[p.pos].payload as u32, "move") {
+                fail_code(p, p.pos, types::error_code(2001))?;
+                parse_core::recover_advance(p);
+                if p.recovery_exceeded { return params; }
+            }
+        }
+        let name: u32 = take_ident(p)?;
+        expect_op(p, 24)?;
+        let type_ref: u32 = parse_type(p, pool)?;
+        if p.recovery_exceeded { return params; }
+        if is_foreign { position::validate_foreign_param(p, pool, type_ref)?; }
+        else { position::validate_param(p, pool, type_ref)?; }
+        @push(params, ast::Param { name: name, type_ref: type_ref, span: span_at(p, p.pos - 1) })?;
+        if is_op(p, 32) {
+            advance(p);
+            if is_op(p, 27) { fail(p, p.pos)?; break; }
+            continue;
+        }
+        break;
+    }
+    return params;
+}
+
+function parse_local(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    let keyword: u8 = p.tokens[p.pos].payload as u8;
+    advance(p);
+    let is_out: bool = keyword == 19;
+    let is_var: bool = keyword == 2;
+    let is_const: bool = keyword == 3;
+    let name: u32 = take_ident(p)?;
+    var type_ref: u32 = 0;
+    if parse_core::option_syntax(p) && !is_out && !is_const && is_op(p, 22) && is_kind_at(p, p.pos + 1, 15) {
+        // 无类型的 null 保留到语义阶段，由预期类型规则统一拒绝。
+        type_ref = 4294967295u32;
+    } else {
+        expect_op(p, 24)?;
+        if is_out { type_ref = type_parser::parse_out_type(p, pool)?; }
+        else { type_ref = parse_type(p, pool)?; }
+    }
+    if p.recovery_exceeded { return 0u32; }
+    position::validate_local(p, pool, keyword, type_ref)?;
+    var init: u32 = 4294967295u32;
+    if is_out {
+        if is_op(p, 22) {
+            fail_code(p, p.pos, types::error_code(2007))?;
+            advance(p);
+            init = parse_expr::parse_expr(p, pool, 1, true)?;
+        } elseif !is_op(p, 33) && !is_op(p, 29) && !is_kind(p, 9) {
+            fail(p, p.pos)?;
+            init = parse_expr::parse_expr(p, pool, 1, true)?;
+        }
+    } elseif is_const {
+        if is_op(p, 22) {
+            advance(p);
+            init = parse_expr::parse_const_expr(p, pool, 1)?;
+        } else {
+            fail_code(p, p.pos, types::error_code(2008))?;
+        }
+    } else {
+        if is_op(p, 22) {
+            advance(p);
+            init = parse_expr::parse_expr(p, pool, 1, true)?;
+        } elseif is_op(p, 33) || is_op(p, 29) || is_kind(p, 9) {
+            var code: u16 = 2008;
+            if parse_core::option_syntax(p) && position::type_kind(pool, type_ref) == 8 { code = 5816; }
+            if parse_core::union_syntax(p) && position::type_kind(pool, type_ref) == 9 { code = 5818; }
+            fail_code(p, p.pos, types::error_code(code))?;
+        } else {
+            fail_code(p, p.pos, types::error_code(2008))?;
+            init = parse_expr::parse_expr(p, pool, 1, true)?;
+        }
+    }
+    let end: u32 = p.pos;
+    expect_op(p, 33)?;
+    let local_id: u32 = @len(pool.locals) as u32;
+    @push(pool.locals, ast::LocalDecl { name: name, is_var: is_var, is_out: is_out, is_const: is_const, type_ref: type_ref, init: init, span: parse_core::span_through(p, start, end) })?;
+    return local_id;
+}
+
+function recover_stmt(p: &parse_core::Parser:ReadWrite): void {
+    parse_core::recover_advance(p);
+    while p.pos < @len(p.tokens) as u32 {
+        if is_op(p, 33) {
+            parse_core::recover_advance(p);
+            return;
+        }
+        if is_op(p, 29) || is_kind(p, 9) { return; }
+        if parse_core::is_stmt_start(p) { return; }
+        parse_core::recover_advance(p);
+    }
+    return;
+}
+
+export function parse_block(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    if p.depth_limit == 0u32 {
+        return parse_block_inner(p, pool)?;
+    }
+    if !parse_core::enter_depth(p) { return 0u32; }
+    let value: u32 = parse_block_inner(p, pool)?;
+    parse_core::leave_depth(p);
+    return value;
+}
+
+function parse_batch_drop(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, stmts: &u32[]:ReadWrite, first: u32): void!AllocError {
+    let enabled: bool = (p.syntax_profile & ALLOW_BATCH_DROP) != 0;
+    if !enabled { fail_code(p, p.pos, types::error_code(3008))?; }
+    var args: u32[] = [];
+    if enabled { @push(args, first)?; }
+    while is_op(p, 32) {
+        advance(p);
+        if is_op(p, 27) { fail(p, p.pos)?; break; }
+        let arg: u32 = parse_expr::parse_expr(p, pool, 1, true)?;
+        if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return; }
+        if enabled { @push(args, arg)?; }
+    }
+    expect_op(p, 27)?;
+    expect_op(p, 33)?;
+    // 保留每个操作数的独立位置，按声明的逆序规则生成现有单参析构语句。
+    var count: u32 = @len(args) as u32;
+    while count > 0 {
+        count = count - 1;
+        let arg: u32 = args[count];
+        let stmt: u32 = @len(pool.stmts) as u32;
+        @push(pool.stmts, ast::Stmt { kind: 18, span: pool.exprs[arg].span, data: arg })?;
+        @push(*stmts, stmt)?;
+    }
+    return;
+}
+
+function parse_block_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
+    let start: u32 = p.pos;
+    if !is_op(p, 28) {
+        fail(p, p.pos)?;
+        let empty_id: u32 = @len(pool.blocks) as u32;
+        @push(pool.blocks, ast::Block { stmts: [], span: span_at(p, start) })?;
+        return empty_id;
+    }
+    advance(p);
+    var stmts: u32[] = [];
+    while p.pos < @len(p.tokens) as u32 && !is_op(p, 29) && !is_kind(p, 9) {
+        let stmt_start: u32 = p.pos;
+        var kind: u8 = 255;
+        var data: u32 = 0;
+        if is_keyword(p, 1) || is_keyword(p, 2) || is_keyword(p, 3) || is_keyword(p, 19) {
+            kind = 1;
+            data = parse_local(p, pool)?;
+        } elseif is_builtin(p, 20484) {
+            kind = 18;
+            advance(p);
+            expect_op(p, 26)?;
+            data = parse_expr::parse_expr(p, pool, 1, true)?;
+            if is_op(p, 32) {
+                parse_batch_drop(p, pool, &stmts:ReadWrite, data)?;
+                if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return 0u32; }
+                continue;
+            }
+            expect_op(p, 27)?;
+            expect_op(p, 33)?;
+        } elseif is_keyword(p, 4) {
+            kind = 14;
+            data = parse_if(p, pool)?;
+        } elseif is_keyword(p, 7) {
+            kind = 15;
+            data = parse_while(p, pool, 0)?;
+        } elseif (is_kind(p, 0) || is_kind(p, 1)) && is_op_at(p, p.pos + 1, 24) && is_keyword_at(p, p.pos + 2, 7) {
+            let label: u32 = take_ident(p)?;
+            expect_op(p, 24)?;
+            kind = 15;
+            data = parse_while(p, pool, label)?;
+        } elseif is_keyword(p, 11) {
+            kind = 16;
+            data = parse_match(p, pool)?;
+        } elseif is_keyword(p, 10) {
+            kind = 10;
+            advance(p);
+            data = 4294967295u32;
+            if !is_op(p, 33) { data = parse_expr::parse_expr(p, pool, 1, true)?; }
+            expect_op(p, 33)?;
+        } elseif is_keyword(p, 8) {
+            kind = 11;
+            advance(p);
+            var break_label: u32 = 0;
+            if is_kind(p, 0) || is_kind(p, 1) { break_label = take_ident(p)?; }
+            data = break_label;
+            expect_op(p, 33)?;
+        } elseif is_keyword(p, 9) {
+            kind = 12;
+            advance(p);
+            var continue_label: u32 = 0;
+            if is_kind(p, 0) || is_kind(p, 1) { continue_label = take_ident(p)?; }
+            data = continue_label;
+            expect_op(p, 33)?;
+        } elseif is_kind(p, 0) || is_kind(p, 1) || is_kind(p, 2) || is_kind(p, 3) || is_kind(p, 4) || is_kind(p, 5) || is_kind(p, 8) || is_kind(p, 15) || is_op(p, 11) || is_op(p, 12) || is_op(p, 13) || is_op(p, 18) || is_op(p, 19) || is_op(p, 26) || is_op(p, 30) || is_op(p, 5) {
+            let target: u32 = parse_expr::parse_expr(p, pool, 1, true)?;
+            if is_op(p, 22) {
+                if !parse_expr::is_place_expr(pool, target) { fail_code(p, p.pos, types::error_code(2006))?; }
+                advance(p);
+                let value: u32 = parse_expr::parse_expr(p, pool, 1, true)?;
+                let assign_id: u32 = @len(pool.assigns) as u32;
+                @push(pool.assigns, ast::AssignStmt { target: target, value: value, span: span_at(p, stmt_start) })?;
+                kind = 17;
+                data = assign_id;
+            } else {
+                kind = 13;
+                data = target;
+            }
+            expect_op(p, 33)?;
+        } else {
+            fail(p, p.pos)?;
+            recover_stmt(p);
+        }
+        if p.match_path_exceeded || p.recovery_exceeded { return 0u32; }
+        if kind != 255 {
+            let stmt_id: u32 = @len(pool.stmts) as u32;
+            @push(pool.stmts, ast::Stmt { kind: kind, span: span_at(p, stmt_start), data: data })?;
+            @push(stmts, stmt_id)?;
+        }
+    }
+    let end: u32 = p.pos;
+    expect_op(p, 29)?;
+    let block_id: u32 = @len(pool.blocks) as u32;
+    @push(pool.blocks, ast::Block { stmts: stmts, span: parse_core::span_through(p, start, end) })?;
+    return block_id;
+}

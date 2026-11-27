@@ -1,0 +1,7 @@
+// expected_code: E4005
+// module_graph: scan
+// dependency: cycle_branch.yak
+// spec: spec/lang/module.md#N-5、spec/lang/name.md#N-5、spec/lang/base.md#R-8
+// 触发：两个不同模块相互导入。
+import cycle_branch;
+function main(): void { return; }

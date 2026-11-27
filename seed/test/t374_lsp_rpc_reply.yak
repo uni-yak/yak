@@ -1,0 +1,58 @@
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: json_string=../../compiler/lsp/json_string.yak
+// module: json=../../compiler/lsp/json.yak
+// module: rpc=../../compiler/lsp/rpc.yak
+// module: rpc_reply=../../compiler/lsp/rpc_reply.yak
+// module: positions=../../compiler/lsp/positions.yak
+// module: documents=../../compiler/lsp/documents.yak
+// module: types=../../compiler/min/lib/types.yak
+import json;
+import rpc;
+import rpc_reply;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function expect(input: &[u8], phase: u8, status: u8, expected: &[u8]): void!AllocError {
+    let doc: json::Document = json::parse(input)?;
+    let action: rpc::Route = rpc::classify(&doc:Read, input, phase);
+    let reply: rpc_reply::Reply = rpc_reply::encode(&action:Read, input)?;
+    assert(reply.status == status && @len(reply.bytes) == @len(expected));
+    let bytes: u32 = @len(expected) as u32;
+    var i: u32 = 0;
+    while i < bytes { assert(reply.bytes[i] == expected[i]); i = i + 1; }
+    if bytes != 0 {
+        let parsed: json::Document = json::parse(&reply.bytes[0..bytes]:Read)?;
+        assert(parsed.status == 0u8 && json::is_object(parsed.nodes[0].kind));
+    }
+    return;
+}
+
+function run(): void!AllocError {
+    expect("{", 0, 1, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}")?;
+    expect("[]", 0, 1, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}")?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":-0,\"method\":\"other\"}", 0, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":-0,\"error\":{\"code\":-32002,\"message\":\"Server not initialized\"}}")?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":\"汉😀\\u0061\",\"method\":\"initialize\",\"params\":{}}", 0, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":\"汉😀\\u0061\",\"result\":{\"capabilities\":{}}}")?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\"}", 0, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}")?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":2147483647,\"method\":\"other\"}", 2, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":2147483647,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}")?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":-2147483648,\"method\":\"shutdown\"}", 2, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":-2147483648,\"result\":null}")?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}", 1, 0, "")?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}", 3, 0, "")?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"unknown\"}", 2, 0, "")?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{}}", 2, 0, "")?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{}}", 2, 0, "")?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{}}", 2, 0, "")?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32601}}", 2, 0, "")?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run();
+    @drop(failed);
+    exit(1);
+}

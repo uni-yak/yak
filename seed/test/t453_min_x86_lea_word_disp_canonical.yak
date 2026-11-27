@@ -1,0 +1,67 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产栈槽取址仍按完整位移区分短、长形态。
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 128)?;
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 129)?;
+    assert(pe::code_len(&code:Read) == 11 && code.bytes[2] == 0x45 && code.bytes[6] == 0x85);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // 访存和宽目的 LEA 保留位移；已回填的窄 RIP LEA 只保留低半字。
+    let controls: [u8; 49] = [0x66, 0x8b, 0x81, 0, 0, 1, 0,
+        0x8d, 0x81, 0, 0, 1, 0, 0x48, 0x8d, 0x81, 0, 0, 1, 0,
+        0x66, 0x8d, 0x05, 0, 0, 1, 0, 0x66, 0x8d, 0x04, 0x25, 0, 0, 0, 0,
+        0x66, 0x8d, 0x81, 0x80, 0, 0, 0, 0x66, 0x8d, 0x81, 0x7f, 0xff, 0xff, 0xff];
+    encoding(&controls[0..20]:Read, 0)?;
+    encoding(&controls[20..27]:Read, 7102)?;
+    encoding(&controls[27..35]:Read, 7103)?;
+    encoding(&controls[35..49]:Read, 0)?;
+    // 低半字分别为 0、+127、−128；正、负的高半字均不影响结果。
+    let forms: [u8; 34] = [0x66, 0x8d, 0x81, 0, 0, 1, 0, 0x66, 0x89, 0xc8,
+        0x66, 0x8d, 0x81, 0x7f, 0, 0xff, 0xff, 0x66, 0x8d, 0x41, 0x7f,
+        0x66, 0x8d, 0x84, 0x89, 0x80, 0xff, 0, 0, 0x66, 0x8d, 0x44, 0x89, 0x80];
+    encoding(&forms[7..10]:Read, 0)?;
+    encoding(&forms[17..21]:Read, 0)?;
+    encoding(&forms[29..34]:Read, 0)?;
+    encoding(&forms[21..28]:Read, 7101)?;
+    encoding(&forms[0..7]:Read, 7103)?;
+    encoding(&forms[10..17]:Read, 7103)?;
+    encoding(&forms[21..29]:Read, 7103)?;
+    // 不可缩短时，低半字的符号扩展是唯一等长形态。
+    let plus_edge: [u8; 14] = [0x66, 0x8d, 0x81, 0x80, 0x00, 0x00, 0x00,
+        0x66, 0x8d, 0x81, 0x80, 0x00, 0x01, 0x00];
+    encoding(&plus_edge[0..7]:Read, 0)?;
+    encoding(&plus_edge[7..13]:Read, 7101)?;
+    encoding(&plus_edge[7..14]:Read, 7102)?;
+    let minus_edge: [u8; 14] = [0x66, 0x8d, 0x85, 0x7f, 0xff, 0xff, 0xff,
+        0x66, 0x8d, 0x85, 0x7f, 0xff, 0x01, 0x00];
+    encoding(&minus_edge[0..7]:Read, 0)?;
+    encoding(&minus_edge[7..13]:Read, 7101)?;
+    encoding(&minus_edge[7..14]:Read, 7102)?;
+    let minus_sib: [u8; 18] = [0x66, 0x42, 0x8d, 0x84, 0xa1, 0x00, 0x80, 0xff, 0xff,
+        0x66, 0x42, 0x8d, 0x84, 0xa1, 0x00, 0x80, 0x00, 0x00];
+    encoding(&minus_sib[0..9]:Read, 0)?;
+    encoding(&minus_sib[9..17]:Read, 7101)?;
+    encoding(&minus_sib[9..18]:Read, 7102)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

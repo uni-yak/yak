@@ -1,0 +1,2 @@
+// expected_trap: escaping slice
+function main(): void { var a: u8[] = [1]; var s: &[u8] = &a[0..1]; { let b: u8[] = [2]; s = &b[0..1]; } }

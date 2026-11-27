@@ -1,0 +1,7 @@
+// t04: 模块级 const + const 引用
+const PAGE_SIZE: u32 = 4096;
+
+function main(): void {
+    let x: u32 = PAGE_SIZE * 2;
+    return;
+}

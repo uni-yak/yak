@@ -1,0 +1,12 @@
+// t63: 整数宽度收窄assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let x: u8 = 255;
+    assert(x == 255);
+    let y: u16 = 65535;
+    assert(y == 65535);
+    let z: i8 = -128;
+    assert(z == -128);
+    return;
+}

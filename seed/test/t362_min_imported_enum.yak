@@ -1,0 +1,383 @@
+// 定向验证跨单元导入枚举：变体载荷重映射、tag/payload 布局与 MIR match 边界。
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import copy_facts;
+import typecheck_driver;
+import layout;
+import iface;
+import iface_write;
+import iface_load;
+import mir;
+import mir_lower;
+import mir_verify;
+
+foreign assert(cond: bool): void;
+
+const TK_BUILTIN: u8 = 1;
+const TK_IMPORTED: u8 = 3;
+const BUILTIN_U32: u16 = 4099;
+
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+struct Dep { loaded: iface::LoadedInterface, deps: resolve_refs::DependencySet }
+struct Prep {
+    input: Loaded,
+    resolution: resolve_refs::Resolution,
+    checked: typecheck::TypeCheckResult,
+    layouts: layout::LayoutResult,
+    imported_layouts: layout::ImportedLayoutTable,
+}
+
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    return Loaded { parsed: p, lexed: r };
+}
+
+function build_dep(src: &[u8], module_name: &[u8]): Dep!AllocError {
+    let input: Loaded = load(src, 2300)?;
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let empty: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&input.parsed.file:Read, &input.parsed.pool:Read, &input.lexed.names:Read, &empty:Read, module_name, &d:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&input.parsed.file:Read, &input.parsed.pool:Read, &resolution:Read, &d:ReadWrite)?;
+    let ly: layout::LayoutResult = layout::layout_unit(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, &d:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d:Read));
+    var sizes: u64[] = [];
+    var aligns: u8[] = [];
+    var known: bool[] = [];
+    var i: u32 = 0;
+    while i < @len(ly.table.items) as u32 {
+        @push(sizes, ly.table.items[i].size)?;
+        @push(aligns, ly.table.items[i].align)?;
+        @push(known, ly.table.items[i].known)?;
+        i = i + 1;
+    }
+    let info: iface::LayoutData = iface::LayoutData { sizes: sizes, aligns: aligns, known: known };
+    let built: iface::InterfaceResult = iface_write::write_interface(&input.parsed.file:Read, &input.parsed.pool:Read, &resolution:Read, &input.lexed.names:Read, &tc:Read, &info:Read, module_name, &d:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d:Read));
+    let loaded: iface::LoadedInterface = iface_load::load_interface(&built.data.bytes[0..@len(built.data.bytes)]:Read, &d:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d:Read));
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    iface_load::add_binary_dependency(&deps:ReadWrite, &loaded:Read)?;
+    return Dep { loaded: loaded, deps: deps };
+}
+
+function prepare(user_src: &[u8], dep: &Dep:Read, with_imports: bool): Prep!AllocError {
+    let input: Loaded = load(user_src, 2301)?;
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&input.parsed.file:Read, &input.parsed.pool:Read, &input.lexed.names:Read, &dep.deps:Read, "", &d:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&input.parsed.file:Read, &input.parsed.pool:Read, &resolution:Read, &d:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d:Read));
+    var imported_layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    if with_imports {
+        var si: u32 = 0;
+        while si < @len(dep.loaded.summaries) as u32 {
+            @push(imported_layouts.items, layout::ImportedLayout { dep: 1, export_id: dep.loaded.summaries[si].type_export_id, size: dep.loaded.summaries[si].size, align: dep.loaded.summaries[si].align })?;
+            si = si + 1;
+        }
+    }
+    let layouts: layout::LayoutResult = layout::layout_unit_with_imports(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, &imported_layouts:Read, &checked.imported_enums:Read, &d:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d:Read));
+    return Prep { input: input, resolution: resolution, checked: checked, layouts: layouts, imported_layouts: imported_layouts };
+}
+
+function find_kind(types: &typecheck::TypeTable:Read, kind: u8): u32 {
+    var i: u32 = 0;
+    while i < @len(types.entries) as u32 {
+        if types.entries[i].kind == kind { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+function build(prep: &Prep:Read, drops: &u32[]:Read, layouts: &layout::ImportedLayoutTable:Read): mir::MirResult!AllocError {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let empty_fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    return mir_lower::build_mir_with_drops(&prep.input.parsed.file:Read, &prep.input.parsed.pool:Read, &prep.resolution:Read, &prep.checked:Read, drops, layouts, &empty_fields:Read, &prep.checked.imported_enums:Read, &d:ReadWrite)?;
+}
+
+// 正例：变体载荷重映射、tag/payload 布局、MIR 构造与 match 接受。
+function imported_enum_accepts(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32) }\nexport function make_choice(x: u32): Choice { if x == 0u32 { return Choice::Empty; } return Choice::Small(x); }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(c: dep::Choice): u32 { match c { Empty => { return 0u32; }, Small(v) => { return v; } } }\n", &dep:Read, true)?;
+    // 两个变体按声明序输出；Empty 无载荷，Small 载荷为内建 u32。
+    assert(@len(prep.checked.imported_enums.items) == 2);
+    assert(prep.checked.imported_enums.items[0].dep == 1 && prep.checked.imported_enums.items[0].variant == 0 && prep.checked.imported_enums.items[0].payload == 0);
+    assert(prep.checked.imported_enums.items[1].variant == 1 && prep.checked.imported_enums.items[1].payload != 0);
+    let payload: typecheck::TypeEntry = prep.checked.types.entries[prep.checked.imported_enums.items[1].payload - 1];
+    assert(payload.kind == TK_BUILTIN && payload.builtin == BUILTIN_U32);
+    let choice: u32 = find_kind(&prep.checked.types:Read, TK_IMPORTED);
+    assert(choice != 0);
+    let info: layout::LayoutInfo = prep.layouts.table.items[choice - 1];
+    assert(info.known);
+    assert(info.size == 8 && info.align == 4);
+    assert(info.tag_size == 1 && info.payload_off == 4);
+    let empty_drops: u32[] = [];
+    let result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(result.accepted);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+
+// 负例一：缺摘要时导入枚举布局未知，MIR 拒绝。
+function missing_summary_rejects(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32) }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(c: dep::Choice): u32 { match c { Empty => { return 0u32; }, Small(v) => { return v; } } }\n", &dep:Read, false)?;
+    let choice: u32 = find_kind(&prep.checked.types:Read, TK_IMPORTED);
+    assert(choice != 0);
+    assert(!prep.layouts.table.items[choice - 1].known);
+    let empty_drops: u32[] = [];
+    let result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(!result.accepted);
+    return;
+}
+
+// 负例二：缺变体表（等价于手工接口无 enum_members）时不得 match 导入枚举。
+function missing_variants_rejects(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32) }\n", "dep")?;
+    var prep: Prep = prepare("import dep; function pick(c: dep::Choice): u32 { match c { Empty => { return 0u32; }, Small(v) => { return v; } } }\n", &dep:Read, true)?;
+    assert(@len(prep.checked.imported_enums.items) == 2);
+    prep.checked.imported_enums.items = [];
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let layouts: layout::LayoutResult = layout::layout_unit_with_imports(&prep.checked.types:Read, &prep.checked.fields:Read, &prep.checked.enums:Read, &prep.imported_layouts:Read, &prep.checked.imported_enums:Read, &d:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d:Read));
+    let empty_drops: u32[] = [];
+    let result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(!result.accepted);
+    return;
+}
+
+// 使用真实接口建立签名表；只有第一个签名被调用，第二个也不能躲过表级校验。
+function imported_signatures_verified(): void!AllocError {
+    let dep: Dep = build_dep("export function first(x: u32): u32 { return x; }\nexport function unused(x: u32): u32 { return x; }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(x: u32): u32 { return dep::first(x); }\n", &dep:Read, true)?;
+    let empty_drops: u32[] = [];
+    var result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(result.accepted);
+    assert(@len(result.module.imports) == 2 && @len(result.module.import_params) == 2);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+
+    let saved: mir::MirImport = result.module.imports[1];
+    assert(saved.dep == result.module.imports[0].dep && saved.export_id > result.module.imports[0].export_id);
+    result.module.imports[1].export_id = result.module.imports[0].export_id;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imports[1] = saved;
+    result.module.imports[1].param_start = result.module.imports[0].param_start;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imports[1] = saved;
+    result.module.imports[1].ret = 0;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imports[1] = saved;
+    let param: u32 = result.module.import_params[saved.param_start];
+    result.module.import_params[saved.param_start] = 0;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.import_params[saved.param_start] = param;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    @push(result.module.import_params, param)?;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+
+// 保留合法分派边，另从空变体臂引入一条不初始化载荷的入边。
+function imported_payload_edges_verified(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32) }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(c: dep::Choice, cond: bool): u32 { match c { Empty => { if cond { return 0u32; } return 1u32; }, Small(v) => { return v; } } }\n", &dep:Read, true)?;
+    let empty_drops: u32[] = [];
+    var result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    let entry: u16 = result.module.functions[0].entry;
+    let dispatch: mir::MirTerminator = result.module.functions[0].blocks[entry].terminator;
+    assert(dispatch.op == 177 && dispatch.c == 2);
+    let empty: u16 = result.module.functions[0].arms[dispatch.b].block;
+    let bound: u16 = result.module.functions[0].arms[dispatch.b + 1].block;
+    assert(result.module.functions[0].blocks[empty].payload == 0);
+    assert(result.module.functions[0].blocks[bound].payload != 0);
+    let split: mir::MirTerminator = result.module.functions[0].blocks[empty].terminator;
+    assert(split.op == 193);
+    let saved: mir::MirTerminator = result.module.functions[0].blocks[split.b].terminator;
+    assert(saved.op == 194);
+    result.module.functions[0].blocks[split.b].terminator = mir::MirTerminator { op: 192, a: 0, b: bound as u32, c: 0 };
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    let cond: u32 = result.module.functions[0].params[1];
+    result.module.functions[0].blocks[split.b].terminator = mir::MirTerminator { op: 193, a: cond, b: empty as u32, c: bound as u32 };
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].blocks[split.b].terminator = saved;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+
+// 同一个导入枚举允许显式省略绑定，也允许通配臂覆盖有载荷的变体。
+function imported_payload_discard_accepts(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32), Wide(u64) }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(c: dep::Choice): u32 { match c { Small => { return 1u32; }, _ => { return 2u32; } } }\n", &dep:Read, true)?;
+    let empty_drops: u32[] = [];
+    let result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    let dispatch: mir::MirTerminator = result.module.functions[0].blocks[result.module.functions[0].entry].terminator;
+    assert(dispatch.op == 177 && dispatch.c == 3);
+    let first: u16 = result.module.functions[0].arms[dispatch.b].block;
+    let second: u16 = result.module.functions[0].arms[dispatch.b + 1].block;
+    let third: u16 = result.module.functions[0].arms[dispatch.b + 2].block;
+    assert(first == third && first != second);
+    assert(result.module.functions[0].blocks[first].payload == 0 && result.module.functions[0].blocks[second].payload == 0);
+    return;
+}
+
+// 使用真实接口；未使用的枚举也不能改变载荷身份或标签声明序。
+function imported_variant_signatures_verified(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32) }\nexport enum Unused { Empty, Signed(i32) }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(c: dep::Choice): u32 { match c { Empty => { return 0u32; }, Small(v) => { return v; } } }\n", &dep:Read, true)?;
+    let empty_drops: u32[] = [];
+    var result: mir::MirResult = build(&prep:Read, &empty_drops:Read, &prep.imported_layouts:Read)?;
+    assert(result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    assert(@len(result.module.imported_enums.items) == 4);
+    let choice: u32 = find_kind(&prep.checked.types:Read, TK_IMPORTED);
+    assert(choice != 0);
+    let choice_export: u32 = prep.checked.types.entries[choice - 1].export_id;
+    var used_start: u32 = 0;
+    var unused_start: u32 = 2;
+    if result.module.imported_enums.items[0].export_id != choice_export {
+        used_start = 2;
+        unused_start = 0;
+    }
+    let unsigned: typecheck::ImportedEnumVariant = result.module.imported_enums.items[used_start + 1];
+    let empty: typecheck::ImportedEnumVariant = result.module.imported_enums.items[unused_start];
+    let signed: typecheck::ImportedEnumVariant = result.module.imported_enums.items[unused_start + 1];
+    assert(unsigned.export_id != signed.export_id && unsigned.variant == 1);
+    assert(empty.export_id == signed.export_id && empty.variant == 0 && signed.variant == 1);
+    assert(empty.known && empty.payload == 0 && signed.known && signed.payload != unsigned.payload);
+    assert(result.module.types.entries[unsigned.payload - 1].builtin == BUILTIN_U32);
+    assert(result.module.types.entries[signed.payload - 1].builtin == 4103);
+    result.module.imported_enums.items[unused_start + 1].payload = unsigned.payload;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imported_enums.items[unused_start + 1].payload = 0;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imported_enums.items[unused_start + 1].known = false;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imported_enums.items[unused_start + 1] = signed;
+    result.module.imported_enums.items[unused_start + 1].variant = empty.variant;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imported_enums.items[unused_start] = signed;
+    result.module.imported_enums.items[unused_start + 1] = empty;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imported_enums.items[unused_start] = empty;
+    result.module.imported_enums.items[unused_start + 1] = signed;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+
+// 不使用导入聚合的简化入口仍须保留独立接口中未使用的枚举签名。
+function simplified_builder_keeps_unused_enum(): void!AllocError {
+    let dep: Dep = build_dep("export enum Unused { Empty, Signed(i32) }\nexport function answer(): u32 { return 42u32; }\n", "dep")?;
+    let prep: Prep = prepare("import dep; function pick(): u32 { return dep::answer(); }\n", &dep:Read, false)?;
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = mir_lower::build_mir(&prep.input.parsed.file:Read, &prep.input.parsed.pool:Read, &prep.resolution:Read, &prep.checked:Read, &d:ReadWrite)?;
+    assert(result.accepted && !d.has_error && mir_verify::verify_module(&result.module:Read)?);
+    assert(@len(result.module.imported_enums.items) == 2 && @len(result.module.imported_layouts.items) == 0);
+    // 记录未使用签名不等于获得降低导入枚举匹配所需的布局。
+    let needs_layout: Prep = prepare("import dep; function pick(x: dep::Unused): i32 { match x { Empty => { return 0i32; }, Signed(v) => { return v; } } }\n", &dep:Read, true)?;
+    var reject_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: mir::MirResult = mir_lower::build_mir(&needs_layout.input.parsed.file:Read, &needs_layout.input.parsed.pool:Read, &needs_layout.resolution:Read, &needs_layout.checked:Read, &reject_diags:ReadWrite)?;
+    assert(!rejected.accepted && rejected.rejection.kind == 3);
+    return;
+}
+
+// 整组变体换序后仍可回退查询，但带未知变体的枚举不能证明 Copy。
+function imported_copy_variant_order(): void!AllocError {
+    let dep: Dep = build_dep("export enum Choice { Empty, Small(u32) }\nexport enum Unused { Empty, Signed(i32) }\n", "dep")?;
+    var prep: Prep = prepare("import dep; function pick(c: dep::Choice): u32 { match c { Empty => { return 0u32; }, Small(v) => { return v; } } }\n", &dep:Read, true)?;
+    let choice: u32 = find_kind(&prep.checked.types:Read, TK_IMPORTED);
+    assert(choice != 0 && @len(prep.checked.imported_enums.items) == 4);
+    let a: typecheck::ImportedEnumVariant = prep.checked.imported_enums.items[0];
+    let b: typecheck::ImportedEnumVariant = prep.checked.imported_enums.items[1];
+    let c: typecheck::ImportedEnumVariant = prep.checked.imported_enums.items[2];
+    let d: typecheck::ImportedEnumVariant = prep.checked.imported_enums.items[3];
+    let ordered: u8 = copy_facts::imported_copy_order(&prep.checked:Read);
+    assert(ordered == 3 && copy_facts::is_copy_value_ordered(&prep.checked:Read, choice, ordered));
+    assert(copy_facts::is_copy_value(&prep.checked:Read, choice));
+    prep.checked.imported_enums.items[0] = c;
+    prep.checked.imported_enums.items[1] = d;
+    prep.checked.imported_enums.items[2] = a;
+    prep.checked.imported_enums.items[3] = b;
+    let unordered: u8 = copy_facts::imported_copy_order(&prep.checked:Read);
+    assert(unordered == 2 && copy_facts::is_copy_value_ordered(&prep.checked:Read, choice, unordered));
+    prep.checked.imported_enums.items[0] = a;
+    prep.checked.imported_enums.items[1] = b;
+    prep.checked.imported_enums.items[2] = c;
+    prep.checked.imported_enums.items[3] = d;
+    var i: u32 = 1;
+    if a.export_id != prep.checked.types.entries[choice - 1].export_id { i = 3; }
+    prep.checked.imported_enums.items[i].known = false;
+    assert(!copy_facts::is_copy_value_ordered(&prep.checked:Read, choice, ordered));
+    assert(!copy_facts::is_copy_value(&prep.checked:Read, choice));
+    return;
+}
+
+function main(): void {
+    imported_copy_variant_order()?;
+    imported_enum_accepts()?;
+    simplified_builder_keeps_unused_enum()?;
+    imported_variant_signatures_verified()?;
+    imported_payload_edges_verified()?;
+    imported_payload_discard_accepts()?;
+    imported_signatures_verified()?;
+    missing_summary_rejects()?;
+    missing_variants_rejects()?;
+    return;
+}

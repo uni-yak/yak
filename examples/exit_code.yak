@@ -1,0 +1,7 @@
+// 以显式退出码结束的可执行程序：进程退出码与 foreign exit 的实参真值一致。
+// 编译：tools/link.sh examples/exit_code.yak
+foreign exit(code: u8): void;
+
+function main(): void {
+    exit(42);
+}

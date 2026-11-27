@@ -1,0 +1,24 @@
+import error_set_source_cases;
+
+foreign read(buffer: &[u8]:ReadWrite): u32;
+foreign exit(status: u8): void;
+
+function verify_input(): void!AllocError {
+    var source: u8[] = [];
+    var chunk: u8[] = [];
+    while @len(chunk) < 4096 { @push(chunk, 0u8)?; }
+    while true {
+        let used: u32 = read(&chunk[0..4096]:ReadWrite);
+        if used == 0 { break; }
+        var i: u32 = 0;
+        while i < used { @push(source, chunk[i])?; i = i + 1; }
+    }
+    error_set_source_cases::check_oversized_source(&source[0..@len(source)]:Read)?;
+    return;
+}
+
+function main(): void {
+    let unhandled: void!AllocError = verify_input();
+    @drop(unhandled);
+    exit(1);
+}

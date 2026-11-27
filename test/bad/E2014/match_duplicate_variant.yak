@@ -1,0 +1,7 @@
+// expected_code: E2014
+// spec: spec/lang/parse.md P-14
+// 触发：限定与非限定写法指向同一标签，不能分别匹配。
+enum Choice { A }
+function bad(e: Choice): void { match e { A => { return; }, Choice::A => { return; } } }
+
+function main(): void { return; }

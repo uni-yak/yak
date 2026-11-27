@@ -1,0 +1,24 @@
+// module: source=fixtures/read_argument.yak
+import source;
+foreign assert(cond: bool): void;
+function sum(left: &u32, right: &u32:Read): u32 { return *left + *right; }
+function increment(value: &u32:ReadWrite): void { *value = *value + 1u32; }
+function inspect(value: &u32:ReadWrite): void {
+    assert(sum(*value, *value) == 12u32);
+    increment(*value);
+    assert(*value == 7u32);
+}
+function main(): void {
+    let item: source::Item = source::make(9u32);
+    let indirect: &function(&source::Item): u32 = &source::read;
+    assert(source::read(item) == 9u32);
+    assert(indirect(item) == 9u32);
+    let fixed: u32 = 4u32;
+    assert(sum(fixed, fixed) == 8u32);
+    const constant: u32 = 2;
+    assert(sum(constant, fixed) == 6u32);
+    var count: u32 = 5u32;
+    increment(count);
+    inspect(count);
+    assert(count == 7u32);
+}

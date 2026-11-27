@@ -1,0 +1,346 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+// module: coff_code=../../compiler/min/src/emit/coff_code.yak
+// module: coff_state=../../compiler/min/src/emit/coff_state.yak
+// module: coff_call=../../compiler/min/src/emit/coff_call.yak
+// module: coff_place=../../compiler/min/src/emit/coff_place.yak
+// module: coff_inst=../../compiler/min/src/emit/coff_inst.yak
+// module: coff_carrier=../../compiler/min/src/emit/coff_carrier.yak
+// module: coff_func=../../compiler/min/src/emit/coff_func.yak
+// module: coff_layout=../../compiler/min/src/emit/coff_layout.yak
+// module: coff=../../compiler/min/src/emit/coff.yak
+// module: coff_symbols=../../compiler/min/src/emit/coff_symbols.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// 静态字节池的对象发射定向用例：覆盖 .rdata 布局、数据符号、lea 重定位与切片实参展开。
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+import mir_verify;
+import pe;
+import coff_code;
+import coff;
+import coff_symbols;
+import coff_state;
+foreign assert(cond: bool): void;
+
+// 单条字符串字面量作为外部服务实参：MIR 只给 LocalId，发射时展开成 (指针, 长度)。
+const SOURCE: &[u8] = "foreign write(data: &[u8]): void; function main(): void { write(\"hi\\n\"); return; }\n";
+
+// 走带静态池的解析入口，其余阶段与会话内测试运行器保持一致。
+function compile(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", diags)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, diags)?;
+    return mir_lower::build_mir(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &tc:Read, diags)?;
+}
+// 小端读取 16 位与 32 位。
+function u16_at(data: &u8[]:Read, at: u32): u16 {
+    return (data[at] as u16) | ((data[at + 1] as u16) << 8u16);
+}
+function u32_at(data: &u8[]:Read, at: u32): u32 {
+    return (data[at] as u32) | ((data[at + 1] as u32) << 8u32)
+        | ((data[at + 2] as u32) << 16u32) | ((data[at + 3] as u32) << 24u32);
+}
+// 追加一段 ASCII 字节（测试只用到短名）。
+function push_text(dst: &u8[]:ReadWrite, text: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(text) as u32 { @push(*dst, text[i])?; i = i + 1; }
+    return;
+}
+// 取第一条外部服务调用的目标 DefId（op 147 的 b），没有则返回 0。
+function foreign_def(m: &mir::MirModule:Read): u32 {
+    var f: u32 = 0;
+    while f < @len(m.functions) as u32 {
+        var k: u32 = 0;
+        while k < @len(m.functions[f].insts) as u32 {
+            if mir::is_foreign_call(m.functions[f].insts[k].op) { return m.functions[f].insts[k].b; }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    return 0;
+}
+// 构造最小链接表：main 为对象内部函数，write 为外部服务符号（与 names.yak 的映射一致）。
+function link_table(m: &mir::MirModule:Read): coff_state::LinkTable!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var entry: u8[] = [];
+    push_text(&entry:ReadWrite, "main")?;
+    @push(table.symbols, coff_state::LinkSymbol { def: m.functions[0].def as u64, kind: 0u8, name: @move(entry) })?;
+    let write_def: u32 = foreign_def(m);
+    assert(write_def != 0);
+    var service: u8[] = [];
+    push_text(&service:ReadWrite, "yak_rt_try_write")?;
+    @push(table.symbols, coff_state::LinkSymbol { def: write_def as u64, kind: 1u8, name: @move(service) })?;
+    return table;
+}
+// 组合：编译模块并发射对象（真实入口必须接受）。
+function emitted(diags: &diag::DiagBuffer:ReadWrite): coff::EmitResult!AllocError {
+    let result: mir::MirResult = compile(SOURCE, 1244, diags)?;
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    assert(@len(result.module.statics) == 1);
+    assert(@len(result.module.static_bytes) == 3);
+    let table: coff_state::LinkTable = link_table(&result.module:Read)?;
+    return coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+}
+// .rdata：节表第 2 项（偏移 60）指向静态字节池，内容逐字节等于 "hi\n"。
+function rdata_bytes(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let res: coff::EmitResult = emitted(&diags:ReadWrite)?;
+    assert(diags_empty(&diags:Read));
+    assert(res.ok);
+    // 节名 ".rdata" 右侧补 0，共 8 字节。
+    assert(res.bytes.data[60] == 46 && res.bytes.data[61] == 114 && res.bytes.data[62] == 100);
+    assert(res.bytes.data[63] == 97 && res.bytes.data[64] == 116 && res.bytes.data[65] == 97);
+    assert(res.bytes.data[66] == 0);
+    let raw_size: u32 = u32_at(&res.bytes.data:Read, 76);
+    let raw_ptr: u32 = u32_at(&res.bytes.data:Read, 80);
+    assert(raw_size == 3);
+    // 文件头 20 + 节表 3×40 之后紧跟 .text，静态字节排在 .text 之后。
+    assert(raw_ptr >= 140);
+    assert(res.bytes.data[raw_ptr] == 104);
+    assert(res.bytes.data[raw_ptr + 1] == 105);
+    assert(res.bytes.data[raw_ptr + 2] == 10);
+    return;
+}
+// 数据符号：节号 2（.rdata）、存储类 STATIC(3)、名 "`$s0`" 内联、值为静态字节偏移 0。
+function data_symbol(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let res: coff::EmitResult = emitted(&diags:ReadWrite)?;
+    assert(res.ok);
+    let symtab: u32 = u32_at(&res.bytes.data:Read, 8);
+    let symbols: u32 = u32_at(&res.bytes.data:Read, 12);
+    // 根、外部服务以及静态数据各一条符号。
+    assert(symbols == 3);
+    // 符号条目 18 字节；数据符号按插入顺序排在链接表符号之后。
+    let data_at: u32 = symtab + 18u32 * 2u32;
+    assert(res.bytes.data[data_at] == 36);
+    assert(res.bytes.data[data_at + 1] == 115);
+    assert(res.bytes.data[data_at + 2] == 48);
+    assert(res.bytes.data[data_at + 3] == 0);
+    assert(u32_at(&res.bytes.data:Read, data_at + 8) == 0);
+    assert(u16_at(&res.bytes.data:Read, data_at + 12) == 2);
+    assert(u16_at(&res.bytes.data:Read, data_at + 14) == 0);
+    assert(res.bytes.data[data_at + 16] == 3);
+    return;
+}
+// 重定位：静态数据及外部服务的两条 REL32。
+function text_relocs(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let res: coff::EmitResult = emitted(&diags:ReadWrite)?;
+    assert(res.ok);
+    let reloc_ptr: u32 = u32_at(&res.bytes.data:Read, 44);
+    let reloc_count: u32 = u16_at(&res.bytes.data:Read, 52) as u32;
+    assert(reloc_count == 2);
+    let first_type: u16 = u16_at(&res.bytes.data:Read, reloc_ptr + 8);
+    let second_type: u16 = u16_at(&res.bytes.data:Read, reloc_ptr + 18);
+    assert(first_type == 4 && second_type == 4);
+    let first_symbol: u32 = u32_at(&res.bytes.data:Read, reloc_ptr + 4);
+    let second_symbol: u32 = u32_at(&res.bytes.data:Read, reloc_ptr + 14);
+    // 先加载静态数据再调用外部函数，重定位按站点地址升序排列。
+    assert(first_symbol == 2 && second_symbol == 0);
+    let site: u32 = u32_at(&res.bytes.data:Read, reloc_ptr);
+    assert(site < u32_at(&res.bytes.data:Read, reloc_ptr + 10));
+    // 数据引用站点前三个字节是 `lea rax, [rip+disp32]` 的 48 8D 05。
+    assert(res.bytes.data[140 + site - 3] == 72);
+    assert(res.bytes.data[140 + site - 2] == 141);
+    assert(res.bytes.data[140 + site - 1] == 5);
+    return;
+}
+// 切片局部：栈槽按 16 字节胖指针规划，宽度仍记 8 字节。
+function slice_slot(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(SOURCE, 1244, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(@len(layout.functions) == 1);
+    assert(@len(layout.static_offsets) == 1);
+    assert(layout.static_offsets[0] == 0);
+    assert(@len(layout.rdata) == 3 && layout.rdata[0] == 104 && layout.rdata[1] == 105);
+    assert(@len(layout.functions[0].slots) == 1);
+    assert(layout.functions[0].slots[0] == 16);
+    assert(layout.functions[0].widths[0] == 8);
+    // 切片槽之后还有保存寄存器区的 32 字节，再向上对齐到 16。
+    assert(layout.functions[0].frame_size >= 48);
+    return;
+}
+// 确定性：同一模块两次发射逐字节相同（build.sh 的跨编译器比对前提）。
+function deterministic(): void!AllocError {
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let one: coff::EmitResult = emitted(&d1:ReadWrite)?;
+    let two: coff::EmitResult = emitted(&d2:ReadWrite)?;
+    assert(one.ok && two.ok);
+    assert(coff_code::bytes_len(&one.bytes:Read) == coff_code::bytes_len(&two.bytes:Read));
+    var i: u32 = 0;
+    while i < coff_code::bytes_len(&one.bytes:Read) {
+        assert(one.bytes.data[i] == two.bytes.data[i]);
+        i = i + 1;
+    }
+    return;
+}
+// 诊断缓冲为空（测试辅助）。
+function diags_empty(diags: &diag::DiagBuffer:Read): bool {
+    return diag::diagbuf_count(diags) == 0;
+}
+
+// 混合调用与静态数据站点，验证地址排序、同址次序和符号关联。
+function reloc_order(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let source: &[u8] = "foreign write(data: &[u8]): void; function main(): void { write(\"a\"); write(\"b\"); write(\"c\"); return; }\n";
+    let result: mir::MirResult = compile(source, 1245, &diags:ReadWrite)?;
+    assert(result.accepted);
+    var layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    let table: coff_state::LinkTable = link_table(&result.module:Read)?;
+    assert(@len(layout.functions[0].calls) == 3 && @len(layout.functions[0].data_refs) == 3);
+    // 故意让采集序列为 20、20、4、12、20、0。
+    layout.functions[0].calls[0].at = 20;
+    layout.functions[0].calls[1].at = 20;
+    layout.functions[0].calls[2].at = 4;
+    layout.functions[0].data_refs[0].at = 12;
+    layout.functions[0].data_refs[1].at = 20;
+    layout.functions[0].data_refs[2].at = 0;
+    let output: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    let pos: u32 = u32_at(&output.data:Read, 44);
+    assert(u16_at(&output.data:Read, 52) == 6);
+    assert(u32_at(&output.data:Read, pos) == 0 && u32_at(&output.data:Read, pos + 4) == 4);
+    assert(u32_at(&output.data:Read, pos + 10) == 4);
+    assert(u32_at(&output.data:Read, pos + 20) == 12 && u32_at(&output.data:Read, pos + 24) == 2);
+    assert(u32_at(&output.data:Read, pos + 30) == 20 && u32_at(&output.data:Read, pos + 40) == 20 && u32_at(&output.data:Read, pos + 50) == 20);
+    assert(u32_at(&output.data:Read, pos + 34) == u32_at(&output.data:Read, pos + 44));
+    assert(u32_at(&output.data:Read, pos + 54) == 3);
+    // 同址的数据符号不同，能观察排序是否保持收集顺序。
+    layout.functions[0].data_refs[0].at = 20;
+    let tied: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    let tied_pos: u32 = u32_at(&tied.data:Read, 44);
+    assert(u32_at(&tied.data:Read, tied_pos + 20) == 20);
+    assert(u32_at(&tied.data:Read, tied_pos + 30) == 20);
+    assert(u32_at(&tied.data:Read, tied_pos + 40) == 20);
+    assert(u32_at(&tied.data:Read, tied_pos + 50) == 20);
+    assert(u32_at(&tied.data:Read, tied_pos + 24) == u32_at(&tied.data:Read, tied_pos + 14));
+    assert(u32_at(&tied.data:Read, tied_pos + 34) == u32_at(&tied.data:Read, tied_pos + 14));
+    assert(u32_at(&tied.data:Read, tied_pos + 44) == 2);
+    assert(u32_at(&tied.data:Read, tied_pos + 54) == 3);
+    // 两列有序时走直接归并；同址仍先写调用，再按次序写数据。
+    layout.functions[0].calls[0].at = 4;
+    layout.functions[0].calls[1].at = 20;
+    layout.functions[0].calls[2].at = 20;
+    layout.functions[0].data_refs[0].at = 0;
+    layout.functions[0].data_refs[1].at = 20;
+    layout.functions[0].data_refs[2].at = 20;
+    let ordered: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    let ordered_pos: u32 = u32_at(&ordered.data:Read, 44);
+    assert(u32_at(&ordered.data:Read, ordered_pos) == 0 && u32_at(&ordered.data:Read, ordered_pos + 4) == 2);
+    assert(u32_at(&ordered.data:Read, ordered_pos + 10) == 4);
+    assert(u32_at(&ordered.data:Read, ordered_pos + 20) == 20 && u32_at(&ordered.data:Read, ordered_pos + 30) == 20);
+    assert(u32_at(&ordered.data:Read, ordered_pos + 24) == u32_at(&ordered.data:Read, ordered_pos + 14));
+    assert(u32_at(&ordered.data:Read, ordered_pos + 34) == u32_at(&ordered.data:Read, ordered_pos + 14));
+    assert(u32_at(&ordered.data:Read, ordered_pos + 44) == 3 && u32_at(&ordered.data:Read, ordered_pos + 54) == 4);
+    var empty: coff_code::Bytes = coff_code::bytes_new();
+    let functions: coff_state::FunctionLayout[] = [];
+    let symbols: coff_symbols::OutSymbol[] = [];
+    assert(coff::emit_relocs(&empty:ReadWrite, &functions[0..@len(functions)]:Read, &symbols[0..@len(symbols)]:Read, 0)? == 0);
+    assert(@len(empty.data) == 0);
+    return;
+}
+// 后续函数同时含分支、静态数据和外部调用；两条发射路径须保持原字节和节内坐标。
+function later_function_relocs(): void!AllocError {
+    let source: &[u8] = "foreign write(data: &[u8]): void; function first(): bool { return true; } function next(take: bool): void { if take { write(\"next\\n\"); } return; }\n";
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(source, 1245, &diags:ReadWrite)?;
+    assert(result.accepted && diags_empty(&diags:Read));
+    assert(@len(result.module.functions) == 2 && @len(result.module.statics) == 1);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var table: coff_state::LinkTable = link_table(&result.module:Read)?;
+    var name: u8[] = [];
+    push_text(&name:ReadWrite, "next")?;
+    @push(table.symbols, coff_state::LinkSymbol { def: result.module.functions[1].def as u64, kind: 0u8, name: @move(name) })?;
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    let packed: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    let explicit: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    assert(packed.ok && @len(packed.bytes.data) == @len(explicit.data));
+    var i: u32 = 0;
+    while i < @len(explicit.data) as u32 {
+        assert(packed.bytes.data[i] == explicit.data[i]);
+        i = i + 1;
+    }
+    assert(@len(layout.functions[0].calls) == 0 && @len(layout.functions[0].data_refs) == 0);
+    let second: &coff_state::FunctionLayout:Read = &layout.functions[1]:Read;
+    assert(second.text_offset > 0 && @len(result.module.functions[1].blocks) > 1);
+    assert(@len(second.data_refs) == 1 && @len(second.calls) == 1);
+    let reloc: u32 = u32_at(&packed.bytes.data:Read, 44);
+    assert(u16_at(&packed.bytes.data:Read, 52) == 2);
+    assert(u16_at(&packed.bytes.data:Read, reloc + 8) == 4 && u16_at(&packed.bytes.data:Read, reloc + 18) == 4);
+    let data_at: u32 = u32_at(&packed.bytes.data:Read, reloc);
+    let call_at: u32 = u32_at(&packed.bytes.data:Read, reloc + 10);
+    assert(data_at == second.text_offset + second.data_refs[0].at);
+    assert(call_at == second.text_offset + second.calls[0].at);
+    assert(second.text_offset < data_at && data_at < call_at && call_at + 4 <= second.text_offset + second.code_size);
+    let code: u32 = u32_at(&packed.bytes.data:Read, 40);
+    assert(packed.bytes.data[code + data_at - 1] == 5 && packed.bytes.data[code + call_at - 1] == 232);
+    return;
+}
+function main(): void {
+    later_function_relocs()?;
+    reloc_order()?;
+    rdata_bytes()?;
+    data_symbol()?;
+    text_relocs()?;
+    slice_slot()?;
+    deterministic()?;
+    return;
+}

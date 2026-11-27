@@ -1,0 +1,4 @@
+// expected_trap: index out of bounds
+// module: nested=fixtures/nested_fields.yak
+import nested;
+function main(): void { let value: u32 = nested::make().inner.data[1u32]; @drop(value); }

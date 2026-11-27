@@ -1,0 +1,531 @@
+// base 常量求值：只消费已解析身份和类型快照，不执行宿主调用。
+import ast;
+import types;
+import diag;
+import resolve;
+import resolve_refs;
+
+export struct ConstType { kind: u8, builtin: u16, def: u32, elem: u32, cap: u8, length: u64 }
+export struct ConstEnum { def: u32, payloads: u32[] }
+export struct ConstValue { kind: u8, value_type_id: u32, bits: u64, variant: u32, children_start: u32, children_count: u32, static_index: u32 }
+export struct ConstBinding { def: u32, value_type_id: u32, value: u32 }
+export struct ConstTable { values: ConstValue[], children: u32[], bindings: ConstBinding[] }
+export struct ConstInput { types: ConstType[], enums: ConstEnum[], def_types: u32[] }
+
+export struct InitLookupBudget { limited: bool, remaining: u32, exhausted: bool }
+export function init_lookup_budget(limit: u32): InitLookupBudget {
+    return InitLookupBudget { limited: limit != 0u32, remaining: limit, exhausted: false };
+}
+function charge_init_lookup(work: &InitLookupBudget:ReadWrite): bool {
+    if work.remaining == 0u32 { work.exhausted = true; return false; }
+    work.remaining = work.remaining - 1u32;
+    return true;
+}
+
+export struct MaterialBudget { limited: bool, remaining: u32, exhausted: bool }
+export function material_budget(limit: u32): MaterialBudget {
+    return MaterialBudget { limited: limit != 0u32, remaining: limit, exhausted: false };
+}
+function charge_material(work: &MaterialBudget:ReadWrite): bool {
+    if work.remaining == 0u32 { work.exhausted = true; return false; }
+    work.remaining = work.remaining - 1u32;
+    return true;
+}
+
+export struct FoldBudget { limited: bool, remaining: u32, exhausted: bool }
+export function fold_budget(limit: u32): FoldBudget {
+    return FoldBudget { limited: limit != 0u32, remaining: limit, exhausted: false };
+}
+export function charge_fold(work: &FoldBudget:ReadWrite): bool {
+    if work.remaining == 0u32 { work.exhausted = true; return false; }
+    work.remaining = work.remaining - 1u32;
+    return true;
+}
+
+export function new_table(): ConstTable { return ConstTable { values: [], children: [], bindings: [] }; }
+function emit(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+function fail(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span): u32!AllocError { emit(diags, code, span)?; return 0; }
+function width(b: u16): u32 {
+    if b == 4097 || b == 4101 { return 8; }
+    if b == 4098 || b == 4102 { return 16; }
+    if b == 4099 || b == 4103 { return 32; }
+    if b == 4100 || b == 4104 { return 64; }
+    return 0;
+}
+function mask(w: u32): u64 { return 18446744073709551615u64 >> (64u64 - (w as u64)); }
+function signed(b: u16): bool { return b >= 4101 && b <= 4104; }
+function negative(bits: u64, w: u32): bool { return (bits & (1u64 << ((w as u64) - 1u64))) != 0; }
+function magnitude(bits: u64, w: u32, neg: bool): u64 {
+    if neg { return @wrap_sub(0u64, bits) & mask(w); }
+    return bits;
+}
+function encode(value: u64, w: u32, neg: bool): u64 {
+    if neg { return @wrap_sub(0u64, value) & mask(w); }
+    return value;
+}
+function ref_index(refs: &resolve_refs::RefTable:Read, expr: u32): u32 {
+    if @len(refs.expr_index) != 0 {
+        if expr < @len(refs.expr_index) as u32 { return refs.expr_index[expr]; }
+        return 0;
+    }
+    var i: u32 = 0;
+    while i < @len(refs.items) as u32 {
+        if refs.items[i].node_kind == 0 && refs.items[i].node == expr { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function enum_index(input: &ConstInput:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(input.enums) as u32 { if input.enums[i].def == def { return i + 1; } i = i + 1; }
+    return 0;
+}
+// 对枚举全部分支做类型级判定，不能因当前标签没有 payload 而放行资源类型。
+function materializable(input: &ConstInput:Read, value_type_id: u32, top: bool, depth: u32): bool {
+    if value_type_id == 0 || value_type_id > @len(input.types) as u32 || depth > @len(input.types) as u32 { return false; }
+    let t: ConstType = input.types[value_type_id - 1];
+    if t.kind == 1 { return width(t.builtin) != 0 || t.builtin == 4105 || t.builtin == 4106 || t.builtin == 4108; }
+    if t.kind == 5 && top && t.cap == 0 && t.elem != 0 && t.elem <= @len(input.types) as u32 {
+        return input.types[t.elem - 1].kind == 1 && input.types[t.elem - 1].builtin == 4097;
+    }
+    if t.kind == 7 { return t.length > 0 && materializable(input, t.elem, false, depth + 1); }
+    if t.kind == 2 {
+        let e: u32 = enum_index(input, t.def);
+        if e == 0 { return false; }
+        var i: u32 = 0;
+        while i < @len(input.enums[e - 1].payloads) as u32 {
+            let payload: u32 = input.enums[e - 1].payloads[i];
+            if payload != 0 && !materializable(input, payload, false, depth + 1) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+// 与批处理判定同序；预算不足先返回，由调用者区别于类型本身不可物化。
+function materializable_limited(input: &ConstInput:Read, value_type_id: u32, top: bool, depth: u32, work: &MaterialBudget:ReadWrite): bool {
+    if value_type_id == 0 || value_type_id > @len(input.types) as u32 || depth > @len(input.types) as u32 { return false; }
+    if !charge_material(work) { return false; }
+    let t: ConstType = input.types[value_type_id - 1];
+    if t.kind == 1 { return width(t.builtin) != 0 || t.builtin == 4105 || t.builtin == 4106 || t.builtin == 4108; }
+    if t.kind == 5 && top && t.cap == 0 && t.elem != 0 && t.elem <= @len(input.types) as u32 {
+        if !charge_material(work) { return false; }
+        let elem: ConstType = input.types[t.elem - 1];
+        return elem.kind == 1 && elem.builtin == 4097;
+    }
+    if t.kind == 7 { return t.length > 0 && materializable_limited(input, t.elem, false, depth + 1, work); }
+    if t.kind == 2 {
+        var e: u32 = 0;
+        while e < @len(input.enums) as u32 {
+            if !charge_material(work) { return false; }
+            if input.enums[e].def == t.def { break; }
+            e = e + 1;
+        }
+        if e == @len(input.enums) as u32 { return false; }
+        var i: u32 = 0;
+        while i < @len(input.enums[e].payloads) as u32 {
+            if !charge_material(work) { return false; }
+            let payload: u32 = input.enums[e].payloads[i];
+            if payload != 0 && !materializable_limited(input, payload, false, depth + 1, work) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+function push_value(table: &ConstTable:ReadWrite, kind: u8, value_type_id: u32, bits: u64, variant: u32, start: u32, count: u32, static_index: u32): u32!AllocError {
+    @push(table.values, ConstValue { kind: kind, value_type_id: value_type_id, bits: bits, variant: variant, children_start: start, children_count: count, static_index: static_index })?;
+    return @len(table.values) as u32;
+}
+function literal(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, expected: u32, neg: bool): u32!AllocError {
+    let value: u64 = pool.exprs[expr].data;
+    let b: u16 = input.types[expected - 1].builtin;
+    let w: u32 = width(b);
+    if w == 0 { return fail(diags, 5006, pool.exprs[expr].span)?; }
+    let suffix: u8 = pool.exprs[expr].integer_suffix;
+    if suffix != 0 && b != 4096 + suffix as u16 { return fail(diags, 5001, pool.exprs[expr].span)?; }
+    var limit: u64 = mask(w);
+    if signed(b) { limit = limit >> 1; if neg { limit = limit + 1; } }
+    if value > limit || (neg && !signed(b) && value != 0) { return fail(diags, 1004, pool.exprs[expr].span)?; }
+    return push_value(table, 1, expected, encode(value, w, neg), 0, 0, 0, 0)?;
+}
+function integer_binary(table: &ConstTable:ReadWrite, input: &ConstInput:Read, diags: &diag::DiagBuffer:ReadWrite, op: u8, left: u32, right: u32, span: types::Span): u32!AllocError {
+    let value_type_id: u32 = table.values[left - 1].value_type_id;
+    if table.values[left - 1].kind != 1 || table.values[right - 1].kind != 1 { return fail(diags, 5006, span)?; }
+    if value_type_id != table.values[right - 1].value_type_id { return fail(diags, 5001, span)?; }
+    let b: u16 = input.types[value_type_id - 1].builtin;
+    let w: u32 = width(b);
+    let m: u64 = mask(w);
+    let a: u64 = table.values[left - 1].bits;
+    let c: u64 = table.values[right - 1].bits;
+    let an: bool = signed(b) && negative(a, w);
+    let cn: bool = signed(b) && negative(c, w);
+    var result: u64 = 0;
+    if op == 11 || op == 12 {
+        if op == 11 { result = @wrap_add(a, c) & m; }
+        else { result = @wrap_sub(a, c) & m; }
+        if signed(b) {
+            let rn: bool = negative(result, w);
+            if (op == 11 && an == cn && rn != an) || (op == 12 && an != cn && rn != an) { return fail(diags, 5008, span)?; }
+        } else {
+            if (op == 11 && a > m - c) || (op == 12 && a < c) { return fail(diags, 5008, span)?; }
+        }
+    } elseif op == 13 || op == 14 || op == 15 {
+        let am: u64 = magnitude(a, w, an);
+        let cm: u64 = magnitude(c, w, cn);
+        if op == 13 {
+            var limit: u64 = m;
+            if signed(b) { limit = m >> 1; if an != cn { limit = limit + 1; } }
+            if cm != 0 && am > limit / cm { return fail(diags, 5008, span)?; }
+            result = encode(am * cm, w, an != cn);
+        } else {
+            if cm == 0 { return fail(diags, 5008, span)?; }
+            if op == 14 {
+                if signed(b) && an && am == (1u64 << ((w as u64) - 1u64)) && cn && cm == 1 { return fail(diags, 5008, span)?; }
+                result = encode(am / cm, w, an != cn);
+            } else { result = encode(am % cm, w, an); }
+        }
+    } elseif op == 7 || op == 8 {
+        if c >= w as u64 { return fail(diags, 5008, span)?; }
+        if op == 7 { result = (a << c) & m; }
+        else {
+            result = a >> c;
+            if an && c != 0 { result = result | (m ^ (m >> c)); }
+        }
+    } elseif op == 19 { result = a & c; }
+    elseif op == 20 { result = a | c; }
+    elseif op == 21 { result = a ^ c; }
+    else { return fail(diags, 5006, span)?; }
+    return push_value(table, 1, value_type_id, result, 0, 0, 0, 0)?;
+}
+function eval_enum(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, expected: u32, expr: u32, ri: u32, call: u32): u32!AllocError {
+    let r: resolve_refs::ResolvedRef = refs.items[ri - 1];
+    let t: ConstType = input.types[expected - 1];
+    if r.kind == 5 {
+        if t.kind != 1 || t.builtin != r.x as u16 || r.x != 4108 { return fail(diags, 5001, pool.exprs[expr].span)?; }
+        if call != 4294967295u32 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+        return push_value(table, 5, expected, 0, r.y, 0, 0, 0)?;
+    }
+    if r.kind != 3 || t.kind != 2 || t.def != r.x { return fail(diags, 5006, pool.exprs[expr].span)?; }
+    let e: u32 = enum_index(input, r.x);
+    if e == 0 || r.y >= @len(input.enums[e - 1].payloads) as u32 { return fail(diags, 5006, pool.exprs[expr].span)?; }
+    let payload: u32 = input.enums[e - 1].payloads[r.y];
+    var child: u32 = 0;
+    if payload != 0 {
+        if call == 4294967295u32 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+        if @len(pool.calls[call].args) != 1 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+        child = eval_expr(table, input, pool, refs, diags, pool.calls[call].args[0].value, payload, false, 5007)?;
+        if child == 0 { return 0; }
+    } elseif call != 4294967295u32 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+    let start: u32 = @len(table.children) as u32;
+    if child != 0 { @push(table.children, child)?; }
+    var count: u32 = 0;
+    if child != 0 { count = 1; }
+    return push_value(table, 5, expected, 0, r.y, start, count, 0)?;
+}
+function eval_expr(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, expected: u32, top: bool, invalid: u16): u32!AllocError {
+    if expr >= @len(pool.exprs) as u32 || expected == 0 || expected > @len(input.types) as u32 { return 0; }
+    let node: ast::Expr = pool.exprs[expr];
+    let data: u32 = node.data as u32;
+    if node.kind == 2 { return literal(table, input, pool, diags, expr, expected, false)?; }
+    if node.kind == 3 || node.kind == 4 {
+        var b: u16 = 4105;
+        if node.kind == 4 { b = 4106; }
+        if input.types[expected - 1].kind != 1 || input.types[expected - 1].builtin != b { return fail(diags, 5001, node.span)?; }
+        var kind: u8 = 2;
+        if node.kind == 4 { kind = 3; }
+        return push_value(table, kind, expected, node.data, 0, 0, 0, 0)?;
+    }
+    if node.kind == 5 {
+        if !top { return fail(diags, 5007, node.span)?; }
+        if input.types[expected - 1].kind != 5 { return fail(diags, 5006, node.span)?; }
+        if data >= @len(pool.statics) as u32 { return fail(diags, 5006, node.span)?; }
+        return push_value(table, 4, expected, 0, 0, 0, 0, data)?;
+    }
+    if node.kind == 0 || node.kind == 25 {
+        let ri: u32 = ref_index(refs, expr);
+        if ri == 0 || refs.items[ri - 1].kind == resolve_refs::pending_value_name() { return 0; }
+        if refs.items[ri - 1].kind == 3 || refs.items[ri - 1].kind == 5 { return eval_enum(table, input, pool, refs, diags, expected, expr, ri, 4294967295u32)?; }
+        if refs.items[ri - 1].kind != 0 { return fail(diags, 4002, node.span)?; }
+        var i: u32 = 0;
+        while i < @len(table.bindings) as u32 {
+            if table.bindings[i].def == refs.items[ri - 1].x {
+                if table.bindings[i].value_type_id != expected { return fail(diags, 5001, node.span)?; }
+                let value: u32 = table.bindings[i].value;
+                if !top && table.values[value - 1].kind == 4 { return fail(diags, 5007, node.span)?; }
+                return value;
+            }
+            i = i + 1;
+        }
+        return fail(diags, 4004, node.span)?;
+    }
+    if node.kind == 22 {
+        let ri: u32 = ref_index(refs, pool.calls[data].callee);
+        if ri != 0 {
+            if refs.items[ri - 1].kind == resolve_refs::pending_value_name() { return 0; }
+            if refs.items[ri - 1].kind == 3 || refs.items[ri - 1].kind == 5 { return eval_enum(table, input, pool, refs, diags, expected, expr, ri, data)?; }
+        }
+        return fail(diags, invalid, node.span)?;
+    }
+    if node.kind == 26 {
+        let t: ConstType = input.types[expected - 1];
+        if t.kind != 7 || t.length == 0 || t.length != @len(pool.arrays[data].elements) as u64 { return fail(diags, 5007, node.span)?; }
+        var children: u32[] = [];
+        var i: u32 = 0;
+        while i < @len(pool.arrays[data].elements) as u32 {
+            let child: u32 = eval_expr(table, input, pool, refs, diags, pool.arrays[data].elements[i], t.elem, false, 5007)?;
+            if child == 0 { return 0; }
+            @push(children, child)?;
+            i = i + 1;
+        }
+        let start: u32 = @len(table.children) as u32;
+        i = 0;
+        while i < @len(children) as u32 { @push(table.children, children[i])?; i = i + 1; }
+        return push_value(table, 6, expected, 0, 0, start, @len(children) as u32, 0)?;
+    }
+    if node.kind == 21 {
+        if pool.unaries[data].op != 12 || width(input.types[expected - 1].builtin) == 0 { return fail(diags, invalid, node.span)?; }
+        let operand: u32 = pool.unaries[data].operand;
+        if pool.exprs[operand].kind == 2 { return literal(table, input, pool, diags, operand, expected, true)?; }
+        let child: u32 = eval_expr(table, input, pool, refs, diags, operand, expected, false, invalid)?;
+        if child == 0 { return 0; }
+        let bits: u64 = table.values[child - 1].bits;
+        let b: u16 = input.types[expected - 1].builtin;
+        let w: u32 = width(b);
+        if (!signed(b) && bits != 0) || (signed(b) && bits == (1u64 << ((w as u64) - 1u64))) { return fail(diags, 5008, node.span)?; }
+        return push_value(table, 1, expected, @wrap_sub(0u64, bits) & mask(w), 0, 0, 0, 0)?;
+    }
+    if node.kind == 20 {
+        let left: u32 = eval_expr(table, input, pool, refs, diags, pool.binaries[data].left, expected, false, invalid)?;
+        if left == 0 { return 0; }
+        let right: u32 = eval_expr(table, input, pool, refs, diags, pool.binaries[data].right, expected, false, invalid)?;
+        if right == 0 { return 0; }
+        return integer_binary(table, input, diags, pool.binaries[data].op, left, right, node.span)?;
+    }
+    return fail(diags, invalid, node.span)?;
+}
+// 索引已构建时计一次槽位读取，否则按实际访问的引用行计费。
+function fold_ref_index(refs: &resolve_refs::RefTable:Read, expr: u32, work: &FoldBudget:ReadWrite): u32 {
+    if @len(refs.expr_index) != 0 {
+        if expr >= @len(refs.expr_index) as u32 || !charge_fold(work) { return 0; }
+        return refs.expr_index[expr];
+    }
+    var i: u32 = 0;
+    while i < @len(refs.items) as u32 {
+        if !charge_fold(work) { return 0; }
+        if refs.items[i].node_kind == 0 && refs.items[i].node == expr { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function fold_enum_index(input: &ConstInput:Read, def: u32, work: &FoldBudget:ReadWrite): u32 {
+    var i: u32 = 0;
+    while i < @len(input.enums) as u32 {
+        if !charge_fold(work) { return 0; }
+        if input.enums[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function eval_enum_limited(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, expected: u32, expr: u32, ri: u32, call: u32, work: &FoldBudget:ReadWrite): u32!AllocError {
+    let r: resolve_refs::ResolvedRef = refs.items[ri - 1];
+    let t: ConstType = input.types[expected - 1];
+    if r.kind == 5 {
+        if t.kind != 1 || t.builtin != r.x as u16 || r.x != 4108 { return fail(diags, 5001, pool.exprs[expr].span)?; }
+        if call != 4294967295u32 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+        return push_value(table, 5, expected, 0, r.y, 0, 0, 0)?;
+    }
+    if r.kind != 3 || t.kind != 2 || t.def != r.x { return fail(diags, 5006, pool.exprs[expr].span)?; }
+    let e: u32 = fold_enum_index(input, r.x, work);
+    if work.exhausted { return 0; }
+    if e == 0 || r.y >= @len(input.enums[e - 1].payloads) as u32 { return fail(diags, 5006, pool.exprs[expr].span)?; }
+    if !charge_fold(work) { return 0; }
+    let payload: u32 = input.enums[e - 1].payloads[r.y];
+    var child: u32 = 0;
+    if payload != 0 {
+        if call == 4294967295u32 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+        if @len(pool.calls[call].args) != 1 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+        child = eval_expr_limited(table, input, pool, refs, diags, pool.calls[call].args[0].value, payload, false, 5007, work)?;
+        if child == 0 { return 0; }
+    } elseif call != 4294967295u32 { return fail(diags, 5804, pool.exprs[expr].span)?; }
+    let start: u32 = @len(table.children) as u32;
+    if child != 0 { @push(table.children, child)?; }
+    var count: u32 = 0;
+    if child != 0 { count = 1; }
+    return push_value(table, 5, expected, 0, r.y, start, count, 0)?;
+}
+function eval_expr_limited(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, expected: u32, top: bool, invalid: u16, work: &FoldBudget:ReadWrite): u32!AllocError {
+    if expr >= @len(pool.exprs) as u32 || expected == 0 || expected > @len(input.types) as u32 { return 0; }
+    if !charge_fold(work) { return 0; }
+    let node: ast::Expr = pool.exprs[expr];
+    let data: u32 = node.data as u32;
+    if node.kind == 2 { return literal(table, input, pool, diags, expr, expected, false)?; }
+    if node.kind == 3 || node.kind == 4 {
+        var b: u16 = 4105;
+        if node.kind == 4 { b = 4106; }
+        if input.types[expected - 1].kind != 1 || input.types[expected - 1].builtin != b { return fail(diags, 5001, node.span)?; }
+        var kind: u8 = 2;
+        if node.kind == 4 { kind = 3; }
+        return push_value(table, kind, expected, node.data, 0, 0, 0, 0)?;
+    }
+    if node.kind == 5 {
+        if !top { return fail(diags, 5007, node.span)?; }
+        if input.types[expected - 1].kind != 5 { return fail(diags, 5006, node.span)?; }
+        if data >= @len(pool.statics) as u32 { return fail(diags, 5006, node.span)?; }
+        return push_value(table, 4, expected, 0, 0, 0, 0, data)?;
+    }
+    if node.kind == 0 || node.kind == 25 {
+        let ri: u32 = fold_ref_index(refs, expr, work);
+        if ri == 0 || refs.items[ri - 1].kind == resolve_refs::pending_value_name() { return 0; }
+        if refs.items[ri - 1].kind == 3 || refs.items[ri - 1].kind == 5 { return eval_enum_limited(table, input, pool, refs, diags, expected, expr, ri, 4294967295u32, work)?; }
+        if refs.items[ri - 1].kind != 0 { return fail(diags, 4002, node.span)?; }
+        var i: u32 = 0;
+        while i < @len(table.bindings) as u32 {
+            if !charge_fold(work) { return 0; }
+            if table.bindings[i].def == refs.items[ri - 1].x {
+                if table.bindings[i].value_type_id != expected { return fail(diags, 5001, node.span)?; }
+                let value: u32 = table.bindings[i].value;
+                if !top && table.values[value - 1].kind == 4 { return fail(diags, 5007, node.span)?; }
+                return value;
+            }
+            i = i + 1;
+        }
+        return fail(diags, 4004, node.span)?;
+    }
+    if node.kind == 22 {
+        let ri: u32 = fold_ref_index(refs, pool.calls[data].callee, work);
+        if work.exhausted { return 0; }
+        if ri != 0 {
+            if refs.items[ri - 1].kind == resolve_refs::pending_value_name() { return 0; }
+            if refs.items[ri - 1].kind == 3 || refs.items[ri - 1].kind == 5 { return eval_enum_limited(table, input, pool, refs, diags, expected, expr, ri, data, work)?; }
+        }
+        return fail(diags, invalid, node.span)?;
+    }
+    if node.kind == 26 {
+        let t: ConstType = input.types[expected - 1];
+        if t.kind != 7 || t.length == 0 || t.length != @len(pool.arrays[data].elements) as u64 { return fail(diags, 5007, node.span)?; }
+        var children: u32[] = [];
+        var i: u32 = 0;
+        while i < @len(pool.arrays[data].elements) as u32 {
+            if !charge_fold(work) { return 0; }
+            let child: u32 = eval_expr_limited(table, input, pool, refs, diags, pool.arrays[data].elements[i], t.elem, false, 5007, work)?;
+            if child == 0 { return 0; }
+            @push(children, child)?;
+            i = i + 1;
+        }
+        let start: u32 = @len(table.children) as u32;
+        i = 0;
+        while i < @len(children) as u32 {
+            if !charge_fold(work) { return 0; }
+            @push(table.children, children[i])?;
+            i = i + 1;
+        }
+        return push_value(table, 6, expected, 0, 0, start, @len(children) as u32, 0)?;
+    }
+    if node.kind == 21 {
+        if pool.unaries[data].op != 12 || width(input.types[expected - 1].builtin) == 0 { return fail(diags, invalid, node.span)?; }
+        let operand: u32 = pool.unaries[data].operand;
+        // 先检查负字面量快捷分支；非字面量还会进入递归求值。
+        if !charge_fold(work) { return 0; }
+        if pool.exprs[operand].kind == 2 { return literal(table, input, pool, diags, operand, expected, true)?; }
+        let child: u32 = eval_expr_limited(table, input, pool, refs, diags, operand, expected, false, invalid, work)?;
+        if child == 0 { return 0; }
+        let bits: u64 = table.values[child - 1].bits;
+        let b: u16 = input.types[expected - 1].builtin;
+        let w: u32 = width(b);
+        if (!signed(b) && bits != 0) || (signed(b) && bits == (1u64 << ((w as u64) - 1u64))) { return fail(diags, 5008, node.span)?; }
+        return push_value(table, 1, expected, @wrap_sub(0u64, bits) & mask(w), 0, 0, 0, 0)?;
+    }
+    if node.kind == 20 {
+        let left: u32 = eval_expr_limited(table, input, pool, refs, diags, pool.binaries[data].left, expected, false, invalid, work)?;
+        if left == 0 { return 0; }
+        let right: u32 = eval_expr_limited(table, input, pool, refs, diags, pool.binaries[data].right, expected, false, invalid, work)?;
+        if right == 0 { return 0; }
+        return integer_binary(table, input, diags, pool.binaries[data].op, left, right, node.span)?;
+    }
+    return fail(diags, invalid, node.span)?;
+}
+
+// 试算只用于证明常量值；动态表达式及运算失败不进入正式诊断。
+export function try_integer(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32, value_type_id: u32): u32!AllocError {
+    var scratch: diag::DiagBuffer = diag::diagbuf_new();
+    return eval_expr(table, input, pool, refs, &scratch:ReadWrite, expr, value_type_id, false, 5006)?;
+}
+// 试算使用独立的限额状态；预算中止与普通未知由调用方区分。
+export function try_integer_limited(table: &ConstTable:ReadWrite, input: &ConstInput:Read, pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32, value_type_id: u32, work: &FoldBudget:ReadWrite): u32!AllocError {
+    var scratch: diag::DiagBuffer = diag::diagbuf_new();
+    return eval_expr_limited(table, input, pool, refs, &scratch:ReadWrite, expr, value_type_id, false, 5006, work)?;
+}
+// 普通解析结果没有文档侧表，保留原扫描与计费行为。
+function scan_const_init(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolved: &resolve::ResolveResult:Read, d: u32, work: &InitLookupBudget:ReadWrite): u32 {
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if work.limited && !charge_init_lookup(work) { return 4294967295u32; }
+        if file.items[i].kind == 3 && resolved.file.items[i].def_id == d + 1 {
+            let expr: u32 = pool.consts[file.items[i].data].init;
+            if expr != 4294967295u32 { return expr; }
+            break;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(pool.locals) as u32 {
+        if work.limited && !charge_init_lookup(work) { return 4294967295u32; }
+        if pool.locals[i].is_const && pool.locals[i].span.offset == resolved.tables.defs[d].decl_offset { return pool.locals[i].init; }
+        i = i + 1;
+    }
+    return 4294967295u32;
+}
+
+export function evaluate_limited(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, input: &ConstInput:Read, diags: &diag::DiagBuffer:ReadWrite, work: &InitLookupBudget:ReadWrite, material: &MaterialBudget:ReadWrite, fold: &FoldBudget:ReadWrite): ConstTable!AllocError {
+    let resolved: &resolve::ResolveResult:Read = &resolution.result:Read;
+    var table: ConstTable = new_table();
+    let indexed: bool = resolved.tables.index_locals;
+    var count: u32 = @len(resolved.tables.defs) as u32;
+    if indexed { count = @len(resolved.tables.const_inits) as u32; }
+    var row: u32 = 0;
+    while row < count {
+        var d: u32 = row;
+        var expr: u32 = 4294967295u32;
+        if indexed {
+            if work.limited && !charge_init_lookup(work) { return new_table(); }
+            let item: resolve::ConstInit = resolved.tables.const_inits[row];
+            d = item.def - 1u32;
+            expr = item.expr;
+        } elseif resolved.tables.defs[d].kind == 4u8 {
+            expr = scan_const_init(file, pool, resolved, d, work);
+        }
+        if work.exhausted { return new_table(); }
+        if expr != 4294967295u32 && d < @len(input.def_types) as u32 {
+            let value_type_id: u32 = input.def_types[d];
+            var allowed: bool = false;
+            if material.limited {
+                allowed = materializable_limited(input, value_type_id, true, 0, material);
+                if material.exhausted { return new_table(); }
+            } else { allowed = materializable(input, value_type_id, true, 0); }
+            if !allowed { emit(diags, 5006, pool.exprs[expr].span)?; }
+            else {
+                var value: u32 = 0;
+                if fold.limited {
+                    value = eval_expr_limited(&table:ReadWrite, input, pool, &resolution.refs:Read, diags, expr, value_type_id, true, 5006, fold)?;
+                    if fold.exhausted { return new_table(); }
+                } else {
+                    value = eval_expr(&table:ReadWrite, input, pool, &resolution.refs:Read, diags, expr, value_type_id, true, 5006)?;
+                }
+                if value != 0 { @push(table.bindings, ConstBinding { def: d + 1, value_type_id: value_type_id, value: value })?; }
+            }
+        }
+        row = row + 1u32;
+    }
+    return table;
+}
+
+export function evaluate(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, input: &ConstInput:Read, diags: &diag::DiagBuffer:ReadWrite): ConstTable!AllocError {
+    var work: InitLookupBudget = init_lookup_budget(0u32);
+    var material: MaterialBudget = material_budget(0u32);
+    var fold: FoldBudget = fold_budget(0u32);
+    return evaluate_limited(file, pool, resolution, input, diags, &work:ReadWrite, &material:ReadWrite, &fold:ReadWrite)?;
+}

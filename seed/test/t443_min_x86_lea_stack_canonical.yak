@@ -1,0 +1,56 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 零位移直接传送 RBP，非零位移按有符号字节边界选择。
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, 0, 0)?;
+    pe::lea_rbp(&code:ReadWrite, 8, 128)?;
+    pe::lea_rbp(&code:ReadWrite, 0, 129)?;
+    let canonical: [u8; 14] = [0x48, 0x89, 0xe8, 0x4c, 0x8d, 0x45, 0x80,
+        0x48, 0x8d, 0x85, 0x7f, 0xff, 0xff, 0xff];
+    assert(pe::code_len(&code:Read) == 14);
+    var i: u32 = 0;
+    while i < 14 { assert(code.bytes[i] == canonical[i]); i = i + 1; }
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // RBP/R13 可移入基址位；R12 仍需 SIB，但可缩短到 disp8。
+    let long_forms: [u8; 40] = [0x48, 0x8d, 0x04, 0x2d, 0, 0, 0, 0,
+        0x4c, 0x8d, 0x04, 0x2d, 0x80, 0xff, 0xff, 0xff, 0x48, 0x8d, 0x04, 0x2d, 0x7f, 0xff, 0xff, 0xff,
+        0x4a, 0x8d, 0x04, 0x2d, 0x80, 0, 0, 0, 0x4a, 0x8d, 0x04, 0x25, 0x7f, 0, 0, 0];
+    encoding(&long_forms[0..8]:Read, 7103)?;
+    encoding(&long_forms[8..16]:Read, 7103)?;
+    encoding(&long_forms[16..24]:Read, 7103)?;
+    encoding(&long_forms[24..32]:Read, 7103)?;
+    encoding(&long_forms[32..40]:Read, 7103)?;
+    encoding(&long_forms[32..39]:Read, 7101)?;
+    // RBP 访存保留原段。R12 的数据段访存可用带短位移的基址形式。
+    let controls: [u8; 48] = [0x48, 0x8b, 0x04, 0x2d, 0, 0, 0, 0,
+        0x4a, 0x8b, 0x04, 0x25, 0x7f, 0, 0, 0, 0x48, 0x8d, 0x04, 0x25, 0, 0, 0, 0,
+        0x49, 0x8d, 0x84, 0x24, 0x80, 0, 0, 0, 0x49, 0x8d, 0x84, 0x24, 0x7f, 0xff, 0xff, 0xff,
+        0x48, 0x8d, 0x04, 0xad, 0, 0, 0, 0];
+    encoding(&controls[0..8]:Read, 0)?;
+    encoding(&controls[8..16]:Read, 7103)?;
+    encoding(&controls[16..48]:Read, 0)?;
+    let short_forms: [u8; 12] = [0x49, 0x8d, 0x85, 0x80, 0, 0, 0, 0x49, 0x8d, 0x44, 0x24, 0x7f];
+    encoding(&short_forms[0..12]:Read, 0)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

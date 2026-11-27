@@ -1,0 +1,8 @@
+// t06: foreign write + 字符串字面量
+// expected_stdout: hello
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    write("hello");
+    return;
+}

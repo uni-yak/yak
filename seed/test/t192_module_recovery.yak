@@ -1,0 +1,3 @@
+// module: recovery=fixtures/recovery.yak
+import recovery; foreign assert(cond: bool): void;
+function main(): void { let value: i64? = 41; assert(value.then(&recovery::inc).unwrap() == 42); }

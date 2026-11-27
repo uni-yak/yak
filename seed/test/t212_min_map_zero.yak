@@ -1,0 +1,8 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// expected_trap: assert failed
+import hashmap;
+function main(): void {
+    var map: hashmap::HashMap = hashmap::hashmap_new();
+    hashmap::hashmap_insert(&map:ReadWrite, 1, 0, 1, 0)?;
+}

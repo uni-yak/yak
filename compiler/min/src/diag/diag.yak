@@ -1,0 +1,232 @@
+// diag.yak —— 诊断收集、排序与终端输出（src/diag/README.md 设计）
+// 依赖：buffer（buf::ByteBuf）、types（types::Span）、foreign write
+// 规范：proc/diag.md
+
+import buf;
+import types;
+
+foreign write(data: &[u8]): void;
+
+// ── 诊断结构 ──
+
+export struct DiagRef {
+    kind: u8,       // 种类：0=DefId，1=BuiltinId，2=types::ImportRef，3=FieldId，4=VariantId，5=LocalId
+    value: u32,
+    dep: u16,       // types::ImportRef 的 DependencyId（非 import 为 0）
+}
+
+export struct DiagArg {
+    kind: u8,       // 0=类型签名，1=内置编号，2=字符串字面量，3=整数字面量
+    value: u64,
+}
+
+// 引用表与参数表用定长数组内联：base 子集不提供部分移动，Diag 必须保持可按值整体搬运，
+// 排序与终端输出才能沿用既有写法。容量是协议常量，超出容量的引用不得截断后冒充完整。
+export struct DiagRefs {
+    items: [DiagRef; 4],
+    count: u8,
+}
+
+export struct DiagArgs {
+    items: [DiagArg; 4],
+    count: u8,
+}
+
+export struct Diag {
+    code: types::ErrorCode,
+    severity: u8,   // 0=错误，1=警告，2=信息
+    span: types::Span,
+    unit: u16,
+    refs: DiagRefs,
+    args: DiagArgs,
+}
+
+export struct DiagBuffer {
+    diags: Diag[],
+    has_error: bool,
+    count: u32,
+    limit: u32,
+    truncated: bool,
+    discarded: u64,
+}
+
+// ── 引用表/参数表构造 ──
+
+export function diag_refs_none(): DiagRefs {
+    return DiagRefs { items: [DiagRef { kind: 0, value: 0, dep: 0 }, DiagRef { kind: 0, value: 0, dep: 0 }, DiagRef { kind: 0, value: 0, dep: 0 }, DiagRef { kind: 0, value: 0, dep: 0 }], count: 0 };
+}
+
+export function diag_args_none(): DiagArgs {
+    return DiagArgs { items: [DiagArg { kind: 0, value: 0 }, DiagArg { kind: 0, value: 0 }, DiagArg { kind: 0, value: 0 }, DiagArg { kind: 0, value: 0 }], count: 0 };
+}
+
+// 重复声明：旧定义在前、新定义在后，顺序固定才能保证 JSONL 字节可复现。
+export function diag_refs_def_pair(old_def: u32, new_def: u32): DiagRefs {
+    return DiagRefs { items: [DiagRef { kind: 0, value: old_def, dep: 0 }, DiagRef { kind: 0, value: new_def, dep: 0 }, DiagRef { kind: 0, value: 0, dep: 0 }, DiagRef { kind: 0, value: 0, dep: 0 }], count: 2 };
+}
+
+// ── DiagBuffer 接口 ──
+
+// 零表示不限条数，保留批处理入口的既有行为。
+export function diagbuf_limited(limit: u32): DiagBuffer {
+    return DiagBuffer { diags: [], has_error: false, count: 0, limit: limit, truncated: false, discarded: 0 };
+}
+
+export function diagbuf_new(): DiagBuffer { return diagbuf_limited(0u32); }
+
+export function diagbuf_emit(buffer: &DiagBuffer:ReadWrite, d: Diag): void!AllocError {
+    if buffer.limit != 0u32 && buffer.count >= buffer.limit {
+        // 舍弃错误也不能把编译判定翻转成通过。
+        if d.severity == 0 { buffer.has_error = true; }
+        diagbuf_note_truncated(buffer);
+        return;
+    }
+    @push(buffer.diags, d)?;
+    buffer.count = buffer.count + 1;
+    if d.severity == 0 { buffer.has_error = true; }
+    return;
+}
+
+export function diagbuf_has_error(buffer: &DiagBuffer:Read): bool {
+    return buffer.has_error;
+}
+
+export function diagbuf_count(buffer: &DiagBuffer:Read): u32 {
+    return buffer.count;
+}
+
+// 阶段内部用事件数检查是否新增诊断；不能以它作为数组长度。
+export function diagbuf_events(buffer: &DiagBuffer:Read): u64 {
+    return (buffer.count as u64) + buffer.discarded;
+}
+
+// 暂存截断只表示结果不完整，不把未知严重级别的条目算作真实错误。
+export function diagbuf_note_truncated(buffer: &DiagBuffer:ReadWrite): void {
+    buffer.truncated = true;
+    buffer.discarded = buffer.discarded + 1u64;
+    return;
+}
+
+// ── 排序（插入排序，按 unit → offset → code 升序）──
+
+export function diagbuf_sort(buffer: &DiagBuffer:ReadWrite): void {
+    let n: u32 = buffer.count;
+    var i: u32 = 1;
+    while i < n {
+        let key: Diag = buffer.diags[i];
+        var j: u32 = i;
+        while j > 0 && diag_less(&key:Read, &buffer.diags[j - 1]:Read) {
+            buffer.diags[j] = buffer.diags[j - 1];
+            j = j - 1;
+        }
+        buffer.diags[j] = key;
+        i = i + 1;
+    }
+    return;
+}
+
+// d1 < d2 当且仅当 (d1.unit, d1.span.offset, d1.code) < (d2.unit, d2.span.offset, d2.code)
+function diag_less(d1: &Diag:Read, d2: &Diag:Read): bool {
+    if d1.unit != d2.unit {
+        return d1.unit < d2.unit;
+    }
+    if d1.span.offset != d2.span.offset {
+        return d1.span.offset < d2.span.offset;
+    }
+    let left: types::ErrorCode = d1.code;
+    let right: types::ErrorCode = d2.code;
+    return left.raw < right.raw;
+}
+
+// ── 终端输出 ──
+
+export function diagbuf_print_terminal(buffer: &DiagBuffer:Read): void!AllocError {
+    let n: u32 = buffer.count;
+    var errors: u32 = 0;
+    var i: u32 = 0;
+    while i < n {
+        let d: Diag = buffer.diags[i];
+        var line: buf::ByteBuf = buf::buf_new();
+
+        // 前缀
+        if d.severity == 0 {
+            errors = errors + 1;
+            buf::buf_push_bytes(&line:ReadWrite, "错误 ")?;
+        } elseif d.severity == 1 {
+            buf::buf_push_bytes(&line:ReadWrite, "警告 ")?;
+        } else {
+            buf::buf_push_bytes(&line:ReadWrite, "信息 ")?;
+        }
+
+        // 错误码 E<code>
+        buf::buf_push_u8(&line:ReadWrite, 69 as u8)?;
+        let code: types::ErrorCode = d.code;
+        write_u16_decimal(&line:ReadWrite, code.raw)?;
+
+        // 偏移
+        buf::buf_push_bytes(&line:ReadWrite, " @ off=")?;
+        write_u32_decimal(&line:ReadWrite, d.span.offset)?;
+
+        // 换行
+        buf::buf_push_u8(&line:ReadWrite, 10 as u8)?;
+
+        // 输出
+        let slice: &[u8] = &line.data[0..buf::buf_len(&line:Read)];
+        write(slice);
+
+        i = i + 1;
+    }
+
+    // 汇总
+    if errors > 0 {
+        var summary: buf::ByteBuf = buf::buf_new();
+        buf::buf_push_bytes(&summary:ReadWrite, "构建失败：")?;
+        write_u32_decimal(&summary:ReadWrite, errors)?;
+        buf::buf_push_bytes(&summary:ReadWrite, " 个错误\n")?;
+        let s: &[u8] = &summary.data[0..buf::buf_len(&summary:Read)];
+        write(s);
+    }
+    return;
+}
+
+// ── 内部：数字 → ASCII 十进制 ──
+
+function write_u16_decimal(buffer: &buf::ByteBuf:ReadWrite, val: u16): void!AllocError {
+    if val == 0 {
+        buf::buf_push_u8(buffer, 48 as u8)?;
+        return;
+    }
+    // 提取数字（逆序）
+    var digits: u8[] = [];
+    var v: u16 = val;
+    while v > 0 {
+        @push(digits, (48 as u8) + ((v % 10) as u8))?;
+        v = v / 10;
+    }
+    // 逆序输出
+    var i: u32 = @len(digits) as u32;
+    while i > 0 {
+        i = i - 1;
+        buf::buf_push_u8(buffer, digits[i])?;
+    }
+    return;
+}
+
+function write_u32_decimal(buffer: &buf::ByteBuf:ReadWrite, val: u32): void!AllocError {
+    if val == 0 {
+        buf::buf_push_u8(buffer, 48 as u8)?;
+        return;
+    }
+    var digits: u8[] = [];
+    var v: u32 = val;
+    while v > 0 {
+        @push(digits, (48 as u8) + ((v % 10) as u8))?;
+        v = v / 10;
+    }
+    var i: u32 = @len(digits) as u32;
+    while i > 0 {
+        i = i - 1;
+        buf::buf_push_u8(buffer, digits[i])?;
+    }
+    return;
+}

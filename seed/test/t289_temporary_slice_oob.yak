@@ -1,0 +1,2 @@
+// expected_trap: index out of bounds
+function main(): void { let value: u8 = "abc"[3u32]; }

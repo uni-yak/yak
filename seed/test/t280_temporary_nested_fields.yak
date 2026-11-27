@@ -1,0 +1,34 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Inner { value: u32, len: u32, cap: u32 }
+struct Middle { inner: Inner }
+struct Outer { middle: Middle, data: u32[] }
+function make(counter: &u32:ReadWrite): Outer {
+    *counter = *counter + 1u32;
+    return Outer { middle: Middle { inner: Inner { value: 12u32, len: 13u32, cap: 14u32 } }, data: [1u32, 2u32] };
+}
+enum Failure { Bad }
+function maybe(ok: bool): Outer!Failure {
+    if !ok { return Failure::Bad; }
+    var count: u32 = 0;
+    return make(&count:ReadWrite);
+}
+function number(ok: bool): u32!Failure { return (maybe(ok)?).middle.inner.value; }
+function recover(e: &Failure): u32 { return 99u32; }
+function main(): void {
+    assert(number(false).catch(&recover) == 99u32);
+    assert(number(true).catch(&recover) == 12u32);
+    let item: Middle = Middle { inner: Inner { value: 21u32, len: 22u32, cap: 23u32 } };
+    assert(item.inner.value == 21u32 && item.inner.len == 22u32);
+    let items: [Middle; 1] = [Middle { inner: Inner { value: 31u32, len: 32u32, cap: 33u32 } }];
+    assert(items[0].inner.value == 31u32 && items[0].inner.cap == 33u32);
+    var count: u32 = 0;
+    var i: u32 = 0;
+    while i < 500 {
+        assert(make(&count:ReadWrite).middle.inner.value == 12u32);
+        assert(make(&count:ReadWrite).middle.inner.len == 13u32);
+        assert(make(&count:ReadWrite).middle.inner.cap == 14u32);
+        i = i + 1u32;
+    }
+    assert(count == 1500u32);
+}

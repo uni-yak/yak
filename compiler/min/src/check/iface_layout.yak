@@ -1,0 +1,24 @@
+// 将已校验接口的布局摘要转换为消费方的依赖编号。
+import iface;
+import layout;
+
+// 下标由依赖装配提供，顺序与名称解析一致：直接前缀，传递类型后缀。
+export function imported_layouts(candidates: &[iface::LoadedInterface]:Read, direct: &[u32]:Read, targets: &[u32]:Read): layout::ImportedLayoutTable!AllocError {
+    var table: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let direct_count: u32 = @len(direct) as u32;
+    var dep_index: u32 = 0;
+    while dep_index < direct_count + @len(targets) as u32 {
+        var candidate: u32 = 0;
+        if dep_index < direct_count { candidate = direct[dep_index]; }
+        else { candidate = targets[dep_index - direct_count]; }
+        let lib: &iface::LoadedInterface:Read = &candidates[candidate]:Read;
+        var i: u32 = 0;
+        while i < @len(lib.summaries) as u32 {
+            let item: &iface::LoadedSummary:Read = &lib.summaries[i]:Read;
+            @push(table.items, layout::ImportedLayout { dep: (dep_index + 1u32) as u16, export_id: item.type_export_id, size: item.size, align: item.align })?;
+            i = i + 1u32;
+        }
+        dep_index = dep_index + 1u32;
+    }
+    return @move(table);
+}

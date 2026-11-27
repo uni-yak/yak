@@ -1,0 +1,813 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    if @len(r.diagnostics) != 0 { write(src); }
+    assert(@len(r.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    return Loaded { parsed: parsed, lexed: r };
+}
+function run_case(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): typecheck::TypeCheckResult!AllocError {
+    let loaded: Loaded = load(src, file)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", diags)?;
+    return typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, diags)?;
+}
+function count_expr_builtin(result: &typecheck::TypeCheckResult:Read, builtin: u16): u32 {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(result.expr_types.items) as u32 {
+        let id: u32 = result.expr_types.items[i];
+        if id != 0 && id <= @len(result.types.entries) as u32 {
+            if result.types.entries[id - 1].kind == 1 && result.types.entries[id - 1].builtin == builtin { count = count + 1; }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+function check_expression_types(): void!AllocError {
+    // 已知右操作数反向定型，不引入默认整数宽度。
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: typecheck::TypeCheckResult = run_case("function f(x: u32): bool { return 1 + x < 3; }\n", 420, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+    assert(count_expr_builtin(&r1:Read, 4099) >= 4);
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("function f(x: u8): u8 { return @wrap_add(1, x); }\n", 421, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 0);
+    assert(count_expr_builtin(&r2:Read, 4097) >= 3);
+    // 枚举 payload 的类型由标签声明给出，而非函数的成功类型。
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("enum E { Bad(u16) } function f(): u32!E { return E::Bad(7); }\n", 422, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 0);
+    assert(count_expr_builtin(&r3:Read, 4098) == 1);
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: typecheck::TypeCheckResult = run_case("enum E { Bad(u16) } function f(): u32!E { return E::Bad; }\n", 423, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 1);
+    assert(d4.diags[0].code.raw == 5804);
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: typecheck::TypeCheckResult = run_case("enum E { Bad(u16) } function f(): u32!E { return E::Bad(true); }\n", 424, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+    assert(d5.diags[0].code.raw == 5805);
+    var empty_ok: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: typecheck::TypeCheckResult = run_case("enum E { Empty } function f(): E { return E::Empty; }\n", 450, &empty_ok:ReadWrite)?;
+    assert(diag::diagbuf_count(&empty_ok:Read) == 0);
+    var empty_call: diag::DiagBuffer = diag::diagbuf_new();
+    let wrong: typecheck::TypeCheckResult = run_case("enum E { Empty } function f(): E { return E::Empty(); }\n", 451, &empty_call:ReadWrite)?;
+    assert(diag::diagbuf_count(&empty_call:Read) == 1 && empty_call.diags[0].code.raw == 5804);
+    // 模块与局部常量的初始化都记录真实表达式类型。
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let r6: typecheck::TypeCheckResult = run_case("const X: i16 = 4; function f(): i16 { return X; }\n", 425, &d6:ReadWrite)?;
+    assert(diag::diagbuf_count(&d6:Read) == 0);
+    assert(count_expr_builtin(&r6:Read, 4102) == 2);
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let r7: typecheck::TypeCheckResult = run_case("function f(): u8 { const K: u8 = 2; return @copy(K); }\n", 426, &d7:ReadWrite)?;
+    assert(diag::diagbuf_count(&d7:Read) == 0);
+    assert(count_expr_builtin(&r7:Read, 4097) >= 3);
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let r8: typecheck::TypeCheckResult = run_case("function f(): u16 { return 1 as u16; }\n", 427, &d8:ReadWrite)?;
+    assert(diag::diagbuf_count(&d8:Read) == 0);
+    assert(count_expr_builtin(&r8:Read, 4098) == 2);
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let r9: typecheck::TypeCheckResult = run_case("function f(): u8 { return @wrap_add(1u8, 2u16); }\n", 428, &d9:ReadWrite)?;
+    assert(diag::diagbuf_count(&d9:Read) == 1);
+    assert(d9.diags[0].code.raw == 5001);
+    return;
+}
+function check_propagation(): void!AllocError {
+    // 错误集子集可扩大传播；成员不兼容与非 carrier 目标均明确拒绝。
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: typecheck::TypeCheckResult = run_case("enum A { X } enum B { Y } function source(): u32!A { return 1; } function f(): u32!(A | B) { return source()?; }\n", 430, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("enum A { X } enum B { Y } function source(): u32!A { return 1; } function f(): u32!B { return source()?; }\n", 431, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 1);
+    assert(d2.diags[0].code.raw == 6007);
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("enum E { Bad } function source(): u32!E { return 1; } function f(): u32 { return source()?; }\n", 432, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 1);
+    assert(d3.diags[0].code.raw == 6007);
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: typecheck::TypeCheckResult = run_case("enum E { Bad } function source(): void!E { return; } function f(): void!E { source()?; return; }\n", 433, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 0);
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: typecheck::TypeCheckResult = run_case("enum E { Bad } function source(): u32!E { return 1; } function f(): u32!E { return source(); }\n", 434, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 0);
+    return;
+}
+function check_clone_type(): void!AllocError {
+    // 克隆结果携带分配错误，传播时必须检查目标错误集。
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let result: typecheck::TypeCheckResult = run_case("function f(x: u32[]): u32[]!AllocError { return @clone(x); }\n", 450, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    var propagated: diag::DiagBuffer = diag::diagbuf_new();
+    let p: typecheck::TypeCheckResult = run_case("function f(x: u32[]): u32[]!AllocError { return @clone(x)?; }\n", 451, &propagated:ReadWrite)?;
+    assert(diag::diagbuf_count(&propagated:Read) == 0);
+    var incompatible: diag::DiagBuffer = diag::diagbuf_new();
+    let bad: typecheck::TypeCheckResult = run_case("enum E { Bad } function f(x: u32[]): u32[]!E { return @clone(x)?; }\n", 452, &incompatible:ReadWrite)?;
+    assert(diag::diagbuf_count(&incompatible:Read) == 1);
+    assert(incompatible.diags[0].code.raw == 6007);
+    var wrong_type: diag::DiagBuffer = diag::diagbuf_new();
+    let wrong: typecheck::TypeCheckResult = run_case("function f(x: u32[]): void { let y: u32[] = @clone(x); @drop(y); }\n", 454, &wrong_type:ReadWrite)?;
+    assert(diag::diagbuf_count(&wrong_type:Read) == 1);
+    assert(wrong_type.diags[0].code.raw == 5001);
+    var unhandled: diag::DiagBuffer = diag::diagbuf_new();
+    let missing: typecheck::TypeCheckResult = run_case("function f(x: u32[]): u32[] { return @clone(x)?; }\n", 453, &unhandled:ReadWrite)?;
+    assert(diag::diagbuf_count(&unhandled:Read) == 1);
+    assert(unhandled.diags[0].code.raw == 6007);
+    return;
+}
+function check_integer_ranges(): void!AllocError {
+    // 直接取负的有符号最小值合法，正数必须位于目标范围。
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(): void { let a: i8 = -128; let b: i16 = -32768i16; let c: i32 = -2147483648; let d: i64 = -9223372036854775808i64; let e: u8 = 255; @drop(a); @drop(b); @drop(c); @drop(d); @drop(e); }\n", 470, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("function f(): void { let a: u8 = 256; let b: i8 = 128i8; let c: i16 = 32768; let d: i32 = 2147483648i32; let e: i64 = 9223372036854775808; @drop(a); @drop(b); @drop(c); @drop(d); @drop(e); }\n", 471, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 5);
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(&bad:Read) { assert(bad.diags[i].code.raw == 1004); i = i + 1; }
+    var nested: diag::DiagBuffer = diag::diagbuf_new();
+    let c: typecheck::TypeCheckResult = run_case("function f(x: u8): bool { let a: u16[] = [65536]; @drop(a); return 256 == x; }\n", 472, &nested:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested:Read) == 2);
+    assert(nested.diags[0].code.raw == 1004 && nested.diags[1].code.raw == 1004);
+    var constants: diag::DiagBuffer = diag::diagbuf_new();
+    let d: typecheck::TypeCheckResult = run_case("const bad: u8 = 256; function f(): u8 { return bad; }\n", 473, &constants:ReadWrite)?;
+    assert(diag::diagbuf_count(&constants:Read) == 1);
+    assert(constants.diags[0].code.raw == 1004);
+    var lower: diag::DiagBuffer = diag::diagbuf_new();
+    let e: typecheck::TypeCheckResult = run_case("function f(): i16 { return -32769; }\n", 474, &lower:ReadWrite)?;
+    assert(diag::diagbuf_count(&lower:Read) == 1 && lower.diags[0].code.raw == 1004);
+    return;
+}
+function check_array_types(): void!AllocError {
+    // 动态数组的元素和空字面量均由预期类型定型。
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let result: typecheck::TypeCheckResult = run_case("function f(): void { let a: u32[] = []; let b: u16[] = [1, 2]; let c: [u8; 2] = [3, 4]; let d: u16[][] = [[5], []]; @drop(a); @drop(b); @drop(c); @drop(d); return; }\n", 460, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    assert(count_expr_builtin(&result:Read, 4098) >= 2);
+    // 后续已定型的元素必须约束前面尚未定型的整数字面量。
+    var inferred: diag::DiagBuffer = diag::diagbuf_new();
+    let backward: typecheck::TypeCheckResult = run_case("function f(): void { @drop([1, 2u8]); }\n", 464, &inferred:ReadWrite)?;
+    assert(diag::diagbuf_count(&inferred:Read) == 0);
+    assert(count_expr_builtin(&backward:Read, 4097) == 2);
+    var overflow: diag::DiagBuffer = diag::diagbuf_new();
+    let too_large: typecheck::TypeCheckResult = run_case("function f(): void { @drop([256, 1u8]); }\n", 465, &overflow:ReadWrite)?;
+    assert(diag::diagbuf_count(&overflow:Read) == 1 && overflow.diags[0].code.raw == 1004);
+    // 直接负号与操作数都必须从后续元素取得同一类型。
+    var signed: diag::DiagBuffer = diag::diagbuf_new();
+    let minimum: typecheck::TypeCheckResult = run_case("function f(): void { @drop([-128, 0i8]); }\n", 468, &signed:ReadWrite)?;
+    assert(diag::diagbuf_count(&signed:Read) == 0);
+    assert(count_expr_builtin(&minimum:Read, 4101) == 3);
+    var underflow: diag::DiagBuffer = diag::diagbuf_new();
+    let below: typecheck::TypeCheckResult = run_case("function f(): void { @drop([-129, 0i8]); }\n", 469, &underflow:ReadWrite)?;
+    assert(diag::diagbuf_count(&underflow:Read) == 1 && underflow.diags[0].code.raw == 1004);
+    var several: diag::DiagBuffer = diag::diagbuf_new();
+    let limits: typecheck::TypeCheckResult = run_case("function f(): void { @drop([-32768, -1, 0i16]); }\n", 475, &several:ReadWrite)?;
+    assert(diag::diagbuf_count(&several:Read) == 0 && count_expr_builtin(&limits:Read, 4102) == 5);
+    var different: diag::DiagBuffer = diag::diagbuf_new();
+    let mismatch_signed: typecheck::TypeCheckResult = run_case("function f(): void { @drop([-1i16, 0i8]); }\n", 476, &different:ReadWrite)?;
+    assert(diag::diagbuf_count(&different:Read) == 1 && different.diags[0].code.raw == 5001);
+    // 后续元素的类型传入前面的纯整数算术树。
+    var arithmetic: diag::DiagBuffer = diag::diagbuf_new();
+    let expression: typecheck::TypeCheckResult = run_case("function f(): void { @drop([1 + 2 * 3, 0u8]); }\n", 477, &arithmetic:ReadWrite)?;
+    assert(diag::diagbuf_count(&arithmetic:Read) == 0 && count_expr_builtin(&expression:Read, 4097) == 6);
+    // 后续元素也能约束纯整数回绕原语的返回值和实参。
+    var wraps: diag::DiagBuffer = diag::diagbuf_new();
+    let wrap_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([@wrap_add(1, 2), 0u8]); }\n", 502, &wraps:ReadWrite)?;
+    assert(diag::diagbuf_count(&wraps:Read) == 0 && count_expr_builtin(&wrap_result:Read, 4097) == 4);
+    var wraps_range: diag::DiagBuffer = diag::diagbuf_new();
+    let wrap_bad: typecheck::TypeCheckResult = run_case("function f(): void { @drop([@wrap_add(256, 1), 0u8]); }\n", 503, &wraps_range:ReadWrite)?;
+    assert(diag::diagbuf_count(&wraps_range:Read) == 1 && wraps_range.diags[0].code.raw == 1004);
+    var wraps_deep: diag::DiagBuffer = diag::diagbuf_new();
+    let wrap_deep: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[@wrap_sub(@wrap_mul(-129, 2), 3)], [0i8]]); }\n", 504, &wraps_deep:ReadWrite)?;
+    assert(diag::diagbuf_count(&wraps_deep:Read) == 1 && wraps_deep.diags[0].code.raw == 1004);
+    var wraps_invalid: diag::DiagBuffer = diag::diagbuf_new();
+    let wrap_invalid: typecheck::TypeCheckResult = run_case("function f(): void { @drop([@wrap_add(), 0u8]); }\n", 505, &wraps_invalid:ReadWrite)?;
+    assert(diag::diagbuf_count(&wraps_invalid:Read) == 1 && wraps_invalid.diags[0].code.raw == 5001);
+    var wraps_array: diag::DiagBuffer = diag::diagbuf_new();
+    let wrap_array: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[@wrap_add([], []), @clone()], [0u8]]); }\n", 506, &wraps_array:ReadWrite)?;
+    assert(diag::diagbuf_count(&wraps_array:Read) == 1 && wraps_array.diags[0].code.raw == 5001);
+    var arithmetic_range: diag::DiagBuffer = diag::diagbuf_new();
+    let expression_bad: typecheck::TypeCheckResult = run_case("function f(): void { @drop([256 + 1, 0u8]); }\n", 478, &arithmetic_range:ReadWrite)?;
+    assert(diag::diagbuf_count(&arithmetic_range:Read) == 1 && arithmetic_range.diags[0].code.raw == 1004);
+    var negative_expr: diag::DiagBuffer = diag::diagbuf_new();
+    let nested_signed: typecheck::TypeCheckResult = run_case("function f(): void { @drop([-129 + 1, 0i8]); }\n", 479, &negative_expr:ReadWrite)?;
+    assert(diag::diagbuf_count(&negative_expr:Read) == 1 && negative_expr.diags[0].code.raw == 1004);
+    var unrelated: diag::DiagBuffer = diag::diagbuf_new();
+    let invalid_expr: typecheck::TypeCheckResult = run_case("function f(): void { @drop([true + 1, 0u8]); }\n", 480, &unrelated:ReadWrite)?;
+    assert(diag::diagbuf_count(&unrelated:Read) == 2 && unrelated.diags[0].code.raw == 5001 && unrelated.diags[1].code.raw == 5001);
+    // 内层数组的元素类型也可由后续同层数组提供。
+    var nested_inferred: diag::DiagBuffer = diag::diagbuf_new();
+    let nested_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[1], [2u8]]); }\n", 481, &nested_inferred:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested_inferred:Read) == 0 && count_expr_builtin(&nested_result:Read, 4097) == 2);
+    var nested_range: diag::DiagBuffer = diag::diagbuf_new();
+    let nested_bad: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[256], [2u8]]); }\n", 482, &nested_range:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested_range:Read) == 1 && nested_range.diags[0].code.raw == 1004);
+    var empty_first: diag::DiagBuffer = diag::diagbuf_new();
+    let empty_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[], [2u8]]); }\n", 483, &empty_first:ReadWrite)?;
+    assert(diag::diagbuf_count(&empty_first:Read) == 0);
+    var deep: diag::DiagBuffer = diag::diagbuf_new();
+    let deep_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[1 + 2]], [[3u8]]]); }\n", 484, &deep:ReadWrite)?;
+    assert(diag::diagbuf_count(&deep:Read) == 0 && count_expr_builtin(&deep_result:Read, 4097) == 4);
+    var shape: diag::DiagBuffer = diag::diagbuf_new();
+    let shape_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[]], [1u8]]); }\n", 486, &shape:ReadWrite)?;
+    assert(diag::diagbuf_count(&shape:Read) > 0 && shape.diags[0].code.raw == 5001);
+    // 即使元素无法定型，数组形状仍与后续标量不兼容。
+    var nonpure: diag::DiagBuffer = diag::diagbuf_new();
+    let nonpure_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[@clone(1)], true]); }\n", 491, &nonpure:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure:Read) == 1 && nonpure.diags[0].code.raw == 5001);
+    var nonpure_deep: diag::DiagBuffer = diag::diagbuf_new();
+    let deep_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[@clone(1)]], [1u8]]); }\n", 494, &nonpure_deep:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure_deep:Read) == 1 && nonpure_deep.diags[0].code.raw == 5001);
+    // 仅对独立的纯整数子树回填类型，不重推旁边的错误调用。
+    var mixed_range: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed_range_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[256, @clone()], [2u8]]); }\n", 498, &mixed_range:ReadWrite)?;
+    assert(diag::diagbuf_count(&mixed_range:Read) == 2 && mixed_range.diags[0].code.raw == 5001 && mixed_range.diags[1].code.raw == 1004);
+    var mixed_deep: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed_deep_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[-129 + 1, @clone()]], [[0i8]]]); }\n", 499, &mixed_deep:ReadWrite)?;
+    assert(diag::diagbuf_count(&mixed_deep:Read) == 2 && mixed_deep.diags[0].code.raw == 5001 && mixed_deep.diags[1].code.raw == 1004);
+    var mixed_good: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed_good_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[-128, @clone(256)]], [[0i8]]]); }\n", 500, &mixed_good:ReadWrite)?;
+    assert(diag::diagbuf_count(&mixed_good:Read) == 0 && count_expr_builtin(&mixed_good_result:Read, 4101) == 3);
+    var mixed_shape: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed_shape_result: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[1], @clone()], [2u8]]); }\n", 501, &mixed_shape:ReadWrite)?;
+    assert(diag::diagbuf_count(&mixed_shape:Read) == 2 && mixed_shape.diags[0].code.raw == 5001 && mixed_shape.diags[1].code.raw == 5001);
+    var nonpure_same: diag::DiagBuffer = diag::diagbuf_new();
+    let same_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[@clone(1)]], [[2u8]]]); }\n", 495, &nonpure_same:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure_same:Read) == 0);
+    var nonpure_multiple: diag::DiagBuffer = diag::diagbuf_new();
+    let multiple_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[[@clone()], [@clone()]], [1u8]]); }\n", 496, &nonpure_multiple:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure_multiple:Read) == 4);
+    var nonpure_fixed: diag::DiagBuffer = diag::diagbuf_new();
+    let fixed_shape: typecheck::TypeCheckResult = run_case("function pair(): [u8; 2] { return [1u8, 2u8]; } function f(): void { @drop([[@clone(1)], pair()]); }\n", 497, &nonpure_fixed:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure_fixed:Read) == 1 && nonpure_fixed.diags[0].code.raw == 5001);
+    var nonpure_reverse: diag::DiagBuffer = diag::diagbuf_new();
+    let reverse_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([true, [@clone(1)]]); }\n", 492, &nonpure_reverse:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure_reverse:Read) == 1 && nonpure_reverse.diags[0].code.raw == 5001);
+    var nonpure_error: diag::DiagBuffer = diag::diagbuf_new();
+    let error_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[@clone()], true]); }\n", 493, &nonpure_error:ReadWrite)?;
+    assert(diag::diagbuf_count(&nonpure_error:Read) == 2 && nonpure_error.diags[0].code.raw == 5001 && nonpure_error.diags[1].code.raw == 5001);
+    var later_bool: diag::DiagBuffer = diag::diagbuf_new();
+    let bool_shape: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[], true]); }\n", 489, &later_bool:ReadWrite)?;
+    assert(diag::diagbuf_count(&later_bool:Read) == 1 && later_bool.diags[0].code.raw == 5001);
+    var later_struct: diag::DiagBuffer = diag::diagbuf_new();
+    let struct_shape: typecheck::TypeCheckResult = run_case("struct S { x: u8 } function f(): void { @drop([[], S { x: 1u8 }]); }\n", 490, &later_struct:ReadWrite)?;
+    assert(diag::diagbuf_count(&later_struct:Read) == 1 && later_struct.diags[0].code.raw == 5001);
+    var wrong_host: diag::DiagBuffer = diag::diagbuf_new();
+    let wrong_value: typecheck::TypeCheckResult = run_case("struct S { x: u8 } function f(): void { let x: S = []; @drop(x); }\n", 487, &wrong_host:ReadWrite)?;
+    assert(diag::diagbuf_count(&wrong_host:Read) == 1 && wrong_host.diags[0].code.raw == 5001);
+    var wrong_slice: diag::DiagBuffer = diag::diagbuf_new();
+    let wrong_view: typecheck::TypeCheckResult = run_case("function f(): void { let x: &[u8] = []; @drop(x); }\n", 488, &wrong_slice:ReadWrite)?;
+    assert(diag::diagbuf_count(&wrong_slice:Read) == 1 && wrong_slice.diags[0].code.raw == 5001);
+    var nested_conflict: diag::DiagBuffer = diag::diagbuf_new();
+    let nested_mismatch: typecheck::TypeCheckResult = run_case("function f(): void { @drop([[1u16], [2u8]]); }\n", 485, &nested_conflict:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested_conflict:Read) == 1 && nested_conflict.diags[0].code.raw == 5001);
+    var ordered: diag::DiagBuffer = diag::diagbuf_new();
+    let forward: typecheck::TypeCheckResult = run_case("function f(): void { @drop([1u8, 256]); }\n", 466, &ordered:ReadWrite)?;
+    assert(diag::diagbuf_count(&ordered:Read) == 1 && ordered.diags[0].code.raw == 1004);
+    var conflict: diag::DiagBuffer = diag::diagbuf_new();
+    let differing: typecheck::TypeCheckResult = run_case("function f(): void { @drop([1, 2u8, 3u16]); }\n", 467, &conflict:ReadWrite)?;
+    assert(diag::diagbuf_count(&conflict:Read) == 1 && conflict.diags[0].code.raw == 5001);
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed: typecheck::TypeCheckResult = run_case("function f(): void { let a: u32[] = [1u32, true]; @drop(a); return; }\n", 461, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 1);
+    assert(bad.diags[0].code.raw == 5001);
+    var fixed: diag::DiagBuffer = diag::diagbuf_new();
+    let mismatch: typecheck::TypeCheckResult = run_case("function f(): void { let a: [u32; 2] = [1u32, 2u16]; @drop(a); return; }\n", 462, &fixed:ReadWrite)?;
+    assert(diag::diagbuf_count(&fixed:Read) == 1);
+    assert(fixed.diags[0].code.raw == 5001);
+    var length: diag::DiagBuffer = diag::diagbuf_new();
+    let short: typecheck::TypeCheckResult = run_case("function f(): void { let a: [u32; 2] = [1u32]; @drop(a); return; }\n", 463, &length:ReadWrite)?;
+    assert(diag::diagbuf_count(&length:Read) == 1);
+    assert(length.diags[0].code.raw == 5001);
+    return;
+}
+function check_foreign_services(): void!AllocError {
+    // 名称与固定签名共同决定服务身份，参数拼写和无分配标记不改变身份。
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: typecheck::TypeCheckResult = run_case("enum Marker { Tag } foreign #exit(status: u8): void; foreign #assert(flag: bool): void; foreign read(dst: &[u8]:ReadWrite): u32; foreign write(src: &[u8]): void;\n", 440, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+    assert(@len(r1.funcs.items) == 4);
+    assert(r1.funcs.items[0].def == 2);
+    assert(r1.funcs.items[0].service == 1);
+    assert(r1.funcs.items[1].service == 2);
+    assert(r1.funcs.items[2].service == 3);
+    assert(r1.funcs.items[3].service == 4);
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("foreign #args_count(): u32; foreign args_len(index: u32): u32; foreign args_read(index: u32, dst: &[u8]:ReadWrite): u32; foreign file_size(name: &[u8]): u64; foreign file_read(name: &[u8], offset: u64, dst: &[u8]:ReadWrite): u32; foreign file_write(name: &[u8], data: &[u8]): void;\n", 441, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 0);
+    assert(@len(r2.funcs.items) == 6);
+    var i: u32 = 0;
+    while i < 6 { assert(r2.funcs.items[i].service as u32 == 16 + i); i = i + 1; }
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("foreign leave(code: u8): void;\n", 442, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 1);
+    assert(d3.diags[0].code.raw == 8001);
+    assert(r3.funcs.items[0].service == 0);
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: typecheck::TypeCheckResult = run_case("foreign exit(code: u32): void;\n", 443, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 1);
+    assert(d4.diags[0].code.raw == 8001);
+    assert(r4.funcs.items[0].service == 0);
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: typecheck::TypeCheckResult = run_case("foreign read(dst: &[u8]:ReadWrite): u64;\n", 444, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+    assert(d5.diags[0].code.raw == 8001);
+    assert(r5.funcs.items[0].service == 0);
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let r6: typecheck::TypeCheckResult = run_case("foreign write(data: &[u8]:ReadWrite): void;\n", 445, &d6:ReadWrite)?;
+    assert(diag::diagbuf_count(&d6:Read) == 1);
+    assert(d6.diags[0].code.raw == 8001);
+    assert(r6.funcs.items[0].service == 0);
+    return;
+}
+function check_cast_whitelist(): void!AllocError {
+    // ── 整数之间的显式转换允许 ──
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: typecheck::TypeCheckResult = run_case("function f(x: u32): u8 { return x as u8; }\n", 420, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+
+    // ── char 与 u32 双向允许 ──
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("function f(c: char): u32 { return c as u32; }\n", 421, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 0);
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("function f(x: u32): char { return x as char; }\n", 422, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 0);
+
+    // ── 编译期已知的代理对码点转 char 必须在检查期拒绝，变量转换保持合法 ──
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let r8: typecheck::TypeCheckResult = run_case("function f(): char { return 55296u32 as char; }\n", 427, &d8:ReadWrite)?;
+    assert(diag::diagbuf_count(&d8:Read) == 1);
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let r9: typecheck::TypeCheckResult = run_case("function f(): char { return 57343u32 as char; }\n", 428, &d9:ReadWrite)?;
+    assert(diag::diagbuf_count(&d9:Read) == 1);
+    var d10: diag::DiagBuffer = diag::diagbuf_new();
+    let r10: typecheck::TypeCheckResult = run_case("function f(): char { return 57344u32 as char; }\n", 429, &d10:ReadWrite)?;
+    assert(diag::diagbuf_count(&d10:Read) == 0);
+    var d11: diag::DiagBuffer = diag::diagbuf_new();
+    let r11: typecheck::TypeCheckResult = run_case("function f(): char { return 55295u32 as char; }\n", 430, &d11:ReadWrite)?;
+    assert(diag::diagbuf_count(&d11:Read) == 0);
+
+    // ── char 与其他整数必须经 u32 中转 ──
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: typecheck::TypeCheckResult = run_case("function f(c: char): u8 { return c as u8; }\n", 423, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 1);
+
+    // ── 整数转 bool 不在白名单 ──
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: typecheck::TypeCheckResult = run_case("function f(x: u32): bool { return x as bool; }\n", 424, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+
+    // ── bool 转整数不在白名单 ──
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let r6: typecheck::TypeCheckResult = run_case("function f(b: bool): u32 { return b as u32; }\n", 425, &d6:ReadWrite)?;
+    assert(diag::diagbuf_count(&d6:Read) == 1);
+
+    // 枚举与整数双向转换使用专有码；其他枚举转换继续使用通用码。
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let r7: typecheck::TypeCheckResult = run_case("enum E { A } function from_int(x: u32): E { return x as E; } function to_int(x: E): i16 { return x as i16; }\n", 426, &d7:ReadWrite)?;
+    assert(diag::diagbuf_count(&d7:Read) == 2 && d7.diags[0].code.raw == 5808 && d7.diags[1].code.raw == 5808);
+    var enum_other: diag::DiagBuffer = diag::diagbuf_new();
+    let enum_other_result: typecheck::TypeCheckResult = run_case("enum E { A } enum F { A } function same(x: E): E { return x as E; } function distinct(x: E): F { return x as F; } function boolean(x: E): bool { return x as bool; } function character(x: char): E { return x as E; }\n", 431, &enum_other:ReadWrite)?;
+    assert(diag::diagbuf_count(&enum_other:Read) == 4);
+    assert(enum_other.diags[0].code.raw == 5001 && enum_other.diags[1].code.raw == 5001 && enum_other.diags[2].code.raw == 5001 && enum_other.diags[3].code.raw == 5001);
+    return;
+}
+function check_match_rules(): void!AllocError {
+    // 已知非枚举和值载体分别使用规格规定的诊断。
+    var scalar_match: diag::DiagBuffer = diag::diagbuf_new();
+    let scalar_result: typecheck::TypeCheckResult = run_case("function f(x: u32): void { match x { _ => { return; } } }\n", 494, &scalar_match:ReadWrite)?;
+    assert(diag::diagbuf_count(&scalar_match:Read) == 1 && scalar_match.diags[0].code.raw == 6001);
+    var struct_match: diag::DiagBuffer = diag::diagbuf_new();
+    let struct_result: typecheck::TypeCheckResult = run_case("struct S { x: u32 } function f(s: S): void { match s { _ => { return; } } }\n", 495, &struct_match:ReadWrite)?;
+    assert(diag::diagbuf_count(&struct_match:Read) == 1 && struct_match.diags[0].code.raw == 6001);
+    var ref_match: diag::DiagBuffer = diag::diagbuf_new();
+    let ref_result: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: &E:Read): void { match e { _ => { return; } } }\n", 496, &ref_match:ReadWrite)?;
+    assert(diag::diagbuf_count(&ref_match:Read) == 1 && ref_match.diags[0].code.raw == 6001);
+    var carrier_match: diag::DiagBuffer = diag::diagbuf_new();
+    let carrier_result: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: u32!E): void { match e { _ => { return; } } }\n", 497, &carrier_match:ReadWrite)?;
+    assert(diag::diagbuf_count(&carrier_match:Read) == 1 && carrier_match.diags[0].code.raw == 2012);
+    // 裸标签使用 scrutinee 的成员表，并与完整路径共享覆盖状态。
+    var bare_ok: diag::DiagBuffer = diag::diagbuf_new();
+    let bare_types: typecheck::TypeCheckResult = run_case("enum E { A(u16), B } function f(e: E): u16 { match e { A(v) => { return v; }, B => { return 0; } } }\n", 490, &bare_ok:ReadWrite)?;
+    assert(!bare_ok.has_error);
+    // 同名局部变量不能改变标签解析，遗漏标签仍须报告非穷尽。
+    var bare_shadow: diag::DiagBuffer = diag::diagbuf_new();
+    let shadow_types: typecheck::TypeCheckResult = run_case("enum E { A(u16), B } function f(e: E, A: u32): u16 { A; match e { A(v) => { return v; }, B => { return 0; } } }\n", 498, &bare_shadow:ReadWrite)?;
+    assert(!bare_shadow.has_error);
+    var bare_unused: diag::DiagBuffer = diag::diagbuf_new();
+    let unused_types: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: E, A: u32): void { match e { A => { return; } } }\n", 500, &bare_unused:ReadWrite)?;
+    assert(diag::diagbuf_count(&bare_unused:Read) == 1 && bare_unused.diags[0].code.raw == 4009);
+    var bare_incomplete: diag::DiagBuffer = diag::diagbuf_new();
+    let incomplete_types: typecheck::TypeCheckResult = run_case("enum E { A, B } function f(e: E): void { match e { A => { return; } } }\n", 499, &bare_incomplete:ReadWrite)?;
+    assert(diag::diagbuf_count(&bare_incomplete:Read) == 1 && bare_incomplete.diags[0].code.raw == 2002);
+    var bare_missing: diag::DiagBuffer = diag::diagbuf_new();
+    let bare_wrong: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: E): void { match e { Missing => { return; }, _ => { return; } } }\n", 491, &bare_missing:ReadWrite)?;
+    assert(diag::diagbuf_count(&bare_missing:Read) == 1 && bare_missing.diags[0].code.raw == 2013);
+    var bare_duplicate: diag::DiagBuffer = diag::diagbuf_new();
+    let duplicate_types: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: E): void { match e { A => { return; }, E::A => { return; } } }\n", 492, &bare_duplicate:ReadWrite)?;
+    assert(diag::diagbuf_count(&bare_duplicate:Read) == 1 && bare_duplicate.diags[0].code.raw == 2014);
+    var bare_binding: diag::DiagBuffer = diag::diagbuf_new();
+    let binding_types: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: E): void { match e { A(v) => { v; } } }\n", 493, &bare_binding:ReadWrite)?;
+    assert(diag::diagbuf_count(&bare_binding:Read) == 1 && bare_binding.diags[0].code.raw == 2003);
+    var payload_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let payload_types: typecheck::TypeCheckResult = run_case("enum E { A(u16), B } function f(e: E): u16 { match e { E::A(v) => { return v; }, E::B => { return 0; } } }\n", 435, &payload_diags:ReadWrite)?;
+    assert(!payload_diags.has_error);
+    var empty_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let empty_types: typecheck::TypeCheckResult = run_case("enum E { A } function f(e: E): void { match e { E::A(v) => { v; } } }\n", 436, &empty_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&empty_diags:Read) == 1 && empty_diags.diags[0].code.raw == 2003);
+    // ── 穷尽全部标签，无需通配臂 ──
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: typecheck::TypeCheckResult = run_case("enum E { A, B }\nfunction f(e: E): u32 { match e { E::A => { return 1; }, E::B => { return 2; } } }\n", 430, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+
+    // ── 缺少标签报 P-2 ──
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("enum E { A, B }\nfunction f(e: E): u32 { match e { E::A => { return 1; } } }\n", 431, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 1);
+    assert(d2.diags[0].code.raw == 2002);
+
+    // ── 通配臂覆盖剩余标签 ──
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("enum E { A, B }\nfunction f(e: E): u32 { match e { E::A => { return 1; }, _ => { return 2; } } }\n", 432, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 0);
+
+    // ── 重复标签报 P-14 ──
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: typecheck::TypeCheckResult = run_case("enum E { A, B }\nfunction f(e: E): u32 { match e { E::A => { return 1; }, E::A => { return 2; }, E::B => { return 3; } } }\n", 433, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 1);
+    assert(d4.diags[0].code.raw == 2014);
+
+    // ── 通配臂后仍有 arm 报 P-14 ──
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: typecheck::TypeCheckResult = run_case("enum E { A, B }\nfunction f(e: E): u32 { match e { _ => { return 1; }, E::A => { return 2; } } }\n", 434, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+    assert(d5.diags[0].code.raw == 2014);
+    return;
+}
+function check_array_comparisons(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(a: [u32; 2], b: [u32; 2], x: u32[], y: u32[]): void { @drop(a == b); @drop(a != b); @drop(x == y); @drop(x != y); }\n", 502, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 4);
+    var i: u32 = 0; while i < 4 { assert(bad.diags[i].code.raw == 5001); i = i + 1; }
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("function f(a: u32, b: u32, x: &function(): u32, y: &function(): u32): void { @drop(a == b); @drop(x != y); }\n", 503, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_slice_equality(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(a: &[u8]:Read, b: &[u8]:Read, x: &[u32]:ReadWrite, y: &[u32]:ReadWrite): void { @drop(a == b); @drop(a != b); @drop(x == y); @drop(x != y); @drop(\"a\" == \"b\"); @drop(\"a\" != \"b\"); }\n", 507, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 6);
+    var i: u32 = 0; while i < 6 { assert(bad.diags[i].code.raw == 5001); i = i + 1; }
+    return;
+}
+function check_ref_equality(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(a: &u32:Read, b: &u32:Read, x: &u32:ReadWrite, y: &u32:ReadWrite): void { @drop(a == b); @drop(a != b); @drop(x == y); @drop(x != y); }\n", 505, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 4);
+    var i: u32 = 0; while i < 4 { assert(bad.diags[i].code.raw == 5001); i = i + 1; }
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("function f(a: &function(): u32, b: &function(): u32, x: u32, y: u32): void { @drop(a == b); @drop(a != b); @drop(x == y); @drop(x != y); }\n", 506, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_ref_ordering(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(a: &u32:Read, b: &u32:Read, x: &function(): u32, y: &function(): u32): void { @drop(a < b); @drop(a <= b); @drop(a > b); @drop(a >= b); @drop(x < y); @drop(x <= y); @drop(x > y); @drop(x >= y); }\n", 504, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 8);
+    var i: u32 = 0; while i < 8 { assert(bad.diags[i].code.raw == 5001); i = i + 1; }
+    return;
+}
+function check_struct_comparisons(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("struct S { x: u32 } function f(a: S, b: S): void { @drop(a == b); @drop(a != b); }\n", 492, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 2);
+    assert(bad.diags[0].code.raw == 5001 && bad.diags[1].code.raw == 5001);
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("enum E { A, B } function f(a: E, b: E): bool { return a == b; }\n", 493, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_ordering(): void!AllocError {
+    var aggregate: diag::DiagBuffer = diag::diagbuf_new();
+    let aggregates: typecheck::TypeCheckResult = run_case("struct S { x: u32 } function f(a: [u32; 2], b: u32[], c: &[u8], s: S): void { @drop(a < a); @drop(b <= b); @drop(c > c); @drop(s >= s); @drop(\"a\" < \"b\"); }\n", 508, &aggregate:ReadWrite)?;
+    assert(diag::diagbuf_count(&aggregate:Read) == 5);
+    var j: u32 = 0;
+    while j < 5 { assert(aggregate.diags[j].code.raw == 5001); j = j + 1; }
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("enum E { A, B } function f(a: E, b: E): void { @drop(a < b); @drop(a <= b); @drop(a > b); @drop(a >= b); }\n", 494, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 4);
+    var i: u32 = 0; while i < 4 { assert(bad.diags[i].code.raw == 5001); i = i + 1; }
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("enum E { A, B } function f(a: E, b: E, x: u32, y: u32, c: char, d: char): void { @drop(a == b); @drop(a != b); @drop(x < y); @drop(c >= d); }\n", 495, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_enum_payload_comparisons(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("struct S { x: u32 } enum E { Empty, Value(S) } function f(a: E, b: E): void { @drop(a == b); @drop(a != b); }\n", 496, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 2);
+    assert(bad.diags[0].code.raw == 5809 && bad.diags[1].code.raw == 5809);
+    var arrays: diag::DiagBuffer = diag::diagbuf_new();
+    let c: typecheck::TypeCheckResult = run_case("enum Fixed { Empty, Value([u32; 2]) } enum Dynamic { Empty, Value(u32[]) } function f(a: Fixed, b: Fixed, x: Dynamic, y: Dynamic): void { @drop(a == b); @drop(a != b); @drop(x == y); @drop(x != y); }\n", 498, &arrays:ReadWrite)?;
+    assert(diag::diagbuf_count(&arrays:Read) == 4);
+    var i: u32 = 0; while i < 4 { assert(arrays.diags[i].code.raw == 5809); i = i + 1; }
+    var nested: diag::DiagBuffer = diag::diagbuf_new();
+    let n: typecheck::TypeCheckResult = run_case("struct S { x: u32 } enum Inner { A, B(S) } enum Middle { A(Inner), B } enum Outer { A, B(Middle) } function f(a: Outer, b: Outer): void { @drop(a == b); @drop(a != b); }\n", 499, &nested:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested:Read) == 2 && nested.diags[0].code.raw == 5809 && nested.diags[1].code.raw == 5809);
+    var nested_array: diag::DiagBuffer = diag::diagbuf_new();
+    let na: typecheck::TypeCheckResult = run_case("enum Inner { A([u32; 2]), B } enum Outer { A(Inner), B } function f(a: Outer, b: Outer): void { @drop(a == b); @drop(a != b); }\n", 501, &nested_array:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested_array:Read) == 2 && nested_array.diags[0].code.raw == 5809 && nested_array.diags[1].code.raw == 5809);
+    var valid: diag::DiagBuffer = diag::diagbuf_new();
+    let v: typecheck::TypeCheckResult = run_case("enum Inner { A, B(u32) } enum Outer { A(Inner), B } function f(a: Outer, b: Outer): void { @drop(a == b); @drop(a != b); }\n", 500, &valid:ReadWrite)?;
+    assert(diag::diagbuf_count(&valid:Read) == 0);
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("enum E { Empty, Number(u32), Flag(bool) } function f(a: E, b: E): void { @drop(a == b); @drop(a != b); }\n", 497, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_bool_comparisons(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(a: bool, b: bool): void { @drop(a < b); @drop(a <= b); @drop(a > b); @drop(a >= b); }\n", 490, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 4);
+    var i: u32 = 0; while i < 4 { assert(bad.diags[i].code.raw == 5001); i = i + 1; }
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("function f(a: bool, b: bool, c: char, d: char, x: u32, y: u32): void { @drop(a == b); @drop(a != b); @drop(c < d); @drop(x >= y); }\n", 491, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_untyped_integers(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("function f(): bool { return 1 < 2; }\n", 460, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 2);
+    assert(bad.diags[0].code.raw == 5005 && bad.diags[1].code.raw == 5005);
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("function f(x: u16): bool { return 1 + 2 < x; }\n", 461, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function check_cast_truncation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: typecheck::TypeCheckResult = run_case("const K: u32 = 65536u32; function f(x: u32): void { @drop(256u16 as u8); @drop(K as u16); @drop((255u16 + 1u16) as u8); @drop(4294967296u64 as u32); @drop(255u16 as u8); @drop(65535u32 as u16); @drop(0u64 as u8); @drop(x as u8); @drop(256u16 as u32); }\n", 475, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 4);
+    var i: u32 = 0;
+    while i < 4 { assert(diags.diags[i].code.raw == 5004); i = i + 1; }
+    var mixed: diag::DiagBuffer = diag::diagbuf_new();
+    let converted: typecheck::TypeCheckResult = run_case("const K: u64 = 4294967296u64; function f(x: u16): void { @drop(256u16 as i8); @drop(65536u32 as i16); @drop(K as i32); @drop(255u16 as i8); @drop(65535u32 as i16); @drop(4294967295u64 as i32); @drop(x as i8); @drop(256u16 as i32); @drop(65535u16 as i16); }\n", 477, &mixed:ReadWrite)?;
+    assert(diag::diagbuf_count(&mixed:Read) == 3);
+    i = 0; while i < 3 { assert(mixed.diags[i].code.raw == 5004); i = i + 1; }
+    var positive: diag::DiagBuffer = diag::diagbuf_new();
+    let signed: typecheck::TypeCheckResult = run_case("const K: i64 = 4294967296i64; function f(x: i16): void { @drop(256i16 as u8); @drop(65536i32 as i16); @drop(K as u32); @drop(255i16 as u8); @drop(0i16 as i8); @drop(x as u8); @drop((-1i16) as u8); @drop((-32768i16) as i8); @drop((-2147483648i32) as u16); @drop((-9223372036854775808i64) as i32); @drop(256i16 as i16); }\n", 478, &positive:ReadWrite)?;
+    assert(diag::diagbuf_count(&positive:Read) == 3);
+    i = 0; while i < 3 { assert(positive.diags[i].code.raw == 5004); i = i + 1; }
+    var nested: diag::DiagBuffer = diag::diagbuf_new();
+    let chain: typecheck::TypeCheckResult = run_case("function f(a: [u8; 2], x: u8): void { @drop(a[(2u8 as u16) as u64]); @drop(a[((-1i8) as i16) as i64]); @drop(a[(1u8 as u16) as u64]); @drop(a[(x as u16) as u64]); @drop((256u16 as u32) as u8); @drop(a[(256u16 as u8) as u64]); @drop(a[((-1i8) as u8) as u64]); }\n", 479, &nested:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested:Read) == 5);
+    var found_bounds: u32 = 0; var found_cast: u32 = 0;
+    i = 0; while i < 5 { if nested.diags[i].code.raw == 6002 { found_bounds = found_bounds + 1; } if nested.diags[i].code.raw == 5004 { found_cast = found_cast + 1; } i = i + 1; }
+    assert(found_bounds == 3 && found_cast == 2);
+    var repeated: diag::DiagBuffer = diag::diagbuf_new();
+    let cached: typecheck::TypeCheckResult = run_case("function f(): void { @drop(((((((1u8 as u64) as u8) as u64) as u8) as u64) as u8) as u64) as u8); }\n", 480, &repeated:ReadWrite)?;
+    assert(diag::diagbuf_count(&repeated:Read) == 0);
+    assert(@len(cached.consts.values) == 1);
+    var shared: diag::DiagBuffer = diag::diagbuf_new();
+    let reuse: typecheck::TypeCheckResult = run_case("function f(a: [u8; 2], x: u8): void { @drop(a[((1u8 as u64) as u8) as u64]); @drop(a[((x as u64) as u8) as u64]); @drop(a[(((1u16 / 0u16) as u64) as u8) as u64]); }\n", 481, &shared:ReadWrite)?;
+    assert(diag::diagbuf_count(&shared:Read) == 0);
+    assert(@len(reuse.consts.values) == 3);
+    var retry: diag::DiagBuffer = diag::diagbuf_new();
+    let next: typecheck::TypeCheckResult = run_case("const K: u16 = 256u16; function f(x: u16): void { @drop((1u16 / 0u16) as u8); @drop((65535u16 + 1u16) as u8); @drop((x + K) as u8); @drop(K as u8); }\n", 476, &retry:ReadWrite)?;
+    assert(diag::diagbuf_count(&retry:Read) == 1 && retry.diags[0].code.raw == 5004);
+    return;
+}
+function check_projection_deref_depth(): void!AllocError {
+    // 仅当继续解引用会得到有效投影时才使用专有码。
+    var nested: diag::DiagBuffer = diag::diagbuf_new();
+    let bad: typecheck::TypeCheckResult = run_case("struct S { x: u32 } function f(r: &S:Read, a: &([u32; 2]):Read): void { @drop((&r).x); @drop((&a)[0u32]); }\n", 503, &nested:ReadWrite)?;
+    assert(diag::diagbuf_count(&nested:Read) == 2 && nested.diags[0].code.raw == 6010 && nested.diags[1].code.raw == 6010);
+    var wrong: diag::DiagBuffer = diag::diagbuf_new();
+    let invalid: typecheck::TypeCheckResult = run_case("struct S { x: u32 } function f(r: &S:Read, s: &u32:Read): void { @drop((&r).missing); @drop((&s)[0u32]); }\n", 504, &wrong:ReadWrite)?;
+    assert(diag::diagbuf_count(&wrong:Read) == 2 && wrong.diags[0].code.raw == 5001 && wrong.diags[1].code.raw == 5001);
+    var explicit: diag::DiagBuffer = diag::diagbuf_new();
+    let good: typecheck::TypeCheckResult = run_case("struct S { x: u32 } function f(r: &S:Read, a: &([u32; 2]):Read, s: &u32:Read): void { @drop(r.x); @drop(a[0u32]); @drop((*(&r)).x); @drop((*(&a))[0u32]); @drop(*(*(&s))); }\n", 505, &explicit:ReadWrite)?;
+    assert(diag::diagbuf_count(&explicit:Read) == 0);
+    return;
+}
+function check_index_bounds(): void!AllocError {
+    var types: diag::DiagBuffer = diag::diagbuf_new();
+    let typed: typecheck::TypeCheckResult = run_case("function f(a: [u8; 2], d: u8[], s: &[u8], b: bool, c: char, i: i16): u8 { @drop(a[b]); @drop(d[c]); @drop(s[b]); @drop(a[i]); @drop(a[0]); return a[1u8]; }\n", 482, &types:ReadWrite)?;
+    assert(diag::diagbuf_count(&types:Read) == 3);
+    var j: u32 = 0; while j < 3 { assert(types.diags[j].code.raw == 5001); j = j + 1; }
+    var assign: diag::DiagBuffer = diag::diagbuf_new();
+    let write: typecheck::TypeCheckResult = run_case("function f(a: &([u8; 2]):ReadWrite, b: bool): void { a[b] = 1u8; a[0u8] = 2u8; }\n", 483, &assign:ReadWrite)?;
+    assert(diag::diagbuf_count(&assign:Read) == 1 && assign.diags[0].code.raw == 5001);
+    var hosts: diag::DiagBuffer = diag::diagbuf_new();
+    let checked: typecheck::TypeCheckResult = run_case("function f(a: &u8[]:Read, i: u64): u8 { return a[i]; }\n", 485, &hosts:ReadWrite)?;
+    assert(diag::diagbuf_count(&hosts:Read) == 0);
+    var writable: diag::DiagBuffer = diag::diagbuf_new();
+    let valid: typecheck::TypeCheckResult = run_case("function f(a: &u8[]:ReadWrite, s: &[u8]:ReadWrite, i: u64): void { a[i] = 1u8; s[i] = 2u8; }\n", 487, &writable:ReadWrite)?;
+    assert(diag::diagbuf_count(&writable:Read) == 0);
+    var unknown: diag::DiagBuffer = diag::diagbuf_new();
+    let missing: typecheck::TypeCheckResult = run_case("function f(i: u64): void { @drop(missing[i]); }\n", 488, &unknown:ReadWrite)?;
+    assert(diag::diagbuf_count(&unknown:Read) == 1 && unknown.diags[0].code.raw == 4002);
+    var invalid: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: typecheck::TypeCheckResult = run_case("function f(x: &u8:Read, y: u8, i: u64): void { @drop(x[i]); @drop(y[i]); }\n", 486, &invalid:ReadWrite)?;
+    assert(diag::diagbuf_count(&invalid:Read) == 2 && invalid.diags[0].code.raw == 5001 && invalid.diags[1].code.raw == 5001);
+    var negative: diag::DiagBuffer = diag::diagbuf_new();
+    let dynamic: typecheck::TypeCheckResult = run_case("const K: i16 = -1i16; function f(a: u8[], r: &u8[]:Read, s: &[u8], i: i64): void { @drop(a[-1]); @drop(r[-2i8]); @drop(s[K]); @drop(s[(-1i8) as i64]); @drop(a[-32768i16]); @drop(s[-2147483648i32]); @drop(r[-9223372036854775808i64]); @drop(a[-0]); @drop(s[0u8]); @drop(a[i]); @drop(s[(-1i8) as u8]); }\n", 484, &negative:ReadWrite)?;
+    assert(diag::diagbuf_count(&negative:Read) == 7);
+    j = 0; while j < 7 { assert(negative.diags[j].code.raw == 6002); j = j + 1; }
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let a: typecheck::TypeCheckResult = run_case("const K: u16 = 2; function f(i: u32): u8 { let a: [u8; 2] = [1u8, 2u8]; const L: i8 = -1; @drop(a[2]); @drop(a[-1]); @drop(a[2u8]); @drop(a[L]); @drop(a[K + 1u16]); return a[i]; }\n", 470, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 5);
+    var i: u32 = 0;
+    while i < 5 { assert(bad.diags[i].code.raw == 6002); i = i + 1; }
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let b: typecheck::TypeCheckResult = run_case("function f(i: u64): u8 { let a: [u8; 2] = [1u8, 2u8]; @drop(a[0]); @drop(a[-0]); @drop(a[1u8]); @drop(a[i + 1u64]); @drop(a[i]); return a[0u64]; }\n", 471, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    var reference: diag::DiagBuffer = diag::diagbuf_new();
+    let source: &[u8] = "function f(a: &([u8; 2]):Read): u8 { @drop(a[2]); @drop(a[-1i64]); return a[1]; }\n";
+    let parsed: Loaded = load(source, 472)?;
+    assert(@len(parsed.parsed.diagnostics) == 0);
+    let c: typecheck::TypeCheckResult = run_case(source, 472, &reference:ReadWrite)?;
+    assert(diag::diagbuf_count(&reference:Read) == 2);
+    assert(reference.diags[0].code.raw == 6002 && reference.diags[1].code.raw == 6002);
+    var limits: diag::DiagBuffer = diag::diagbuf_new();
+    let d: typecheck::TypeCheckResult = run_case("function f(a: [u8; 2], i: u8): u8 { @drop(a[18446744073709551615u64]); @drop(a[-128i8]); @drop(a[-32768i16]); @drop(a[-2147483648i32]); @drop(a[-9223372036854775808i64]); @drop(a[i + 1u8]); @drop(a[1u8 / 0u8]); return a[1]; }\n", 473, &limits:ReadWrite)?;
+    assert(diag::diagbuf_count(&limits:Read) == 5);
+    i = 0; while i < 5 { assert(limits.diags[i].code.raw == 6002); i = i + 1; }
+    var casts: diag::DiagBuffer = diag::diagbuf_new();
+    let e: typecheck::TypeCheckResult = run_case("function f(a: [u8; 2], x: i8): u8 { @drop(a[2u8 as u64]); @drop(a[(-1i8) as i64]); @drop(a[(-1i8) as u64]); @drop(a[258u16 as u8]); @drop(a[x as i64]); @drop(a[1u8 as u64]); @drop(a[256u16 as u8]); return a[0]; }\n", 474, &casts:ReadWrite)?;
+    assert(diag::diagbuf_count(&casts:Read) == 6);
+    assert(casts.diags[0].code.raw == 5004 && casts.diags[1].code.raw == 5004);
+    i = 2; while i < 6 { assert(casts.diags[i].code.raw == 6002); i = i + 1; }
+    return;
+}
+function check_char_constants(): void!AllocError {
+    var invalid: diag::DiagBuffer = diag::diagbuf_new();
+    let bad: typecheck::TypeCheckResult = run_case("const K: u32 = 55296u32; function f(): void { @drop(K as char); @drop((55295u32 + 1u32) as char); @drop((57343u16 as u32) as char); @drop(1114112u32 as char); }\n", 490, &invalid:ReadWrite)?;
+    assert(diag::diagbuf_count(&invalid:Read) == 4);
+    var i: u32 = 0; while i < 4 { assert(invalid.diags[i].code.raw == 5001); i = i + 1; }
+    var valid: diag::DiagBuffer = diag::diagbuf_new();
+    let good: typecheck::TypeCheckResult = run_case("function f(x: u32): void { @drop((55294u32 + 1u32) as char); @drop((57344u16 as u32) as char); @drop(1114111u32 as char); @drop(x as char); @drop((1u32 / 0u32) as char); }\n", 491, &valid:ReadWrite)?;
+    assert(diag::diagbuf_count(&valid:Read) == 0);
+    return;
+}
+function check_foreign_write_arguments(): void!AllocError {
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: typecheck::TypeCheckResult = run_case("foreign assert(cond: bool): void; function f(x: &bool:Write): void { assert(x); out slot: bool; assert(out slot); }\n", 506, &bad:ReadWrite)?;
+    assert(diag::diagbuf_count(&bad:Read) == 2);
+    assert(bad.diags[0].code.raw == 9202 && bad.diags[0].span.offset == 76 && bad.diags[0].span.length == 1);
+    assert(bad.diags[1].code.raw == 9202 && bad.diags[1].span.offset == 103 && bad.diags[1].span.length == 3);
+    var good: diag::DiagBuffer = diag::diagbuf_new();
+    let allowed: typecheck::TypeCheckResult = run_case("foreign read(dst: &[u8]:ReadWrite): u32; function fill(x: &bool:Write): void { *x = true; } function f(): void { var buf: [u8; 1] = [0u8]; @drop(read(&buf[0..1]:ReadWrite)); out slot: bool; fill(out slot); @drop(@move(slot)); }\n", 507, &good:ReadWrite)?;
+    assert(diag::diagbuf_count(&good:Read) == 0);
+    return;
+}
+function main(): void {
+    check_foreign_write_arguments()?;
+    check_char_constants()?;
+    check_index_bounds()?;
+    check_projection_deref_depth()?;
+    check_cast_truncation()?;
+    check_untyped_integers()?; check_bool_comparisons()?; check_array_comparisons()?; check_slice_equality()?; check_ref_equality()?; check_ref_ordering()?; check_struct_comparisons()?; check_ordering()?; check_enum_payload_comparisons()?;
+    check_expression_types()?;
+    check_propagation()?;
+    check_clone_type()?;
+    check_integer_ranges()?;
+    check_array_types()?;
+    check_foreign_services()?;
+    // 显式切片构造和普通取引用必须产生不同的类型。
+    var slices: diag::DiagBuffer = diag::diagbuf_new();
+    let slice_types: typecheck::TypeCheckResult = run_case("foreign read(dst: &[u8]:ReadWrite): u32; foreign write(src: &[u8]): void; function f(): void { var a: [u8; 2] = [0u8, 0u8]; let n: u32 = read(&a[0..2]:ReadWrite); write(&a[0..n]:Read); let b: &u32 = &n:Read; if *b == n { return; } }\n", 460, &slices:ReadWrite)?;
+    if diag::diagbuf_has_error(&slices:Read) { diag::diagbuf_print_terminal(&slices:Read)?; }
+    assert(diag::diagbuf_count(&slices:Read) == 0);
+    var upgrade: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: typecheck::TypeCheckResult = run_case("foreign read(dst: &[u8]:ReadWrite): u32; function f(a: &[u8]): void { let n: u32 = read(&a[0..1]:ReadWrite); if n == 0 { return; } }\n", 461, &upgrade:ReadWrite)?;
+    assert(diag::diagbuf_count(&upgrade:Read) == 1 && upgrade.diags[0].code.raw == 6008);
+    check_cast_whitelist()?;
+    check_match_rules()?;
+    // ── 返回类型匹配（P-5）正例 ──
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: typecheck::TypeCheckResult = run_case("function f(x: u32): u32 { return x; }\n", 400, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+    assert(@len(r1.funcs.items) == 1);
+
+    // ── P-5：bool 返回 u32 ──
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: typecheck::TypeCheckResult = run_case("function f(): u32 { return true; }\n", 401, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 1);
+    assert(d2.diags[0].code.raw == 2005);
+
+    // ── P-4：整数条件不是 bool ──
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: typecheck::TypeCheckResult = run_case("function f(): void { if 1 { return; } return; }\n", 402, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 1);
+    assert(d3.diags[0].code.raw == 2004);
+
+    // ── P-4：bool 条件正例 ──
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let r4: typecheck::TypeCheckResult = run_case("function f(x: bool): void { if x { return; } return; }\n", 403, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 0);
+
+    // ── 局部初始化类型不一致 ──
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let r5: typecheck::TypeCheckResult = run_case("function f(): void { let x: u32 = true; @drop(x); return; }\n", 404, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+    assert(d5.diags[0].code.raw == 5001);
+
+    // ── 可错返回：成功值 ──
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let r6: typecheck::TypeCheckResult = run_case("enum E { Bad }\nfunction f(): u32!E { return 1; }\n", 405, &d6:ReadWrite)?;
+    assert(diag::diagbuf_count(&d6:Read) == 0);
+
+    // ── 可错返回：错误标签 ──
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let r7: typecheck::TypeCheckResult = run_case("enum E { Bad }\nfunction f(): u32!E { return E::Bad; }\n", 406, &d7:ReadWrite)?;
+    assert(diag::diagbuf_count(&d7:Read) == 0);
+
+    // ── 可错返回：既非成功值也非错误标签 ──
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let r8: typecheck::TypeCheckResult = run_case("enum E { Bad }\nfunction f(): u32!E { return true; }\n", 407, &d8:ReadWrite)?;
+    assert(diag::diagbuf_count(&d8:Read) == 1);
+    assert(d8.diags[0].code.raw == 2005);
+
+    // ── 整数字面量后缀定型 ──
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let r9: typecheck::TypeCheckResult = run_case("function f(): u8 { return 255u8; }\n", 408, &d9:ReadWrite)?;
+    assert(diag::diagbuf_count(&d9:Read) == 0);
+
+    // ── 调用实参类型不匹配 ──
+    var d10: diag::DiagBuffer = diag::diagbuf_new();
+    let r10: typecheck::TypeCheckResult = run_case("function g(x: u32): void { @drop(x); return; } function f(): void { g(true); return; }\n", 409, &d10:ReadWrite)?;
+    assert(diag::diagbuf_count(&d10:Read) == 1);
+    assert(d10.diags[0].code.raw == 5001);
+
+    // ── 二元运算操作数不一致 ──
+    var d11: diag::DiagBuffer = diag::diagbuf_new();
+    let r11: typecheck::TypeCheckResult = run_case("function f(): void { let x: u32 = 1 + true; @drop(x); return; }\n", 410, &d11:ReadWrite)?;
+    assert(diag::diagbuf_count(&d11:Read) == 1);
+    assert(d11.diags[0].code.raw == 5001);
+
+    // ── 调用返回类型参与 P-5 ──
+    var d12: diag::DiagBuffer = diag::diagbuf_new();
+    let r12: typecheck::TypeCheckResult = run_case("function g(): u32 { return 1; } function f(): u32 { return g(); }\n", 411, &d12:ReadWrite)?;
+    assert(diag::diagbuf_count(&d12:Read) == 0);
+
+    // ── 多成员 ErrorSet 的成功 / 错误返回 ──
+    var d13: diag::DiagBuffer = diag::diagbuf_new();
+    let r13: typecheck::TypeCheckResult = run_case("enum A { X } enum B { Y } function f(ok: bool): u32!(A | B) { if ok { return 1; } return B::Y; }\n", 412, &d13:ReadWrite)?;
+    assert(diag::diagbuf_count(&d13:Read) == 0);
+
+    // ── void!E 的成功返回 ──
+    var d14: diag::DiagBuffer = diag::diagbuf_new();
+    let r14: typecheck::TypeCheckResult = run_case("enum E { Bad } function f(): void!E { return; }\n", 413, &d14:ReadWrite)?;
+    assert(diag::diagbuf_count(&d14:Read) == 0);
+
+    // ── struct 字段读取类型 ──
+    var d15: diag::DiagBuffer = diag::diagbuf_new();
+    let r15: typecheck::TypeCheckResult = run_case("struct P { x: u32 } function f(p: P): u32 { return p.x; }\n", 414, &d15:ReadWrite)?;
+    assert(diag::diagbuf_count(&d15:Read) == 0);
+
+    // ── void 返回携带表达式 ──
+    var d16: diag::DiagBuffer = diag::diagbuf_new();
+    let r16: typecheck::TypeCheckResult = run_case("function f(): void { return 1; }\n", 415, &d16:ReadWrite)?;
+    assert(diag::diagbuf_count(&d16:Read) == 1);
+    assert(d16.diags[0].code.raw == 2005);
+    return;
+}

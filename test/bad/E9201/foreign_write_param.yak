@@ -1,0 +1,18 @@
+// expected_code: E9201
+// expected_diagnostics: E9201 E9201 E9201 E9201 E9201 E9201 E9201 E9201 E9201 E9201
+// spec: spec/lang/foreign.md F-2
+// 触发：拥有型值、Write 引用、可错载体与函数静态引用不得作为外部声明的参数或返回值。
+foreign f(x: &u32:Write): void;
+foreign dyn_param(x: u8[]): void;
+foreign fixed_param(x: [u8; 1]): void;
+foreign carrier_param(x: u8!AllocError): void;
+foreign fn_param(x: &function(&u8): void): void;
+foreign dyn_result(): u8[];
+foreign fixed_result(): [u8; 1];
+foreign write_result(): &u32:Write;
+foreign carrier_result(): u8!AllocError;
+foreign fn_result(): &function(&u8): void;
+
+function main(): void {
+    return;
+}

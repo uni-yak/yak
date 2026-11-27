@@ -1,0 +1,174 @@
+// 写出 YKIF format 2 文件，并建立共享的导出编号。
+import iface;
+import iface_write_sections;
+import lex;
+import ast;
+import diag;
+import resolve_refs;
+import typecheck;
+
+// 公开入口：接口编码与链接阶段共用同一排序与编号规则。
+export function build_export_map(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read): iface::ExportMap!AllocError {
+    let sorted: iface::ExportInput[] = iface_write_sections::sorted_exports(file, pool, resolution, names)?;
+    return iface_write_sections::map_of_exports(&sorted[0..@len(sorted)]:Read)?;
+}
+
+function append_section(output: &iface::ByteSink:ReadWrite, section_kind: u16, data: &iface::ByteSink:Read, length: u32, count: u32): void!AllocError {
+    let index: u32 = section_kind as u32 - 1;
+    let offset: u32 = @len(output.bytes) as u32;
+    iface_write_sections::set_u16(&output.bytes:ReadWrite, 56 + index * 16, section_kind);
+    iface_write_sections::set_u16(&output.bytes:ReadWrite, 58 + index * 16, 0);
+    iface_write_sections::set_u32(&output.bytes:ReadWrite, 60 + index * 16, offset);
+    iface_write_sections::set_u32(&output.bytes:ReadWrite, 64 + index * 16, length);
+    iface_write_sections::set_u32(&output.bytes:ReadWrite, 68 + index * 16, count);
+    if length > 0 { iface_write_sections::push_bytes(output, &data.bytes[0..length]:Read)?; }
+    return;
+}
+
+function write_interface_core(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read, facts: &[u8]:Read, strict: bool, module_name: &[u8], loaded: &[iface::LoadedInterface]:Read, order: &[u32]:Read, profile: u32, diags: &diag::DiagBuffer:ReadWrite): iface::InterfaceResult!AllocError {
+    // 身份长度写入 u16，截断会造成接口身份与实际模块不一致。
+    if (profile != 65537 && profile != 65538) || @len(module_name) > 65535 || !iface::valid_module_name(module_name) {
+        iface::emit_unsupported(diags)?;
+        return iface::InterfaceResult { data: iface::ByteSink { bytes: [] }, export_count: 0, digest: [] };
+    }
+    let sorted: iface::ExportInput[] = iface_write_sections::sorted_exports(file, pool, resolution, names)?;
+    let map: iface::ExportMap = iface_write_sections::map_of_exports(&sorted[0..@len(sorted)]:Read)?;
+    let export_kinds: u32[] = iface_write_sections::local_error_exports(&sorted[0..@len(sorted)]:Read)?;
+    var sig_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var name_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var export_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var name_offs: u32[] = [];
+    var name_lens: u32[] = [];
+    var sig_offs: u32[] = [];
+    var sig_lens: u32[] = [];
+    var aux_offs: u32[] = [];
+    var next: u32 = 0;
+    while next < @len(sorted) as u32 {
+        @push(name_offs, @len(name_data.bytes) as u32)?;
+        iface_write_sections::push_name(&name_data:ReadWrite, names, sorted[next].name)?;
+        @push(name_lens, @len(name_data.bytes) as u32 - name_offs[next])?;
+        @push(sig_offs, 0)?;
+        @push(sig_lens, 0)?;
+        @push(aux_offs, 0)?;
+        next = next + 1;
+    }
+    // 函数签名。
+    next = 0;
+    while next < @len(sorted) as u32 {
+        if sorted[next].kind == 1 {
+            let begin: u32 = @len(sig_data.bytes) as u32;
+            iface::encode_function_for(&tc.types:Read, &tc.funcs:Read, &map:Read, sorted[next].def, &sig_data:ReadWrite, diags, &export_kinds[0..@len(export_kinds)]:Read, loaded, order, @len(order) as u32)?;
+            sig_offs[next] = begin;
+            sig_lens[next] = @len(sig_data.bytes) as u32 - begin;
+        }
+        next = next + 1;
+    }
+    // 签名失败时不能将部分编码封装成带摘要的接口。
+    if diags.has_error { return iface::InterfaceResult { data: iface::ByteSink { bytes: [] }, export_count: 0, digest: [] }; }
+    let type_secs: iface_write_sections::TypeSections = iface_write_sections::encode_type_sections(file, pool, resolution, names, tc, layouts, &sorted[0..@len(sorted)]:Read, &map:Read, &export_kinds[0..@len(export_kinds)]:Read, loaded, order, &name_data:ReadWrite, &sig_data:ReadWrite, &aux_offs:ReadWrite, diags)?;
+    // 描述符失败后同样不生成接口容器。
+    if diags.has_error { return iface::InterfaceResult { data: iface::ByteSink { bytes: [] }, export_count: 0, digest: [] }; }
+    let module_off: u32 = @len(name_data.bytes) as u32;
+    iface_write_sections::push_bytes(&name_data:ReadWrite, module_name)?;
+    next = 0;
+    while next < @len(sorted) as u32 {
+        iface_write_sections::push_u32(&export_data:ReadWrite, name_offs[next])?;
+        iface_write_sections::push_u16(&export_data:ReadWrite, name_lens[next] as u16)?;
+        iface_write_sections::push_u8(&export_data:ReadWrite, sorted[next].kind)?;
+        var flags: u8 = 0;
+        if strict && sorted[next].kind == 1 {
+            let def: u32 = sorted[next].def;
+            if def == 0 || def > @len(facts) as u32 || facts[def - 1] == 0 || facts[def - 1] > 2 {
+                iface::emit_unsupported(diags)?;
+                return iface::InterfaceResult { data: iface::ByteSink { bytes: [] }, export_count: 0, digest: [] };
+            }
+            flags = facts[def - 1] - 1;
+        }
+        iface_write_sections::push_u8(&export_data:ReadWrite, flags)?;
+        iface_write_sections::push_u64(&export_data:ReadWrite, names.entries[sorted[next].name - 1].hash)?;
+        iface_write_sections::push_u32(&export_data:ReadWrite, next + 1)?;
+        iface_write_sections::push_u32(&export_data:ReadWrite, sig_offs[next])?;
+        iface_write_sections::push_u32(&export_data:ReadWrite, sig_lens[next])?;
+        iface_write_sections::push_u32(&export_data:ReadWrite, aux_offs[next])?;
+        next = next + 1;
+    }
+    var module_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    iface_write_sections::push_u32(&module_data:ReadWrite, module_off)?;
+    iface_write_sections::push_u16(&module_data:ReadWrite, @len(module_name) as u16)?;
+    iface_write_sections::push_u16(&module_data:ReadWrite, 0)?;
+    var dependency_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var dep: u32 = 0;
+    while dep < @len(order) as u32 {
+        let entry: &iface::LoadedInterface:Read = &loaded[order[dep]]:Read;
+        let name: &[u8] = &entry.module_name[0..@len(entry.module_name)]:Read;
+        iface_write_sections::push_u32(&dependency_data:ReadWrite, @len(name_data.bytes) as u32)?;
+        iface_write_sections::push_u16(&dependency_data:ReadWrite, @len(name) as u16)?;
+        iface_write_sections::push_u16(&dependency_data:ReadWrite, 0)?;
+        iface_write_sections::push_bytes(&dependency_data:ReadWrite, &entry.digest[0..32]:Read)?;
+        iface_write_sections::push_bytes(&name_data:ReadWrite, name)?;
+        dep = dep + 1;
+    }
+    // 私有名追加在 name_bytes 末尾，不改变此前任何名称偏移。
+    var private_count: u32 = 0;
+    let private_data: iface::ByteSink = iface_write_sections::encode_privates(file, pool, names, &name_data:ReadWrite, &private_count:ReadWrite)?;
+    var output: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var z: u32 = 0;
+    while z < 296 { @push(output.bytes, 0)?; z = z + 1; }
+    append_section(&output:ReadWrite, 1, &name_data:Read, @len(name_data.bytes) as u32, @len(name_data.bytes) as u32)?;
+    append_section(&output:ReadWrite, 2, &module_data:Read, 8, 1)?;
+    append_section(&output:ReadWrite, 3, &dependency_data:Read, @len(dependency_data.bytes) as u32, @len(order) as u32)?;
+    let empty_sink: iface::ByteSink = iface::ByteSink { bytes: [] };
+    append_section(&output:ReadWrite, 4, &export_data:Read, @len(export_data.bytes) as u32, @len(sorted) as u32)?;
+    append_section(&output:ReadWrite, 5, &sig_data:Read, @len(sig_data.bytes) as u32, @len(sig_data.bytes) as u32)?;
+    append_section(&output:ReadWrite, 6, &type_secs.summary_data:Read, @len(type_secs.summary_data.bytes) as u32, @len(type_secs.summary_data.bytes) as u32 / 16)?;
+    append_section(&output:ReadWrite, 7, &type_secs.enum_desc_data:Read, @len(type_secs.enum_desc_data.bytes) as u32, @len(type_secs.enum_desc_data.bytes) as u32 / 16)?;
+    append_section(&output:ReadWrite, 8, &type_secs.enum_member_data:Read, @len(type_secs.enum_member_data.bytes) as u32, @len(type_secs.enum_member_data.bytes) as u32 / 32)?;
+    append_section(&output:ReadWrite, 9, &type_secs.enum_index_data:Read, @len(type_secs.enum_index_data.bytes) as u32, @len(type_secs.enum_index_data.bytes) as u32 / 8)?;
+    append_section(&output:ReadWrite, 10, &empty_sink:Read, 0, 0)?;
+    append_section(&output:ReadWrite, 11, &empty_sink:Read, 0, 0)?;
+    append_section(&output:ReadWrite, 12, &type_secs.struct_desc_data:Read, @len(type_secs.struct_desc_data.bytes) as u32, @len(type_secs.struct_desc_data.bytes) as u32 / 16)?;
+    append_section(&output:ReadWrite, 13, &type_secs.struct_field_data:Read, @len(type_secs.struct_field_data.bytes) as u32, @len(type_secs.struct_field_data.bytes) as u32 / 32)?;
+    append_section(&output:ReadWrite, 14, &type_secs.struct_index_data:Read, @len(type_secs.struct_index_data.bytes) as u32, @len(type_secs.struct_index_data.bytes) as u32 / 8)?;
+    append_section(&output:ReadWrite, 15, &private_data:Read, @len(private_data.bytes) as u32, private_count)?;
+    output.bytes[0] = 89;
+    output.bytes[1] = 75;
+    output.bytes[2] = 73;
+    output.bytes[3] = 70;
+    iface_write_sections::set_u16(&output.bytes:ReadWrite, 4, 2);
+    // header flags bit 0 声明含私有名节；旧接口（flags=0）由加载器拒绝。
+    iface_write_sections::set_u16(&output.bytes:ReadWrite, 6, 1);
+    iface_write_sections::set_u32(&output.bytes:ReadWrite, 8, profile);
+    iface_write_sections::set_u16(&output.bytes:ReadWrite, 12, 15);
+    iface_write_sections::set_u16(&output.bytes:ReadWrite, 14, 0);
+    iface_write_sections::set_u32(&output.bytes:ReadWrite, 16, 56);
+    let final_size: u32 = @len(output.bytes) as u32;
+    iface_write_sections::set_u32(&output.bytes:ReadWrite, 20, final_size);
+    var digest: u8[] = iface::sha256(&output.bytes[0..final_size]:Read)?;
+    var d: u32 = 0;
+    while d < 32 { output.bytes[24 + d] = digest[d]; d = d + 1; }
+    return iface::InterfaceResult { data: output, export_count: @len(sorted) as u32, digest: digest };
+}
+// 严格入口的事实按 DefId 减一索引：0 未知、1 不安全、2 无增。
+export function write_interface_analyzed(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read, facts: &[u8]:Read, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::InterfaceResult!AllocError {
+    let loaded: iface::LoadedInterface[] = [];
+    let order: u32[] = [];
+    return write_interface_core(file, pool, resolution, names, tc, layouts, facts, true, module_name, &loaded[0..0]:Read, &order[0..0]:Read, 65537, diags)?;
+}
+// 已载入的直接接口和依赖顺序必须与传给解析器的 DependencySet 一致。
+export function write_interface_with_dependencies(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read, facts: &[u8]:Read, module_name: &[u8], loaded: &[iface::LoadedInterface]:Read, order: &[u32]:Read, diags: &diag::DiagBuffer:ReadWrite): iface::InterfaceResult!AllocError {
+    return write_target_interface(file, pool, resolution, names, tc, layouts, facts, module_name, loaded, order, 65537, diags)?;
+}
+export function write_target_interface(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read, facts: &[u8]:Read, module_name: &[u8], loaded: &[iface::LoadedInterface]:Read, order: &[u32]:Read, profile: u32, diags: &diag::DiagBuffer:ReadWrite): iface::InterfaceResult!AllocError {
+    return write_interface_core(file, pool, resolution, names, tc, layouts, facts, true, module_name, loaded, order, profile, diags)?;
+}
+// 原有入口只产生保守零标志，不应代替已分析驱动的严格入口。
+export function write_interface(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::InterfaceResult!AllocError {
+    let facts: u8[] = [];
+    let loaded: iface::LoadedInterface[] = [];
+    let order: u32[] = [];
+    return write_interface_core(file, pool, resolution, names, tc, layouts, &facts[0..@len(facts)]:Read, false, module_name, &loaded[0..0]:Read, &order[0..0]:Read, 65537, diags)?;
+}
+export function write_function_interface(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::InterfaceResult!AllocError {
+    let empty_layouts: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    return write_interface(file, pool, resolution, names, tc, &empty_layouts:Read, module_name, diags)?;
+}

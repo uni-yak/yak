@@ -1,0 +1,6 @@
+// expected_trap: place has active Read borrows
+function mutate(data: &u32[]:ReadWrite): u32 { return 0u32; }
+function main(): void {
+    var data: u32[] = [1u32, 2u32];
+    let value: u32 = (&data[0u32..2u32])[mutate(&data:ReadWrite)];
+}

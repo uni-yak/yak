@@ -1,0 +1,8 @@
+# 打包时复制的语言服务和安装包
+/bin/
+/dist/
+*.vsix
+
+# 扩展测试下载的编辑器宿主
+/.vscode-test/
+/.vscode-test-web/

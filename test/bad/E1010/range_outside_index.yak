@@ -1,0 +1,5 @@
+// expected_code: E1010
+// spec: lang/lex.md#L-10
+// 触发：双点写在普通返回表达式中而非切片下标中。
+function bad(): u32 { return 1 + 2..3; }
+function main(): void { assert(bad() == 0u32); }

@@ -1,0 +1,4 @@
+// expected_code: E1017
+// spec: spec/lang/lex.md L-17
+// 触发：行中有不与换行配对的回车。
+function main(): void {    return; }

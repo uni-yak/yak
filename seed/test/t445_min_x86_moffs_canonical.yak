@@ -1,0 +1,58 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 低 4 GiB 用地址宽度前缀加 moffs32；负半区内可符号扩展的地址用绝对 SIB。
+    let canonical: [u8; 48] = [0x67, 0xa0, 0xff, 0xff, 0xff, 0x7f,
+        0x66, 0x8b, 0x04, 0x25, 0, 0, 0, 0x80, 0x67, 0xa2, 0, 0, 0, 0,
+        0x48, 0x89, 0x04, 0x25, 0xff, 0xff, 0xff, 0xff,
+        0x67, 0xa1, 0, 0, 0, 0x80, 0x67, 0x48, 0xa3, 0xff, 0xff, 0xff, 0xff,
+        0x66, 0x67, 0xa1, 0x78, 0x56, 0x34, 0x12];
+    encoding(&canonical[0..48]:Read, 0)?;
+    encoding(&canonical[41..47]:Read, 7101)?;
+    // 低 4 GiB 与符号扩展区之外的地址保留 moffs64。
+    let outside: [u8; 19] = [0xa1, 0, 0, 0, 0, 1, 0, 0, 0,
+        0x48, 0xa3, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff];
+    encoding(&outside[0..19]:Read, 0)?;
+    encoding(&outside[9..18]:Read, 7101)?;
+    let long_forms: [u8; 38] = [0xa0, 0xff, 0xff, 0xff, 0x7f, 0, 0, 0, 0,
+        0x66, 0xa1, 0, 0, 0, 0x80, 0xff, 0xff, 0xff, 0xff, 0xa2, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x48, 0xa3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    encoding(&long_forms[0..9]:Read, 7103)?;
+    encoding(&long_forms[9..19]:Read, 7103)?;
+    encoding(&long_forms[19..28]:Read, 7103)?;
+    encoding(&long_forms[28..38]:Read, 7103)?;
+    let alternatives: [u8; 32] = [0xa1, 0, 0, 0, 0x80, 0, 0, 0, 0,
+        0x8a, 0x04, 0x25, 0xff, 0xff, 0xff, 0x7f, 0x88, 0x04, 0x25, 0, 0, 0, 0,
+        0x67, 0x48, 0x89, 0x04, 0x25, 0, 0, 0, 0x80];
+    encoding(&alternatives[0..9]:Read, 7103)?;
+    encoding(&alternatives[9..16]:Read, 7103)?;
+    encoding(&alternatives[16..23]:Read, 7103)?;
+    encoding(&alternatives[23..32]:Read, 7103)?;
+    // 16 位操作数与 32 位地址共用时，宽度前缀排在地址前缀之前。
+    let prefix_order: [u8; 7] = [0x67, 0x66, 0xa1, 0x78, 0x56, 0x34, 0x12];
+    encoding(&prefix_order[0..7]:Read, 7102)?;
+    // R8 和 RDX 没有专用 moffs 形态，保留绝对 SIB。
+    let other: [u8; 16] = [0x4c, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0x8b, 0x14, 0x25, 0, 0, 0, 0];
+    encoding(&other[0..16]:Read, 0)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

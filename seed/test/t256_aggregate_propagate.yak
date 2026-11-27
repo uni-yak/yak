@@ -1,0 +1,11 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+struct Pair { first: i32, second: i32, }
+function number(ok: bool): i32!Failure { if !ok { return Failure::Bad; } return 5; }
+function forbidden(): i32 { assert(false); return 1; }
+function build(ok: bool): i32!Failure {
+    let pair: Pair = Pair { first: number(ok)?, second: forbidden() };
+    return pair.first;
+}
+function recover(e: &Failure): i32 { return 99; }
+function main(): void { assert(build(false).catch(&recover) == 99); }

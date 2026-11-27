@@ -1,0 +1,15 @@
+// expected_exit: 7
+// spec: spec/lang/base.md 7.12
+// out 槽位全流程：声明空槽、经 Write 形参整值提交、@move 提取满槽，退出码 7。
+// 注：seed 解释器不接受 Write 能力标注，本案例只能经编译器产物验证。
+foreign exit(code: u8): void;
+
+function fill(x: &u32:Write): void { *x = 7u32; }
+
+function main(): void {
+    out r: u32;
+    fill(out r);
+    let v: u32 = @move(r);
+    exit(v as u8);
+    return;
+}

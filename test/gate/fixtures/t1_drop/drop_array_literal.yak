@@ -1,0 +1,24 @@
+// 唯一编号分别标记失败元素、已入数组的元素和其他活跃绑定。
+function leaf(id: u32): u32[] { return [id]; }
+
+export function literal_owned(): u32 {
+    let outside: u32[] = [20u32];
+    if @len(outside) != 1u64 { return 99u32; }
+    let rows: u32[][] = [leaf(21u32), leaf(22u32), leaf(23u32)];
+    return @len(rows) as u32;
+}
+
+function maybe_leaf(id: u32): u32[]!AllocError {
+    var a: u32[] = [];
+    @push(a, id)?;
+    return @move(a);
+}
+
+export function literal_propagate(): u32!AllocError {
+    let outside: u32[] = [30u32];
+    if @len(outside) != 1u64 { return 99u32; }
+    let rows: u32[][] = [leaf(31u32), maybe_leaf(32u32)?, leaf(33u32)];
+    return @len(rows) as u32;
+}
+
+function main(): void { return; }

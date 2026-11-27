@@ -1,0 +1,4 @@
+// expected_code: E1006
+// spec: spec/lang/lex.md L-6；spec/lang/type/char.md L-6
+// 触发：字符字面量使用未登记的转义。
+function main(): void { let value: char = '\q'; return; }

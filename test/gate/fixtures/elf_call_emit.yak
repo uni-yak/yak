@@ -1,0 +1,126 @@
+// 只让 System V 槽位模块生成双向调用，不经过生产目标入口。
+import buf;
+import elf;
+import elf_call;
+import host;
+import pe;
+foreign assert(cond: bool): void;
+
+function name_bytes(name: &[u8]): u8[]!AllocError {
+    var bytes: u8[] = [];
+    var i: u64 = 0;
+    while i < @len(name) { @push(bytes, name[i])?; i = i + 1; }
+    return @move(bytes);
+}
+
+function args_for_probe(): elf_call::Argument[]!AllocError {
+    var args: elf_call::Argument[] = [];
+    let word: u8 = elf_call::word_form();
+    var i: u32 = 8;
+    while i <= 40 {
+        @push(args, elf_call::Argument { slot: i, form: word })?;
+        i = i + 8;
+    }
+    @push(args, elf_call::Argument { slot: 56, form: elf_call::slice_form() })?;
+    @push(args, elf_call::Argument { slot: 64, form: word })?;
+    return @move(args);
+}
+
+function negative_cases(args: &[elf_call::Argument]): void!AllocError {
+    let invalid: elf_call::Frame = elf_call::plan(2147483633u32, 6);
+    assert(invalid.code == 8023);
+    var code: pe::Code = pe::code_new();
+    let misaligned: elf_call::Frame = elf_call::Frame { code: 0, local_bytes: 64, outgoing_words: 2, bytes: 79 };
+    assert(elf_call::enter(&code:ReadWrite, &misaligned:Read)? == 8014);
+    assert(elf_call::leave(&code:ReadWrite, &misaligned:Read)? == 8014);
+    let undersized: elf_call::Frame = elf_call::plan(64, 6);
+    let too_many: elf_call::CallSite = elf_call::call(&code:ReadWrite, &undersized:Read, args)?;
+    assert(too_many.code == 8023 && too_many.at == 0);
+    let good: elf_call::Frame = elf_call::plan(64, 8);
+    let short_slice: [elf_call::Argument; 1] = [elf_call::Argument { slot: 8, form: elf_call::slice_form() }];
+    let crossed: [elf_call::Argument; 2] = [elf_call::Argument { slot: 16, form: 1 }, elf_call::Argument { slot: 24, form: 2 }];
+    let unaligned: [elf_call::Argument; 1] = [elf_call::Argument { slot: 9, form: 1 }];
+    assert(elf_call::spill(&code:ReadWrite, &good:Read, &short_slice[0..1]:Read)? == 8023);
+    assert(elf_call::spill(&code:ReadWrite, &good:Read, &crossed[0..2]:Read)? == 8023);
+    let bad_slot: elf_call::CallSite = elf_call::call(&code:ReadWrite, &good:Read, &unaligned[0..1]:Read)?;
+    assert(bad_slot.code == 8023 && bad_slot.at == 0);
+    assert(pe::code_len(&code:Read) == 0);
+    code.win64_body = true;
+    assert(elf_call::enter(&code:ReadWrite, &good:Read)? == 8023);
+    assert(pe::code_len(&code:Read) == 0);
+    return;
+}
+
+function require_rax(code: &pe::Code:ReadWrite, value: u64): u32!AllocError {
+    pe::mov_imm64(code, pe::r10(), value)?;
+    pe::cmp_rr(code, pe::rax(), pe::r10())?;
+    return pe::jcc_rel32(code, pe::cc_ne())?;
+}
+
+function sample(): elf::ObjectInput!AllocError {
+    var args: elf_call::Argument[] = args_for_probe()?;
+    negative_cases(&args[0..7]:Read)?;
+    let frame: elf_call::Frame = elf_call::plan(64, 8);
+    assert(frame.code == 0 && frame.bytes == 80 && frame.outgoing_words == 2);
+    var code: pe::Code = pe::code_new();
+    assert(elf_call::enter(&code:ReadWrite, &frame:Read)? == 0);
+    assert(elf_call::spill(&code:ReadWrite, &frame:Read, &args[0..7]:Read)? == 0);
+
+    // 不依赖下一次调用的参数重装，先直接检查每个已保存槽。
+    let values: [u64; 8] = [11, 22, 33, 44, 55, 4, 89, 77];
+    let slots: [u32; 8] = [8, 16, 24, 32, 40, 48, 56, 64];
+    var failures: u32[] = [];
+    var i: u32 = 0;
+    while i < 8 {
+        pe::load_slot(&code:ReadWrite, pe::rax(), slots[i], 8)?;
+        if i == 6 { pe::load_base(&code:ReadWrite, pe::rax(), pe::rax(), 0, 1)?; }
+        let failed_at: u32 = require_rax(&code:ReadWrite, values[i])?;
+        @push(failures, failed_at)?;
+        i = i + 1;
+    }
+    // 交换首尾、第二与第四个整数槽，触及寄存器和栈两侧的数据搬运。
+    args[0].slot = 64;
+    args[1].slot = 32;
+    args[3].slot = 16;
+    args[6].slot = 8;
+    let call_site: elf_call::CallSite = elf_call::call(&code:ReadWrite, &frame:Read, &args[0..7]:Read)?;
+    assert(call_site.code == 0 && call_site.at != 0);
+    assert(elf_call::leave(&code:ReadWrite, &frame:Read)? == 0);
+    let fail: u32 = pe::code_len(&code:Read);
+    pe::mov_imm64(&code:ReadWrite, pe::rax(), 0)?;
+    assert(elf_call::leave(&code:ReadWrite, &frame:Read)? == 0);
+    i = 0;
+    while i < 8 { pe::patch_rel32(&code:ReadWrite, failures[i], fail); i = i + 1; }
+
+    var input: elf::ObjectInput = elf::ObjectInput { sections: [], symbols: [], relocations: [], small_mode: true };
+    let size: u32 = pe::code_len(&code:Read);
+    let text: u8[] = name_bytes(&code.bytes[0..size]:Read)?;
+    assert(@len(text) == (size as u64));
+    @push(input.sections, elf::Section { index: 1, flags: 6, bytes: @move(text) })?;
+    @push(input.sections, elf::Section { index: 2, flags: 2, bytes: [] })?;
+    @push(input.sections, elf::Section { index: 3, flags: 3, bytes: [] })?;
+    let generated: u8[] = name_bytes("yak$abiprobe$f1")?;
+    let witness: u8[] = name_bytes("abi_probe_callee")?;
+    @push(input.symbols, elf::Symbol { link: 1, name: @move(generated), section: 1, kind: 2, public: true, value: 0, size: size as u64 })?;
+    @push(input.symbols, elf::Symbol { link: 2, name: @move(witness), section: 0, kind: 2, public: true, value: 0, size: 0 })?;
+    @push(input.relocations, elf::Relocation { section: 1, offset: call_site.at as u64, target: 2, kind: 4, width: 4, addend: 0i64 - 4i64 })?;
+    return @move(input);
+}
+
+function emit(completed: &bool:ReadWrite): void!AllocError {
+    let input: elf::ObjectInput = sample()?;
+    let result: elf::ObjectResult = elf::emit_object(&input:Read)?;
+    let bytes: &buf::ByteBuf:Read = &result.bytes:Read;
+    assert(result.code == 0 && @len(bytes.data) != 0u64);
+    host::output_bytes("obj", &bytes.data[0..@len(bytes.data)]:Read);
+    *completed = true;
+    return;
+}
+
+function main(): void {
+    var completed: bool = false;
+    let result: void!AllocError = emit(&completed:ReadWrite);
+    @drop(result);
+    assert(completed);
+    return;
+}

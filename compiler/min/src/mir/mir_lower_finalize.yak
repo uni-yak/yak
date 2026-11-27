@@ -1,0 +1,277 @@
+// MIR 函数降级收尾：不可达块删除、指令按块分桶、陷阱清理与槽位回滚。
+import types;
+import ast;
+import diag;
+import typecheck;
+import copy_facts;
+import layout;
+import mir;
+import mir_verify;
+import mir_no_alloc;
+import mir_materialize;
+import mir_builder;
+import mir_trap_cleanup;
+
+const NONE: u32 = 4294967295u32;
+
+export function empty_function(def: u32, signature: u32, declared: bool): mir::MirFunction {
+    return mir::MirFunction { def: def, signature: signature, declared_no_alloc: declared, no_alloc: true,
+        locals: [], blocks: [], insts: [], args: [], params: [], arms: [], view_ends: [], entry: 0,
+        has_trap_target: false, trap_target: 0 };
+}
+
+export function find_u8_slice(tt: &typecheck::TypeTable:Read): u32 {
+    var i: u32 = 0;
+    while i < @len(tt.entries) as u32 {
+        if mir::is_u8_slice(tt, i + 1) { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 地址局部的类型：统一按内建 u64（4100）承载指针。
+export function builtin_mir_type(module: &mir::MirModule:ReadWrite, builtin: u16): u32!AllocError {
+    var i: u32 = 0;
+    while i < @len(module.types.entries) as u32 {
+        let entry: typecheck::TypeEntry = module.types.entries[i];
+        if entry.kind == 1 && entry.builtin == builtin { return i + 1; }
+        i = i + 1;
+    }
+    @push(module.types.entries, typecheck::TypeEntry { kind: 1, builtin: builtin, def: 0, dep: 0, export_id: 0, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    return @len(module.types.entries) as u32;
+}
+
+// 到达分析先删除未达合流块，再决定哪些正常出口需要返回诊断。
+export function finalize(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite, source: &mir_no_alloc::SourceMap:ReadWrite): void!AllocError {
+    if build.rejection.kind != 0 { return; }
+    if build.needs_trap {
+        let saved: u16 = build.current;
+        let trap: u16 = mir_builder::new_block(ctx, build)?;
+        ctx.has_trap_target = true;
+        ctx.trap_target = trap;
+        build.current = trap;
+        mir_builder::term(ctx, build, 195, 0, 0, 0);
+        build.current = saved;
+    }
+    if build.rejection.kind != 0 { return; }
+    var reachable: u8[] = [];
+    var mapping: u32[] = [];
+    var queue: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(ctx.blocks) as u32 { @push(reachable, 0)?; @push(mapping, NONE)?; i = i + 1; }
+    reachable[ctx.entry] = 1;
+    @push(queue, ctx.entry as u32)?;
+    var cursor: u32 = 0;
+    while cursor < @len(queue) as u32 {
+        let block: u32 = queue[cursor];
+        let end: mir::MirTerminator = ctx.blocks[block].terminator;
+        var targets: u32[] = [];
+        if end.op == 192 { @push(targets, end.b)?; }
+        elseif end.op == 193 || end.op == 162 { @push(targets, end.b)?; @push(targets, end.c)?; }
+        elseif end.op == 177 {
+            var k: u32 = 0;
+            while k < end.c && end.b + k < @len(ctx.arms) as u32 {
+                @push(targets, ctx.arms[end.b + k].block as u32)?;
+                k = k + 1;
+            }
+        }
+        var t: u32 = 0;
+        while t < @len(targets) as u32 {
+            let dest: u32 = targets[t];
+            if dest >= @len(ctx.blocks) as u32 { mir_builder::reject(build, 6, build.span); return; }
+            if reachable[dest] == 0 { reachable[dest] = 1; @push(queue, dest)?; }
+            t = t + 1;
+        }
+        cursor = cursor + 1;
+    }
+    if ctx.has_trap_target { reachable[ctx.trap_target] = 2; }
+    i = 0;
+    var count: u32 = 0;
+    while i < @len(ctx.blocks) as u32 {
+        if reachable[i] != 0 { mapping[i] = count; count = count + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.blocks) as u32 {
+        if reachable[i] == 1 && ctx.blocks[i].terminator.op == 0 {
+            if !mir::is_void(&tc.types:Read, build.ret) { mir_builder::emit(diags, types::error_code(2005), build.span)?; mir_builder::reject(build, 7, build.span); return; }
+            // 掉出函数末尾的隐式返回同样按逆序析构（owner.md 6.1）。
+            mir_builder::emit_drops(ctx, build, i as u16, 0, NONE)?;
+            ctx.blocks[i].terminator = mir::MirTerminator { op: 194, a: 0, b: 0, c: 0 };
+        }
+        i = i + 1;
+    }
+    // 按块号线性分桶重排指令，保持各块内原始发射顺序不变，避免 O(块数*指令数) 扫描。
+    let bcount: u32 = @len(ctx.blocks) as u32;
+    let icount: u32 = @len(ctx.insts) as u32;
+    var counts: u32[] = [];
+    var cursors: u32[] = [];
+    i = 0;
+    while i < bcount { @push(counts, 0u32)?; @push(cursors, 0u32)?; i = i + 1; }
+    var j: u32 = 0;
+    while j < icount {
+        let owner: u32 = build.owners[j] as u32;
+        if owner < bcount && reachable[owner] != 0 { counts[owner] = counts[owner] + 1; }
+        j = j + 1;
+    }
+    var blocks: mir::MirBlock[] = [];
+    var total_insts: u32 = 0;
+    i = 0;
+    while i < bcount {
+        if reachable[i] != 0 {
+            let start: u32 = total_insts;
+            cursors[i] = start;
+            total_insts = total_insts + counts[i];
+            var end: mir::MirTerminator = ctx.blocks[i].terminator;
+            if end.op == 192 || end.op == 193 || end.op == 162 { end.b = mapping[end.b]; }
+            if end.op == 193 || end.op == 162 { end.c = mapping[end.c]; }
+            @push(blocks, mir::MirBlock { id: mapping[i] as u16, inst_start: start, inst_count: counts[i], terminator: end, payload: ctx.blocks[i].payload, entry_view_ends: ctx.blocks[i].entry_view_ends })?;
+        }
+        i = i + 1;
+    }
+    var insts: mir::MirInst[] = [];
+    var spans: types::Span[] = [];
+    let zero_inst: mir::MirInst = mir::MirInst { op: 0, a: 0, b: 0, c: 0, value_type_id: 0, value: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false };
+    let zero_span: types::Span = types::Span { file: 0, offset: 0, length: 0 };
+    j = 0;
+    while j < total_insts {
+        @push(insts, zero_inst)?;
+        if build.track_spans { @push(spans, zero_span)?; }
+        j = j + 1;
+    }
+    j = 0;
+    while j < icount {
+        let owner: u32 = build.owners[j] as u32;
+        if owner < bcount && reachable[owner] != 0 {
+            let pos: u32 = cursors[owner];
+            cursors[owner] = pos + 1;
+            insts[pos] = ctx.insts[j];
+            if build.track_spans { spans[pos] = build.spans[j]; }
+        }
+        j = j + 1;
+    }
+    // 臂表在终结指令之外单独保存块号，必须随块重编号同步重映射。
+    var remapped_arms: mir::MirArm[] = [];
+    i = 0;
+    while i < @len(ctx.arms) as u32 {
+        var arm: mir::MirArm = ctx.arms[i];
+        if (arm.block as u32) < @len(mapping) as u32 && mapping[arm.block as u32] != NONE {
+            arm.block = mapping[arm.block as u32] as u16;
+        }
+        @push(remapped_arms, arm)?;
+        i = i + 1;
+    }
+    ctx.arms = @move(remapped_arms);
+    ctx.entry = mapping[ctx.entry] as u16;
+    if ctx.has_trap_target { ctx.trap_target = mapping[ctx.trap_target] as u16; }
+    ctx.blocks = @move(blocks);
+    ctx.insts = @move(insts);
+    if !mir_trap_cleanup::insert_trap_cleanups(ctx, build, tc, &spans:ReadWrite)? { mir_builder::reject(build, 6, build.span); return; }
+    if !mir_verify::insert_slot_rollbacks(ctx, &tc.types:Read, build.ret, &spans:ReadWrite, build.span, build.track_spans)? {
+        mir_builder::emit(diags, types::error_code(7036), build.span)?;
+        mir_builder::reject(build, 6, build.span);
+        return;
+    }
+    if build.track_spans {
+        @push(source.starts, @len(source.spans))?;
+        i = 0;
+        while i < @len(spans) as u32 { @push(source.spans, spans[i])?; i = i + 1; }
+    }
+    return;
+}
+
+// 构造逐函数复用的降级构建器（含布局缓存与导入签名副本）。
+export function init_builder(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, module: &mir::MirModule:Read, tc: &typecheck::TypeCheckResult:Read, imported_layouts: &layout::ImportedLayoutTable:Read, imported_fields: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, defs: u32, ptr_ty: u32, bool_ty: u32, agg_map: u32[], agg_len: u64[], empty_span: types::Span): mir_builder::Builder!AllocError {
+    var track_spans: bool = false;
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 0 && pool.functions[file.items[i].data].is_hash { track_spans = true; break; }
+        i = i + 1;
+    }
+    var layout_scratch: diag::DiagBuffer = diag::diagbuf_new();
+    let cached_layouts: layout::LayoutTable = layout::layout_table_with_imports(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, imported_layouts, imported_enums, &layout_scratch:ReadWrite)?;
+    let type_count: u32 = @len(tc.types.entries) as u32;
+    var type_support: u8[] = [];
+    var cleanup_types: u8[] = [];
+    i = 0;
+    while i < type_count { @push(type_support, 0)?; @push(cleanup_types, 0)?; i = i + 1; }
+    var call_signatures: mir::MirImport[] = [];
+    var call_params: u32[] = [];
+    i = 0;
+    while i < @len(module.imports) as u32 { @push(call_signatures, module.imports[i])?; i = i + 1; }
+    i = 0;
+    while i < @len(module.import_params) as u32 { @push(call_params, module.import_params[i])?; i = i + 1; }
+    var def_map: u32[] = [];
+    i = 0;
+    while i < defs { @push(def_map, 0)?; i = i + 1; }
+    return mir_builder::Builder { current: 0, owners: [], spans: [], track_spans: track_spans, def_map: @move(def_map), bound_defs: [], loops: [], loop_depth: 0,
+        bound_views: [], view_depth: 0, temporary_views: [], temporary_depth: 0, last_inst: [],
+        ret: 0, body: 0, span: empty_span, rejection: mir::MirRejection { kind: 0, span: empty_span }, needs_trap: false, has_drop: false, ptr_ty: ptr_ty, bool_ty: bool_ty, dyn_views: [],
+        agg_map: @move(agg_map), agg_len: @move(agg_len), drop_defs: [], expression_temps: [], expression_depth: 0, hold_projection: false,
+        imported_fields: mir::copy_imported_fields(imported_fields)?, imported_fields_ordered: layout::imported_fields_ordered(imported_fields),
+        imported_enums: mir::copy_imported_enums(imported_enums)?,
+        copy_order: copy_facts::imported_copy_order(tc), import_signatures: @move(call_signatures), import_params: @move(call_params),
+        imported_layouts: mir_materialize::copy_imported_layouts(imported_layouts)?, layouts: @move(cached_layouts), type_support: @move(type_support), cleanup_types: @move(cleanup_types) };
+}
+
+// 解包单个函数的扁平析构计划段；校验每条边的节点合法性。
+export function unpack_function_drops(pool: &ast::AstPool:Read, drops: &u32[]:Read, cursor: &u32:ReadWrite, fn_body: u32, out_defs: &u32[]:ReadWrite): bool!AllocError {
+    if @len((*drops)) == 0 { return true; }
+    let size: u32 = @len((*drops)) as u32;
+    if *cursor >= size { return false; }
+    let records: u32 = (*drops)[*cursor];
+    *cursor = *cursor + 1;
+    var k: u32 = 0;
+    while k < records {
+        if size - *cursor < 3 { return false; }
+        let edge: u32 = (*drops)[*cursor];
+        let key: u32 = (*drops)[*cursor + 1];
+        let count: u32 = (*drops)[*cursor + 2];
+        *cursor = *cursor + 3;
+        var valid: bool = false;
+        if edge == 0 { valid = key == NONE || (key < @len(pool.stmts) as u32 && pool.stmts[key].kind == 10); }
+        elseif edge == 1 { valid = key < @len(pool.exprs) as u32 && pool.exprs[key].kind == 13; }
+        elseif edge == 2 { valid = key < @len(pool.stmts) as u32 && pool.stmts[key].kind == 11; }
+        elseif edge == 3 { valid = key < @len(pool.stmts) as u32 && pool.stmts[key].kind == 12; }
+        elseif edge == 4 { valid = key < @len(pool.blocks) as u32 && key != fn_body; }
+        if count > size - *cursor || !valid { return false; }
+        @push(*out_defs, edge)?;
+        @push(*out_defs, key)?;
+        @push(*out_defs, count)?;
+        var j: u32 = 0;
+        while j < count { @push(*out_defs, (*drops)[*cursor + j])?; j = j + 1; }
+        *cursor = *cursor + count;
+        k = k + 1;
+    }
+    return true;
+}
+
+// 逐函数降级前重置构建器的函数级字段，保留跨函数缓存。
+export function reset_builder(build: &mir_builder::Builder:ReadWrite, item_span: types::Span, empty_span: types::Span): void {
+    build.current = 0;
+    build.owners = [];
+    build.spans = [];
+    build.last_inst = [];
+    build.view_depth = 0;
+    build.temporary_depth = 0;
+    var bound: u32 = 0;
+    let bound_count: u32 = @len(build.bound_defs) as u32;
+    while bound < bound_count {
+        let def_index: u32 = build.bound_defs[bound];
+        build.def_map[def_index] = 0;
+        bound = bound + 1;
+    }
+    build.bound_defs = [];
+    build.loops = [];
+    build.loop_depth = 0;
+    build.expression_depth = 0;
+    build.ret = 0;
+    build.body = 0;
+    build.span = item_span;
+    build.rejection = mir::MirRejection { kind: 0, span: empty_span };
+    build.needs_trap = false;
+    build.has_drop = false;
+    build.dyn_views = [];
+    build.drop_defs = [];
+    return;
+}

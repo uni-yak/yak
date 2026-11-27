@@ -1,0 +1,32 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+struct Record { data: i32[], count: i32, }
+function number(ok: bool): i32!Failure { if !ok { return Failure::Bad; } return 5; }
+function forbidden(): i32 { assert(false); return 1; }
+function record(ok: bool): i32!Failure {
+    let value: Record = Record { data: [1, 2], count: number(ok)? };
+    return value.data[1] + value.count;
+}
+function array(ok: bool): i32!Failure {
+    let values: i32[] = [1, number(ok)?, 3];
+    return values[0] + values[1] + values[2];
+}
+function stop(): i32!Failure {
+    let values: i32[] = [number(false)?, forbidden()];
+    return values[0];
+}
+function recover(e: &Failure): i32 { return 99; }
+function main(): void {
+    assert(record(false).catch(&recover) == 99);
+    assert(record(true).catch(&recover) == 7);
+    assert(array(false).catch(&recover) == 99);
+    assert(array(true).catch(&recover) == 9);
+    assert(stop().catch(&recover) == 99);
+    var i: u32 = 0;
+    while i < 500 {
+        assert(record(false).catch(&recover) == 99);
+        assert(array(false).catch(&recover) == 99);
+        i = i + 1;
+    }
+}

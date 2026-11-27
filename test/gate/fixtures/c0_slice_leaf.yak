@@ -1,0 +1,1 @@
+export struct Span { file: u16, offset: u32, length: u16 }

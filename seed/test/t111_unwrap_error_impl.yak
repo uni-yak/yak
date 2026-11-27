@@ -1,0 +1,17 @@
+// t111: .unwrap() Err + Error 实现 → present 自定义文本（S-9.4 / S-15）
+// expected_trap: boom: E::Bad
+enum E { Bad, }
+impl Error for E {
+    function present(e: &E): &[u8] {
+        return "boom: E::Bad";
+    }
+}
+function maybe(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function main(): void {
+    let a: u32 = maybe(0).unwrap();
+    assert(false);
+    return;
+}

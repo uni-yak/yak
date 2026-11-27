@@ -1,0 +1,28 @@
+foreign assert(condition: bool): void;
+foreign read(buffer: &[u8]:ReadWrite): u32;
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+struct Payload { bytes: u8[] }
+
+export function exercise(mode: u8): void {
+    out slot: Payload;
+    fill(mode, out slot);
+    let result: Payload = @move(slot);
+    assert(result.bytes.len == 1u64);
+}
+
+function fill(mode: u8, target: &Payload:Write): void {
+    *target = Payload { bytes: [81u8] };
+    let local: u8[] = [82u8];
+    if mode == 0u8 { assert(local[0u64] == 0u8); }
+    elseif mode == 1u8 || mode == 4u8 {
+        var input: [u8; 2] = [0u8, 0u8];
+        let count: u32 = read(&input[0u64..2u64]:ReadWrite);
+        let end: u32 = read(&input[0u64..2u64]:ReadWrite);
+        assert(count == 1u32 && end == 0u32 && input[0u64] == 90u8);
+    } elseif mode == 2u8 { write("unexpected stdout"); }
+    else { exit(local[0u64] - 45u8); }
+}
+
+function main(): void { return; }

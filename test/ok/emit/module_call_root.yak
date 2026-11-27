@@ -1,0 +1,13 @@
+// expected_exit: 30
+// dependency: module_call_dep.yak
+// spec: spec/lang/module.md、spec/lang/base.md 八
+// 跨模块调用：根单元经 call_far 调用依赖单元导出函数，退出码 30。
+foreign exit(code: u8): void;
+
+import module_call_dep;
+
+function main(): void {
+    let v: u32 = module_call_dep::add(10u32, 20u32);
+    exit(v as u8);
+    return;
+}

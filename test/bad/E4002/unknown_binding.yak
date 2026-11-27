@@ -1,0 +1,4 @@
+// expected_code: E4002
+// spec: spec/lang/name.md N-2
+// 触发：函数返回表达式引用不存在的绑定。
+function main(): void { return missing; }

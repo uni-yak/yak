@@ -1,0 +1,30 @@
+// 调用成功交接两个聚合槽；调用方遇到越界时先释放局部，再逆序回滚满槽。
+struct Payload { first: u32[], second: u32[] }
+
+function fill(left: &Payload:Write, right: &Payload:Write, a: Payload, b: Payload): void {
+    *left = @move(a);
+    *right = @move(b);
+    return;
+}
+
+function trigger(hi: u32): void!AllocError {
+    var a: u32[] = [];
+    var b: u32[] = [];
+    var c: u32[] = [];
+    var d: u32[] = [];
+    var witness: u32[] = [];
+    @push(a, 211u32)?;
+    @push(b, 212u32)?;
+    @push(c, 221u32)?;
+    @push(d, 222u32)?;
+    @push(witness, 230u32)?;
+    let first: Payload = Payload { first: @move(a), second: @move(b) };
+    let second: Payload = Payload { first: @move(c), second: @move(d) };
+    out left: Payload;
+    out right: Payload;
+    fill(out left, out right, @move(first), @move(second));
+    if @len(witness[0u32..hi]) == 0u64 { return; }
+    return;
+}
+
+function main(): void { trigger(9u32); return; }

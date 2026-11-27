@@ -1,0 +1,176 @@
+// 确定性有界 Yak 源码格式化器（textDocument/formatting）。
+// 规则：规范化行尾为 LF、按花括号层级重排缩进、清理行尾空白、折叠多余空行、保证末尾单 LF。
+import positions;
+
+const FORMAT_BYTE_LIMIT: u64 = 65536;
+const MAX_INDENT_DEPTH: u32 = 32;
+
+// status：0 参数非法，1 无改动/不可格式化，2 有编辑。
+export struct FormatResult {
+    status: u8,
+    changed: bool,
+    range: positions::Range,
+    new_text: u8[],
+}
+
+function empty_range(): positions::Range {
+    let zero: positions::Position = positions::Position { line: 0, character: 0 };
+    return positions::Range { start: zero, end: zero };
+}
+
+function no_format(status: u8): FormatResult {
+    return FormatResult { status: status, changed: false, range: empty_range(), new_text: [] };
+}
+
+function bytes_equal(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+// 统计一行有效代码内的花括号净变化，并跟踪跨行块注释层级。
+struct LineBraceState { block_comment: u32, leading_closes: u32, opens_after: u32, closes_after: u32 }
+
+function scan_line_braces(src: &[u8], start: u32, end: u32, in_comment: u32): LineBraceState {
+    var depth: u32 = in_comment;
+    var p: u32 = start;
+    var leading: u32 = 0;
+    var saw_code: bool = false;
+    var opens: u32 = 0;
+    var closes: u32 = 0;
+    while p < end {
+        let b: u8 = src[p];
+        if depth > 0u32 {
+            if b == 47u8 && p + 1u32 < end && src[p + 1u32] == 42u8 {
+                depth = depth + 1u32;
+                p = p + 2u32;
+            } elseif b == 42u8 && p + 1u32 < end && src[p + 1u32] == 47u8 {
+                depth = depth - 1u32;
+                p = p + 2u32;
+            } else {
+                p = p + 1u32;
+            }
+            continue;
+        }
+        if b == 32u8 || b == 9u8 {
+            p = p + 1u32;
+            continue;
+        }
+        if b == 47u8 && p + 1u32 < end && src[p + 1u32] == 47u8 {
+            break;
+        }
+        if b == 47u8 && p + 1u32 < end && src[p + 1u32] == 42u8 {
+            depth = 1u32;
+            p = p + 2u32;
+            continue;
+        }
+        if b == 34u8 || b == 39u8 {
+            saw_code = true;
+            let quote: u8 = b;
+            p = p + 1u32;
+            while p < end {
+                if src[p] == 92u8 && p + 1u32 < end { p = p + 2u32; }
+                elseif src[p] == quote { p = p + 1u32; break; }
+                else { p = p + 1u32; }
+            }
+            continue;
+        }
+        if b == 125u8 {
+            if !saw_code { leading = leading + 1u32; }
+            else { closes = closes + 1u32; }
+            p = p + 1u32;
+            continue;
+        }
+        saw_code = true;
+        if b == 123u8 { opens = opens + 1u32; }
+        p = p + 1u32;
+    }
+    return LineBraceState { block_comment: depth, leading_closes: leading, opens_after: opens, closes_after: closes };
+}
+
+function push_indent(dst: &u8[]:ReadWrite, level: u32, tab_size: u32, use_spaces: bool): void!AllocError {
+    var clamped: u32 = level;
+    if clamped > MAX_INDENT_DEPTH { clamped = MAX_INDENT_DEPTH; }
+    var i: u32 = 0;
+    if !use_spaces {
+        while i < clamped { @push(*dst, 9u8)?; i = i + 1u32; }
+        return;
+    }
+    let total: u32 = clamped * tab_size;
+    while i < total { @push(*dst, 32u8)?; i = i + 1u32; }
+    return;
+}
+
+// 格式化整篇文档；输入超过配额时安全拒绝返回无编辑。
+export function format_document(src: &[u8], index: &positions::Index:Read, tab_size: u32, use_spaces: bool): FormatResult!AllocError {
+    if @len(src) > FORMAT_BYTE_LIMIT || index.status != 0u8 || @len(index.lines) == 0u64 {
+        return no_format(1u8);
+    }
+    var width: u32 = tab_size;
+    if width == 0u32 { width = 4u32; }
+    if width > 8u32 { width = 8u32; }
+
+    var dst: u8[] = [];
+    var indent: u32 = 0;
+    var block_comment: u32 = 0;
+    var prev_blank: bool = false;
+    var emitted_any: bool = false;
+
+    let line_count: u32 = @len(index.lines) as u32;
+    var row: u32 = 0;
+    while row < line_count {
+        let line: positions::Line = index.lines[row];
+        var s: u32 = line.start;
+        var e: u32 = line.end;
+        while s < e && (src[s] == 32u8 || src[s] == 9u8) { s = s + 1u32; }
+        while e > s && (src[e - 1u32] == 32u8 || src[e - 1u32] == 9u8) { e = e - 1u32; }
+        if s == e {
+            if emitted_any && !prev_blank && row + 1u32 < line_count {
+                @push(dst, 10u8)?;
+                prev_blank = true;
+            }
+        } else {
+            let state: LineBraceState = scan_line_braces(src, s, e, block_comment);
+            var line_indent: u32 = indent;
+            if state.leading_closes >= line_indent { line_indent = 0u32; }
+            else { line_indent = line_indent - state.leading_closes; }
+            push_indent(&dst:ReadWrite, line_indent, width, use_spaces)?;
+            var p: u32 = s;
+            while p < e {
+                @push(dst, src[p])?;
+                p = p + 1u32;
+            }
+            @push(dst, 10u8)?;
+            emitted_any = true;
+            prev_blank = false;
+            var next_indent: u32 = line_indent + state.opens_after;
+            if state.closes_after >= next_indent { next_indent = 0u32; }
+            else { next_indent = next_indent - state.closes_after; }
+            indent = next_indent;
+            block_comment = state.block_comment;
+        }
+        row = row + 1u32;
+    }
+    // 清理尾随多余空行，确保非空源码以单个 LF 结尾。
+    while @len(dst) >= 2u64 && dst[@len(dst) as u32 - 1u32] == 10u8 && dst[@len(dst) as u32 - 2u32] == 10u8 {
+        var trimmed: u8[] = [];
+        var k: u32 = 0;
+        let lim: u32 = @len(dst) as u32 - 1u32;
+        while k < lim { @push(trimmed, dst[k])?; k = k + 1u32; }
+        dst = @move(trimmed);
+    }
+    if bytes_equal(src, &dst[0..@len(dst)]:Read) {
+        return FormatResult { status: 2, changed: false, range: empty_range(), new_text: [] };
+    }
+    let last_row: u32 = line_count - 1u32;
+    let last_line: positions::Line = index.lines[last_row];
+    let full: positions::Range = positions::Range {
+        start: positions::Position { line: 0, character: 0 },
+        end: positions::Position { line: last_row, character: last_line.units },
+    };
+    return FormatResult { status: 2, changed: true, range: full, new_text: @move(dst) };
+}

@@ -1,0 +1,3 @@
+export struct Point { x: i64, }
+export function make(): Point { return Point { x: 42 }; }
+export function get(p: &Point): i64 { return p.x; }

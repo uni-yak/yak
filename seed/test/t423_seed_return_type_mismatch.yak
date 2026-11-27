@@ -1,0 +1,12 @@
+// expected_trap: return: expression type does not match the declared return type (P-5)
+// 触发：函数声明返回 u8，却返回已定型为 u32 的值。
+
+function narrow(): u8 {
+    let value: u32 = 7;
+    return value;
+}
+
+function main(): void {
+    narrow();
+    return;
+}

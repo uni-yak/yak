@@ -1,0 +1,217 @@
+// 所有权检查使用的只读 AST 控制流判定。
+import ast;
+
+function block_has_transfer(pool: &ast::AstPool:Read, block: u32): bool {
+    if block >= @len(pool.blocks) as u32 { return true; }
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block].stmts[i]];
+        if stmt.kind == 11 || stmt.kind == 12 || stmt.kind == 15 { return true; }
+        if stmt.kind == 14 {
+            let cond: &ast::IfStmt:Read = &pool.ifs[stmt.data]:Read;
+            var branch: u32 = 0;
+            while branch < @len(cond.branches) as u32 {
+                if block_has_transfer(pool, cond.branches[branch].body) { return true; }
+                branch = branch + 1;
+            }
+            if cond.else_body < @len(pool.blocks) as u32 && block_has_transfer(pool, cond.else_body) { return true; }
+        }
+        if stmt.kind == 16 {
+            let arms: &ast::MatchStmt:Read = &pool.matches[stmt.data]:Read;
+            var arm: u32 = 0;
+            while arm < @len(arms.arms) as u32 {
+                if block_has_transfer(pool, arms.arms[arm].body) { return true; }
+                arm = arm + 1;
+            }
+        }
+        if stmt.kind == 10 { return false; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 类型检查已保证匹配穷尽；循环和不确定路径不推断返回。
+export function block_returns(pool: &ast::AstPool:Read, block: u32): bool {
+    if block >= @len(pool.blocks) as u32 { return false; }
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block].stmts[i]];
+        if stmt.kind == 10 { return true; }
+        if stmt.kind == 14 {
+            let cond: &ast::IfStmt:Read = &pool.ifs[stmt.data]:Read;
+            if cond.else_body < @len(pool.blocks) as u32 && block_returns(pool, cond.else_body) {
+                var all: bool = true;
+                var branch: u32 = 0;
+                while branch < @len(cond.branches) as u32 {
+                    if !block_returns(pool, cond.branches[branch].body) { all = false; }
+                    branch = branch + 1;
+                }
+                if all { return true; }
+            }
+            var branch: u32 = 0;
+            while branch < @len(cond.branches) as u32 {
+                if block_has_transfer(pool, cond.branches[branch].body) { return false; }
+                branch = branch + 1;
+            }
+            if cond.else_body < @len(pool.blocks) as u32 && block_has_transfer(pool, cond.else_body) { return false; }
+        }
+        if stmt.kind == 16 {
+            let arms: &ast::MatchStmt:Read = &pool.matches[stmt.data]:Read;
+            var all: bool = @len(arms.arms) > 0;
+            var arm: u32 = 0;
+            while arm < @len(arms.arms) as u32 {
+                if !block_returns(pool, arms.arms[arm].body) { all = false; }
+                arm = arm + 1;
+            }
+            if all { return true; }
+            arm = 0;
+            while arm < @len(arms.arms) as u32 {
+                if block_has_transfer(pool, arms.arms[arm].body) { return false; }
+                arm = arm + 1;
+            }
+        }
+        if stmt.kind == 11 || stmt.kind == 12 || stmt.kind == 15 { return false; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 顺序合流只接受真正落到块末尾的路径；循环跳转单独记录。
+// 无普通后继的语句既不参与分支合流，也不继续登记本块的借用。
+export function slice_stmt_falls_through(pool: &ast::AstPool:Read, stmt: ast::Stmt): bool {
+    if stmt.kind == 10 || stmt.kind == 11 || stmt.kind == 12 { return false; }
+    if stmt.kind == 14 {
+        if slice_falls_through(pool, pool.ifs[stmt.data].else_body) { return true; }
+        var i: u32 = 0;
+        while i < @len(pool.ifs[stmt.data].branches) as u32 {
+            if slice_falls_through(pool, pool.ifs[stmt.data].branches[i].body) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if stmt.kind == 16 {
+        var i: u32 = 0;
+        while i < @len(pool.matches[stmt.data].arms) as u32 {
+            if slice_falls_through(pool, pool.matches[stmt.data].arms[i].body) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    return true;
+}
+
+export function slice_falls_through(pool: &ast::AstPool:Read, block: u32): bool {
+    if block >= @len(pool.blocks) as u32 { return true; }
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        if !slice_stmt_falls_through(pool, pool.stmts[pool.blocks[block].stmts[i]]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 三项块事实互相独立：例如循环会转移控制，但仍可能落尾。
+export struct FlowSummary { transfers: bool, returns: bool, falls: bool }
+export struct FlowFacts { blocks: FlowSummary[], stmt_falls: bool[], enabled: bool }
+
+function merge_arm(summary: FlowSummary, arm: FlowSummary): FlowSummary {
+    return FlowSummary { transfers: summary.transfers || arm.transfers, returns: summary.returns && arm.returns, falls: summary.falls || arm.falls };
+}
+
+function stmt_summary(pool: &ast::AstPool:Read, facts: &FlowFacts:Read, stmt: ast::Stmt): FlowSummary {
+    if stmt.kind == 10 { return FlowSummary { transfers: false, returns: true, falls: false }; }
+    if stmt.kind == 11 || stmt.kind == 12 { return FlowSummary { transfers: true, returns: false, falls: false }; }
+    if stmt.kind == 15 { return FlowSummary { transfers: true, returns: false, falls: true }; }
+    var summary: FlowSummary = FlowSummary { transfers: false, returns: false, falls: true };
+    if stmt.kind == 14 {
+        let cond: &ast::IfStmt:Read = &pool.ifs[stmt.data]:Read;
+        if cond.else_body < @len(pool.blocks) as u32 { summary = facts.blocks[cond.else_body]; }
+        var branch: u32 = 0;
+        while branch < @len(cond.branches) as u32 {
+            summary = merge_arm(summary, facts.blocks[cond.branches[branch].body]);
+            branch = branch + 1u32;
+        }
+    } elseif stmt.kind == 16 {
+        let selection: &ast::MatchStmt:Read = &pool.matches[stmt.data]:Read;
+        summary.returns = @len(selection.arms) > 0;
+        summary.falls = false;
+        var arm: u32 = 0;
+        while arm < @len(selection.arms) as u32 {
+            summary = merge_arm(summary, facts.blocks[selection.arms[arm].body]);
+            arm = arm + 1u32;
+        }
+    }
+    return summary;
+}
+
+// 仅处理无解析错误的 AST；解析器在归还父块编号前已追加所有子块。
+// 按块顺序扫每条语句与分支边一次；即使后续语句不可达，也为其保留独立事实。
+export function build_facts(pool: &ast::AstPool:Read, enabled: bool): FlowFacts!AllocError {
+    var facts: FlowFacts = FlowFacts { blocks: [], stmt_falls: [], enabled: enabled };
+    if !enabled { return facts; }
+    var i: u32 = 0;
+    while i < @len(pool.stmts) as u32 {
+        @push(facts.stmt_falls, false)?;
+        i = i + 1u32;
+    }
+    var block: u32 = 0;
+    while block < @len(pool.blocks) as u32 {
+        var summary: FlowSummary = FlowSummary { transfers: false, returns: false, falls: true };
+        var transfer_open: bool = true;
+        var return_open: bool = true;
+        i = 0;
+        while i < @len(pool.blocks[block].stmts) as u32 {
+            let stmt_id: u32 = pool.blocks[block].stmts[i];
+            let stmt: ast::Stmt = pool.stmts[stmt_id];
+            let kind: u8 = stmt.kind;
+            let item: FlowSummary = stmt_summary(pool, &facts:Read, stmt);
+            facts.stmt_falls[stmt_id] = item.falls;
+            summary.falls = summary.falls && item.falls;
+            if transfer_open && (kind == 10 || item.transfers) {
+                summary.transfers = item.transfers;
+                transfer_open = false;
+            }
+            // 必返回先于分支控制转移判断，与递归判定的短路顺序一致。
+            if return_open && (item.returns || item.transfers) {
+                summary.returns = item.returns;
+                return_open = false;
+            }
+            i = i + 1u32;
+        }
+        @push(facts.blocks, summary)?;
+        block = block + 1u32;
+    }
+    return facts;
+}
+
+// 直线落尾或跳回本循环为 1，直线跳出本循环为 2，其余为 0。
+export function loop_prefix(pool: &ast::AstPool:Read, block: u32, label: u32): u8 {
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block].stmts[i]];
+        let kind: u8 = stmt.kind;
+        if kind != 1 && kind != 13 && kind != 17 && kind != 18 {
+            if stmt.data != 0u32 && stmt.data != label { return 0u8; }
+            if kind == 12u8 { return 1u8; }
+            if kind == 11u8 { return 2u8; }
+            return 0u8;
+        }
+        i = i + 1u32;
+    }
+    return 1u8;
+}
+
+export function returns_in(pool: &ast::AstPool:Read, facts: &FlowFacts:Read, block: u32): bool {
+    if !facts.enabled { return block_returns(pool, block); }
+    return block < @len(facts.blocks) as u32 && facts.blocks[block].returns;
+}
+
+export function falls_in(pool: &ast::AstPool:Read, facts: &FlowFacts:Read, block: u32): bool {
+    if !facts.enabled { return slice_falls_through(pool, block); }
+    return block >= @len(facts.blocks) as u32 || facts.blocks[block].falls;
+}
+
+export function stmt_falls_in(pool: &ast::AstPool:Read, facts: &FlowFacts:Read, stmt: u32): bool {
+    if !facts.enabled { return slice_stmt_falls_through(pool, pool.stmts[stmt]); }
+    return facts.stmt_falls[stmt];
+}

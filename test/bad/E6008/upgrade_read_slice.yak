@@ -1,0 +1,14 @@
+// expected_code: E6008
+// spec: spec/lang/base.md R-14
+// 触发：从只读切片派生 ReadWrite 子切片。
+foreign exit(code: u8): void;
+
+function sub_length(data: &[u8]): u64 {
+    return @len(&data[0..1]:ReadWrite);
+}
+
+function main(): void {
+    let bytes: [u8; 1] = [0u8];
+    exit(sub_length(&bytes[0..1]) as u8);
+    return;
+}

@@ -1,0 +1,47 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function main(): void {
+    // R12 作基址仍需 SIB。R13 作单独基址可省 SIB，零位移则须保留 disp8。
+    let index_only: [u8; 56] = [0x4a, 0x8b, 0x04, 0x25, 0x7f, 0, 0, 0, 0x4a, 0x8b, 0x04, 0x25, 0x80, 0, 0, 0,
+        0x4a, 0x8b, 0x04, 0x2d, 0x80, 0, 0, 0, 0x4a, 0x8b, 0x04, 0x65, 0, 0, 0, 0,
+        0x4a, 0x8b, 0x04, 0x65, 0x80, 0, 0, 0, 0x4a, 0x8b, 0x04, 0x6d, 0x80, 0xff, 0xff, 0xff,
+        0x4a, 0x8b, 0x04, 0x6d, 0x80, 0, 0, 0];
+    encoding(&index_only[0..8]:Read, 7103)?;
+    encoding(&index_only[8..16]:Read, 7102)?;
+    encoding(&index_only[16..24]:Read, 7103)?;
+    encoding(&index_only[24..32]:Read, 7103)?;
+    encoding(&index_only[32..40]:Read, 7102)?;
+    encoding(&index_only[40..48]:Read, 7103)?;
+    encoding(&index_only[48..56]:Read, 7102)?;
+    encoding(&index_only[48..55]:Read, 7101)?;
+    let actual_bases: [u8; 24] = [0x49, 0x8b, 0x44, 0x24, 0x7f, 0x49, 0x8b, 0x85, 0x80, 0, 0, 0,
+        0x4b, 0x8b, 0x04, 0x24, 0x4b, 0x8b, 0x84, 0x2d, 0x80, 0, 0, 0];
+    encoding(&actual_bases[0..24]:Read, 0)?;
+
+    // 互换 R13 的角色可消除零位移，已有必要位移时为等长别名。
+    let swaps: [u8; 14] = [0x49, 0x8b, 0x44, 0x0d, 0, 0x49, 0x8b, 0x44, 0x0d, 1, 0x49, 0x8b, 0x04, 0x0c];
+    encoding(&swaps[0..5]:Read, 7103)?;
+    encoding(&swaps[5..10]:Read, 7102)?;
+    encoding(&swaps[10..14]:Read, 7102)?;
+    // 实际 RBP 与 RSP 的基址保持栈段；它们不与数据段寄存器交换。
+    let stack: [u8; 32] = [0x48, 0x8b, 0x04, 0x2d, 0, 0, 0, 0, 0x48, 0x8b, 0x04, 0x6d, 0, 0, 0, 0,
+        0x48, 0x8b, 0x44, 0x0d, 0, 0x4a, 0x8b, 0x04, 0x24, 0x49, 0x8b, 0x44, 0x2d, 0, 0x4b, 0x8b];
+    encoding(&stack[0..30]:Read, 0)?;
+    encoding(&stack[30..32]:Read, 7101)?;
+
+    var code: pe::Code = pe::code_new();
+    pe::modrm_base_index(&code:ReadWrite, 0, 13, 14)?;
+    assert(pe::code_len(&code:Read) == 3 && code.bytes[0] == 0x4b && code.bytes[1] == 0x04 && code.bytes[2] == 0x2e);
+    return;
+}

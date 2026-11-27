@@ -1,0 +1,64 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产栈槽取址使用完整位移，不拿低半字替代宽地址。
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 65664)?;
+    assert(pe::code_len(&code:Read) == 7 && code.bytes[2] == 0x85 && code.bytes[5] == 0xfe);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // 宽目的、真实缩放和访存不按 16 位取址结果截断位移。
+    let memory_r12: [u8; 9] = [0x66, 0x42, 0x8b, 0x04, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    // 位移完整保留，R12 的 ×1 索引可改为同段基址，编码等长。
+    encoding(&memory_r12[0..9]:Read, 7102)?;
+    let memory_rbp: [u8; 8] = [0x66, 0x8b, 0x04, 0x6d, 0x80, 0xff, 0x00, 0x00];
+    encoding(&memory_rbp[0..8]:Read, 0)?;
+    let memory_rcx: [u8; 8] = [0x66, 0x8b, 0x04, 0x4d, 0x00, 0x00, 0x01, 0x00];
+    encoding(&memory_rcx[0..8]:Read, 7102)?;
+    let dword_r12: [u8; 8] = [0x42, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&dword_r12[0..8]:Read, 7102)?;
+    let qword_rbp: [u8; 8] = [0x48, 0x8d, 0x04, 0x6d, 0x80, 0xff, 0x00, 0x00];
+    encoding(&qword_rbp[0..8]:Read, 7102)?;
+    let word_outer: [u8; 9] = [0x66, 0x42, 0x8d, 0x04, 0x25, 0x80, 0x00, 0x01, 0x00];
+    encoding(&word_outer[0..9]:Read, 7102)?;
+    let word_scale: [u8; 9] = [0x66, 0x42, 0x8d, 0x04, 0xa5, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&word_scale[0..9]:Read, 0)?;
+    let word_absolute: [u8; 8] = [0x66, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&word_absolute[0..8]:Read, 7103)?;
+    // 无基址形式先验证完整位移，再判定能否改用更短的有基址形式。
+    let r12_short: [u8; 6] = [0x66, 0x41, 0x8d, 0x44, 0x24, 0x7f];
+    let r12_long: [u8; 9] = [0x66, 0x42, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&r12_short[0..6]:Read, 0)?;
+    encoding(&r12_long[0..8]:Read, 7101)?;
+    encoding(&r12_long[0..9]:Read, 7103)?;
+    let rbp_short: [u8; 5] = [0x66, 0x8d, 0x44, 0x2d, 0x80];
+    let rbp_long: [u8; 8] = [0x66, 0x8d, 0x04, 0x6d, 0x80, 0xff, 0x00, 0x00];
+    encoding(&rbp_short[0..5]:Read, 0)?;
+    encoding(&rbp_long[0..7]:Read, 7101)?;
+    encoding(&rbp_long[0..8]:Read, 7103)?;
+    let rcx_short: [u8; 4] = [0x66, 0x8d, 0x04, 0x09];
+    let rcx_long: [u8; 8] = [0x66, 0x8d, 0x04, 0x4d, 0x00, 0x00, 0x01, 0x00];
+    encoding(&rcx_short[0..4]:Read, 0)?;
+    encoding(&rcx_long[0..7]:Read, 7101)?;
+    encoding(&rcx_long[0..8]:Read, 7103)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

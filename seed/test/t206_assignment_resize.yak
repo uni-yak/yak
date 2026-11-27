@@ -1,0 +1,3 @@
+foreign assert(cond: bool): void;
+function grow(values: &u32[]:ReadWrite): u32!AllocError { var i: u32 = 0; while i < 16 { @push(*values, i)?; i = i + 1; } return 42; }
+function main(): void { var values: u32[] = [1]; { let r: &u32[]:ReadWrite = &values:ReadWrite; r[0] = grow(r)?; } assert(values[0] == 42); assert(@len(values) == 17); }

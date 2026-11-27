@@ -1,0 +1,338 @@
+// Win64 调用约定：参数传递、聚合搬运与返回槽。
+
+import pe;
+import mir;
+import coff_state;
+
+// 从外部指针精确复制 size 字节到栈槽，不能假定其后有填充。
+// rax/rcx/r11 之外不触碰尚未回填的实参寄存器。
+function copy_ptr_to_slot(em: &coff_state::Emitter:ReadWrite, src_reg: u8, dst_disp: u32, size: u32): void!AllocError {
+    pe::lea_rbp(&em.code:ReadWrite, pe::r11(), dst_disp)?;
+    var at: u32 = 0;
+    while at < size {
+        let remaining: u32 = size - at;
+        var width: u8 = 1;
+        if remaining >= 8 { width = 8; } elseif remaining >= 4 { width = 4; } elseif remaining >= 2 { width = 2; }
+        pe::load_base(&em.code:ReadWrite, pe::rcx(), src_reg, at, width)?;
+        pe::store_base(&em.code:ReadWrite, pe::rcx(), pe::r11(), at, width)?;
+        at = at + width as u32;
+    }
+    return;
+}
+// 把栈槽 src_disp 的 size 字节复制到指针寄存器 dst_reg 指向的目标。
+export function copy_slot_to_ptr(em: &coff_state::Emitter:ReadWrite, src_disp: u32, dst_reg: u8, size: u32): void!AllocError {
+    pe::lea_rbp(&em.code:ReadWrite, pe::r11(), src_disp)?;
+    var at: u32 = 0;
+    while at < size {
+        let remaining: u32 = size - at;
+        var width: u8 = 1;
+        if remaining >= 8 { width = 8; } elseif remaining >= 4 { width = 4; } elseif remaining >= 2 { width = 2; }
+        pe::load_base(&em.code:ReadWrite, pe::rcx(), pe::r11(), at, width)?;
+        pe::store_base(&em.code:ReadWrite, pe::rcx(), dst_reg, at, width)?;
+        at = at + width as u32;
+    }
+    return;
+}
+// 形参回填：调用方按 ABI 把前四个展开实参装入 rcx/rdx/r8/r9，其余落在
+// [rbp + 48 + 8*k]（k 为中转整型参数位，从 0 计；48 = 返回地址 8 + 保存的 rbp 8 + shadow 32）。
+// 切片展开成相邻两个整型实参，指针可落在 r9 而长度落到站栈上（abi-win 2.2）。
+// 按指针传递的聚合在寄存器或栈槽里收到调用方副本地址，被调方复制到自己的槽以保持值语义。
+// 被调方必须把入参写回形参局部，否则函数体读到的是未初始化的栈槽。
+// 被调方读取栈上实参：第 k 个中转整型参数位位于 [rbp + 48 + 8*k]，
+// 48 = 返回地址 8 + 保存的 rbp 8 + shadow space 32（abi-win 2.1）。
+// 正向位移走 load_base 的 disp32 编码，不受 modrm_rbp 只支持负偏移的限制。
+function load_incoming(em: &coff_state::Emitter:ReadWrite, k: u32, reg: u8): void!AllocError {
+    let disp: u32 = 48 + 8 * k;
+    pe::load_base(&em.code:ReadWrite, reg, pe::rbp(), disp, 8)?;
+    return;
+}
+// 调用方写入出站实参：第 k 个落在 [rsp + 32 + 8*k]，而 rsp 恒等于 rbp - frame_size，
+// 故等价于 rbp 相对负偏移 frame_size - 32 - 8*k。out_slots 已在帧内预留，
+// 该偏移恒为正且与局部区不重叠（abi-win 2.1、2.5）。
+function store_outgoing(em: &coff_state::Emitter:ReadWrite, k: u32, reg: u8): void!AllocError {
+    let disp: u32 = em.frame_size - 32 - 8 * k;
+    pe::store_slot(&em.code:ReadWrite, reg, disp, 8)?;
+    return;
+}
+export function spill_params(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read): void!AllocError {
+    if em.code.sysv { spill_sysv_params(em, func)?; return; }
+    var reg: u32 = 0;
+    // 按指针返回时，隐藏返回缓冲区指针占用第一个整数参数位 rcx（abi-win 2.8）。
+    let sret_disp: u32 = em.sret;
+    if sret_disp != 0 {
+        pe::store_slot(&em.code:ReadWrite, pe::rcx(), sret_disp, 8)?;
+        reg = 1;
+    }
+    // 栈上实参的中转计数：与 reg 独立，只有 reg 超出 4 之后才逐位递增。
+    var stk: u32 = 0;
+    var p: u32 = 0;
+    while p < @len(func.params) as u32 {
+        let local: u32 = func.params[p];
+        if coff_state::local_slice(em, local) {
+            let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, local);
+            // 切片展开的两个实参各自独立定位：指针可能仍在寄存器，长度可能已落到栈上。
+            if reg < 4 {
+                pe::store_slot(&em.code:ReadWrite, coff_state::arg_reg(reg), disp, 8)?;
+            } else {
+                load_incoming(em, stk, pe::rax())?;
+                pe::store_slot(&em.code:ReadWrite, pe::rax(), disp, 8)?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+            if reg < 4 {
+                pe::store_slot(&em.code:ReadWrite, coff_state::arg_reg(reg), disp - 8, 8)?;
+            } else {
+                load_incoming(em, stk, pe::rax())?;
+                pe::store_slot(&em.code:ReadWrite, pe::rax(), disp - 8, 8)?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+        } else {
+            if local != 0 && local <= @len(em.by_ptr) as u32 && em.by_ptr[local - 1] {
+                let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, local);
+                let size: u32 = em.agg_sizes[local - 1];
+                if disp == 0 || size == 0 || size > coff_state::abi_copy_limit() {
+                    em.rejected = 255;
+                    em.reject_kind = 6;
+                    return;
+                }
+                if reg < 4 {
+                    pe::mov_rr(&em.code:ReadWrite, pe::rax(), coff_state::arg_reg(reg))?;
+                } else {
+                    load_incoming(em, stk, pe::rax())?;
+                    stk = stk + 1;
+                }
+                copy_ptr_to_slot(em, pe::rax(), disp, size)?;
+            } else {
+                if reg < 4 {
+                    coff_state::store_local(em, local, coff_state::arg_reg(reg))?;
+                } else {
+                    load_incoming(em, stk, pe::rax())?;
+                    coff_state::store_local(em, local, pe::rax())?;
+                    stk = stk + 1;
+                }
+            }
+            reg = reg + 1;
+        }
+        p = p + 1;
+    }
+    return;
+}
+// 调用指令：返回调用点位移字段偏移，供重定位（REL32）登记。
+// 切片实参展开为 (指针, 长度) 两个整型实参，与 `yak_rt_write(const u8* ptr, u64 len)` 对齐；
+// 展开后超出 rcx/rdx/r8/r9 的部分写进本帧预留的出站实参区 [rsp + 32 + 8*k]（abi-win 2.1），
+// 因此不再有“放不进就拒绝”的形态；只有内部不一致才返回 4294967295。
+export function lower_call(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): u32!AllocError {
+    if em.code.sysv { return lower_sysv_call(em, inst, func)?; }
+    var i: u32 = 0;
+    var reg: u32 = 0;
+    // 按指针返回：调用方把结果槽地址放入 rcx 作为隐藏返回缓冲区（abi-win 2.8），
+    // 用户实参从 rdx 起依次占用后续整数参数位。
+    if inst.a != 0 && inst.a <= @len(em.by_ptr) as u32 && em.by_ptr[inst.a - 1] {
+        let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+        if dst == 0 { return 4294967295u32; }
+        pe::lea_rbp(&em.code:ReadWrite, pe::rcx(), dst)?;
+        reg = 1;
+    }
+    // 栈上实参的中转计数：与 reg 独立，只有 reg 超出 4 之后才逐位递增。
+    var stk: u32 = 0;
+    while i < inst.args_count {
+        let local: u32 = func.args[inst.args_start + i];
+        if local != 0 && local <= @len(func.locals) as u32 && func.locals[local - 1].kind == 3 {
+            if !mir::is_slot_call(inst.op) || func.locals[local - 1].state != 10 { return 4294967295u32; }
+            let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, local);
+            if disp == 0 { return 4294967295u32; }
+            // 借出地址必须用 lea 取得，先经 r10 中转再决定落寄存器还是出站区。
+            pe::lea_rbp(&em.code:ReadWrite, pe::r10(), disp)?;
+            if reg < 4 {
+                pe::mov_rr(&em.code:ReadWrite, coff_state::arg_reg(reg), pe::r10())?;
+            } else {
+                store_outgoing(em, stk, pe::r10())?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+        } elseif coff_state::local_slice(em, local) {
+            let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, local);
+            // 切片展开的两个实参各自独立定位：指针可能仍在寄存器，长度可能已落到出站区。
+            if reg < 4 {
+                pe::load_slot(&em.code:ReadWrite, coff_state::arg_reg(reg), disp, 8)?;
+            } else {
+                pe::load_slot(&em.code:ReadWrite, pe::r10(), disp, 8)?;
+                store_outgoing(em, stk, pe::r10())?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+            if reg < 4 {
+                pe::load_slot(&em.code:ReadWrite, coff_state::arg_reg(reg), disp - 8, 8)?;
+            } else {
+                pe::load_slot(&em.code:ReadWrite, pe::r10(), disp - 8, 8)?;
+                store_outgoing(em, stk, pe::r10())?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+        } elseif local != 0 && local <= @len(em.by_ptr) as u32 && em.by_ptr[local - 1] {
+            // 按指针传递聚合：寄存器装的是调用方副本地址（abi-win 2.7）。
+            // 外部 C 函数可能改写该对象，把本帧槽地址交出去违反调用方副本语义，失败关闭。
+            if mir::is_foreign_call(inst.op) {
+                coff_state::reject_abi_form(em, inst.op)?;
+                return 4294967295u32;
+            }
+            let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, local);
+            let size: u32 = em.agg_sizes[local - 1];
+            if disp == 0 || size == 0 || size > coff_state::abi_copy_limit() {
+                coff_state::reject_abi_form(em, inst.op)?;
+                return 4294967295u32;
+            }
+            pe::lea_rbp(&em.code:ReadWrite, pe::r10(), disp)?;
+            if reg < 4 {
+                pe::mov_rr(&em.code:ReadWrite, coff_state::arg_reg(reg), pe::r10())?;
+            } else {
+                store_outgoing(em, stk, pe::r10())?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+        } else {
+            // 标量按槽宽装载：窄宽度只写低字节、零扩展后上栈，与寄存器路径一致。
+            if reg < 4 {
+                coff_state::load_local(em, local, coff_state::arg_reg(reg))?;
+            } else {
+                coff_state::load_local(em, local, pe::r10())?;
+                store_outgoing(em, stk, pe::r10())?;
+                stk = stk + 1;
+            }
+            reg = reg + 1;
+        }
+        i = i + 1;
+    }
+    if mir::is_indirect_call(inst.op) {
+        // 先排好实参寄存器与出站栈槽，再把目标地址装入独立的易失寄存器。
+        coff_state::load_local(em, inst.b, pe::r11())?;
+        pe::call_rm64(&em.code:ReadWrite, pe::r11())?;
+        return 0;
+    }
+    return pe::call_rel32(&em.code:ReadWrite)?;
+}
+// 调用后把 rax 写回结果局部（void 调用 a == 0 时不写）。
+// 按指针返回的聚合已由被调方直接写入结果槽，rax 只是缓冲区指针，不能再当值存回。
+export function store_call_result(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): void!AllocError {
+    if inst.a == 0 { return; }
+    if em.code.sysv {
+        let size: u32 = em.agg_sizes[inst.a - 1];
+        if size > 16 { return; }
+        if size != 0 {
+            let slot: u32 = em.slots[inst.a - 1];
+            pe::store_slot(&em.code:ReadWrite, pe::rax(), slot, 8)?;
+            if size > 8 { pe::store_slot(&em.code:ReadWrite, pe::rdx(), slot - 8, 8)?; }
+            return;
+        }
+        coff_state::store_local(em, inst.a, pe::rax())?;
+        return;
+    }
+    if inst.a <= @len(em.by_ptr) as u32 && em.by_ptr[inst.a - 1] { return; }
+    coff_state::store_local(em, inst.a, pe::rax())?;
+    return;
+}
+
+// 两个 System V 字段搬运路径共用栈槽和参数落点；末尾字节只在有效载荷内读取。
+export function load_sysv_word(em: &coff_state::Emitter:ReadWrite, slot: u32, offset: u32, size: u32, reg: u8): void!AllocError {
+    let remaining: u32 = size - offset;
+    if remaining >= 8 { pe::load_slot(&em.code:ReadWrite, reg, slot - offset, 8)?; return; }
+    if remaining == 1 || remaining == 2 || remaining == 4 {
+        pe::load_slot(&em.code:ReadWrite, reg, slot - offset, remaining as u8)?;
+        return;
+    }
+    // 聚合槽按 8 字节预留。屏蔽未使用的槽尾字节，避免将填充传过 ABI 边界。
+    pe::load_slot(&em.code:ReadWrite, reg, slot - offset, 8)?;
+    let mask: u64 = (1u64 << ((remaining as u64) * 8u64)) - 1u64;
+    pe::mov_imm64(&em.code:ReadWrite, pe::r11(), mask)?;
+    pe::and_rr(&em.code:ReadWrite, reg, pe::r11())?;
+    return;
+}
+
+function spill_sysv_params(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read): void!AllocError {
+    var regs: u32 = 0;
+    var stack: u32 = 0;
+    let hidden: u32 = em.sret;
+    if hidden != 0 {
+        pe::store_slot(&em.code:ReadWrite, pe::rdi(), hidden, 8)?;
+        regs = 1;
+    }
+    var i: u32 = 0;
+    while i < @len(func.params) as u32 {
+        let local: u32 = func.params[i];
+        let slot: u32 = em.slots[local - 1];
+        let out_address: bool = func.locals[local - 1].kind == 3;
+        var aggregate: u32 = 0;
+        if !out_address { aggregate = em.agg_sizes[local - 1]; }
+        let slice: bool = !out_address && coff_state::local_slice(em, local);
+        var size: u32 = 8;
+        if aggregate != 0 { size = aggregate; }
+        elseif slice { size = 16; }
+        let where: coff_state::SysvLocation = coff_state::sysv_location(regs, size, aggregate != 0);
+        var word: u32 = 0;
+        while word < where.words {
+            var src: u8 = pe::rax();
+            if word < where.registers { src = pe::sysv_arg_reg(regs + word); }
+            else {
+                // 保存的 rbp 和返回地址各占八字节；第一个栈参数距 rbp 十六字节。
+                pe::load_base(&em.code:ReadWrite, src, pe::rbp(), 16 + stack * 8, 8)?;
+                stack = stack + 1;
+            }
+            var width: u8 = 8;
+            if aggregate == 0 && !slice { width = em.widths[local - 1]; }
+            pe::store_slot(&em.code:ReadWrite, src, slot - word * 8, width)?;
+            word = word + 1;
+        }
+        regs = regs + where.registers;
+        i = i + 1;
+    }
+    return;
+}
+
+function lower_sysv_call(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): u32!AllocError {
+    var regs: u32 = 0;
+    var stack: u32 = 0;
+    if inst.a != 0 && inst.a <= @len(em.agg_sizes) as u32 && em.agg_sizes[inst.a - 1] > 16 {
+        let result_slot: u32 = em.slots[inst.a - 1];
+        pe::lea_rbp(&em.code:ReadWrite, pe::rdi(), result_slot)?;
+        regs = 1;
+    }
+    var i: u32 = 0;
+    while i < inst.args_count {
+        let local: u32 = func.args[inst.args_start + i];
+        if local == 0 || local > @len(em.slots) as u32 { return 4294967295u32; }
+        let out_address: bool = func.locals[local - 1].kind == 3;
+        if out_address && (!mir::is_slot_call(inst.op) || func.locals[local - 1].state != 10) { return 4294967295u32; }
+        let slot: u32 = em.slots[local - 1];
+        var aggregate: u32 = 0;
+        if !out_address { aggregate = em.agg_sizes[local - 1]; }
+        let slice: bool = !out_address && coff_state::local_slice(em, local);
+        var size: u32 = 8;
+        if aggregate != 0 { size = aggregate; }
+        elseif slice { size = 16; }
+        let where: coff_state::SysvLocation = coff_state::sysv_location(regs, size, aggregate != 0);
+        if where.words - where.registers > em.out_slots - stack { return 4294967295u32; }
+        var word: u32 = 0;
+        while word < where.words {
+            var dst: u8 = pe::r10();
+            if word < where.registers { dst = pe::sysv_arg_reg(regs + word); }
+            if out_address { pe::lea_rbp(&em.code:ReadWrite, dst, slot)?; }
+            elseif aggregate != 0 || slice { load_sysv_word(em, slot, word * 8, size, dst)?; }
+            else { coff_state::load_local(em, local, dst)?; }
+            if word >= where.registers {
+                let stack_disp: u32 = em.frame_size - stack * 8;
+                pe::store_slot(&em.code:ReadWrite, dst, stack_disp, 8)?;
+                stack = stack + 1;
+            }
+            word = word + 1;
+        }
+        regs = regs + where.registers;
+        i = i + 1;
+    }
+    if mir::is_indirect_call(inst.op) {
+        coff_state::load_local(em, inst.b, pe::r11())?;
+        pe::call_rm64(&em.code:ReadWrite, pe::r11())?;
+        return 0;
+    }
+    return pe::call_rel32(&em.code:ReadWrite)?;
+}

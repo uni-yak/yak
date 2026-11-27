@@ -1,0 +1,3 @@
+// expected_trap: unregistered file name
+foreign file_size(name: &[u8]): u64;
+function main(): void { file_size("unregistered"); }

@@ -1,0 +1,6 @@
+// 传递依赖链顶层：调用 mid，期望值 7 * 2 = 14。
+import mid;
+
+export function top_value(): u32 {
+    return mid::mid_value() * 2u32;
+}

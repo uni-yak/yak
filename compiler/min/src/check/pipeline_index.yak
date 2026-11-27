@@ -1,0 +1,559 @@
+// 文档级语言服务索引收集：语义记号、文档结构、定义跳转、悬停、补全、重命名与成员表。
+import lex;
+import lextables;
+import buf;
+import types;
+import ast;
+import resolve;
+import resolve_refs;
+import typecheck;
+import type_display;
+
+const NO_TOKEN: u32 = 4294967295;
+const TK_LOCAL: u8 = 2;
+const TK_REF: u8 = 4;
+
+// 公开声明只来自完整成功的解析；类别与二进制接口的公开记录一致。
+export struct PublicDeclaration { name: types::Span, kind: u8 }
+export struct PublicDeclarations { valid: bool, items: PublicDeclaration[] }
+
+function token_at(tokens: &[lex::Token], offset: u32): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = @len(tokens) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        if tokens[mid].span.offset < offset { lo = mid + 1u32; }
+        else { hi = mid; }
+    }
+    if lo < @len(tokens) as u32 && tokens[lo].span.offset == offset { return lo; }
+    return NO_TOKEN;
+}
+
+function token_is_name(tokens: &[lex::Token], at: u32, name: u32, file: u16): bool {
+    if at >= @len(tokens) as u32 || name == 0u32 { return false; }
+    let tok: lex::Token = tokens[at];
+    return tok.kind <= 1u8 && tok.payload == name as u64 && tok.span.file == file && tok.span.length != 0u32;
+}
+
+function definition_token(tokens: &[lex::Token], info: resolve::DefEntry, file: u16): u32 {
+    if info.kind < 1u8 || info.kind == 6u8 || info.kind > 10u8 || info.kind == 7u8 { return NO_TOKEN; }
+    let keyword: u32 = token_at(tokens, info.decl_offset);
+    if keyword == NO_TOKEN { return NO_TOKEN; }
+    if token_is_name(tokens, keyword + 1u32, info.name, file) { return keyword + 1u32; }
+    return NO_TOKEN;
+}
+
+// 参数的旧跨度是类型尾 token；用前一参数的尾部和逗号找到下一参数名。
+function index_parameters(tokens: &[lex::Token], syntax: &ast::AstFile:Read, pool: &ast::AstPool:Read, result: &resolve::ResolveResult:Read, targets: &u32[]:ReadWrite): void {
+    var i: u32 = 0;
+    while i < @len(syntax.items) as u32 && i < @len(result.file.items) as u32 {
+        let item: ast::AstItem = syntax.items[i];
+        let def: u32 = result.file.items[i].def_id;
+        if item.kind == 0u8 && def != 0u32 && def <= @len(*targets) as u32 {
+            let name_at: u32 = (*targets)[def - 1u32];
+            let fn: u32 = item.data;
+            if name_at != NO_TOKEN && name_at + 1u32 < @len(tokens) as u32 && tokens[name_at + 1u32].kind == 7u8 && tokens[name_at + 1u32].payload == 26u64 {
+                var param_at: u32 = name_at + 2u32;
+                var j: u32 = 0;
+                while j < @len(pool.functions[fn].params) as u32 {
+                    let param: ast::Param = pool.functions[fn].params[j];
+                    let slot: u32 = def + j;
+                    if slot >= @len(*targets) as u32 { break; }
+                    let info: resolve::DefEntry = result.tables.defs[slot];
+                    let tail: u32 = token_at(tokens, param.span.offset);
+                    if tail == NO_TOKEN || tail <= param_at || info.kind != 7u8 || info.name != param.name || info.decl_offset != param.span.offset { break; }
+                    if !token_is_name(tokens, param_at, param.name, syntax.file) { break; }
+                    (*targets)[slot] = param_at;
+                    if tail + 1u32 >= @len(tokens) as u32 || tokens[tail + 1u32].kind != 7u8 || tokens[tail + 1u32].payload != 32u64 { break; }
+                    param_at = tail + 2u32;
+                    j = j + 1u32;
+                }
+            }
+        }
+        i = i + 1u32;
+    }
+    return;
+}
+
+// 每个可定位的声明最多生成一条展示，引用只指向共享文本区间。
+function collect_hover_text(source: &[u8], tokens: &[lex::Token], targets: &[u32], checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, index: &types::DocumentDefinitions:ReadWrite): types::Span[]!AllocError {
+    var names: types::Span[] = [];
+    var i: u32 = 0;
+    while i < @len(targets) as u32 {
+        let at: u32 = targets[i];
+        if at == NO_TOKEN { @push(names, types::Span { file: 0, offset: 0, length: 0 })?; }
+        else { @push(names, tokens[at].span)?; }
+        i = i + 1u32;
+    }
+    var texts: types::Span[] = [];
+    i = 0u32;
+    while i < @len(targets) as u32 {
+        let start: u32 = @len(index.hover_text) as u32;
+        var length: u32 = 0;
+        if names[i].length != 0u32 && start < 16384u32 {
+            var item: buf::ByteBuf = buf::buf_new();
+            let ok: bool = type_display::display_binding(checked, source, &names[0..@len(names)]:Read, i + 1u32, tables.defs[i].kind == 5u8, &item:ReadWrite)?;
+            if ok && item.pos <= 16384u32 - start {
+                var j: u32 = 0;
+                while j < item.pos { @push(index.hover_text, item.data[j])?; j = j + 1u32; }
+                length = item.pos;
+            }
+        }
+        @push(texts, types::Span { file: 0, offset: start, length: length })?;
+        i = i + 1u32;
+    }
+    return texts;
+}
+
+// 路径跨度可能只有首记号；构造表达式的跨度则指向左花括号。
+function import_path_tail(tokens: &[lex::Token], span: types::Span, segments: &[u32], file: u16, constructor: bool): u32 {
+    if span.file != file || @len(segments) < 2 { return NO_TOKEN; }
+    var at: u32 = token_at(tokens, span.offset);
+    if at == NO_TOKEN { return at; }
+    if constructor {
+        let width: u32 = 2u32 * (@len(segments) as u32) - 1u32;
+        if at < width || tokens[at].kind != 7u8 || tokens[at].payload != 28u64 { return NO_TOKEN; }
+        at = at - width;
+    }
+    var i: u32 = 0;
+    while i < @len(segments) as u32 {
+        if !token_is_name(tokens, at, segments[i], file) { return NO_TOKEN; }
+        i = i + 1u32;
+        if i == @len(segments) as u32 { return at; }
+        at = at + 1u32;
+        if at >= @len(tokens) as u32 || tokens[at].kind != 7u8 || tokens[at].payload != 0u64 { return NO_TOKEN; }
+        at = at + 1u32;
+    }
+    return NO_TOKEN;
+}
+
+function import_use_token(tokens: &[lex::Token], pool: &ast::AstPool:Read, item: resolve_refs::ResolvedRef, file: u16): u32 {
+    if item.node_kind == 0u8 && item.node < @len(pool.exprs) as u32 {
+        let expr: ast::Expr = pool.exprs[item.node];
+        let data: u32 = expr.data as u32;
+        if expr.kind == 25u8 && data < @len(pool.paths) as u32 {
+            return import_path_tail(tokens, item.span, &pool.paths[data].segments[0..@len(pool.paths[data].segments)]:Read, file, false);
+        }
+        if expr.kind == 30u8 && data < @len(pool.ctors) as u32 {
+            return import_path_tail(tokens, item.span, &pool.ctors[data].path[0..@len(pool.ctors[data].path)]:Read, file, true);
+        }
+    }
+    if item.node_kind == 1u8 && item.node < @len(pool.types) as u32 {
+        let data: u32 = pool.types[item.node].data;
+        if pool.types[item.node].kind == 1u8 && data < @len(pool.type_paths) as u32 {
+            return import_path_tail(tokens, item.span, &pool.type_paths[data].segments[0..@len(pool.type_paths[data].segments)]:Read, file, false);
+        }
+    }
+    return NO_TOKEN;
+}
+
+function copy_import_interface(item: &resolve_refs::Iface:Read): types::ImportedInterface!AllocError {
+    var module: u8[] = [];
+    var digest: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(item.module) as u32 { @push(module, item.module[i])?; i = i + 1u32; }
+    i = 0u32;
+    while i < 32u32 { @push(digest, item.digest[i])?; i = i + 1u32; }
+    return types::ImportedInterface { module: module, digest: digest };
+}
+
+struct ImportUseCandidate { dependency: u32, export_id: u32 }
+
+// 仅记录普通导出引用；导入前缀、成员和枚举变体不产生链接。
+export function collect_import_uses(tokens: &[lex::Token], pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, deps: &resolve_refs::DependencySet:Read, direct: u32, file: u16, index: &types::DocumentDefinitions:ReadWrite): void!AllocError {
+    if direct == 0u32 { return; }
+    var uses: ImportUseCandidate[] = [];
+    var interfaces: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(tokens) as u32 { @push(uses, ImportUseCandidate { dependency: 0, export_id: 0 })?; i = i + 1u32; }
+    i = 0u32;
+    while i < direct { @push(interfaces, 0u32)?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(refs.items) as u32 {
+        let item: resolve_refs::ResolvedRef = refs.items[i];
+        let dep: u32 = item.x;
+        if item.kind == 2u8 && dep != 0u32 && dep <= direct && item.y != 0u32 && @len(deps.ifaces[dep - 1u32].digest) == 32 && @len(deps.ifaces[dep - 1u32].module) != 0 {
+            let at: u32 = import_use_token(tokens, pool, item, file);
+            if at != NO_TOKEN {
+                if uses[at].dependency == 0u32 { uses[at] = ImportUseCandidate { dependency: dep, export_id: item.y }; }
+                elseif uses[at].dependency != dep || uses[at].export_id != item.y { uses[at].dependency = NO_TOKEN; }
+            }
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(tokens) as u32 {
+        let hit: ImportUseCandidate = uses[i];
+        if hit.dependency != 0u32 && hit.dependency != NO_TOKEN {
+            let dep: u32 = hit.dependency - 1u32;
+            if interfaces[dep] == 0u32 {
+                @push(index.imported_interfaces, copy_import_interface(&deps.ifaces[dep]:Read)?)?;
+                interfaces[dep] = @len(index.imported_interfaces) as u32;
+            }
+            let site: types::Span = tokens[i].span;
+            @push(index.imported_uses, types::ImportedDefinitionUse { offset: site.offset, length: site.length, interface_row: interfaces[dep], export_id: hit.export_id })?;
+        }
+        i = i + 1u32;
+    }
+    return;
+}
+
+// 将解析器块范围映射到作用域；模式绑定的臂作用域和其正文共用范围。
+struct CompletionScope { start: u32, end: u32, rank: u32 }
+function completion_scopes(pool: &ast::AstPool:Read, tables: &resolve::ResolveTables:Read, file: u16, size: u32): CompletionScope[]!AllocError {
+    var ranges: CompletionScope[] = [];
+    var i: u32 = 0;
+    while i < @len(tables.scopes) as u32 {
+        let scope: resolve::ScopeEntry = tables.scopes[i];
+        var rank: u32 = 0;
+        if scope.parent > 0u32 && scope.parent <= i { rank = ranges[scope.parent - 1u32].rank + 1u32; }
+        var end: u32 = 0;
+        if i == 0u32 && scope.kind == 1u8 { end = size + 1u32; }
+        @push(ranges, CompletionScope { start: 0, end: end, rank: rank })?;
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(pool.blocks) as u32 && i < @len(tables.block_scope) as u32 {
+        let id: u32 = tables.block_scope[i];
+        let span: types::Span = pool.blocks[i].span;
+        if id != 0u32 && id <= @len(ranges) as u32 && span.file == file && span.length >= 2u32 && span.offset <= size && span.length <= size - span.offset {
+            let start: u32 = span.offset + 1u32;
+            let end: u32 = span.offset + span.length;
+            ranges[id - 1u32].start = start;
+            ranges[id - 1u32].end = end;
+            let parent: u32 = tables.scopes[id - 1u32].parent;
+            if parent != 0u32 && tables.scopes[parent - 1u32].kind == 5u8 {
+                ranges[parent - 1u32].start = start;
+                ranges[parent - 1u32].end = end;
+            }
+        }
+        i = i + 1u32;
+    }
+    return ranges;
+}
+
+// 解引用到名义类型定义编号，供 `.` 成员补全反查结构体字段。
+function unwrap_local_def(table: &typecheck::TypeTable:Read, id: u32): u32 {
+    var cur: u32 = id;
+    var hops: u32 = 0;
+    while cur != 0u32 && (cur as u64) <= @len(table.entries) && hops < 4u32 {
+        let entry: typecheck::TypeEntry = table.entries[cur - 1u32];
+        if entry.kind == TK_LOCAL { return entry.def; }
+        if entry.kind == TK_REF { cur = entry.elem; }
+        else { return 0u32; }
+        hops = hops + 1u32;
+    }
+    return 0u32;
+}
+
+// 收集结构体字段与枚举变体成员表，供 `.` 与 `::` 补全检索。
+function collect_members(tokens: &[lex::Token], syntax: &ast::AstFile:Read, pool: &ast::AstPool:Read, index: &types::DocumentDefinitions:ReadWrite): void!AllocError {
+    let total: u32 = @len(tokens) as u32;
+    var i: u32 = 0;
+    while i < @len(syntax.items) as u32 {
+        let item: ast::AstItem = syntax.items[i];
+        let at: u32 = token_at(tokens, item.span.offset);
+        if at != NO_TOKEN && item.span.file == syntax.file {
+            let item_end: u32 = item.span.offset + item.span.length;
+            if item.kind == 2u8 && token_is_name(tokens, at + 1u32, pool.structs[item.data].name, syntax.file) {
+                let owner: types::Span = tokens[at + 1u32].span;
+                let decl: &ast::StructDecl:Read = &pool.structs[item.data]:Read;
+                var scan: u32 = at + 2u32;
+                var f: u32 = 0;
+                while f < @len(decl.fields) as u32 {
+                    let field_name: u32 = decl.fields[f].name;
+                    while scan < total && tokens[scan].span.offset < item_end {
+                        if token_is_name(tokens, scan, field_name, syntax.file) && scan + 1u32 < total && tokens[scan + 1u32].kind == 7u8 && tokens[scan + 1u32].payload == 24u64 {
+                            let ms: types::Span = tokens[scan].span;
+                            @push(index.member_entries, types::MemberEntry { owner_offset: owner.offset, owner_length: owner.length, member_offset: ms.offset, member_length: ms.length, kind: 5u8 })?;
+                            scan = scan + 2u32;
+                            break;
+                        }
+                        scan = scan + 1u32;
+                    }
+                    f = f + 1u32;
+                }
+            } elseif item.kind == 1u8 && token_is_name(tokens, at + 1u32, pool.enums[item.data].name, syntax.file) {
+                let owner: types::Span = tokens[at + 1u32].span;
+                let decl: &ast::EnumDecl:Read = &pool.enums[item.data]:Read;
+                var scan: u32 = at + 2u32;
+                var v: u32 = 0;
+                while v < @len(decl.variants) as u32 {
+                    let var_name: u32 = decl.variants[v].name;
+                    while scan < total && tokens[scan].span.offset < item_end {
+                        if token_is_name(tokens, scan, var_name, syntax.file) {
+                            let ms: types::Span = tokens[scan].span;
+                            @push(index.member_entries, types::MemberEntry { owner_offset: owner.offset, owner_length: owner.length, member_offset: ms.offset, member_length: ms.length, kind: 20u8 })?;
+                            scan = scan + 1u32;
+                            break;
+                        }
+                        scan = scan + 1u32;
+                    }
+                    v = v + 1u32;
+                }
+            }
+        }
+        i = i + 1u32;
+    }
+    return;
+}
+
+export function collect_definitions(source: &[u8], tokens: &[lex::Token], syntax: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, checked: &typecheck::TypeCheckResult:Read, file: u16, size: u32, index: &types::DocumentDefinitions:ReadWrite): void!AllocError {
+    var targets: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(resolution.result.tables.defs) as u32 {
+        @push(targets, definition_token(tokens, resolution.result.tables.defs[i], syntax.file))?;
+        i = i + 1u32;
+    }
+    index_parameters(tokens, syntax, pool, &resolution.result:Read, &targets:ReadWrite);
+    let ranges: CompletionScope[] = completion_scopes(pool, &resolution.result.tables:Read, file, size)?;
+    // 按 token 收集，避免引用访问顺序影响查找；冲突位置不生成链接。
+    var by_token: u32[] = [];
+    i = 0u32;
+    while i < @len(tokens) as u32 { @push(by_token, 0u32)?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(resolution.refs.items) as u32 {
+        let reference: resolve_refs::ResolvedRef = resolution.refs.items[i];
+        let def: u32 = reference.x;
+        if reference.kind == 0u8 && reference.node_kind <= 1u8 && def != 0u32 && def <= @len(targets) as u32 && targets[def - 1u32] != NO_TOKEN {
+            let at: u32 = token_at(tokens, reference.span.offset);
+            let info: resolve::DefEntry = resolution.result.tables.defs[def - 1u32];
+            if reference.span.file == syntax.file && token_is_name(tokens, at, info.name, syntax.file) && tokens[at].span.length == reference.span.length {
+                if by_token[at] == 0u32 { by_token[at] = def; }
+                elseif by_token[at] != def { by_token[at] = NO_TOKEN; }
+            }
+        }
+        i = i + 1u32;
+    }
+    let texts: types::Span[] = collect_hover_text(source, tokens, &targets[0..@len(targets)]:Read, checked, &resolution.result.tables:Read, index)?;
+    var declarations: u32[] = [];
+    i = 0u32;
+    while i < @len(tokens) as u32 { @push(declarations, 0u32)?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(targets) as u32 {
+        let at: u32 = targets[i];
+        if at != NO_TOKEN {
+            if declarations[at] == 0u32 { declarations[at] = i + 1u32; }
+            else { declarations[at] = NO_TOKEN; }
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(by_token) as u32 {
+        let def: u32 = by_token[i];
+        let declaration: u32 = declarations[i];
+        let site: types::Span = tokens[i].span;
+        if def != 0u32 && def != NO_TOKEN {
+            let dest: types::Span = tokens[targets[def - 1u32]].span;
+            @push(index.links, types::DefinitionLink { use_offset: site.offset, use_length: site.length, target_offset: dest.offset, target_length: dest.length })?;
+        }
+        if declaration != 0u32 && declaration != NO_TOKEN {
+            let info: resolve::DefEntry = resolution.result.tables.defs[declaration - 1u32];
+            if info.scope != 0u32 && info.scope <= @len(ranges) as u32 {
+                let scope: CompletionScope = ranges[info.scope - 1u32];
+                if scope.end != 0u32 {
+                    @push(index.rename_decls, types::RenameDecl { offset: site.offset, length: site.length, scope_start: scope.start, scope_end: scope.end, kind: info.kind, hash_name: info.kind == 1u8 && info.flags == 1u8 })?;
+                    let local_ty: u32 = unwrap_local_def(&checked.types:Read, typecheck::def_type(&checked.def_types:Read, declaration));
+                    if local_ty != 0u32 && local_ty <= @len(targets) as u32 && targets[local_ty - 1u32] != NO_TOKEN {
+                        let ty_tok: types::Span = tokens[targets[local_ty - 1u32]].span;
+                        @push(index.binding_types, types::BindingTypeEntry { name_offset: site.offset, name_length: site.length, start: scope.start, end: scope.end, type_offset: ty_tok.offset, type_length: ty_tok.length })?;
+                    }
+                }
+            }
+        }
+        var hover_def: u32 = def;
+        if hover_def == 0u32 { hover_def = declaration; }
+        if declaration != 0u32 && declaration != hover_def { hover_def = NO_TOKEN; }
+        if hover_def != 0u32 && hover_def != NO_TOKEN {
+            let text: types::Span = texts[hover_def - 1u32];
+            if text.length != 0u32 {
+                @push(index.hovers, types::HoverLink { offset: site.offset, length: site.length, text_at: text.offset, text_length: text.length })?;
+            }
+        }
+        i = i + 1u32;
+    }
+    collect_members(tokens, syntax, pool, index)?;
+    return;
+}
+
+function completion_kind(kind: u8): u8 {
+    if kind == 1u8 || kind == 5u8 { return 3u8; }
+    if kind == 2u8 { return 13u8; }
+    if kind == 3u8 { return 22u8; }
+    if kind == 4u8 { return 21u8; }
+    if (kind >= 7u8 && kind <= 10u8) || kind == 12u8 { return 6u8; }
+    return 0u8;
+}
+
+struct CompletionName { offset: u32, length: u32, head: u32 }
+struct CompletionChain { def: u32, next: u32 }
+
+// 临时按 NameId 分组，输出只保留同版文本中的拼写及区间。
+export function collect_completion(lexed: &lex::LexResult:Read, pool: &ast::AstPool:Read, tables: &resolve::ResolveTables:Read, file: u16, size: u32, facts: &types::DocumentDefinitions:ReadWrite): void!AllocError {
+    let ranges: CompletionScope[] = completion_scopes(pool, tables, file, size)?;
+    var names: CompletionName[] = [];
+    var i: u32 = 0;
+    while i < @len(lexed.names.entries) as u32 {
+        @push(names, CompletionName { offset: 0, length: 0, head: 0 })?;
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(lexed.tokens) as u32 {
+        let tok: lex::Token = lexed.tokens[i];
+        if tok.kind != 9u8 {
+            var kind: u8 = 0;
+            if tok.kind <= 1u8 || tok.kind == 6u8 || (tok.kind == 3u8 && tok.span.length >= 4u32) { kind = 1u8; }
+            elseif tok.kind == 7u8 && tok.payload == 23u64 { kind = 2u8; }
+            elseif tok.kind == 7u8 && tok.payload == 0u64 { kind = 3u8; }
+            @push(facts.completion_tokens, types::CompletionToken { offset: tok.span.offset, length: tok.span.length, kind: kind })?;
+        }
+        if tok.kind <= 1u8 && tok.payload != 0u64 && tok.payload <= @len(names) {
+            let slot: u32 = tok.payload as u32 - 1u32;
+            if names[slot].length == 0u32 {
+                let prefix: u32 = tok.kind as u32;
+                names[slot].offset = tok.span.offset + prefix;
+                names[slot].length = tok.span.length - prefix;
+            }
+        }
+        i = i + 1u32;
+    }
+    var chain: CompletionChain[] = [];
+    i = 0u32;
+    while i < @len(tables.bindings) as u32 {
+        let binding: resolve::BindingEntry = tables.bindings[i];
+        if binding.name != 0u32 && binding.name <= @len(names) as u32 && binding.def != 0u32 && binding.def <= @len(tables.defs) as u32 {
+            let slot: u32 = binding.name - 1u32;
+            @push(chain, CompletionChain { def: binding.def, next: names[slot].head })?;
+            names[slot].head = @len(chain) as u32;
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(names) as u32 {
+        let label: CompletionName = names[i];
+        if label.length != 0u32 && label.head != 0u32 {
+            let first: u32 = @len(facts.completion_bindings) as u32;
+            var cursor: u32 = label.head;
+            while cursor != 0u32 {
+                let node: CompletionChain = chain[cursor - 1u32];
+                let binding: resolve::DefEntry = tables.defs[node.def - 1u32];
+                if binding.scope != 0u32 && binding.scope <= @len(ranges) as u32 {
+                    let scope: CompletionScope = ranges[binding.scope - 1u32];
+                    if scope.end != 0u32 {
+                        let kind: u8 = completion_kind(binding.kind);
+                        var available: u32 = binding.decl_offset;
+                        if kind == 3u8 || binding.kind == 7u8 || binding.kind == 12u8 { available = scope.start; }
+                        @push(facts.completion_bindings, types::CompletionBinding { start: scope.start, end: scope.end, available: available, rank: scope.rank, kind: kind, hash_name: kind == 3u8 && binding.flags == 1u8 })?;
+                    }
+                }
+                cursor = node.next;
+            }
+            let count: u32 = @len(facts.completion_bindings) as u32 - first;
+            if count != 0u32 { @push(facts.completion_groups, types::CompletionGroup { offset: label.offset, length: label.length, first: first, count: count })?; }
+        }
+        i = i + 1u32;
+    }
+    facts.completion_keywords = lextables::completion_keywords()?;
+    return;
+}
+
+// 只收录实际由解析器确认的多记号声明和成对括号，标记按起始词法记号输出。
+function mark_fold(tokens: &[lex::Token], ends: &u32[]:ReadWrite, first: u32, span: types::Span, file: u16): void {
+    if first >= @len(tokens) as u32 || span.file != file || span.length < 2u32 { return; }
+    let open: lex::Token = tokens[first];
+    if open.kind != 7u8 || open.payload != 28u64 || open.span.file != file || open.span.length != 1u32 || open.span.offset < span.offset { return; }
+    let close_at: u32 = span.offset + span.length - 1u32;
+    if close_at <= open.span.offset { return; }
+    let last: u32 = token_at(tokens, close_at);
+    if last == NO_TOKEN { return; }
+    let close: lex::Token = tokens[last];
+    if close.kind == 7u8 && close.payload == 29u64 && close.span.file == file && close.span.length == 1u32 { ends[first] = close_at; }
+    return;
+}
+
+export function collect_structure(tokens: &[lex::Token], syntax: &ast::AstFile:Read, pool: &ast::AstPool:Read, index: &types::DocumentDefinitions:ReadWrite): void!AllocError {
+    var ends: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(tokens) as u32 { @push(ends, 0u32)?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(syntax.items) as u32 {
+        let item: ast::AstItem = syntax.items[i];
+        var name: u32 = 0;
+        var kind: u8 = 0;
+        var exported: bool = false;
+        if item.kind == 0u8 { name = pool.functions[item.data].name; kind = 12u8; exported = pool.functions[item.data].is_export; }
+        elseif item.kind == 1u8 { name = pool.enums[item.data].name; kind = 10u8; exported = pool.enums[item.data].is_export; }
+        elseif item.kind == 2u8 { name = pool.structs[item.data].name; kind = 23u8; exported = pool.structs[item.data].is_export; }
+        elseif item.kind == 3u8 { name = pool.consts[item.data].name; kind = 14u8; }
+        elseif item.kind == 4u8 { name = pool.foreigns[item.data].name; kind = 12u8; }
+        let at: u32 = token_at(tokens, item.span.offset);
+        if kind != 0u8 && at != NO_TOKEN && item.span.file == syntax.file && token_is_name(tokens, at + 1u32, name, syntax.file) {
+            let selection: types::Span = tokens[at + 1u32].span;
+            var start: u32 = item.span.offset;
+            if exported && at > 0u32 {
+                let prefix: lex::Token = tokens[at - 1u32];
+                if prefix.kind == 6u8 && prefix.payload == 17u64 && prefix.span.file == syntax.file { start = prefix.span.offset; }
+            }
+            let item_end: u32 = item.span.offset + item.span.length;
+            if selection.offset >= start && selection.offset + selection.length <= item_end {
+                @push(index.symbols, types::DocumentSymbolSpan { start: start, end: item_end, selection: selection, kind: kind })?;
+            }
+            if kind == 10u8 || kind == 23u8 { mark_fold(tokens, &ends:ReadWrite, at + 2u32, item.span, syntax.file); }
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(pool.blocks) as u32 {
+        let span: types::Span = pool.blocks[i].span;
+        mark_fold(tokens, &ends:ReadWrite, token_at(tokens, span.offset), span, syntax.file);
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(ends) as u32 {
+        if ends[i] != 0u32 { @push(index.folds, types::DocumentFoldSpan { start: tokens[i].span.offset + 1u32, end: ends[i] })?; }
+        i = i + 1u32;
+    }
+    index.structure_ready = true;
+    return;
+}
+
+export function collect_public_declarations(tokens: &[lex::Token], syntax: &ast::AstFile:Read, pool: &ast::AstPool:Read, file: u16): PublicDeclarations!AllocError {
+    var items: PublicDeclaration[] = [];
+    var i: u32 = 0;
+    while i < @len(syntax.items) as u32 {
+        let item: ast::AstItem = syntax.items[i];
+        var kind: u8 = 0;
+        var name: u32 = 0;
+        if item.kind == 0u8 && pool.functions[item.data].is_export { kind = 1u8; name = pool.functions[item.data].name; }
+        elseif item.kind == 1u8 && pool.enums[item.data].is_export { kind = 2u8; name = pool.enums[item.data].name; }
+        elseif item.kind == 2u8 && pool.structs[item.data].is_export { kind = 3u8; name = pool.structs[item.data].name; }
+        if kind != 0u8 {
+            let at: u32 = token_at(tokens, item.span.offset);
+            if at == NO_TOKEN || !token_is_name(tokens, at + 1u32, name, file) {
+                return PublicDeclarations { valid: false, items: [] };
+            }
+            @push(items, PublicDeclaration { name: tokens[at + 1u32].span, kind: kind })?;
+        }
+        i = i + 1u32;
+    }
+    return PublicDeclarations { valid: true, items: @move(items) };
+}
+
+// 只保留既有词法记号，注释和未分类名称不推断。普通字符串及字符均不跨行。
+export function collect_semantic(tokens: &[lex::Token], index: &types::DocumentDefinitions:ReadWrite): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(tokens) as u32 {
+        let token: lex::Token = tokens[i];
+        var kind: u8 = 255;
+        if token.kind == 3u8 || token.kind == 6u8 || token.kind == 8u8 { kind = 0u8; }
+        elseif token.kind == 4u8 || token.kind == 5u8 { kind = 1u8; }
+        elseif token.kind == 2u8 { kind = 2u8; }
+        elseif token.kind == 7u8 { kind = 3u8; }
+        if kind != 255u8 && token.span.length != 0u32 {
+            @push(index.semantic_tokens, types::SemanticToken { offset: token.span.offset, length: token.span.length, kind: kind })?;
+        }
+        i = i + 1u32;
+    }
+    index.semantic_ready = true;
+    return;
+}

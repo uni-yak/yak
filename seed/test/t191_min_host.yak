@@ -1,0 +1,14 @@
+// module: host=../../compiler/min/host/seed/host.yak
+// input: src=fixtures/input.txt
+// output: dst
+// expected_file: dst=ABC
+// arg: 参数
+import host;
+foreign assert(cond: bool): void;
+function main(): void {
+    assert(host::arg_count() == 1);
+    let argument: u8[] = host::arg_bytes(0)?;
+    assert(@len(argument) == 6);
+    let bytes: u8[] = host::input_bytes("src")?;
+    host::output_bytes("dst", &bytes[0..3]);
+}

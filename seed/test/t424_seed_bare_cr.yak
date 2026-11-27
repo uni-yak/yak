@@ -1,0 +1,4 @@
+// expected_trap: lex: bare CR is not a line ending
+// 触发：return 后的回车没有紧跟换行，文件末尾仍是单个 LF。
+function main(): void {
+    return;}

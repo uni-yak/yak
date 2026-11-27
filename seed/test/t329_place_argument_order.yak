@@ -1,0 +1,6 @@
+// expected_trap: eval: use of exclusively borrowed place (OW-2)
+function update(value: &u32:ReadWrite, next: u32): void { *value = next; }
+function main(): void {
+    var count: u32 = 3u32;
+    update(count, count);
+}

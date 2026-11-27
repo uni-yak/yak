@@ -1,0 +1,6 @@
+// expected_code: E5008
+// spec: spec/lang/const.md C-5
+// 触发：常量无符号整数除法的除数为零。
+const Value: u32 = 1u32 / 0u32;
+function value(): u32 { return Value; }
+function main(): void { return; }

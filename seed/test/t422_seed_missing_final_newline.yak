@@ -1,0 +1,3 @@
+// expected_trap: lex: file must end with exactly one newline
+// 触发：源码末尾缺少唯一的换行。
+function main(): void { return; }

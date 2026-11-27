@@ -1,0 +1,7 @@
+// expected_code: E4004
+// spec: spec/lang/const.md#C-3
+// 触发：常量初始化器读取尚未声明和求值的常量；入口实际读取结果。
+foreign exit(code: u8): void;
+const First: u8 = Later;
+const Later: u8 = 7u8;
+function main(): void { exit(First); return; }

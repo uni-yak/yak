@@ -1,0 +1,12 @@
+// t96: T!E 函数返回 Ok + ? 解包（result.md 字面量）
+foreign assert(cond: bool): void;
+enum E { Bad }
+function f(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function main(): void {
+    let v: u32 = f(42)?;
+    assert(v == 42);
+    return;
+}

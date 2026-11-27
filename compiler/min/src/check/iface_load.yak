@@ -1,0 +1,242 @@
+// 组装接口依赖闭包并核验跨单元布局，提供二进制接口加载入口。
+import types;
+import iface;
+import diag;
+import iface_layout_check;
+import resolve_refs;
+import iface_read;
+
+// 只排序调用方已填充的索引前缀；候选接口数可能大于此前缀。
+export function sort_dependencies(loaded: &[iface::LoadedInterface]:Read, order: &u32[]:ReadWrite, count: u32): void!AllocError {
+    iface::identity_order(loaded, order, count, false)?;
+    return;
+}
+
+export struct DependencyAssembly { valid: bool, targets: u32[], deps: resolve_refs::DependencySet }
+
+function invalid_assembly(): DependencyAssembly {
+    return DependencyAssembly { valid: false, targets: [], deps: resolve_refs::DependencySet { ifaces: [] } };
+}
+
+// 调用方持有已解码的候选接口，并按本单元的导入声明提供下标；此处不读取宿主文件。
+export function assemble_dependencies(candidates: &[iface::LoadedInterface]:Read, order: &u32[]:ReadWrite, direct_count: u32, diags: &diag::DiagBuffer:ReadWrite): DependencyAssembly!AllocError {
+    if diag::diagbuf_has_error(diags) { return invalid_assembly(); }
+    if direct_count > @len(*order) as u32 || direct_count > 65535u32 {
+        iface::emit_unsupported(diags)?;
+        return invalid_assembly();
+    }
+    var dep: u32 = 0;
+    while dep < direct_count {
+        if order[dep] >= @len(candidates) as u32 {
+            iface::emit_unsupported(diags)?;
+            return invalid_assembly();
+        }
+        dep = dep + 1u32;
+    }
+    sort_dependencies(candidates, order, direct_count)?;
+    let targets: u32[] = collect_type_dependencies(candidates, &(*order)[0..direct_count]:Read, diags)?;
+    if diag::diagbuf_has_error(diags) { return invalid_assembly(); }
+    if !verify_dependency_layouts(candidates, &(*order)[0..direct_count]:Read, &targets[0..@len(targets)]:Read, diags)? {
+        return invalid_assembly();
+    }
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    dep = 0u32;
+    while dep < direct_count {
+        add_binary_dependency(&deps:ReadWrite, &candidates[order[dep]]:Read)?;
+        dep = dep + 1u32;
+    }
+    dep = 0u32;
+    while dep < @len(targets) as u32 {
+        add_binary_dependency(&deps:ReadWrite, &candidates[targets[dep]]:Read)?;
+        dep = dep + 1u32;
+    }
+    return DependencyAssembly { valid: true, targets: @move(targets), deps: @move(deps) };
+}
+
+export struct ExportAuxTable { exports: iface::LoadedExport[] }
+function identity_bound(loaded: &[iface::LoadedInterface]:Read, order: &[u32]:Read, key: &[u8], by_name: bool, upper: bool): u32 {
+    var first: u32 = 0;
+    var end: u32 = @len(order) as u32;
+    while first < end {
+        let mid: u32 = first + (end - first) / 2;
+        let item: &iface::LoadedInterface:Read = &loaded[order[mid]]:Read;
+        var cmp: i32 = 0;
+        if by_name { cmp = iface::bytes_order(&item.module_name[0..@len(item.module_name)]:Read, key); }
+        else { cmp = iface::bytes_order(&item.digest[0..32]:Read, key); }
+        if cmp < 0 || (upper && cmp == 0) { first = mid + 1; }
+        else { end = mid; }
+    }
+    return first;
+}
+// 收集直接接口及其传递签名可能引用的名义目标；不可作为本单元产物的依赖记录。
+export function collect_type_dependencies(loaded: &[iface::LoadedInterface]:Read, direct: &[u32]:Read, diags: &diag::DiagBuffer:ReadWrite): u32[]!AllocError {
+    var targets: u32[] = [];
+    var selected: bool[] = [];
+    var names: u32[] = [];
+    var digests: u32[] = [];
+    let count: u32 = @len(loaded) as u32;
+    var i: u32 = 0;
+    while i < @len(direct) as u32 + @len(targets) as u32 {
+        var importer_index: u32 = 0;
+        if i < @len(direct) as u32 { importer_index = direct[i]; }
+        else { importer_index = targets[i - @len(direct) as u32]; }
+        let importer: &iface::LoadedInterface:Read = &loaded[importer_index]:Read;
+        var j: u32 = 0;
+        while j < @len(importer.dependencies) as u32 {
+            if @len(names) == 0 {
+                var index: u32 = 0;
+                while index < count { @push(names, index)?; @push(selected, false)?; index = index + 1; }
+                index = 0;
+                while index < @len(direct) as u32 { selected[direct[index]] = true; index = index + 1; }
+                iface::identity_order(loaded, &names:ReadWrite, count, true)?;
+            }
+            let dep: &iface::LoadedDependency:Read = &importer.dependencies[j]:Read;
+            let name: &[u8] = &importer.name_bytes[dep.name_off..dep.name_off + dep.name_len as u32]:Read;
+            let digest: &[u8] = &dep.digest[0..32]:Read;
+            let first: u32 = identity_bound(loaded, &names[0..count]:Read, name, true, false);
+            let end: u32 = identity_bound(loaded, &names[0..count]:Read, name, true, true);
+            if first < end {
+                // 同名区间已按摘要排序；首尾均匹配才没有混入其他版本。
+                if iface::bytes_order(&loaded[names[first]].digest[0..32]:Read, digest) != 0 || iface::bytes_order(&loaded[names[end - 1]].digest[0..32]:Read, digest) != 0 {
+                    iface::emit_unsupported(diags)?;
+                    return [];
+                }
+                let target: u32 = names[first];
+                if !selected[target] {
+                    selected[target] = true;
+                    if @len(loaded[target].exports) != 0 {
+                        if @len(direct) + @len(targets) == 65535 { iface::emit(diags, types::error_code(9001))?; return []; }
+                        @push(targets, target)?;
+                    }
+                }
+            } else {
+                // 允许不提供标量导入的传递目标；已提供同摘要却改名则不是缺失。
+                if @len(digests) == 0 {
+                    var index: u32 = 0;
+                    while index < count { @push(digests, index)?; index = index + 1; }
+                    iface::identity_order(loaded, &digests:ReadWrite, count, false)?;
+                }
+                let match_index: u32 = identity_bound(loaded, &digests[0..count]:Read, digest, false, false);
+                if match_index < count && iface::bytes_order(&loaded[digests[match_index]].digest[0..32]:Read, digest) == 0 {
+                    iface::emit_unsupported(diags)?;
+                    return [];
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return targets;
+}
+export function load_interface(bytes: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    return iface_read::load_interface(bytes, diags)?;
+}
+
+export function load_target_interface(bytes: &[u8], profile: u32, diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    return iface_read::load_target_interface(bytes, profile, diags)?;
+}
+
+export function load_expected_interface(bytes: &[u8], module_name: &[u8], digest: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    return iface_read::load_expected_interface(bytes, module_name, digest, diags)?;
+}
+
+// 核验完成前，传递候选的成员与导出方依赖编号都必须保留。
+export function verify_dependency_layouts(candidates: &[iface::LoadedInterface]:Read, direct: &[u32]:Read, targets: &[u32]:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    var order: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(candidates) as u32 { @push(order, i)?; i = i + 1; }
+    iface::identity_order(candidates, &order:ReadWrite, @len(candidates) as u32, true)?;
+    i = 0;
+    while i < @len(direct) as u32 + @len(targets) as u32 {
+        var index: u32 = 0;
+        if i < @len(direct) as u32 { index = direct[i]; }
+        else { index = targets[i - @len(direct) as u32]; }
+        i = i + 1;
+        let loaded: &iface::LoadedInterface:Read = &candidates[index]:Read;
+        if @len(loaded.dependencies) == 0 || @len(loaded.summaries) == 0 { continue; }
+        var binding: iface_layout_check::LayoutBinding = iface_layout_check::LayoutBinding { bound: true, targets: [] };
+        var j: u32 = 0;
+        while j < @len(loaded.dependencies) as u32 {
+            let entry: &iface::LoadedDependency:Read = &loaded.dependencies[j]:Read;
+            let name: &[u8] = &loaded.name_bytes[entry.name_off..entry.name_off + entry.name_len as u32]:Read;
+            let match_index: u32 = identity_bound(candidates, &order[0..@len(order)]:Read, name, true, false);
+            var target: u32 = 0;
+            if match_index < @len(order) as u32 {
+                let found: u32 = order[match_index];
+                let lib: &iface::LoadedInterface:Read = &candidates[found]:Read;
+                if iface::bytes_order(&lib.module_name[0..@len(lib.module_name)]:Read, name) == 0 && iface::bytes_order(&lib.digest[0..32]:Read, &entry.digest[0..32]:Read) == 0 { target = found + 1; }
+            }
+            @push(binding.targets, target)?;
+            j = j + 1;
+        }
+        var exports: resolve_refs::IfaceExport[] = [];
+        j = 0;
+        while j < @len(loaded.exports) as u32 {
+            let item: iface::LoadedExport = loaded.exports[j];
+            @push(exports, resolve_refs::IfaceExport { name_hash: item.name_hash, name_off: item.name_off, name_len: item.name_len, kind: item.kind, flags: item.flags, export_id: item.export_id, sig_off: item.sig_off, sig_len: item.sig_len })?;
+            j = j + 1;
+        }
+        let before: u32 = diag::diagbuf_count(diags);
+        if !iface_layout_check::checked_layouts(loaded, &exports[0..@len(exports)]:Read, &binding:Read, candidates, diags)? {
+            if diag::diagbuf_count(diags) == before { iface::emit_unsupported(diags)?; }
+            return false;
+        }
+    }
+    return true;
+}
+
+// 把已载入的二进制接口转换为 resolver 使用的内存 DependencySet；
+// 名称字节直接复制接口节，不重新 hash、不扫描依赖源码。
+export function add_binary_dependency(deps: &resolve_refs::DependencySet:ReadWrite, loaded: &iface::LoadedInterface:Read): void!AllocError {
+    var module_bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(loaded.module_name) as u32 { @push(module_bytes, loaded.module_name[i])?; i = i + 1; }
+    var name_bytes: u8[] = [];
+    i = 0;
+    while i < @len(loaded.name_bytes) as u32 { @push(name_bytes, loaded.name_bytes[i])?; i = i + 1; }
+    var sig_bytes: u8[] = [];
+    i = 0;
+    while i < @len(loaded.sig_bytes) as u32 { @push(sig_bytes, loaded.sig_bytes[i])?; i = i + 1; }
+    var exports: resolve_refs::IfaceExport[] = [];
+    i = 0;
+    while i < @len(loaded.exports) as u32 {
+        @push(exports, resolve_refs::IfaceExport { name_hash: loaded.exports[i].name_hash, name_off: loaded.exports[i].name_off, name_len: loaded.exports[i].name_len, kind: loaded.exports[i].kind, flags: loaded.exports[i].flags, export_id: loaded.exports[i].export_id, sig_off: loaded.exports[i].sig_off, sig_len: loaded.exports[i].sig_len })?;
+        i = i + 1;
+    }
+    var enum_members: resolve_refs::IfaceEnumMember[] = [];
+    i = 0;
+    while i < @len(loaded.enum_members) as u32 {
+        @push(enum_members, resolve_refs::IfaceEnumMember { enum_export: loaded.enum_members[i].enum_export_id, name_hash: loaded.enum_members[i].name_hash, name_off: loaded.enum_members[i].name_off, name_len: loaded.enum_members[i].name_len, variant: loaded.enum_members[i].variant_id as u32, sig_off: loaded.enum_members[i].payload_sig_off, sig_len: loaded.enum_members[i].payload_sig_len, known: true })?;
+        i = i + 1;
+    }
+    var struct_fields: resolve_refs::IfaceStructField[] = [];
+    i = 0;
+    while i < @len(loaded.struct_fields) as u32 {
+        @push(struct_fields, resolve_refs::IfaceStructField { struct_export: loaded.struct_fields[i].struct_export_id, name_hash: loaded.struct_fields[i].name_hash, name_off: loaded.struct_fields[i].name_off, name_len: loaded.struct_fields[i].name_len, field: loaded.struct_fields[i].field_id as u32, sig_off: loaded.struct_fields[i].type_sig_off, sig_len: loaded.struct_fields[i].type_sig_len })?;
+        i = i + 1;
+    }
+    var privates: resolve_refs::IfacePrivate[] = [];
+    i = 0;
+    while i < @len(loaded.privates) as u32 {
+        @push(privates, resolve_refs::IfacePrivate { name_hash: loaded.privates[i].name_hash, name_off: loaded.privates[i].name_off, name_len: loaded.privates[i].name_len, kind: loaded.privates[i].kind })?;
+        i = i + 1;
+    }
+    var digest: u8[] = [];
+    i = 0;
+    while i < @len(loaded.digest) as u32 { @push(digest, loaded.digest[i])?; i = i + 1; }
+    var dependencies: resolve_refs::IfaceDependency[] = [];
+    i = 0;
+    while i < @len(loaded.dependencies) as u32 {
+        let dep: &iface::LoadedDependency:Read = &loaded.dependencies[i]:Read;
+        var name: u8[] = [];
+        var key: u8[] = [];
+        var j: u32 = 0;
+        while j < dep.name_len as u32 { @push(name, loaded.name_bytes[dep.name_off + j])?; j = j + 1; }
+        j = 0;
+        while j < @len(dep.digest) as u32 { @push(key, dep.digest[j])?; j = j + 1; }
+        @push(dependencies, resolve_refs::IfaceDependency { module: @move(name), digest: @move(key) })?;
+        i = i + 1;
+    }
+    @push(deps.ifaces, resolve_refs::Iface { module: @move(module_bytes), names: @move(name_bytes), sigs: @move(sig_bytes), exports: @move(exports), enum_members: @move(enum_members), struct_fields: @move(struct_fields), digest: @move(digest), dependencies: @move(dependencies), privates: @move(privates) })?;
+    return;
+}

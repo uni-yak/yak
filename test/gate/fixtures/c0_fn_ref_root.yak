@@ -1,0 +1,116 @@
+import c0_fn_ref_leaf;
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+struct Reader { run: &function(&u64): u64 }
+enum Choice { Empty, Callable(&function(&u64): u64), Number(u8) }
+enum Wrapped { End, Imported(c0_fn_ref_leaf::Variant), Local(Choice) }
+enum Failure { Bad }
+struct Buffer { bytes: u8[] }
+struct OwningReader { run: &function(&u64): u64, bytes: u8[] }
+
+export function observe_temporary(mode: u8): void { observe_mode(mode); }
+
+function read_value(value: &u64): u64 { return *value + 1u64; }
+function add_two(value: &u64): u64 { return *value + 2u64; }
+function increment(dst: &u64:ReadWrite): void { *dst = *dst + 1u64; }
+function array_length(values: &u8[]): u64 { return values.len; }
+function temporary(): Buffer { return Buffer { bytes: [1u8, 2u8] }; }
+function temporary_reader(): OwningReader { return OwningReader { run: &read_value, bytes: [8u8] }; }
+function invoke(callback: &function(&u64): u64, value: &u64): u64 { return callback(value); }
+function #safe_address(): &function(&u64): u64 { return &read_value; }
+
+function observe_mode(mode: u8): void {
+    if mode == 0u8 { assert(temporary_reader().run(30u64) == 31u64); return; }
+    if mode == 1u8 {
+        let length: &function(&u8[]): u64 = &array_length;
+        assert(length(temporary().bytes) == 2u64);
+        return;
+    }
+    if mode == 2u8 {
+        let result: void!Failure = skip_argument();
+        @drop(result);
+        return;
+    }
+    let result: void!Failure = error_with_out();
+    @drop(result);
+}
+
+function fail(): u64!Failure { return Failure::Bad; }
+function skipped(values: &u8[], number: &u64): void { assert(values.len == 0u64 && *number == 0u64); }
+function skip_argument(): void!Failure {
+    let callback: &function(&u8[], &u64): void = &skipped;
+    callback(temporary().bytes, fail()?);
+    return;
+}
+function fill_error(slot: &u64:Write, values: &u8[]): void!Failure {
+    *slot = values.len;
+    return Failure::Bad;
+}
+function error_with_out(): void!Failure {
+    let callback: &function(&u64:Write, &u8[]): void!Failure = &fill_error;
+    out slot: u64;
+    callback(out slot, temporary().bytes)?;
+    let value: u64 = @move(slot);
+    assert(value == 0u64);
+    return;
+}
+function fill(slot: &u64:Write, value: &u64): void!Failure {
+    *slot = *value;
+    return;
+}
+
+function run_slot(): void!Failure {
+    let callback: &function(&u64:Write, &u64): void!Failure = &fill;
+    out result: u64;
+    callback(out result, 42u64)?;
+    let value: u64 = @move(result);
+    assert(value == 42u64);
+    out remote: u64;
+    c0_fn_ref_leaf::fill_remote(out remote, value);
+    let received: u64 = @move(remote);
+    assert(received == 42u64);
+    write("slot");
+    return;
+}
+
+function main(): void {
+    let left: u64 = 10u64;
+    let right: u64 = 12u64;
+    let remote: &function(&u64, &[u8], &u64, &u64): c0_fn_ref_leaf::Record = &c0_fn_ref_leaf::combine;
+    assert(remote == c0_fn_ref_leaf::select());
+    let record: c0_fn_ref_leaf::Record = remote(left, "A", right, 13u64);
+    assert(record.first == 75u64 && record.second == 12u64 && record.third == 13u64);
+    let reader: Reader = Reader { run: &read_value };
+    assert(reader.run(20u64) == 21u64);
+    assert(safe_address() == reader.run);
+    let higher: &function(&function(&u64): u64, &u64): u64 = &invoke;
+    assert(higher(reader.run, left) == 11u64);
+    assert(c0_fn_ref_leaf::dispatch(higher, reader.run, right) == 13u64);
+    let handlers: [&function(&u64): u64; 2] = [&read_value, &add_two];
+    assert(handlers[1u64](left) == 12u64 && handlers[0u64] != handlers[1u64]);
+    let choice: Choice = Choice::Callable(reader.run);
+    assert(choice == Choice::Callable(&read_value) && choice != Choice::Callable(&add_two));
+    assert(choice != Choice::Number(8u8) && Choice::Number(8u8) == Choice::Number(8u8));
+    let byte: c0_fn_ref_leaf::Variant = c0_fn_ref_leaf::Variant::Byte(5u8);
+    let wide: c0_fn_ref_leaf::Variant = c0_fn_ref_leaf::Variant::Wide(5u64);
+    assert(byte != wide && wide == c0_fn_ref_leaf::Variant::Wide(5u64));
+    assert(Wrapped::Imported(wide) != Wrapped::Imported(byte));
+    assert(Wrapped::Local(choice) == Wrapped::Local(Choice::Callable(&read_value)));
+    assert(Wrapped::Local(choice) != Wrapped::Local(Choice::Callable(&add_two)));
+    assert(Wrapped::End == Wrapped::End && Wrapped::End != Wrapped::Imported(wide));
+    match choice {
+        Empty => { assert(false); },
+        Number => { assert(false); },
+        Choice::Callable(callback) => { assert(callback(right) == 13u64); }
+    }
+    var mode: u8 = 0u8;
+    while mode < 4u8 { observe_temporary(mode); mode = mode + 1u8; }
+    var mutable: c0_fn_ref_leaf::Record = c0_fn_ref_leaf::Record { first: 1u64, second: 2u64, third: 3u64 };
+    let bump: &function(&u64:ReadWrite): void = &increment;
+    bump(mutable.first);
+    c0_fn_ref_leaf::bump(mutable.second);
+    increment(mutable.third);
+    assert(mutable.first == 2u64 && mutable.second == 4u64 && mutable.third == 4u64);
+    run_slot();
+}

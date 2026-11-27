@@ -1,0 +1,7 @@
+// 断言失败的可执行程序：为假时运行时输出陷阱消息并以 70 退出（runtime 的陷阱码）。
+// 编译：tools/link.sh examples/assert_trap.yak
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(false);
+}

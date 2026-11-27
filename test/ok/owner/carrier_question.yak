@@ -1,0 +1,25 @@
+// expected_exit: 35
+// expected_stdout: ok
+// spec: spec/lang/base.md 5.8、7.12
+// 可错传播：`?` 把 T!E 载体沿调用链上抛，成功路径打印 ok 并以退出码 35 结束。
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+enum E { Bad }
+
+function base(x: u32): u32!E {
+    if x == 0u32 { return E::Bad; }
+    return x;
+}
+
+function show(x: u32): void!E {
+    let n: u32 = base(x)?;
+    write("ok");
+    exit(n as u8);
+    return;
+}
+
+function main(): void {
+    show(35u32);
+    return;
+}

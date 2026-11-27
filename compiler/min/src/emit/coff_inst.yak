@@ -1,0 +1,755 @@
+// MIR 指令与终结指令的 Win64 降级和分派。
+
+import pe;
+import mir;
+import typecheck;
+import coff_state;
+import coff_call;
+import coff_place;
+import coff_carrier;
+
+// 带 trap 的算术：add/sub/mul/div/rem/neg（有符号溢出与除零跳 trap_target）。
+export function is_trapping_arith(opcode: u8): bool {
+    if opcode >= 16 && opcode <= 21 { return true; }
+    return false;
+}
+// 回绕算术：同一编码形态但不发溢出跳转（EM-5 要求 wrap_* 不得影响控制流）。
+export function is_wrap_arith(opcode: u8): bool {
+    if opcode >= 22 && opcode <= 24 { return true; }
+    return false;
+}
+// 回绕算术与同期算术共用指令，仅在是否发射 jo 上有差别。
+export function wrap_base(opcode: u8): u8 {
+    if opcode == 22 { return 16; }
+    if opcode == 23 { return 17; }
+    if opcode == 24 { return 18; }
+    return opcode;
+}
+
+// ── 单条指令降级 ──
+// 操作码与 MIR 生产者一致；直接比较，避免冻结解释器在每条指令上调用常量函数。
+// 返回 false 表示该 opcode 不在本次支持范围，由调用方按缺口处理（不静默丢弃）。
+export function lower_inst(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): bool!AllocError {
+    let op: u8 = inst.op;
+    if op == 1 || op == 2 { return lower_const_int(em, inst)?; }
+    if op == 3 { return lower_const_bytes(em, inst)?; }
+    if op == 4 { return lower_const_aggregate(em, inst)?; }
+    if op == 5 {
+        var symbol: u64 = inst.b as u64;
+        if inst.c != 0 { symbol = coff_state::import_symbol_def(inst.c, inst.b); }
+        if symbol == 0 { return false; }
+        let at: u32 = pe::lea_rip(&em.code:ReadWrite, pe::rax())?;
+        @push(em.calls, coff_state::CallSite { at: at, symbol: symbol, kind: op })?;
+        coff_state::store_local(em, inst.a, pe::rax())?;
+        return true;
+    }
+    if op >= 16 && op <= 21 { return lower_arith(em, inst, true)?; }
+    if op >= 22 && op <= 24 { return lower_arith(em, inst, false)?; }
+    if op == 32 || op == 33 || op == 34 { return lower_bit(em, inst)?; }
+    if op == 35 || op == 36 { return lower_shift(em, inst)?; }
+    if op >= 48 && op <= 53 { return lower_compare(em, inst)?; }
+    if op == 64 { return lower_cast(em, inst)?; }
+    if op == 112 || op == 113 { return coff_place::lower_move_copy(em, inst)?; }
+    // 存储槽局部本身就是地址；普通地址局部才需要解引用其值。
+    if (op == 80 || op == 81) && inst.b > 0 && inst.b <= @len(func.locals) as u32 && func.locals[inst.b - 1].kind == 2 {
+        var copy: mir::MirInst = mir::MirInst { op: 113, a: inst.a, b: inst.b, c: 0, value_type_id: inst.value_type_id, value: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false };
+        if op == 81 { copy.a = inst.b; copy.b = inst.c; }
+        return coff_place::lower_move_copy(em, &copy:Read)?;
+    }
+    if op == 208 { return true; }
+    if op == 209 { return coff_place::lower_store(em, inst)?; }
+    if op == 210 { return coff_place::lower_move_copy(em, inst)?; }
+    if op == 80 { return coff_place::lower_load(em, inst)?; }
+    if op == 115 { return coff_place::lower_drop(em, inst, func)?; }
+    if op == 146 { return lower_call_builtin(em, inst, func)?; }
+    if op == 81 { return coff_place::lower_store(em, inst)?; }
+    if op == 128 || op == 129 {
+        let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+        if disp == 0 { return false; }
+        let reference: typecheck::TypeEntry = em.types.entries[inst.value_type_id - 1];
+        var indirect: bool = func.locals[inst.b - 1].value_type_id != reference.elem;
+        // u64 字段地址与 u64 字段同型，须按产生地址的指令区分。
+        if !indirect && func.locals[inst.b - 1].kind == 1 {
+            var i: u32 = 0;
+            while i < @len(func.insts) as u32 {
+                let source: mir::MirInst = func.insts[i];
+                if source.a == inst.b && (source.op == 82 || source.op == 83) { indirect = true; break; }
+                i = i + 1;
+            }
+        }
+        if indirect { pe::load_slot(&em.code:ReadWrite, pe::rax(), disp, 8)?; }
+        else { pe::lea_rbp(&em.code:ReadWrite, pe::rax(), disp)?; }
+        coff_state::store_local(em, inst.a, pe::rax())?;
+        return true;
+    }
+    if op == 82 { return coff_place::lower_field_addr(em, inst)?; }
+    if op == 83 || op == 130 { return coff_place::lower_index_addr(em, inst)?; }
+    if op == 96 || op == 97 { return coff_place::lower_aggregate(em, inst, func)?; }
+    if op == 160 { return coff_carrier::lower_carrier_ok(em, inst)?; }
+    if op == 161 { return coff_carrier::lower_carrier_err(em, inst)?; }
+    if op == 176 { return coff_carrier::lower_enum_construct(em, inst)?; }
+    if op == 178 { return lower_dyn_push(em, inst)?; }
+    if op == 114 { return lower_clone(em, inst)?; }
+    if mir::is_slot_call(op) || mir::is_foreign_call(op) { return lower_inst_call(em, inst, func)?; }
+    return false;
+}
+
+// 调用：装实参、发 call rel32 占位、把调用点登记进重定位表。
+function lower_inst_call(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): bool!AllocError {
+    // 跨单元调用的操作数由独立的依赖编号与导出编号组成。
+    var symbol: u64 = inst.b as u64;
+    if mir::is_far_call(inst.op) {
+        symbol = coff_state::import_symbol_def(inst.c, inst.b);
+        if symbol == 0 { return false; }
+    }
+    let at: u32 = coff_call::lower_call(em, inst, func)?;
+    // 实参放不进寄存器窗口：返回失败哨兵，由调用方按未支持形态拒绝，不静默少传。
+    // >8 字节聚合实参已在 lower_call 里记 EM-6 并写 int3，此处视为已处理，
+    // 否则 emit_block 会再走 unsupported_op 把拒绝类别覆盖回 0 并重复写 int3。
+    if at == 4294967295u32 {
+        if em.rejected != 0 && em.reject_kind == 6 { return true; }
+        return false;
+    }
+    if !mir::is_indirect_call(inst.op) { @push(em.calls, coff_state::CallSite { at: at, symbol: symbol, kind: inst.op })?; }
+    if mir::is_checked_call(inst.op) {
+        pe::test_rr(&em.code:ReadWrite, pe::r11(), pe::r11())?;
+        if inst.trap != 0 { coff_state::jump_trap(em, pe::cc_ne())?; }
+        else {
+            let resume: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+            @push(em.resume_jumps, resume)?;
+        }
+    } elseif inst.op == 149 {
+        // 读取成功时 RAX 为非负的 u32 字节数，其余服务成功返回 0。
+        pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), 18446744073709551615u64)?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+        if inst.trap != 0 { coff_state::jump_trap(em, pe::cc_e())?; }
+        else {
+            let ok: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+            pe::mov_imm64(&em.code:ReadWrite, pe::r11(), 2u64)?;
+            leave_frame(em)?;
+            let next: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, ok, next);
+        }
+    }
+    coff_call::store_call_result(em, inst)?;
+    return true;
+}
+// ── 聚合值的内存形态 ──
+// 聚合局部在栈上按字节存放：`field_addr` / `index_addr` 先算出元素地址存入目标槽，
+// call_builtin（mir.md 4.10）：按 BuiltinId 分派无副作用原语。
+// 目前只有 @len：从切片胖指针槽的高 8 字节（偏移 disp-8）装载长度字写入结果槽，
+// 与发射器槽布局（指针在 disp、长度在 disp-8）一致。
+function lower_call_builtin(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, func: &mir::MirFunction:Read): bool!AllocError {
+    if inst.b != 20486 { return false; }
+    if inst.args_count != 1 || inst.c != 0 { return false; }
+    let operand: u32 = func.args[inst.args_start];
+    let src_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, operand);
+    if src_disp == 0 { return false; }
+    let operand_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, operand);
+    if operand_type == 0 || operand_type > @len(em.types.entries) as u32 { return false; }
+    if inst.a == 0 || coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a) == 0 { return false; }
+    if coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.a) != 8 { return false; }
+    if coff_state::is_slice_type(&em.types:Read, operand_type) {
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), src_disp - 8, 8)?;
+    } elseif em.types.entries[operand_type - 1].kind == 6 {
+        // 动态数组头：len 在头内偏移 8。
+        pe::load_slot_off(&em.code:ReadWrite, pe::rax(), src_disp, 8, 8)?;
+    } else {
+        return false;
+    }
+    coff_state::store_local(em, inst.a, pe::rax())?;
+    return true;
+}
+function lower_const_int(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.a);
+    if width != 1 && width != 2 && width != 4 && width != 8 { return false; }
+    pe::mov_int(&em.code:ReadWrite, pe::rax(), inst.value, width)?;
+    coff_state::store_local(em, inst.a, pe::rax())?;
+    return true;
+}
+// 静态字节常量：`lea` RIP 相对取静态池视图（指针）写入切片槽的低 8 字节，
+// 再把静态条目长度写入高 8 字节。字节内容本身在 `.rdata`，这里不复制数据。
+function lower_const_bytes(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    if inst.b >= @len(em.static_lengths) as u32 { return false; }
+    let slot: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    // 切片槽必须按胖指针规划成 16 字节；槽位不成立说明规划与降级不一致，拒绝而非错写。
+    if slot < 16 { return false; }
+    // 长度先取出：随后对 em.code 取可变引用时不能再读 em 的其它字段。
+    let length: u64 = em.static_lengths[inst.b] as u64;
+    let at: u32 = pe::lea_rip(&em.code:ReadWrite, pe::rax())?;
+    @push(em.data_refs, coff_state::DataRef { at: at, index: inst.b })?;
+    pe::store_slot(&em.code:ReadWrite, pe::rax(), slot, 8)?;
+    pe::mov_imm64(&em.code:ReadWrite, pe::rax(), length)?;
+    pe::store_slot(&em.code:ReadWrite, pe::rax(), slot - 8, 8)?;
+    return true;
+}
+// 剩余字节取 {8,4,2,1} 中不超过剩余量的最大宽度：发射器的装载/存回只支持这四种宽度，
+// 贪心分解保证 size=3/5/6/7 这类尺寸不会发出越读池外（.rdata 节尾）的 8 字节块。
+function block_width(left: u32): u8 {
+    if left >= 8 { return 8; }
+    if left >= 4 { return 4; }
+    if left >= 2 { return 2; }
+    return 1;
+}
+// 聚合常量复制：lea RIP 相对取 .rdata 里的池条目地址，再逐块完整复制到目标聚合槽。
+// 与 0x03 的视图语义不同，这里真的搬运字节：结果槽是本地聚合，不跨调用边界，
+// 因此不经返回寄存器与实参 ABI（EM-6 形态边界保持不动）。
+// 失败边界（槽位缺失、长度为 0、目标非聚合块、长度超过规划槽宽）一律返回 false，
+// 由调用方按未支持形态拒绝（rejected + int3），绝不静默成功或写出半截数据。
+function lower_const_aggregate(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    if inst.b >= @len(em.static_lengths) as u32 { return false; }
+    if inst.c != 0 || inst.args_count != 0 { return false; }
+    if inst.value == 0 || inst.value > 4294967295u64 { return false; }
+    if inst.a == 0 || inst.a > @len(em.agg_sizes) as u32 { return false; }
+    let size: u32 = em.agg_sizes[inst.a - 1];
+    if size == 0 { return false; }
+    if inst.value as u32 > size { return false; }
+    let dst_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    if dst_disp == 0 { return false; }
+    // 池条目地址：与 op3 共用 data_refs / $s<index> 机制，重定位落在 lea 的位移字段上。
+    let at: u32 = pe::lea_rip(&em.code:ReadWrite, pe::rax())?;
+    @push(em.data_refs, coff_state::DataRef { at: at, index: inst.b })?;
+    var done: u32 = 0;
+    let total: u32 = inst.value as u32;
+    while done < total {
+        let width: u8 = block_width(total - done);
+        pe::load_base(&em.code:ReadWrite, pe::rcx(), pe::rax(), done, width)?;
+        pe::store_slot_off(&em.code:ReadWrite, pe::rcx(), dst_disp, done, width)?;
+        done = done + width as u32;
+    }
+    return true;
+}
+// 算术：a = b op c。div/rem 走 rax:rdx，其余走 rax op rcx。
+function lower_arith(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read, trapping: bool): bool!AllocError {
+    let op: u8 = inst.op;
+    if trapping && (op == coff_state::mop_neg()) {
+        // neg：先复制源值到目标槽，再在目标槽上就地取反。
+        // 绝不能直接对源槽取反——源局部在其后仍可能被读取（base 期为值语义）。
+        let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+        let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+        let w_b: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.b);
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), src, w_b)?;
+        let s_a: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.a);
+        pe::store_slot(&em.code:ReadWrite, pe::rax(), dst, s_a)?;
+        pe::neg_slot(&em.code:ReadWrite, dst, s_a)?;
+        if coff_state::type_signed(&em.types:Read, inst.value_type_id) { coff_state::jump_trap(em, pe::cc_o())?; }
+        else { coff_state::jump_trap(em, pe::cc_b())?; }
+        return true;
+    }
+    if op == coff_state::mop_div() || op == coff_state::mop_rem() {
+        return lower_div(em, inst)?;
+    }
+    var base: u8 = op;
+    if !trapping { base = wrap_base(op); }
+    coff_state::emit_binary(em, inst, base, trapping)?;
+    return true;
+}
+// 除余按操作数宽度加载，符号扩展后使用 64 位寄存器运算。
+function lower_div(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let signed: bool = coff_state::type_signed(&em.types:Read, inst.value_type_id);
+    let left: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let right: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+    let w_b: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.b);
+    let w_c: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.c);
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let w_a: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.a);
+    if signed && w_c == 1 { pe::movsx8_slot(&em.code:ReadWrite, pe::rcx(), right)?; }
+    elseif signed && w_c == 2 { pe::movsx16_slot(&em.code:ReadWrite, pe::rcx(), right)?; }
+    else {
+        pe::load_slot(&em.code:ReadWrite, pe::rcx(), right, w_c)?;
+        if signed && w_c == 4 { pe::movsx32_rr(&em.code:ReadWrite, pe::rcx(), pe::rcx())?; }
+    }
+    pe::test_rr(&em.code:ReadWrite, pe::rcx(), pe::rcx())?;
+    coff_state::jump_trap(em, pe::cc_e())?;
+    if signed && w_b == 1 { pe::movsx8_slot(&em.code:ReadWrite, pe::rax(), left)?; }
+    elseif signed && w_b == 2 { pe::movsx16_slot(&em.code:ReadWrite, pe::rax(), left)?; }
+    else {
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), left, w_b)?;
+        if signed && w_b == 4 { pe::movsx32_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?; }
+    }
+    if signed {
+        // 最小值除以负一的商溢出；取余则为零，不能交给 idiv 触发硬件异常。
+        pe::mov_imm64(&em.code:ReadWrite, pe::rdx(), 18446744073709551615u64)?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rcx(), pe::rdx())?;
+        let other_divisor: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+        let minimum: u64 = 18446744073709551615u64 << (((w_b as u64) * 8u64) - 1u64);
+        pe::mov_imm64(&em.code:ReadWrite, pe::rdx(), minimum)?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rdx())?;
+        if inst.op == coff_state::mop_div() {
+            coff_state::jump_trap(em, pe::cc_e())?;
+            let normal: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, other_divisor, normal);
+            pe::cqo(&em.code:ReadWrite)?;
+            pe::divide_signed(&em.code:ReadWrite)?;
+        } else {
+            let other_value: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+            pe::xor_rdx_rdx(&em.code:ReadWrite)?;
+            let finished: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+            let normal: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, other_divisor, normal);
+            pe::patch_rel32(&em.code:ReadWrite, other_value, normal);
+            pe::cqo(&em.code:ReadWrite)?;
+            pe::divide_signed(&em.code:ReadWrite)?;
+            let end: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, finished, end);
+        }
+    } else {
+        pe::divide_unsigned(&em.code:ReadWrite, w_b)?;
+    }
+    var src: u8 = pe::rax();
+    if inst.op == coff_state::mop_rem() { src = pe::rdx(); }
+    pe::store_slot(&em.code:ReadWrite, src, dst, w_a)?;
+    return true;
+}
+// 位运算：and/or/xor。
+function lower_bit(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    coff_state::emit_binary(em, inst, inst.op, false)?;
+    return true;
+}
+// 移位：移位量经 rcx 的 cl，左移 shl、有符号右移 sar、无符号右移 shr。
+function lower_shift(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.b);
+    let shift: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+    let w_c: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.c);
+    pe::load_slot(&em.code:ReadWrite, pe::rcx(), shift, w_c)?;
+    pe::mov_imm64(&em.code:ReadWrite, pe::rax(), (width as u64) * 8u64)?;
+    pe::cmp_rr(&em.code:ReadWrite, pe::rcx(), pe::rax())?;
+    coff_state::jump_trap(em, pe::cc_ae())?;
+    // 窄有符号右移前须扩展符号，其余移位按无符号位模式加载。
+    if inst.op == coff_state::mop_shr() && coff_state::type_signed(&em.types:Read, inst.value_type_id) && width == 1 {
+        pe::movsx8_slot(&em.code:ReadWrite, pe::rax(), src)?;
+    } elseif inst.op == coff_state::mop_shr() && coff_state::type_signed(&em.types:Read, inst.value_type_id) && width == 2 {
+        pe::movsx16_slot(&em.code:ReadWrite, pe::rax(), src)?;
+    } else {
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), src, width)?;
+        if inst.op == coff_state::mop_shr() && coff_state::type_signed(&em.types:Read, inst.value_type_id) && width == 4 {
+            pe::movsx32_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+        }
+    }
+    // 机器指令操作完整槽，先写满 8 字节避免读取未初始化的高位。
+    pe::store_slot(&em.code:ReadWrite, pe::rax(), dst, 8)?;
+    if inst.op == coff_state::mop_shl() { pe::shl_cl(&em.code:ReadWrite, dst)?; }
+    elseif coff_state::type_signed(&em.types:Read, inst.value_type_id) { pe::sar_cl(&em.code:ReadWrite, dst)?; }
+    else { pe::shr_cl(&em.code:ReadWrite, dst)?; }
+    return true;
+}
+// 比较：cmp 后 setcc + movzx 得 0/1，写入 bool 槽。
+// 符号性取操作数 b 的类型（inst.type 是结果 bool，不能用于选条件码，x86.md 3.2）。
+// 条件码非法（未知比较 opcode）时不得发射任何字节，返回 false 交由调用方按 EM-5 拒绝。
+function load_scalar_signed(em: &coff_state::Emitter:ReadWrite, local: u32, reg: u8, signed: bool): void!AllocError {
+    let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, local);
+    let width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, local);
+    if signed && width == 1 { pe::movsx8_slot(&em.code:ReadWrite, reg, disp)?; return; }
+    if signed && width == 2 { pe::movsx16_slot(&em.code:ReadWrite, reg, disp)?; return; }
+    if signed && width == 4 {
+        pe::load_slot(&em.code:ReadWrite, reg, disp, 4)?;
+        pe::movsx32_rr(&em.code:ReadWrite, reg, reg)?;
+        return;
+    }
+    pe::load_slot(&em.code:ReadWrite, reg, disp, width)?;
+    return;
+}
+
+struct CompareSlots { left: u32, right: u32, offset: u32 }
+
+// 逐层比较有效标签及其载荷，把相等标志留给调用方的 setcc。
+function compare_eq_at(em: &coff_state::Emitter:ReadWrite, slots: CompareSlots, id: u32, depth: u32): bool!AllocError {
+    if depth > 16 || !mir::valid_type(&em.types:Read, id) { return false; }
+    let ty: typecheck::TypeEntry = em.types.entries[id - 1];
+    if mir::is_scalar(&em.types:Read, id) || ty.kind == 8 {
+        let width: u8 = coff_state::type_width(&em.types:Read, id);
+        pe::load_slot_off(&em.code:ReadWrite, pe::rax(), slots.left, slots.offset, width)?;
+        pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), slots.right, slots.offset, width)?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+        return true;
+    }
+    let count: u32 = coff_carrier::enum_count_in(em, id);
+    if count == 0 || count > 65536 { return false; }
+    let width: u8 = coff_carrier::enum_tag_width(count);
+    pe::load_slot_off(&em.code:ReadWrite, pe::rax(), slots.left, slots.offset, width)?;
+    pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), slots.right, slots.offset, width)?;
+    pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+    let offset: u64 = coff_state::type_payload_off(em, id);
+    let child_off: u64 = slots.offset as u64 + offset;
+    if child_off > slots.left as u64 || child_off > slots.right as u64 { return false; }
+    let child: CompareSlots = CompareSlots { left: slots.left, right: slots.right, offset: child_off as u32 };
+    let identity: mir::EnumIdentity = mir::enum_identity_of(&em.types:Read, id);
+    var exits: u32[] = [];
+    var i: u32 = 0;
+    while i < count {
+        let payload: u32 = mir::variant_payload(&em.enums:Read, &em.imported_enums:Read, identity, i);
+        if payload == 4294967295u32 { return false; }
+        if payload != 0 {
+            if offset == 0 { return false; }
+            if @len(exits) == 0 { @push(exits, pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?)?; }
+            pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), i as u64)?;
+            pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+            let skip: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+            if !compare_eq_at(em, child, payload, depth + 1)? { return false; }
+            @push(exits, pe::jmp_rel32(&em.code:ReadWrite)?)?;
+            let next: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, skip, next);
+        }
+        i = i + 1;
+    }
+    if @len(exits) != 0 {
+        pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+        let done: u32 = pe::code_len(&em.code:Read);
+        i = 0;
+        while i < @len(exits) as u32 { pe::patch_rel32(&em.code:ReadWrite, exits[i], done); i = i + 1; }
+    }
+    return true;
+}
+
+function lower_compare(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let opnd_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+    let right_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.c);
+    // 有序比较的两侧必须同型，才能共用符号扩展和条件码。
+    if !mir::valid_type(&em.types:Read, opnd_type) || opnd_type != right_type { return false; }
+    if coff_state::is_ordered_compare(inst.op) && !typecheck::is_ordered_type(&em.types:Read, opnd_type) { return false; }
+    // 本地标量载荷继续走等宽合并的短代码路径。
+    var tag_width: u8 = 0;
+    var payload_width: u8 = 0;
+    var mixed_width: bool = false;
+    var enum_index: u32 = 0;
+    var payload_count: u32 = 0;
+    var variant_count: u32 = 0;
+    var all_payload: bool = false;
+    if opnd_type != 0 && opnd_type <= @len(em.types.entries) as u32 {
+        let entry: typecheck::TypeEntry = em.types.entries[opnd_type - 1];
+        if entry.kind == 2 {
+            var i: u32 = 0;
+            while i < @len(em.enums.items) as u32 {
+                if em.enums.items[i].def == entry.def {
+                    let count: u32 = @len(em.enums.items[i].payloads) as u32;
+                    enum_index = i;
+                    variant_count = count;
+                    if count > 0 && count <= 65536 && (inst.op == coff_state::mop_eq() || inst.op == coff_state::mop_ne()) {
+                        tag_width = 1;
+                        if count > 256 { tag_width = 2; }
+                        var j: u32 = 0;
+                        while j < count {
+                            let part: u32 = em.enums.items[i].payloads[j];
+                            if part != 0 {
+                                if part > @len(em.types.entries) as u32 { tag_width = 0; break; }
+                                let ty: typecheck::TypeEntry = em.types.entries[part - 1];
+                                if ty.kind != 8 && (ty.kind != 1 || ty.builtin < 4097 || ty.builtin > 4106) { tag_width = 0; break; }
+                                let width: u8 = coff_state::type_width(&em.types:Read, part);
+                                if payload_width != 0 && payload_width != width { mixed_width = true; }
+                                if width > payload_width { payload_width = width; }
+                                payload_count = payload_count + 1;
+                            }
+                            j = j + 1;
+                        }
+                        all_payload = payload_count == count;
+                    }
+                    break;
+                }
+                i = i + 1;
+            }
+        }
+        if (entry.kind == 2 && tag_width == 0) || entry.kind == 3 || (entry.kind == 1 && entry.builtin == 4108) {
+            if inst.op != coff_state::mop_eq() && inst.op != coff_state::mop_ne() { return false; }
+            let slots: CompareSlots = CompareSlots { left: em.slots[inst.b - 1], right: em.slots[inst.c - 1], offset: 0 };
+            if !compare_eq_at(em, slots, opnd_type, 0)? { coff_state::unsupported_op(em, inst.op)?; return true; }
+            pe::compare_bool(&em.code:ReadWrite, coff_state::cmp_condition(inst.op, false))?;
+            coff_state::store_local(em, inst.a, pe::rax())?;
+            return true;
+        }
+    }
+    let signed: bool = coff_state::type_signed(&em.types:Read, opnd_type);
+    let cc: u8 = coff_state::cmp_condition(inst.op, signed);
+    if cc == coff_state::cc_invalid() { return false; }
+    if tag_width != 0 {
+        let left: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+        let right: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), left, tag_width)?;
+        pe::load_slot(&em.code:ReadWrite, pe::rcx(), right, tag_width)?;
+    } else {
+        load_scalar_signed(em, inst.b, pe::rax(), signed)?;
+        load_scalar_signed(em, inst.c, pe::rcx(), signed)?;
+    }
+    pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+    if tag_width != 0 && payload_width != 0 {
+        // 标签不同时保留比较标志，避免读取不属于该分支的载荷。
+        let unequal: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+        var empty: u32 = 0;
+        if mixed_width {
+            let left: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+            let right: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+            var offset: u32 = payload_width as u32;
+            if tag_width > payload_width { offset = tag_width as u32; }
+            var exits: u32[] = [];
+            var i: u32 = 0;
+            while i < variant_count {
+                let part: u32 = em.enums.items[enum_index].payloads[i];
+                if part != 0 {
+                    let width: u8 = coff_state::type_width(&em.types:Read, part);
+                    pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), i as u64)?;
+                    pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+                    let skip: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+                    pe::load_slot_off(&em.code:ReadWrite, pe::rax(), left, offset, width)?;
+                    pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), right, offset, width)?;
+                    pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+                    let exit: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+                    @push(exits, exit)?;
+                    let next: u32 = pe::code_len(&em.code:Read);
+                    pe::patch_rel32(&em.code:ReadWrite, skip, next);
+                }
+                i = i + 1;
+            }
+            // 同标签未匹配载荷时是无载荷变体，直接设置相等标志。
+            pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+            let target: u32 = pe::code_len(&em.code:Read);
+            pe::patch_rel32(&em.code:ReadWrite, unequal, target);
+            i = 0;
+            while i < @len(exits) as u32 { pe::patch_rel32(&em.code:ReadWrite, exits[i], target); i = i + 1; }
+            pe::compare_bool(&em.code:ReadWrite, cc)?;
+            coff_state::store_local(em, inst.a, pe::rax())?;
+            return true;
+        }
+        if !all_payload {
+            var jumps: u32[] = [];
+            let check_empty: bool = variant_count - payload_count < payload_count;
+            var i: u32 = 0;
+            // 只为较少的一侧生成跳转，避免为全部标签分配临时数组。
+            while i < variant_count {
+                let has_payload: bool = em.enums.items[enum_index].payloads[i] != 0;
+                if has_payload != check_empty {
+                    pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), i as u64)?;
+                    pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+                    let jump: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+                    @push(jumps, jump)?;
+                }
+                i = i + 1;
+            }
+            // 按空标签分派时，未命中分支直接进入载荷比较。
+            var active: u32 = 0;
+            if check_empty { active = pe::jmp_rel32(&em.code:ReadWrite)?; }
+            let empty_start: u32 = pe::code_len(&em.code:Read);
+            // 相同的无载荷标签应相等，且不能读取非活动载荷。
+            pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+            empty = pe::jmp_rel32(&em.code:ReadWrite)?;
+            let start: u32 = pe::code_len(&em.code:Read);
+            if check_empty { pe::patch_rel32(&em.code:ReadWrite, active, start); }
+            i = 0;
+            while i < @len(jumps) as u32 {
+                if check_empty { pe::patch_rel32(&em.code:ReadWrite, jumps[i], empty_start); }
+                else { pe::patch_rel32(&em.code:ReadWrite, jumps[i], start); }
+                i = i + 1;
+            }
+        }
+        let left: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+        let right: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+        var offset: u32 = payload_width as u32;
+        if tag_width > payload_width { offset = tag_width as u32; }
+        pe::load_slot_off(&em.code:ReadWrite, pe::rax(), left, offset, payload_width)?;
+        pe::load_slot_off(&em.code:ReadWrite, pe::rcx(), right, offset, payload_width)?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+        let target: u32 = pe::code_len(&em.code:Read);
+        pe::patch_rel32(&em.code:ReadWrite, unequal, target);
+        if !all_payload { pe::patch_rel32(&em.code:ReadWrite, empty, target); }
+    }
+    pe::compare_bool(&em.code:ReadWrite, cc)?;
+    coff_state::store_local(em, inst.a, pe::rax())?;
+    return true;
+}
+// 转换：按目标类型窄化（写低字节）或宽化（符号/零扩展）。
+function lower_cast(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let from_width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.b);
+    let to_width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, inst.a);
+    let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    if to_width <= from_width {
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), src, from_width)?;
+        pe::store_slot(&em.code:ReadWrite, pe::rax(), dst, to_width)?;
+        return true;
+    }
+    let source_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+    if coff_state::type_signed(&em.types:Read, source_type) {
+        if from_width == 1 { pe::movsx8_slot(&em.code:ReadWrite, pe::rax(), src)?; }
+        elseif from_width == 2 { pe::movsx16_slot(&em.code:ReadWrite, pe::rax(), src)?; }
+        else {
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), src, 4)?;
+            pe::movsx32_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+        }
+    } else {
+        pe::load_slot(&em.code:ReadWrite, pe::rax(), src, from_width)?;
+    }
+    pe::store_slot(&em.code:ReadWrite, pe::rax(), dst, to_width)?;
+    return true;
+}
+
+// ── 块与终结指令 ──
+
+// 178：`@push` 降级。取数组头地址（`&T[]` 局部装指针，`T[]` 局部本身是头）、
+// 元素槽地址与元素字节尺寸，调用运行时 `yak_rt_push`；返回 0/1 状态后写入
+// `void!AllocError` 载体：成功 tag 0，失败 tag 1 + AllocError::OutOfMemory。
+function lower_dyn_push(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    if inst.a == 0 || inst.a > @len(em.slots) as u32 { return false; }
+    if inst.b == 0 || inst.b > @len(em.slots) as u32 { return false; }
+    if inst.c == 0 || inst.c > @len(em.slots) as u32 { return false; }
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let arr_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let elem_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.c);
+    let carrier_size: u64 = coff_state::type_size(em, inst.value_type_id);
+    let payload_off: u64 = coff_state::type_payload_off(em, inst.value_type_id);
+    let elem_size: u64 = inst.value;
+    if dst == 0 || arr_disp == 0 || elem_disp == 0 || carrier_size == 0 || elem_size == 0 { return false; }
+    if carrier_size > coff_state::abi_copy_limit() as u64 || elem_size > 4294967295u64 || payload_off > 4294967295u64 { return false; }
+    coff_state::zero_slot_blocks(em, dst, carrier_size)?;
+    let arr_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+    if arr_type == 0 || arr_type > @len(em.types.entries) as u32 { return false; }
+    let sysv: bool = em.code.sysv;
+    let first: u8 = coff_state::call_reg(sysv, 0);
+    if em.types.entries[arr_type - 1].kind == 6 {
+        pe::lea_rbp(&em.code:ReadWrite, first, arr_disp)?;
+    } else {
+        pe::load_slot(&em.code:ReadWrite, first, arr_disp, 8)?;
+    }
+    pe::lea_rbp(&em.code:ReadWrite, coff_state::call_reg(sysv, 1), elem_disp)?;
+    pe::mov_imm64(&em.code:ReadWrite, coff_state::call_reg(sysv, 2), elem_size)?;
+    let at: u32 = pe::call_rel32(&em.code:ReadWrite)?;
+    @push(em.calls, coff_state::CallSite { at: at, symbol: coff_state::rt_symbol_push(), kind: 178 })?;
+    pe::test_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+    let ok_at: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+    // 追加失败时，所有权已转入 @push 的拥有型元素必须立刻析构，避免内存泄漏。
+    let elem_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.c);
+    if coff_place::em_has_dyn(em, elem_type) {
+        if !coff_place::drop_value(em, elem_disp, 0, elem_type, false, 0)? { return false; }
+    }
+    pe::mov_imm64(&em.code:ReadWrite, pe::rax(), 1)?;
+    pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst, 0, 1)?;
+    let end_at: u32 = pe::code_len(&em.code:Read);
+    pe::patch_rel32(&em.code:ReadWrite, ok_at, end_at);
+    return true;
+}
+// 114：运行时依据布局节点递归构造成功载荷，并在失败时逆序回滚。
+function lower_clone(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let payload: u64 = coff_state::type_payload_off(em, inst.value_type_id);
+    let carrier_size: u64 = coff_state::type_size(em, inst.value_type_id);
+    let src_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+    let src_size: u64 = coff_state::type_size(em, src_type);
+    if src == 0 || payload == 0 || payload >= dst as u64 || payload >= carrier_size ||
+        src_size == 0 || src_size > carrier_size - payload || coff_state::type_tag(em, inst.value_type_id) != 1 { return false; }
+    let sysv: bool = em.code.sysv;
+    if !coff_place::load_value_shape(em, src_type, coff_state::call_reg(sysv, 2))? { return false; }
+    pe::lea_rbp(&em.code:ReadWrite, coff_state::call_reg(sysv, 0), src)?;
+    pe::lea_rbp(&em.code:ReadWrite, coff_state::call_reg(sysv, 1), dst - payload as u32)?;
+    let at: u32 = pe::call_rel32(&em.code:ReadWrite)?;
+    @push(em.calls, coff_state::CallSite { at: at, symbol: coff_state::rt_symbol_clone(), kind: 114 })?;
+    // 返回 0 或 1，分别是成功和错误载体的标签。唯一错误变体标签为零。
+    pe::store_slot(&em.code:ReadWrite, pe::rax(), dst, 1)?;
+    pe::test_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+    let success: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_e())?;
+    pe::clear_reg(&em.code:ReadWrite, pe::rax())?;
+    pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst, payload as u32, 1)?;
+    let end: u32 = pe::code_len(&em.code:Read);
+    pe::patch_rel32(&em.code:ReadWrite, success, end);
+    return true;
+}
+// 终结指令：br 无条件、branch 条件、enum_dispatch 查表、ret 返回、trap/unreachable 终止。
+export function lower_term(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read, term: &mir::MirTerminator:Read, next_block: u32): bool!AllocError {
+    let has_next: bool = next_block < @len(func.blocks) as u32;
+    if term.op == coff_state::mop_br() || term.op == coff_state::mop_branch() && term.b == term.c {
+        if has_next && term.b == next_block { return true; }
+        let at: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+        @push(em.fixups, coff_state::BlockFixup { at: at, target: term.b as u16 })?;
+        return true;
+    }
+    if term.op == coff_state::mop_branch() {
+        coff_state::load_local(em, term.a, pe::rax())?;
+        pe::test_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+        let then_next: bool = has_next && term.b == next_block;
+        var cc: u8 = pe::cc_ne();
+        var target: u32 = term.b;
+        if then_next {
+            // 真边顺行时反转条件，只跳向假边。
+            cc = pe::cc_e();
+            target = term.c;
+        }
+        let at: u32 = pe::jcc_rel32(&em.code:ReadWrite, cc)?;
+        @push(em.fixups, coff_state::BlockFixup { at: at, target: target as u16 })?;
+        if !then_next && (!has_next || term.c != next_block) {
+            let to_else: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+            @push(em.fixups, coff_state::BlockFixup { at: to_else, target: term.c as u16 })?;
+        }
+        return true;
+    }
+    if term.op == coff_state::mop_carrier_dispatch() {
+        return coff_carrier::lower_carrier_dispatch(em, func, term)?;
+    }
+    if term.op == coff_state::mop_enum_dispatch() {
+        return coff_carrier::lower_enum_dispatch(em, func, term)?;
+    }
+    if term.op == coff_state::mop_ret() {
+        return lower_ret(em, term)?;
+    }
+    if term.op == coff_state::mop_trap() {
+        if term.a == 2 {
+            let status: u32 = em.trap_status;
+            pe::load_slot(&em.code:ReadWrite, pe::r11(), status, 8)?;
+        } else {
+            pe::mov_imm64(&em.code:ReadWrite, pe::r11(), term.a as u64 + 1u64)?;
+        }
+        leave_frame(em)?;
+        return true;
+    }
+    if term.op == 196 {
+        pe::int3(&em.code:ReadWrite)?;
+        return true;
+    }
+    if term.op == 197 {
+        coff_state::load_local(em, term.a, pe::r11())?;
+        pe::mov_imm64(&em.code:ReadWrite, pe::rax(), 256u64)?;
+        pe::or_rr(&em.code:ReadWrite, pe::r11(), pe::rax())?;
+        leave_frame(em)?;
+        return true;
+    }
+    return false;
+}
+// 返回：结果按 ABI 放 rax（abi-win 五节），再恢复帧。
+// 尺寸为 1/2/4/8 字节的聚合按同宽整数返回；其余尺寸按隐藏返回缓冲区指针返回
+// （rcx 传入、rax 返回该指针，abi-win 2.8）。切片按值返回仍未登记形态，EM-6 拒绝。
+function lower_ret(em: &coff_state::Emitter:ReadWrite, term: &mir::MirTerminator:Read): bool!AllocError {
+    if term.a != 0 && term.a <= @len(em.slots) as u32 {
+        var size: u32 = 0;
+        if term.a <= @len(em.agg_sizes) as u32 { size = em.agg_sizes[term.a - 1]; }
+        let sysv: bool = em.code.sysv;
+        // 返回值形态检查：非法形态记录拒绝并写 int3 落空，不再装填 rax。
+        if coff_state::local_slice(em, term.a) {
+            coff_state::reject_abi_form(em, coff_state::mop_ret())?;
+        } elseif sysv && size > 0 && size <= 16 {
+            let disp: u32 = em.slots[term.a - 1];
+            coff_call::load_sysv_word(em, disp, 0, size, pe::rax())?;
+            if size > 8 { coff_call::load_sysv_word(em, disp, 8, size, pe::rdx())?; }
+        } elseif sysv && size > 16 || !sysv && term.a <= @len(em.by_ptr) as u32 && em.by_ptr[term.a - 1] {
+            let sret_disp: u32 = em.sret;
+            let src_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, term.a);
+            if sret_disp == 0 || src_disp == 0 || size == 0 || size > coff_state::abi_copy_limit() {
+                coff_state::reject_abi_form(em, coff_state::mop_ret())?;
+            } else {
+                // rax = 调用方的隐藏返回缓冲区；把结果槽字节写入其中，rax 原样返回该指针。
+                pe::load_slot(&em.code:ReadWrite, pe::rax(), sret_disp, 8)?;
+                coff_call::copy_slot_to_ptr(em, src_disp, pe::rax(), size)?;
+            }
+        } else {
+            let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, term.a);
+            let width: u8 = coff_state::width_of(&em.widths[0..@len(em.widths)]:Read, term.a);
+            pe::load_slot(&em.code:ReadWrite, pe::rax(), disp, width)?;
+        }
+    }
+    pe::xor_rr(&em.code:ReadWrite, pe::r11(), pe::r11())?;
+    leave_frame(em)?;
+    return true;
+}
+
+export function leave_frame(em: &coff_state::Emitter:ReadWrite): void!AllocError {
+    if em.code.sysv { pe::sysv_leave(&em.code:ReadWrite)?; }
+    else { pe::win64_leave(&em.code:ReadWrite)?; }
+    return;
+}

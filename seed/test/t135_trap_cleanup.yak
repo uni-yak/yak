@@ -1,0 +1,2 @@
+// expected_trap: assert failed
+foreign assert(cond: bool): void; function main(): void { let a: u8[] = [1]; let r: &u8[] = &a; assert(false); }

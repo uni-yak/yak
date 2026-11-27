@@ -1,0 +1,4 @@
+// expected_code: E1001
+// spec: spec/lang/lex.md L-1
+// 触发：源码中嵌入 U+FEFF，文件头本身无 BOM。
+﻿function main(): void { return; }

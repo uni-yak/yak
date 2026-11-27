@@ -1,0 +1,239 @@
+// 前端管线阶段 2–4：符号解析、类型检查、布局、所有权与文档索引。
+import lex;
+import types;
+import parse;
+import diag;
+import resolve;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import copy_facts;
+import typecheck_driver;
+import typecheck_shape;
+import consteval;
+import layout;
+import owner;
+import pipeline_index;
+
+const DOCUMENT_VALUE_DEPTH: u32 = 64;
+const DOCUMENT_COPY_WALK: u32 = 1023;
+const DOCUMENT_WRITE_VISITS: u32 = 4096;
+const DOCUMENT_OWNER_REPLAYS: u32 = 64;
+const DOCUMENT_PLACE_COPY_ROWS: u32 = 4096;
+const DOCUMENT_SLICE_JOIN_STEPS: u32 = 4096;
+const DOCUMENT_SLICE_COPY_ROWS: u32 = 1024;
+const DOCUMENT_SLICE_SCOPE_STEPS: u32 = 1024;
+const DOCUMENT_SLICE_ASSIGNMENT_STEPS: u32 = 4096;
+const DOCUMENT_BORROW_CONFLICT_ROWS: u32 = 4096;
+const DOCUMENT_PLACE_MERGE_ROWS: u32 = 4096;
+const DOCUMENT_PLACE_LOOKUP_ROWS: u32 = 8192;
+const DOCUMENT_PLACE_EXIT_STEPS: u32 = 4096;
+const DOCUMENT_SLOT_JUMP_STEPS: u32 = 1024;
+const DOCUMENT_SLICE_JUMP_STEPS: u32 = 256;
+const DOCUMENT_NAME_LOOKUP_STEPS: u32 = 4096;
+const DOCUMENT_ENUM_LOOKUP_ROWS: u32 = 1024;
+const DOCUMENT_REFERENCE_OUTPUT_ROWS: u64 = 8192;
+const DOCUMENT_RESERVATION_STEPS: u32 = 4096;
+const DOCUMENT_VALUE_GRAPH_STEPS: u32 = 2048;
+const DOCUMENT_LAYOUT_STEPS: u32 = 2112;
+const DOCUMENT_DECL_INTERN_STEPS: u32 = 4224;
+const DOCUMENT_CONST_SNAPSHOT_ROWS: u64 = 256;
+const DOCUMENT_CONST_INIT_STEPS: u32 = 2048;
+const DOCUMENT_CONST_MATERIAL_STEPS: u32 = 1024;
+const DOCUMENT_CONST_FOLD_STEPS: u32 = 1024;
+const DOCUMENT_INTEGER_PROBE_STEPS: u32 = 1024;
+const DOCUMENT_INTEGER_SCAN_STEPS: u32 = 4096;
+const DOCUMENT_INTEGER_SHAPE_STEPS: u32 = 512;
+const DOCUMENT_ARRAY_INFERENCE_STEPS: u32 = 512;
+const DOCUMENT_CTOR_FIELDS_STEPS: u32 = 1024;
+const DOCUMENT_MATCH_SCAN_STEPS: u32 = 1024;
+const DOCUMENT_OUT_REF_ROWS: u32 = 1000;
+const DOCUMENT_PROJECTION_ROWS: u32 = 1024;
+const DOCUMENT_EQUALITY_ROWS: u32 = 1024;
+const DOCUMENT_BODY_INTERN_STEPS: u32 = 4096;
+
+export struct StageBudget { limit: u64, used: u64, exhausted: bool }
+
+function charge_work(work: &StageBudget:ReadWrite, cost: u64): bool {
+    if work.limit == 0u64 { return true; }
+    if work.exhausted { return false; }
+    if cost > work.limit - work.used {
+        work.used = work.limit;
+        work.exhausted = true;
+        return false;
+    }
+    work.used = work.used + cost;
+    return true;
+}
+
+// 阶段 4：布局、Copy 预备、所有权检查与文档索引（仅持单阶段局部，避免巨型析构路径膨胀）。
+function analyze_layout_and_owner(
+    source: &[u8], file: u16, document: bool, diags: &diag::DiagBuffer:ReadWrite,
+    index_definitions: bool, definitions: &types::DocumentDefinitions:ReadWrite,
+    deps: &resolve_refs::DependencySet:Read, direct_count: u32,
+    imported_layouts: &layout::ImportedLayoutTable:Read, work: &StageBudget:ReadWrite,
+    lexed: &lex::LexResult:Read, parsed: &parse::ParseResult:Read,
+    resolution: &resolve_refs::Resolution:Read, checked: &typecheck::TypeCheckResult:ReadWrite,
+    tail_cost: u64
+): u8!AllocError {
+    if document {
+        var graph: layout::ValueGraphBudget = layout::document_value_graph_budget(DOCUMENT_VALUE_GRAPH_STEPS);
+        let bounded: bool = layout::value_depth_limited(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, DOCUMENT_VALUE_DEPTH, &graph:ReadWrite)?;
+        if graph.exhausted { return 27u8; }
+        if !bounded { return 6u8; }
+    }
+    // 按值递归类型须先由布局阶段拒绝，避免所有权分类无限递归。
+    var layout_work: layout::ValueGraphBudget = layout::value_graph_budget(0u32);
+    if document { layout_work = layout::document_value_graph_budget(DOCUMENT_LAYOUT_STEPS); }
+    let layouts: layout::LayoutResult = layout::layout_unit_with_imports_limited(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, imported_layouts, &checked.imported_enums:Read, diags, &layout_work:ReadWrite)?;
+    let layout_cost: u64 = @len(layouts.table.items);
+    @drop(layouts);
+    if layout_work.exhausted { return 28u8; }
+    if !charge_work(work, layout_cost * 2u64) { return 47u8; }
+    if diag::diagbuf_has_error(diags) {
+        diag::diagbuf_sort(diags);
+        return 1u8;
+    }
+    if document {
+        let bounded: bool = copy_facts::prepare_local_copy(checked, DOCUMENT_COPY_WALK, true)?;
+        if !bounded { return 9u8; }
+    }
+    var limits: owner::OwnerLimits = owner::OwnerLimits { write: 0, replay: 0, place_copy: 0, slice_merge: 0, slice_copy: 0, slice_scope: 0, slice_assignment: 0, borrow_conflict: 0, place_merge: 0, place_lookup: 0, place_exit: 0, slot_jump: 0, slice_jump: 0, document: false };
+    if document {
+        limits = owner::OwnerLimits { write: DOCUMENT_WRITE_VISITS, replay: DOCUMENT_OWNER_REPLAYS, place_copy: DOCUMENT_PLACE_COPY_ROWS, slice_merge: DOCUMENT_SLICE_JOIN_STEPS, slice_copy: DOCUMENT_SLICE_COPY_ROWS, slice_scope: DOCUMENT_SLICE_SCOPE_STEPS, slice_assignment: DOCUMENT_SLICE_ASSIGNMENT_STEPS, borrow_conflict: DOCUMENT_BORROW_CONFLICT_ROWS, place_merge: DOCUMENT_PLACE_MERGE_ROWS, place_lookup: DOCUMENT_PLACE_LOOKUP_ROWS, place_exit: DOCUMENT_PLACE_EXIT_STEPS, slot_jump: DOCUMENT_SLOT_JUMP_STEPS, slice_jump: DOCUMENT_SLICE_JUMP_STEPS, document: true };
+    }
+    let ownership: owner::OwnerResult = owner::check_unit_limited(&parsed.file:Read, &parsed.pool:Read, resolution, &*checked:Read, diags, limits)?;
+    var owner_status: u8 = 0u8;
+    if ownership.write_budget_exhausted { owner_status = 10u8; }
+    elseif ownership.replay_budget_exhausted { owner_status = 11u8; }
+    elseif ownership.place_copy_exhausted { owner_status = 12u8; }
+    elseif ownership.slice_merge_exhausted { owner_status = 13u8; }
+    elseif ownership.slice_copy_exhausted { owner_status = 14u8; }
+    elseif ownership.slice_scope_exhausted { owner_status = 15u8; }
+    elseif ownership.slice_assignment_exhausted { owner_status = 16u8; }
+    elseif ownership.borrow_conflict_exhausted { owner_status = 17u8; }
+    elseif ownership.place_merge_exhausted { owner_status = 18u8; }
+    elseif ownership.place_lookup_exhausted { owner_status = 19u8; }
+    elseif ownership.place_exit_exhausted { owner_status = 20u8; }
+    elseif ownership.slot_jump_exhausted { owner_status = 21u8; }
+    elseif ownership.slice_jump_exhausted { owner_status = 22u8; }
+    @drop(ownership);
+    if owner_status != 0u8 { return owner_status; }
+    if !charge_work(work, tail_cost) { return 47u8; }
+    diag::diagbuf_sort(diags);
+    if diag::diagbuf_has_error(diags) { return 1u8; }
+    if document && index_definitions && !diags.truncated {
+        pipeline_index::collect_definitions(source, &lexed.tokens[0..@len(lexed.tokens)]:Read, &parsed.file:Read, &parsed.pool:Read, resolution, &*checked:Read, file, @len(source) as u32, definitions)?;
+        pipeline_index::collect_completion(lexed, &parsed.pool:Read, &resolution.result.tables:Read, file, @len(source) as u32, definitions)?;
+        pipeline_index::collect_import_uses(&lexed.tokens[0..@len(lexed.tokens)]:Read, &parsed.pool:Read, &resolution.refs:Read, deps, direct_count, file, definitions)?;
+        let index_cost: u64 = @len(definitions.links) + @len(definitions.hovers) + @len(definitions.completion_tokens) + @len(definitions.rename_decls) + @len(definitions.member_entries);
+        if !charge_work(work, index_cost) {
+            *definitions = types::empty_definitions();
+            return 47u8;
+        }
+    }
+    return 0u8;
+}
+
+// 阶段 3：类型检查与常量求值，合并单出口以缩减析构块数量。
+function analyze_typecheck(
+    source: &[u8], file: u16, document: bool, diags: &diag::DiagBuffer:ReadWrite,
+    index_definitions: bool, definitions: &types::DocumentDefinitions:ReadWrite,
+    deps: &resolve_refs::DependencySet:Read, direct_count: u32,
+    imported_layouts: &layout::ImportedLayoutTable:Read, work: &StageBudget:ReadWrite,
+    lexed: &lex::LexResult:Read, parsed: &parse::ParseResult:Read,
+    resolution: &resolve_refs::Resolution:Read, tail_cost: u64
+): u8!AllocError {
+    var snapshot_limit: u64 = 0;
+    var init_limit: u32 = 0;
+    var material_limit: u32 = 0;
+    var fold_limit: u32 = 0;
+    var probe_limit: u32 = 0;
+    var scan_limit: u32 = 0;
+    var shape_limit: u32 = 0;
+    var array_limit: u32 = 0;
+    var ctor_limit: u32 = 0;
+    var match_limit: u32 = 0;
+    var out_limit: u32 = 0;
+    var projection_limit: u32 = 0;
+    var equality_limit: u32 = 0;
+    if document {
+        snapshot_limit = DOCUMENT_CONST_SNAPSHOT_ROWS; init_limit = DOCUMENT_CONST_INIT_STEPS;
+        material_limit = DOCUMENT_CONST_MATERIAL_STEPS; fold_limit = DOCUMENT_CONST_FOLD_STEPS;
+        probe_limit = DOCUMENT_INTEGER_PROBE_STEPS; scan_limit = DOCUMENT_INTEGER_SCAN_STEPS;
+        shape_limit = DOCUMENT_INTEGER_SHAPE_STEPS; array_limit = DOCUMENT_ARRAY_INFERENCE_STEPS;
+        ctor_limit = DOCUMENT_CTOR_FIELDS_STEPS; match_limit = DOCUMENT_MATCH_SCAN_STEPS;
+        out_limit = DOCUMENT_OUT_REF_ROWS; projection_limit = DOCUMENT_PROJECTION_ROWS;
+        equality_limit = DOCUMENT_EQUALITY_ROWS;
+    }
+    var intern_work: typecheck::InternBudget = typecheck::declaration_intern_budget(0u32);
+    if document { intern_work = typecheck::document_intern_budget(DOCUMENT_DECL_INTERN_STEPS); }
+    var snapshot_work: typecheck_driver::ConstSnapshotBudget = typecheck_driver::const_snapshot_budget(snapshot_limit);
+    var init_lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(init_limit);
+    var material: consteval::MaterialBudget = consteval::material_budget(material_limit);
+    var fold: consteval::FoldBudget = consteval::fold_budget(fold_limit);
+    var probe_work: consteval::FoldBudget = consteval::fold_budget(probe_limit);
+    var scan: typecheck_driver::IntegerScanBudget = typecheck_driver::integer_scan_budget(scan_limit);
+    var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(shape_limit, array_limit, ctor_limit, match_limit, out_limit, projection_limit, equality_limit);
+    if document { shape.intern = typecheck::intern_budget(DOCUMENT_BODY_INTERN_STEPS); }
+    var checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit_with_snapshot_budget(&parsed.file:Read, &parsed.pool:Read, resolution, diags, &intern_work:ReadWrite, &init_lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe_work:ReadWrite, &scan:ReadWrite, &shape:ReadWrite, document, &snapshot_work:ReadWrite)?;
+    let body_stop: u8 = typecheck_shape::body_stop_reason(&shape:Read);
+    var stop: u8 = 0u8;
+    if intern_work.exhausted { stop = 29u8; }
+    elseif body_stop >= 1u8 && body_stop <= 4u8 { stop = body_stop + 34u8; }
+    elseif body_stop >= 5u8 && body_stop <= 7u8 { stop = body_stop + 36u8; }
+    elseif body_stop == 8u8 { stop = 45u8; }
+    elseif snapshot_work.exhausted { stop = 44u8; }
+    elseif init_lookup.exhausted { stop = 30u8; }
+    elseif material.exhausted { stop = 31u8; }
+    elseif fold.exhausted { stop = 32u8; }
+    elseif probe_work.exhausted { stop = 33u8; }
+    elseif scan.exhausted { stop = 34u8; }
+    if stop != 0u8 { return stop; }
+    let type_cost: u64 = @len(checked.types.entries) + @len(checked.expr_types.items) + @len(checked.def_types.items) + @len(checked.fields.items) + @len(checked.enums.items);
+    if !charge_work(work, type_cost * 2u64) { return 47u8; }
+    if diag::diagbuf_has_error(diags) {
+        diag::diagbuf_sort(diags);
+        return 1u8;
+    }
+    return analyze_layout_and_owner(source, file, document, diags, index_definitions, definitions, deps, direct_count, imported_layouts, work, lexed, parsed, resolution, &checked:ReadWrite, tail_cost)?;
+}
+
+// 阶段 2：符号与引用解析。
+export function analyze_resolve(
+    source: &[u8], file: u16, document: bool, diags: &diag::DiagBuffer:ReadWrite,
+    index_definitions: bool, definitions: &types::DocumentDefinitions:ReadWrite,
+    module_name: &[u8], deps: &resolve_refs::DependencySet:Read, direct_count: u32,
+    imported_layouts: &layout::ImportedLayoutTable:Read, work: &StageBudget:ReadWrite,
+    lexed: &lex::LexResult:Read, parsed: &parse::ParseResult:Read, ast_cost: u64
+): u8!AllocError {
+    var resolve_limit: u32 = 0;
+    var reservation_limit: u32 = 0;
+    var enum_limit: u32 = 0;
+    var output_limit: u64 = 0;
+    if document {
+        resolve_limit = DOCUMENT_NAME_LOOKUP_STEPS;
+        reservation_limit = DOCUMENT_RESERVATION_STEPS;
+        enum_limit = DOCUMENT_ENUM_LOOKUP_ROWS;
+        output_limit = DOCUMENT_REFERENCE_OUTPUT_ROWS;
+    }
+    var lookup: resolve::LookupBudget = resolve::lookup_budget(resolve_limit, enum_limit);
+    lookup.contextual_enum_labels = true;
+    var reservation: resolve::ReservationBudget = resolve::reservation_budget(reservation_limit);
+    reservation.index_locals = document;
+    var outputs: resolve_unit::ReferenceOutputBudget = resolve_unit::reference_output_budget(output_limit);
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit_limited(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, deps, direct_count, module_name, diags, &lookup:ReadWrite, &reservation:ReadWrite, &outputs:ReadWrite)?;
+    var stop: u8 = 0u8;
+    if reservation.exhausted { stop = 24u8; }
+    elseif lookup.enum_exhausted { stop = 25u8; }
+    elseif lookup.exhausted { stop = 23u8; }
+    elseif outputs.exhausted { stop = 26u8; }
+    if stop != 0u8 { return stop; }
+    let resolve_cost: u64 = @len(resolution.result.tables.defs) + @len(resolution.result.tables.bindings) + @len(resolution.refs.items);
+    if !charge_work(work, resolve_cost * 2u64) { return 47u8; }
+    if diag::diagbuf_has_error(diags) {
+        diag::diagbuf_sort(diags);
+        return 1u8;
+    }
+    return analyze_typecheck(source, file, document, diags, index_definitions, definitions, deps, direct_count, imported_layouts, work, lexed, parsed, &resolution:Read, ast_cost + resolve_cost)?;
+}

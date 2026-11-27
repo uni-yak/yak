@@ -1,0 +1,9 @@
+// YSM 驱动依赖链的根单元：只直接依赖中间单元，叶子单元属于传递依赖。
+foreign exit(code: u8): void;
+
+import chain_mid;
+
+function main(): void {
+    exit(chain_mid::mid_value(35u32) as u8);
+    return;
+}

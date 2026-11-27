@@ -1,0 +1,12 @@
+// t44: 关系运算assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(5 > 3);
+    assert(3 < 5);
+    assert(5 >= 5);
+    assert(5 <= 5);
+    assert(5 == 5);
+    assert(5 != 3);
+    return;
+}

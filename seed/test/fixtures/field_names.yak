@@ -1,0 +1,2 @@
+export struct Item { len: u32, cap: u32, other: u32, }
+export function make(): Item { return Item { len: 10u32, cap: 20u32, other: 30u32 }; }

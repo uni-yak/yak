@@ -1,0 +1,4 @@
+// expected_code: E1022
+// spec: spec/lang/lex.md L-22
+// 触发：字符字面量不含 Unicode 标量。
+function main(): void { let value: char = ''; return; }

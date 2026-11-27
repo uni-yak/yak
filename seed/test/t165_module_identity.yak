@@ -1,0 +1,5 @@
+// expected_trap: duplicate file identity
+// module: a=fixtures/helper.yak
+// module: b=fixtures/helper.yak
+import a; import b;
+function main(): void {  }

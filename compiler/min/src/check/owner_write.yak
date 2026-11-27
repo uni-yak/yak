@@ -1,0 +1,333 @@
+// 被调方 Write 槽位识别及单次整值提交的数据流检查。
+import types;
+import ast;
+import diag;
+import resolve;
+import resolve_refs;
+import typecheck;
+import owner_state;
+
+// 判定一元运算是否解引用。
+export function unary_is_deref(pool: &ast::AstPool:Read, expr: u32): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    if pool.exprs[expr].kind != 21 { return false; }
+    let data: u32 = pool.exprs[expr].data as u32;
+    if data >= @len(pool.unaries) as u32 { return false; }
+    return pool.unaries[data].op == 13;
+}
+
+// 取绑定 DefId 的类型；未知返回 0。
+function def_type_of(checked: &typecheck::TypeCheckResult:Read, def: u32): u32 {
+    if def == 0 || def > @len(checked.def_types.items) as u32 { return 0; }
+    return checked.def_types.items[def - 1];
+}
+
+// 调用方已排除投影，只读取直接名称的本地绑定。
+function direct_root(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32): u32 {
+    if expr >= @len(pool.exprs) as u32 { return 0; }
+    let index: u32 = typecheck::ref_index(refs, 0, expr);
+    if index == 0 || refs.items[index - 1].kind != 0 { return 0; }
+    return refs.items[index - 1].x;
+}
+
+// Write 通道不可读、借用或转发，唯一允许用途是经直接解引用提交整值。
+export function is_write_channel(checked: &typecheck::TypeCheckResult:Read, def: u32): bool {
+    return typecheck::write_ref_target(&checked.types:Read, def_type_of(checked, def)) != 0;
+}
+
+// 只认 Write 形参的直接解引用；投影和普通引用仍由通用赋值检查处理。
+export function write_fill_target(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, expr: u32): u32 {
+    if !unary_is_deref(pool, expr) { return 0; }
+    let operand: u32 = pool.unaries[pool.exprs[expr].data as u32].operand;
+    let kind: u8 = pool.exprs[operand].kind;
+    if kind != 0 && kind != 25 { return 0; }
+    let def: u32 = direct_root(pool, refs, operand);
+    if is_write_channel(checked, def) { return def; }
+    return 0;
+}
+
+// 被调方单次提交检查与调用方的槽位状态分开：仅保存每个形参的可达状态集合。
+const WRITE_UNREACHABLE: u8 = 0;
+const WRITE_EMPTY: u8 = 1;
+const WRITE_FILLED: u8 = 2;
+const WRITE_MIXED: u8 = 3;
+struct WriteLoop { label: u32, back: u8, exit_state: u8 }
+struct WriteFlow { def: u32, loops: WriteLoop[], depth: u32 }
+
+// 文档内所有 Write 形参共享走访配额；批处理不扣配额。
+export struct WriteBudget { limited: bool, remaining: u32, exhausted: bool }
+
+function charge(budget: &WriteBudget:ReadWrite): bool {
+    if !budget.limited { return true; }
+    if budget.remaining == 0 {
+        budget.exhausted = true;
+        return false;
+    }
+    budget.remaining = budget.remaining - 1;
+    return true;
+}
+
+function merge_write(lhs: u8, rhs: u8): u8 {
+    if lhs == WRITE_UNREACHABLE { return rhs; }
+    if rhs == WRITE_UNREACHABLE || lhs == rhs { return lhs; }
+    return WRITE_MIXED;
+}
+
+// 跳转只交给实际的目标循环；返回和跳转均无普通后继。
+function record_write_jump(flow: &WriteFlow:ReadWrite, label: u32, back: bool, state: u8): void {
+    var depth: u32 = flow.depth;
+    while depth > 0 {
+        depth = depth - 1;
+        if label == 0 || label == 4294967295u32 || label == flow.loops[depth].label {
+            if back { flow.loops[depth].back = merge_write(flow.loops[depth].back, state); }
+            else { flow.loops[depth].exit_state = merge_write(flow.loops[depth].exit_state, state); }
+            return;
+        }
+    }
+    return;
+}
+
+function check_write_block(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, flow: &WriteFlow:ReadWrite, budget: &WriteBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, block: u32, incoming: u8, report: bool): u8!AllocError {
+    if !charge(budget) { return WRITE_UNREACHABLE; }
+    if block >= @len(pool.blocks) as u32 { return incoming; }
+    var state: u8 = incoming;
+    var i: u32 = 0;
+    while state != WRITE_UNREACHABLE && i < @len(pool.blocks[block].stmts) as u32 {
+        if !charge(budget) { return WRITE_UNREACHABLE; }
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block].stmts[i]];
+        if stmt.kind == 10 { return WRITE_UNREACHABLE; }
+        if stmt.kind == 11 || stmt.kind == 12 {
+            record_write_jump(flow, stmt.data, stmt.kind == 12, state);
+            return WRITE_UNREACHABLE;
+        }
+        if stmt.kind == 17 {
+            let target: u32 = pool.assigns[stmt.data].target;
+            if write_fill_target(pool, refs, checked, target) == flow.def {
+                if report && (state == WRITE_FILLED || state == WRITE_MIXED) { diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(6102), severity: 0, span: pool.exprs[target].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?; }
+                state = WRITE_FILLED;
+            }
+        } elseif stmt.kind == 14 {
+            let cond: &ast::IfStmt:Read = &pool.ifs[stmt.data]:Read;
+            var merged: u8 = WRITE_UNREACHABLE;
+            var rest: u8 = state;
+            var branch: u32 = 0;
+            while rest != WRITE_UNREACHABLE && branch < @len(cond.branches) as u32 {
+                if !charge(budget) { return WRITE_UNREACHABLE; }
+                let test: ast::Expr = pool.exprs[cond.branches[branch].condition];
+                if test.kind != 3 || test.data != 0 {
+                    let tail: u8 = check_write_block(pool, refs, checked, flow, budget, diags, cond.branches[branch].body, rest, report)?;
+                    if budget.exhausted { return WRITE_UNREACHABLE; }
+                    merged = merge_write(merged, tail);
+                }
+                if test.kind == 3 && test.data == 1 { rest = WRITE_UNREACHABLE; }
+                branch = branch + 1;
+            }
+            let other: u8 = check_write_block(pool, refs, checked, flow, budget, diags, cond.else_body, rest, report)?;
+            if budget.exhausted { return WRITE_UNREACHABLE; }
+            state = merge_write(merged, other);
+        } elseif stmt.kind == 16 {
+            let arms: &ast::MatchStmt:Read = &pool.matches[stmt.data]:Read;
+            var merged: u8 = WRITE_UNREACHABLE;
+            var arm: u32 = 0;
+            while arm < @len(arms.arms) as u32 {
+                let tail: u8 = check_write_block(pool, refs, checked, flow, budget, diags, arms.arms[arm].body, state, report)?;
+                if budget.exhausted { return WRITE_UNREACHABLE; }
+                merged = merge_write(merged, tail);
+                arm = arm + 1;
+            }
+            state = merged;
+        } elseif stmt.kind == 15 {
+            let loop_info: ast::WhileStmt = pool.whiles[stmt.data];
+            let test: ast::Expr = pool.exprs[loop_info.condition];
+            if test.kind != 3 || test.data != 0 {
+                state = check_write_loop(pool, refs, checked, flow, budget, diags, loop_info, state, report)?;
+                if budget.exhausted { return WRITE_UNREACHABLE; }
+            }
+        }
+        i = i + 1;
+    }
+    return state;
+}
+
+function check_write_loop(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, flow: &WriteFlow:ReadWrite, budget: &WriteBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, loop_info: ast::WhileStmt, incoming: u8, report: bool): u8!AllocError {
+    let depth: u32 = flow.depth;
+    let empty: WriteLoop = WriteLoop { label: loop_info.label, back: WRITE_UNREACHABLE, exit_state: WRITE_UNREACHABLE };
+    if depth as u64 == @len(flow.loops) { @push(flow.loops, empty)?; }
+    flow.depth = depth + 1;
+    var head: u8 = incoming;
+    // 先闭合回边；不动点前不报错，避免同一语句随迭代次数重复报错。
+    while true {
+        flow.loops[depth] = empty;
+        let tail: u8 = check_write_block(pool, refs, checked, flow, budget, diags, loop_info.body, head, false)?;
+        if budget.exhausted { flow.depth = depth; return WRITE_UNREACHABLE; }
+        let back: u8 = merge_write(flow.loops[depth].back, tail);
+        let next: u8 = merge_write(incoming, back);
+        if head == next { break; }
+        head = next;
+    }
+    if report {
+        flow.loops[depth] = empty;
+        check_write_block(pool, refs, checked, flow, budget, diags, loop_info.body, head, true)?;
+        if budget.exhausted { flow.depth = depth; return WRITE_UNREACHABLE; }
+    }
+    let exit_state: u8 = flow.loops[depth].exit_state;
+    flow.depth = depth;
+    let test: ast::Expr = pool.exprs[loop_info.condition];
+    if test.kind == 3 && test.data == 1 { return exit_state; }
+    return merge_write(head, exit_state);
+}
+
+// 每个 Write 形参独立计算可达状态，保持源码诊断顺序。
+export function check_parameter(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite, budget: &WriteBudget:ReadWrite, block: u32, def: u32): void!AllocError {
+    if !is_write_channel(checked, def) { return; }
+    var flow: WriteFlow = WriteFlow { def: def, loops: [], depth: 0 };
+    check_write_block(pool, refs, checked, &flow:ReadWrite, budget, diags, block, WRITE_EMPTY, true)?;
+    return;
+}
+
+const JUMP_SLOT_EMPTY: u8 = 0;
+
+// 记录切片借用的循环跳转状态。
+export function record_slice_jump(borrows: &owner_state::BorrowState:ReadWrite, tables: &resolve::ResolveTables:Read, label: u32, back: bool, budget: &owner_state::SliceScopeBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite): void!AllocError {
+    var depth: u32 = borrows.depth;
+    while depth > 0 {
+        if !owner_state::visit_slice_jump(work) { return; }
+        depth = depth - 1;
+        let frame: owner_state::SliceLoop = borrows.loops[depth];
+        if label == 0 || label == 4294967295u32 || label == frame.label {
+            var i: u64 = 0;
+            while i < @len(borrows.slices.items) {
+                if !owner_state::charge_slice_steps(budget, 1u64) { return; }
+                let loan: owner_state::SliceLoan = borrows.slices.items[i];
+                if owner_state::slice_scope_encloses(tables, tables.defs[loan.binding - 1].scope, frame.scope, budget) {
+                    if !owner_state::visit_slice_jump(work) { return; }
+                    let jump: owner_state::SliceJump = owner_state::SliceJump { depth: depth, back: back, loan: loan };
+                    let count: u64 = borrows.jump_count;
+                    if count == @len(borrows.jumps) { @push(borrows.jumps, jump)?; }
+                    else { borrows.jumps[count] = jump; }
+                    borrows.jump_count = count + 1;
+                }
+                if budget.exhausted { return; }
+                i = i + 1;
+            }
+            return;
+        }
+    }
+    return;
+}
+
+// 当前循环消费自己的跳转；跨层标签跳转留给外层。
+export function collect_slice_jumps(borrows: &owner_state::BorrowState:ReadWrite, head: &owner_state::SliceState:ReadWrite, exits: &owner_state::SliceState:ReadWrite, start: u64, depth: u32, budget: &owner_state::SliceMergeBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite): bool!AllocError {
+    var changed: bool = false;
+    var i: u64 = start;
+    var next: u64 = start;
+    while i < borrows.jump_count {
+        if !owner_state::visit_slice_jump(work) { return false; }
+        let jump: owner_state::SliceJump = borrows.jumps[i];
+        if jump.depth != depth { borrows.jumps[next] = jump; next = next + 1; }
+        elseif jump.back {
+            if (owner_state::include_slice_join(head, jump.loan, budget)?) { changed = true; }
+        } else { owner_state::include_slice_join(exits, jump.loan, budget)?; }
+        if budget.exhausted { return false; }
+        i = i + 1;
+    }
+    borrows.jump_count = next;
+    return changed;
+}
+
+function push_slot_jump(borrows: &owner_state::BorrowState:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, jump: owner_state::SlotJump): void!AllocError {
+    if !owner_state::visit_slot_jump(work) { return; }
+    let count: u64 = borrows.slot_jump_count;
+    if count == @len(borrows.slot_jumps) { @push(borrows.slot_jumps, jump)?; }
+    else { borrows.slot_jumps[count] = jump; }
+    borrows.slot_jump_count = count + 1;
+    return;
+}
+
+// 只转交目标循环仍可见的槽位；循环体内声明的槽位不会跨迭代。
+export function record_slot_jump(borrows: &owner_state::BorrowState:ReadWrite, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:Read, label: u32, back: bool, span: types::Span, work: &owner_state::OwnerWorkBudget:ReadWrite): void!AllocError {
+    if !borrows.slot_live { return; }
+    var depth: u32 = borrows.depth;
+    while depth > 0 {
+        if !owner_state::visit_slot_jump(work) { return; }
+        depth = depth - 1;
+        let frame: owner_state::SliceLoop = borrows.loops[depth];
+        if label == 0 || label == 4294967295u32 || label == frame.label {
+            var i: u32 = 0;
+            while i < @len(places.items) as u32 {
+                if !owner_state::visit_slot_jump(work) { return; }
+                let place: owner_state::PlaceState = places.items[i];
+                if place.is_out && owner_state::slot_jump_scope_encloses(tables, tables.defs[place.def - 1].scope, frame.scope, work) {
+                    push_slot_jump(borrows, work, owner_state::SlotJump { depth: depth, back: back, def: place.def, slot: place.slot, span: span })?;
+                }
+                if work.slot_jump_exhausted { return; }
+                i = i + 1;
+            }
+            push_slot_jump(borrows, work, owner_state::SlotJump { depth: depth, back: back, def: 0, slot: JUMP_SLOT_EMPTY, span: span })?;
+            return;
+        }
+    }
+    return;
+}
+
+// 回边与条件求值前的入口比较；跳出边与条件为假的出口比较。
+export function collect_slot_jumps(borrows: &owner_state::BorrowState:ReadWrite, entry: &owner_state::PlaceTable:Read, exits: &owner_state::PlaceTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, start: u64, depth: u32, has_exit: bool): bool!AllocError {
+    var seen_exit: bool = has_exit;
+    var i: u64 = start;
+    var next: u64 = start;
+    while i < borrows.slot_jump_count {
+        if !owner_state::visit_slot_jump(work) { return false; }
+        let jump: owner_state::SlotJump = borrows.slot_jumps[i];
+        if jump.depth != depth { borrows.slot_jumps[next] = jump; next = next + 1; }
+        elseif jump.def == 0 { if !jump.back { seen_exit = true; } }
+        elseif jump.back {
+            let slot: u8 = owner_state::place_slot(entry, work, jump.def);
+            if work.lookup_exhausted { return false; }
+            if slot != jump.slot { owner_state::emit(diags, types::error_code(6103), jump.span)?; }
+        } else {
+            let index: u32 = owner_state::place_index(exits, work, jump.def);
+            if work.lookup_exhausted { return false; }
+            if index != 0 { owner_state::join_slot(exits, index - 1, jump.slot, seen_exit, diags, jump.span)?; }
+        }
+        i = i + 1;
+    }
+    borrows.slot_jump_count = next;
+    return seen_exit;
+}
+
+// 按作用域边界逆序收集待析构的 owning 局部；strict 为真时只收严格内层（break/continue 越过循环体边界）。
+export function live_drop_defs_scoped(checked: &typecheck::TypeCheckResult:Read, copy_order: u8, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:Read, start: u32, boundary: u32, strict: bool): u32[]!AllocError {
+    var defs: u32[] = [];
+    var i: u32 = @len(places.items) as u32;
+    while i > start {
+        i = i - 1;
+        let place: owner_state::PlaceState = places.items[i];
+        // 条件所有者同样随作用域出口按条件析构（owner.md 6.1）。
+        if place.def <= @len(tables.defs) as u32 && owner_state::needs_exit_drop(checked, copy_order, place) {
+            let def_scope: u32 = tables.defs[place.def - 1].scope;
+            if (!strict || def_scope != boundary) && owner_state::scope_encloses(tables, boundary, def_scope) {
+                @push(defs, place.def)?;
+            }
+        }
+    }
+    return defs;
+}
+
+export function record_jump_drop(returns: &owner_state::ReturnDropTable:ReadWrite, checked: &typecheck::TypeCheckResult:Read, copy_order: u8, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:Read, borrows: &owner_state::BorrowState:Read, label: u32, stmt_id: u32, is_continue: bool): void!AllocError {
+    if !returns.enabled { return; }
+    var depth: u32 = borrows.depth;
+    while depth > 0 {
+        depth = depth - 1;
+        let frame: owner_state::SliceLoop = borrows.loops[depth];
+        if label == 0 || label == 4294967295u32 || label == frame.label {
+            var defs: u32[] = live_drop_defs_scoped(checked, copy_order, tables, places, returns.locals_start, frame.scope, true)?;
+            if @len(defs) != 0 {
+                var edge: u32 = 2;
+                if is_continue { edge = 3; }
+                @push(returns.scopes, owner_state::ScopeDropPlan { edge: edge, site: stmt_id, defs: @move(defs) })?;
+            }
+            return;
+        }
+    }
+    return;
+}

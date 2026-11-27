@@ -1,0 +1,39 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // RCX、R12 均能换作不需要位移的基址；扩展位随寄存器交换。
+    let canonical: [u8; 13] = [0x48, 0x8d, 0x04, 0x29, 0x4b, 0x8d, 0x04, 0x2c,
+        0x66, 0x42, 0x8d, 0x04, 0x29];
+    encoding(&canonical[0..13]:Read, 0)?;
+    // 保留内存访问、真实缩放和双 BP 类的规范方向；非零位移用非 BP 基址。
+    let controls: [u8; 25] = [0x48, 0x8b, 0x44, 0x0d, 0, 0x48, 0x8d, 0x44, 0x29, 1,
+        0x48, 0x8d, 0x45, 1, 0x48, 0x8d, 0x44, 0x4d, 0, 0x4a, 0x8d, 0x44, 0x2d, 0, 0x90];
+    encoding(&controls[0..25]:Read, 0)?;
+    let long_forms: [u8; 16] = [0x48, 0x8d, 0x44, 0x0d, 0, 0x4b, 0x8d, 0x44, 0x25, 0,
+        0x66, 0x41, 0x8d, 0x44, 0x0d, 0];
+    encoding(&long_forms[0..4]:Read, 7101)?;
+    encoding(&long_forms[0..5]:Read, 7103)?;
+    encoding(&long_forms[5..10]:Read, 7103)?;
+    encoding(&long_forms[10..16]:Read, 7103)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = verify();
+    @drop(result);
+    assert(false);
+    return;
+}

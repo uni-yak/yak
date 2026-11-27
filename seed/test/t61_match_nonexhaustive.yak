@@ -1,0 +1,16 @@
+// t61: match 非穷尽（应 trap）
+// expected_trap: match non-exhaustive
+foreign write(data: &[u8]): void;
+
+enum Opt {
+    Some,
+    None,
+}
+
+function main(): void {
+    let o: Opt = Opt::Some;
+    match o {
+        None => { write("none\n"); },
+    }
+    return;
+}

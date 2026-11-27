@@ -1,0 +1,17 @@
+// t107: 多成员 .catch handler 表 —— 部分覆盖：未命中成员穿透（S-9.2）
+// expected_trap: uncaught error propagation
+foreign assert(cond: bool): void;
+enum E1 { Bad1, }
+enum E2 { Bad2, }
+function load(x: u32): u32!(E1 | E2) {
+    if x == 0 { return E1::Bad1; }
+    if x == 1 { return E2::Bad2; }
+    return x;
+}
+function recover_e1(e: &E1): u32 { return 100; }
+
+function main(): void {
+    let n: u32 = load(1).catch(E1 => &recover_e1)?;
+    assert(false);
+    return;
+}

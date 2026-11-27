@@ -1,0 +1,10 @@
+// t70: 移位运算assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(1 << 8 == 256);
+    assert(1024 >> 3 == 128);
+    assert(0xFF << 4 == 0xFF0);
+    assert(0xFF >> 4 == 0x0F);
+    return;
+}

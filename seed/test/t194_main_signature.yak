@@ -1,0 +1,2 @@
+// expected_trap: main must have signature
+function main(value: u32): void {}

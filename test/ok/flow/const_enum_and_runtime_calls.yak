@@ -1,0 +1,14 @@
+// expected_exit: 0
+// spec: spec/lang/const.md 2.3、4.1
+// 枚举载荷仍可常量折叠；普通运行期函数仍可调用。
+foreign assert(cond: bool): void;
+enum Result { Empty, Value(u32) }
+const BASE: u32 = 40u32;
+const VALUE: Result = Result::Value(BASE + 1u32);
+function next(value: u32): u32 { return value + 1u32; }
+function main(): void {
+    match VALUE {
+        Empty => { assert(false); },
+        Value(payload) => { assert(next(payload) == 42u32); }
+    }
+}

@@ -1,0 +1,6 @@
+// expected_code: E5803
+// spec: spec/lang/type/enum.md EN-1
+// 触发：同一枚举声明含两个同名标签。
+enum Duplicate { Entry, Entry }
+
+function main(): void { return; }

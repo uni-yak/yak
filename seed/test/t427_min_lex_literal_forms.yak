@@ -1,0 +1,129 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+import lex;
+import types;
+foreign assert(condition: bool): void;
+
+function bytes_match(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u64 = 0;
+    while i < @len(a) { if a[i] != b[i] { return false; } i = i + 1; }
+    return true;
+}
+
+function static_matches(result: &lex::LexResult:Read, id: u32, expected: &[u8]): bool {
+    if (id as u64) >= @len(result.statics) { return false; }
+    let entry: lex::StaticEntry = result.statics[id];
+    return bytes_match(&result.static_bytes[entry.offset..entry.offset + entry.length]:Read, expected);
+}
+
+function check_assetless(result: &lex::LexResult:Read, offset: u32, length: u32): void {
+    assert(@len(result.statics) == 0 && @len(result.static_bytes) == 0);
+    assert(@len(result.templates) == 0 && @len(result.template_pieces) == 0);
+    assert(result.diagnostics[0].span.file == 42 && result.diagnostics[0].span.offset == offset && result.diagnostics[0].span.length == length);
+}
+
+function rejects(source: &[u8], code: u16, offset: u32, length: u32): void!AllocError {
+    let result: lex::LexResult = lex::lex_scan_literals(source, 42)?;
+    assert(@len(result.tokens) == 0 && @len(result.diagnostics) == 1 && result.diagnostics[0].code.raw == code);
+    check_assetless(&result:Read, offset, length);
+    return;
+}
+
+function exact_rejections(): void!AllocError {
+    let byte: lex::LexResult = lex::lex_scan_literals("b''\n", 42)?;
+    // rejection_spec: E1012 spec/lang/lex.md#L-12
+    assert(@len(byte.tokens) == 0 && @len(byte.diagnostics) == 1 && byte.diagnostics[0].code.raw == 1012);
+    check_assetless(&byte:Read, 0, 3);
+    rejects("b'ab'\n", 1012, 0, 4)?;
+    rejects("b'中'\n", 1012, 2, 3)?;
+    rejects("b'\\u{41}'\n", 1012, 2, 2)?;
+
+    let raw: lex::LexResult = lex::lex_scan_literals("r##\"open\"#\n", 42)?;
+    // rejection_spec: E1013 spec/lang/lex.md#L-13
+    assert(@len(raw.tokens) == 0 && @len(raw.diagnostics) == 1 && raw.diagnostics[0].code.raw == 1013);
+    check_assetless(&raw:Read, 0, 4);
+    rejects("r#\"open\"##\n", 1013, 0, 3)?;
+    rejects("r\"open\n", 1013, 0, 2)?;
+
+    let template: lex::LexResult = lex::lex_scan_literals("`hello {value} more\n", 42)?;
+    // rejection_spec: E1014 spec/lang/lex.md#L-14
+    assert(@len(template.tokens) == 0 && @len(template.diagnostics) == 1 && template.diagnostics[0].code.raw == 1014);
+    check_assetless(&template:Read, 0, 1);
+
+    let hole: lex::LexResult = lex::lex_scan_literals("`x{a`\n", 42)?;
+    // rejection_spec: E1015 spec/lang/lex.md#L-15
+    assert(@len(hole.tokens) == 0 && @len(hole.diagnostics) == 1 && hole.diagnostics[0].code.raw == 1015);
+    check_assetless(&hole:Read, 2, 1);
+    rejects("`x{call(\"}\") /* } */\n", 1015, 2, 1)?;
+    rejects("`a\\n`\n", 1006, 2, 1)?;
+    rejects("`a}`\n", 1016, 2, 1)?;
+    rejects("b'\\xF'\n", 1006, 2, 1)?;
+    rejects("b\"one\ntwo\"\n", 1005, 5, 1)?;
+    return;
+}
+
+function byte_and_raw_values(): void!AllocError {
+    let input: &[u8] = "b'A' b'\\xFF' b'\\n' b'\\'' b\"A\\x80\\u{80}\\0\" r\"\\n\" r#\"x\"###y\"# r###\"a\r\nb\"###\r\n";
+    let result: lex::LexResult = lex::lex_scan_literals(input, 21)?;
+    assert(@len(result.diagnostics) == 0 && @len(result.tokens) == 9 && @len(result.statics) == 4);
+    let values: [u64; 4] = [65, 255, 10, 39];
+    var j: u32 = 0;
+    while j < 4 {
+        assert(result.tokens[j].kind == 11 && result.tokens[j].payload == values[j] && result.tokens[j].integer_suffix == 0);
+        j = j + 1;
+    }
+    let binary: [u8; 5] = [65, 128, 194, 128, 0];
+    assert(result.tokens[4].kind == 12 && static_matches(&result:Read, 0, &binary[0..5]:Read));
+    assert(result.tokens[5].kind == 13 && static_matches(&result:Read, 1, "\\n"));
+    assert(result.tokens[6].kind == 13 && static_matches(&result:Read, 2, "x\"###y"));
+    assert(result.tokens[7].kind == 13 && static_matches(&result:Read, 3, "a\nb"));
+    assert(result.tokens[8].kind == 9 && result.tokens[8].span.offset as u64 == @len(input));
+    let prefix: lex::LexResult = lex::lex_scan_literals("r #tag b \"ordinary\" r \"ordinary\"\n", 21)?;
+    assert(@len(prefix.diagnostics) == 0 && @len(prefix.tokens) == 7);
+    assert(prefix.tokens[0].kind == 0 && prefix.tokens[1].kind == 1 && prefix.tokens[2].kind == 0 && prefix.tokens[3].kind == 5);
+    assert(prefix.tokens[4].kind == 0 && prefix.tokens[5].kind == 5);
+    return;
+}
+
+function template_pieces(): void!AllocError {
+    let source: &[u8] = "`head {{x}} \\` \\\\{call(\"}\", r#\"}`\"#, `a{one}` /* } /* ` */ { */)}\r\ntail`\n";
+    let result: lex::LexResult = lex::lex_scan_literals(source, 23)?;
+    assert(@len(result.diagnostics) == 0 && result.tokens[0].kind == 14 && result.tokens[1].kind == 9);
+    assert(@len(result.templates) == 1 && result.templates[0].first == 0 && result.templates[0].count == 3);
+    assert(@len(result.template_pieces) == 3 && @len(result.statics) == 2);
+    assert(!result.template_pieces[0].expression && static_matches(&result:Read, 0, "head {x} ` \\"));
+    assert(!result.template_pieces[2].expression && static_matches(&result:Read, 1, "\ntail"));
+    let hole: lex::TemplatePiece = result.template_pieces[1];
+    assert(hole.expression && hole.span.file == 23);
+    let end: u32 = hole.span.offset + hole.span.length;
+    assert(bytes_match(&source[hole.span.offset..end]:Read, "call(\"}\", r#\"}`\"#, `a{one}` /* } /* ` */ { */)"));
+    let fragment: lex::LexResult = lex::lex_scan_literal_fragment(source, 23, hole.span.offset, end)?;
+    assert(@len(fragment.diagnostics) == 0 && @len(fragment.tokens) == 9);
+    assert(fragment.tokens[0].span.offset == hole.span.offset && fragment.tokens[0].span.file == 23);
+    assert(fragment.tokens[2].kind == 5 && fragment.tokens[4].kind == 13 && fragment.tokens[6].kind == 14);
+    assert(fragment.tokens[8].kind == 9 && fragment.tokens[8].span.offset == end);
+    let inner: types::Span = fragment.template_pieces[1].span;
+    assert(bytes_match(&source[inner.offset..inner.offset + inner.length]:Read, "one"));
+    let leaf: lex::LexResult = lex::lex_scan_literal_fragment(source, 23, inner.offset, inner.offset + inner.length)?;
+    assert(@len(leaf.tokens) == 2 && leaf.tokens[0].span.offset == inner.offset && lex::lookup_name(&leaf.names:Read, "one") == 1);
+
+    let nested_source: &[u8] = "`{node { x: '}', y: 1 } // }\r\n + 2}`\n";
+    let nested_braces: lex::LexResult = lex::lex_scan_literals(nested_source, 23)?;
+    assert(@len(nested_braces.diagnostics) == 0 && nested_braces.templates[0].count == 1);
+    let nested: types::Span = nested_braces.template_pieces[0].span;
+    assert(nested.offset == 2 && bytes_match(&nested_source[nested.offset..nested.offset + nested.length]:Read,
+        "node { x: '}', y: 1 } // }\r\n + 2"));
+    return;
+}
+
+function main(): void {
+    exact_rejections()?;
+    byte_and_raw_values()?;
+    template_pieces()?;
+    return;
+}

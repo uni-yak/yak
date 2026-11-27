@@ -1,0 +1,7 @@
+// expected_trap: must @move to extract owning out value
+function fill(out value: u32[]): void { value = [1]; }
+function main(): void {
+    out value: u32[];
+    fill(out value);
+    let count: u64 = value.len;
+}

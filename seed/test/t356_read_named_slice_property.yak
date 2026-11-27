@@ -1,0 +1,7 @@
+// expected_trap: eval: suspended or stale reference (OW-2)
+function inspect(value: &u32, size: &u64): void {}
+function main(): void {
+    var data: u32[] = [1u32];
+    let view: &[u32]:ReadWrite = &data[0u32..1u32]:ReadWrite;
+    inspect(view[0u32], view.len);
+}

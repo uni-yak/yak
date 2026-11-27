@@ -1,0 +1,351 @@
+// 语句与块内所有权控制流：保存分支、循环及跳转的同一套状态和配额。
+import ast;
+import types;
+import diag;
+import typecheck;
+import resolve;
+import resolve_refs;
+import owner_write;
+import owner_flow;
+import owner_expr;
+import owner_state;
+import owner_stmt;
+
+// place 状态：0=live，1=moved，4=unset（合流占位）。
+const PLACE_LIVE: u8 = 0;
+const PLACE_MOVED: u8 = 1;
+// 合流占位：尚未收到任何有效前驱的状态。首个前驱直接继承自身状态（含已 dropped），
+// 避免把入口已消费的值重新当成 live（owner.md 6.1）。
+const PLACE_UNSET: u8 = 4;
+
+// out 槽位状态：0=empty，1=lent，2=full，3=consumed。
+const SLOT_EMPTY: u8 = 0;
+
+// 文档内所有函数和嵌套块共享控制流配额；首次进入循环不计入回放。
+export struct ControlBudget { document: bool, replay_limited: bool, replay_remaining: u32, replay_exhausted: bool, slices: owner_state::SliceMergeBudget, slice_copies: owner_state::SliceCopyBudget, slice_scopes: owner_state::SliceScopeBudget, slice_assignments: owner_state::SliceScopeBudget }
+
+// 语句级检查：局部声明、赋值、return、控制流与表达式语句。
+function check_stmt_ownership(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, history: &owner_state::BorrowTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, returns: &owner_state::ReturnDropTable:ReadWrite, flow: &owner_flow::FlowFacts:Read, control: &ControlBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, stmt_id: u32, scope: u32): void!AllocError {
+    let stmt: ast::Stmt = pool.stmts[stmt_id];
+    if stmt.kind == 1 {
+        owner_stmt::check_local_decl(pool, refs, checked, tables, places, borrows, history, diags, returns, &control.slice_assignments:ReadWrite, work, stmt.data, scope)?;
+        return;
+    }
+    if stmt.kind == 17 {
+        owner_stmt::check_assign_stmt(pool, refs, checked, tables, places, borrows, history, diags, returns, &control.slice_assignments:ReadWrite, work, stmt.data, stmt.span, scope)?;
+        return;
+    }
+    if stmt.kind == 10 {
+        // 非 Copy 绑定转移给返回值，Copy 值保持可用。
+        if stmt.data != 4294967295u32 {
+            owner_expr::check_value_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, stmt.data, scope)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        }
+        // 返回值求值后，已转移的绑定不再由当前函数析构。
+        owner_state::record_exit_drop(returns, checked, borrows.copy_order, places, stmt_id, false)?;
+        borrows.slot_live = false;
+        return;
+    }
+    if stmt.kind == 11 || stmt.kind == 12 {
+        owner_write::record_jump_drop(returns, checked, borrows.copy_order, tables, places, borrows, stmt.data, stmt_id, stmt.kind == 12)?;
+        owner_write::record_slice_jump(borrows, tables, stmt.data, stmt.kind == 12, &control.slice_scopes:ReadWrite, work)?;
+        if control.slice_scopes.exhausted || work.slice_jump_exhausted { return; }
+        owner_write::record_slot_jump(borrows, tables, places, stmt.data, stmt.kind == 12, stmt.span, work)?;
+        if work.slot_jump_exhausted { return; }
+        borrows.slot_live = false;
+        return;
+    }
+    if stmt.kind == 14 {
+        let if_id: u32 = stmt.data;
+        let incoming_slices: owner_state::SliceState = owner_state::copy_slices(&borrows.slices:Read, &control.slice_copies:ReadWrite)?;
+        if control.slice_copies.exhausted { return; }
+        var merged_slices: owner_state::SliceState = owner_state::SliceState { items: [] };
+        var remaining: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        var merged: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        if !owner_state::charge_place_merge(work, @len(merged.items)) { return; }
+        var m: u32 = 0;
+        // 合流先置占位，由首个落尾前驱决定状态；仅真正参与合流的分支参与（owner.md 6.1）。
+        while m < @len(merged.items) as u32 { merged.items[m].state = PLACE_UNSET; m = m + 1; }
+        var slot_first: bool = false;
+        var slot_remaining: bool = borrows.slot_live;
+        var branch: u32 = 0;
+        while branch < @len(pool.ifs[if_id].branches) as u32 {
+            borrows.slices = owner_state::copy_slices(&incoming_slices:Read, &control.slice_copies:ReadWrite)?;
+            if control.slice_copies.exhausted { return; }
+            borrows.active = 0;
+            borrows.read_active = 0;
+            borrows.scalar_active = 0;
+            borrows.slot_live = slot_remaining;
+            let condition: u32 = pool.ifs[if_id].branches[branch].condition;
+            owner_expr::check_expr_ownership(pool, refs, checked, tables, &remaining:ReadWrite, borrows, history, diags, returns, work, condition, scope)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            let test: ast::Expr = pool.exprs[condition];
+            if test.kind == 3 && test.data == 0 { borrows.slot_live = false; }
+            if test.kind == 3 && test.data == 1 { slot_remaining = false; }
+            var path: owner_state::PlaceTable = owner_state::copy_places(&remaining:Read, work)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            let body: u32 = pool.ifs[if_id].branches[branch].body;
+            check_block_ownership(pool, refs, checked, tables, &path:ReadWrite, borrows, history, diags, returns, flow, control, work, body, scope)?;
+            if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+            if !owner_flow::returns_in(pool, flow, body) { owner_state::merge_place_states(&merged:ReadWrite, &path:Read, work); }
+            if owner_state::owner_work_stopped(work) { return; }
+            if borrows.slot_live {
+                owner_state::merge_slots(&merged:ReadWrite, &path:Read, diags, work, slot_first, pool.ifs[if_id].span)?;
+                if owner_state::owner_work_stopped(work) { return; }
+                slot_first = true;
+            }
+            if owner_flow::falls_in(pool, flow, body) { owner_state::merge_slices(&merged_slices:ReadWrite, &borrows.slices:Read, &control.slices:ReadWrite)?; }
+            if control.slices.exhausted { return; }
+            branch = branch + 1;
+        }
+        let else_body: u32 = pool.ifs[if_id].else_body;
+        borrows.slices = owner_state::copy_slices(&incoming_slices:Read, &control.slice_copies:ReadWrite)?;
+        if control.slice_copies.exhausted { return; }
+        borrows.slot_live = slot_remaining;
+        if else_body < @len(pool.blocks) as u32 { check_block_ownership(pool, refs, checked, tables, &remaining:ReadWrite, borrows, history, diags, returns, flow, control, work, else_body, scope)?; }
+        if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+        if else_body >= @len(pool.blocks) as u32 || !owner_flow::returns_in(pool, flow, else_body) { owner_state::merge_place_states(&merged:ReadWrite, &remaining:Read, work); }
+        if owner_state::owner_work_stopped(work) { return; }
+        if borrows.slot_live {
+            owner_state::merge_slots(&merged:ReadWrite, &remaining:Read, diags, work, slot_first, pool.ifs[if_id].span)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            slot_first = true;
+        }
+        borrows.slot_live = slot_first;
+        if owner_flow::falls_in(pool, flow, else_body) { owner_state::merge_slices(&merged_slices:ReadWrite, &borrows.slices:Read, &control.slices:ReadWrite)?; }
+        if control.slices.exhausted { return; }
+        borrows.slices = @move(merged_slices);
+        if !owner_state::charge_place_merge(work, @len(places.items)) { return; }
+        var i: u32 = 0;
+        while i < @len(places.items) as u32 {
+            // 所有前驱都离开函数时合流结果保持入口状态，不得写入占位值。
+            if merged.items[i].state != PLACE_UNSET { places.items[i].state = merged.items[i].state; }
+            places.items[i].slot = merged.items[i].slot;
+            i = i + 1;
+        }
+        return;
+    }
+    if stmt.kind == 15 {
+        let while_id: u32 = stmt.data;
+        let slot_entry: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        let slot_incoming: bool = borrows.slot_live;
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, pool.whiles[while_id].condition, scope)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        let condition: ast::Expr = pool.exprs[pool.whiles[while_id].condition];
+        if condition.kind == 3 && condition.data == 0 {
+            // 不可达体仍需验证操作数，但其状态和借用不能影响可达路径。
+            var dead_places: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            var dead_borrows: owner_state::BorrowState = owner_state::new_borrows(borrows.copy_order);
+            var dead_history: owner_state::BorrowTable = owner_state::BorrowTable { items: [] };
+            var dead_diags: diag::DiagBuffer = diag::diagbuf_limited(diags.limit);
+            dead_borrows.slot_live = false;
+            var dead_returns: owner_state::ReturnDropTable = owner_state::ReturnDropTable { items: [], scopes: [], locals_start: 0, enabled: false };
+            check_block_ownership(pool, refs, checked, tables, &dead_places:ReadWrite, &dead_borrows:ReadWrite, &dead_history:ReadWrite, &dead_diags:ReadWrite, &dead_returns:ReadWrite, flow, control, work, pool.whiles[while_id].body, scope)?;
+            if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+            owner_state::emit_static_diags(diags, &dead_diags:Read)?;
+            return;
+        }
+        // 条件可能立即为假，循环体的状态不能覆盖零次迭代路径。
+        var body: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        let before: u64 = diag::diagbuf_events(diags);
+        let body_id: u32 = pool.whiles[while_id].body;
+        let depth: u32 = borrows.depth;
+        let frame: owner_state::SliceLoop = owner_state::SliceLoop { scope: scope, label: pool.whiles[while_id].label };
+        if depth as u64 == @len(borrows.loops) { @push(borrows.loops, frame)?; }
+        else { borrows.loops[depth] = frame; }
+        borrows.depth = depth + 1;
+        let start: u64 = borrows.jump_count;
+        let slot_start: u64 = borrows.slot_jump_count;
+        var slot_exits: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        var head: owner_state::SliceState = owner_state::copy_slices(&borrows.slices:Read, &control.slice_copies:ReadWrite)?;
+        if control.slice_copies.exhausted { return; }
+        var exits: owner_state::SliceState = owner_state::SliceState { items: [] };
+        let forever: bool = condition.kind == 3 && condition.data == 1;
+        let falls: bool = owner_flow::falls_in(pool, flow, body_id);
+        check_block_ownership(pool, refs, checked, tables, &body:ReadWrite, borrows, history, diags, returns, flow, control, work, body_id, scope)?;
+        if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+        if borrows.slot_live {
+            var slot_back: owner_state::PlaceTable = owner_state::copy_places(&slot_entry:Read, work)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            owner_state::merge_slots(&slot_back:ReadWrite, &body:Read, diags, work, true, pool.whiles[while_id].span)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        }
+        let has_slot_exit: bool = owner_write::collect_slot_jumps(borrows, &slot_entry:Read, &slot_exits:ReadWrite, diags, work, slot_start, depth, slot_incoming && !forever)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        var changed: bool = owner_write::collect_slice_jumps(borrows, &head:ReadWrite, &exits:ReadWrite, start, depth, &control.slices:ReadWrite, work)?;
+        if control.slices.exhausted || work.slice_jump_exhausted { return; }
+        if falls && (owner_state::merge_slices(&head:ReadWrite, &borrows.slices:Read, &control.slices:ReadWrite)?) { changed = true; }
+        if control.slices.exhausted { return; }
+        // 回边只添加新事实；有限的绑定和宿主对保证达到不动点。
+        var prefix: u8 = 0;
+        if forever { prefix = owner_flow::loop_prefix(pool, body_id, frame.label); }
+        var place_recheck: bool = prefix == 1u8;
+        while (changed || place_recheck) && diag::diagbuf_events(diags) == before {
+            if control.replay_limited {
+                if control.replay_remaining == 0u32 { control.replay_exhausted = true; return; }
+                control.replay_remaining = control.replay_remaining - 1u32;
+            }
+            let next_start: u64 = borrows.jump_count;
+            borrows.slices = owner_state::copy_slices(&head:Read, &control.slice_copies:ReadWrite)?;
+            if control.slice_copies.exhausted { return; }
+            borrows.active = 0;
+            borrows.read_active = 0;
+            borrows.scalar_active = 0;
+            var next_history: owner_state::BorrowTable = owner_state::BorrowTable { items: [] };
+            var next_places: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            if place_recheck { next_places = owner_state::copy_places(&body:Read, work)?; }
+            if owner_state::owner_work_stopped(work) { return; }
+            // 重扫沿用原入口槽位；本次记录的跳转已在首轮处理，不向外重复交付。
+            if !owner_state::charge_place_merge(work, @len(slot_entry.items)) { return; }
+            var s: u32 = 0;
+            while s < @len(slot_entry.items) as u32 {
+                if slot_entry.items[s].is_out { owner_state::join_slot(&next_places:ReadWrite, s, slot_entry.items[s].slot, false, diags, pool.whiles[while_id].span)?; }
+                s = s + 1;
+            }
+            let slot_keep: u64 = borrows.slot_jump_count;
+            borrows.slot_live = slot_incoming;
+            // 借用重扫不重复发布已经记录的退出点。
+            var replay_returns: owner_state::ReturnDropTable = owner_state::ReturnDropTable { items: [], scopes: [], locals_start: 0, enabled: false };
+            owner_expr::check_expr_ownership(pool, refs, checked, tables, &next_places:ReadWrite, borrows, &next_history:ReadWrite, diags, &replay_returns:ReadWrite, work, pool.whiles[while_id].condition, scope)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            check_block_ownership(pool, refs, checked, tables, &next_places:ReadWrite, borrows, &next_history:ReadWrite, diags, &replay_returns:ReadWrite, flow, control, work, body_id, scope)?;
+            if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+            borrows.slot_jump_count = slot_keep;
+            changed = owner_write::collect_slice_jumps(borrows, &head:ReadWrite, &exits:ReadWrite, next_start, depth, &control.slices:ReadWrite, work)?;
+            if control.slices.exhausted || work.slice_jump_exhausted { return; }
+            if falls && (owner_state::merge_slices(&head:ReadWrite, &borrows.slices:Read, &control.slices:ReadWrite)?) { changed = true; }
+            if control.slices.exhausted { return; }
+            if place_recheck { body = @move(next_places); place_recheck = false; }
+        }
+        if !forever { owner_state::merge_slices(&exits:ReadWrite, &head:Read, &control.slices:ReadWrite)?; }
+        if control.slices.exhausted { return; }
+        borrows.slices = @move(exits);
+        borrows.depth = depth;
+        if prefix == 2u8 {
+            // 入口必定经过此 break，不存在零次迭代的出口。
+            if !owner_state::charge_place_merge(work, @len(places.items)) { return; }
+            var i: u32 = 0;
+            while i < @len(places.items) as u32 {
+                if !places.items[i].is_out { places.items[i].state = body.items[i].state; }
+                i = i + 1;
+            }
+        } elseif !owner_flow::returns_in(pool, flow, body_id) {
+            owner_state::merge_place_states(places, &body:Read, work);
+            if owner_state::owner_work_stopped(work) { return; }
+        }
+        if has_slot_exit {
+            owner_state::merge_slots(places, &slot_exits:Read, diags, work, false, pool.whiles[while_id].span)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        }
+        borrows.slot_live = has_slot_exit;
+        return;
+    }
+    if stmt.kind == 16 {
+        let match_id: u32 = stmt.data;
+        let value: u32 = pool.matches[match_id].scrutinee;
+        let root: u32 = owner_state::indexed_place_root(pool, refs, work, value);
+        let kind: u8 = pool.exprs[value].kind;
+        if owner_state::is_owning_projection(pool, checked, borrows.copy_order, value) {
+            owner_state::emit(diags, types::error_code(6205), pool.exprs[value].span)?;
+            return;
+        }
+        // 非 Copy 枚举在选择臂之前整体转移，Copy 值与临时表达式仍按普通读取处理。
+        if (kind == 0 || kind == 25) && root != 0 && owner_state::expr_is_owning(checked, borrows.copy_order, value) {
+            owner_state::consume_place(places, borrows, diags, work, root, PLACE_MOVED, pool.exprs[value].span)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        } else {
+            owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, value, scope)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        }
+        let incoming_slices: owner_state::SliceState = owner_state::copy_slices(&borrows.slices:Read, &control.slice_copies:ReadWrite)?;
+        if control.slice_copies.exhausted { return; }
+        var merged_slices: owner_state::SliceState = owner_state::SliceState { items: [] };
+        var merged: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        if !owner_state::charge_place_merge(work, @len(merged.items)) { return; }
+        var i: u32 = 0;
+        // 与 if 相同：占位后由首个落尾臂决定状态，未参与合流的臂不得共享结果（owner.md 6.1）。
+        while i < @len(merged.items) as u32 { merged.items[i].state = PLACE_UNSET; i = i + 1; }
+        let slot_incoming: bool = borrows.slot_live;
+        var slot_first: bool = false;
+        var arm: u32 = 0;
+        while arm < @len(pool.matches[match_id].arms) as u32 {
+            borrows.slices = owner_state::copy_slices(&incoming_slices:Read, &control.slice_copies:ReadWrite)?;
+            if control.slice_copies.exhausted { return; }
+            borrows.slot_live = slot_incoming;
+            var path: owner_state::PlaceTable = owner_state::copy_places(places, work)?;
+            if owner_state::owner_work_stopped(work) { return; }
+            let body: u32 = pool.matches[match_id].arms[arm].body;
+            let pattern: u32 = pool.matches[match_id].arms[arm].pattern;
+            if pattern < @len(pool.patterns) as u32 && pool.patterns[pattern].binding != 0 && body < @len(tables.block_scope) as u32 {
+                let name: u32 = pool.patterns[pattern].binding;
+                let span: types::Span = pool.patterns[pattern].span;
+                var def: u32 = 0u32;
+                if control.document { def = resolve::match_arm_entry_def(tables, body, scope, name, span.offset); }
+                else { def = resolve::lookup_binding(tables, tables.block_scope[body], name); }
+                if def != 0 { owner_state::set_place(&path:ReadWrite, work, def, PLACE_LIVE, SLOT_EMPTY, false, span)?; }
+                if work.lookup_exhausted { return; }
+            }
+            check_block_ownership(pool, refs, checked, tables, &path:ReadWrite, borrows, history, diags, returns, flow, control, work, body, scope)?;
+            if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+            if !owner_flow::returns_in(pool, flow, body) { owner_state::merge_place_states(&merged:ReadWrite, &path:Read, work); }
+            if owner_state::owner_work_stopped(work) { return; }
+            if borrows.slot_live {
+                owner_state::merge_slots(&merged:ReadWrite, &path:Read, diags, work, slot_first, pool.matches[match_id].span)?;
+                if owner_state::owner_work_stopped(work) { return; }
+                slot_first = true;
+            }
+            if owner_flow::falls_in(pool, flow, body) { owner_state::merge_slices(&merged_slices:ReadWrite, &borrows.slices:Read, &control.slices:ReadWrite)?; }
+            if control.slices.exhausted { return; }
+            arm = arm + 1;
+        }
+        borrows.slices = @move(merged_slices);
+        borrows.slot_live = slot_first;
+        if !owner_state::charge_place_merge(work, @len(places.items)) { return; }
+        i = 0;
+        while i < @len(places.items) as u32 {
+            // 全部臂都返回时保持入口状态；占位值不得外泄。
+            if merged.items[i].state != PLACE_UNSET { places.items[i].state = merged.items[i].state; }
+            places.items[i].slot = merged.items[i].slot;
+            i = i + 1;
+        }
+        return;
+    }
+    if stmt.kind == 18 {
+        owner_stmt::check_drop_stmt(pool, refs, checked, tables, places, borrows, history, diags, returns, work, stmt.data, stmt.span, scope)?;
+        return;
+    }
+    if stmt.kind == 13 {
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, stmt.data, scope)?;
+        return;
+    }
+    return;
+}
+
+// 块级检查：按声明顺序遍历语句。
+export function check_block_ownership(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, history: &owner_state::BorrowTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, returns: &owner_state::ReturnDropTable:ReadWrite, flow: &owner_flow::FlowFacts:Read, control: &ControlBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, block: u32, scope: u32): void!AllocError {
+    if block >= @len(pool.blocks) as u32 { return; }
+    var block_scope: u32 = scope;
+    if block < @len(tables.block_scope) as u32 && tables.block_scope[block] != 0 { block_scope = tables.block_scope[block]; }
+    var fell_through: bool = true;
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        let stmt_id: u32 = pool.blocks[block].stmts[i];
+        borrows.active = 0;
+        borrows.read_active = 0;
+        borrows.scalar_active = 0;
+        check_stmt_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, flow, control, work, stmt_id, block_scope)?;
+        if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+        if !owner_flow::stmt_falls_in(pool, flow, stmt_id) { fell_through = false; break; }
+        i = i + 1;
+    }
+    owner_stmt::finish_block_scope(checked, tables, places, borrows, returns, &control.slice_scopes:ReadWrite, work, block, block_scope, fell_through)?;
+    return;
+}

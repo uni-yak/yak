@@ -1,0 +1,5 @@
+// expected_code: E5006
+// spec: spec/lang/const.md C-1
+// 触发：动态数组不能作为 base 常量类型。
+const Values: i32[] = [1];
+function main(): void { return; }

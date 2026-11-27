@@ -1,0 +1,50 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // R12 基址形式保留必要的 SIB，检查正负 disp32 与不同目的宽度。
+    let canonical: [u8; 25] = [0x49, 0x8d, 0x84, 0x24, 0x80, 0, 0, 0,
+        0x45, 0x8d, 0x84, 0x24, 0x7f, 0xff, 0xff, 0xff,
+        0x66, 0x41, 0x8d, 0x84, 0x24, 0x80, 0, 0, 0];
+    encoding(&canonical[0..25]:Read, 0)?;
+    // R12 数据段访存也使用基址形态；绝对地址和真实缩放仍保留。
+    let controls: [u8; 24] = [0x4a, 0x8b, 0x04, 0x25, 0x80, 0, 0, 0,
+        0x48, 0x8d, 0x04, 0x25, 0x80, 0, 0, 0, 0x4a, 0x8d, 0x04, 0xa5, 0x80, 0, 0, 0];
+    encoding(&controls[0..8]:Read, 7102)?;
+    encoding(&controls[8..24]:Read, 0)?;
+    // 缺少位移、可缩短位移和等长别名分别报告不同的诊断。
+    let forms: [u8; 49] = [0x4a, 0x8d, 0x04, 0x25, 0x7f, 0, 0, 0,
+        0x4a, 0x8d, 0x04, 0x25, 0x80, 0xff, 0xff, 0xff,
+        0x4a, 0x8d, 0x04, 0x25, 0x80, 0, 0, 0,
+        0x46, 0x8d, 0x04, 0x25, 0x7f, 0xff, 0xff, 0xff,
+        0x66, 0x42, 0x8d, 0x04, 0x25, 0x80, 0, 0, 0,
+        0x4b, 0x8d, 0x04, 0x25, 0x80, 0, 0, 0];
+    encoding(&forms[16..23]:Read, 7101)?;
+    encoding(&forms[0..8]:Read, 7103)?;
+    encoding(&forms[8..16]:Read, 7103)?;
+    encoding(&forms[16..24]:Read, 7102)?;
+    encoding(&forms[24..32]:Read, 7102)?;
+    encoding(&forms[32..41]:Read, 7102)?;
+    // 无基址形式忽略 REX.B；取 64 位结果和 R12 索引仍需 W 与 X。
+    encoding(&forms[41..49]:Read, 7102)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

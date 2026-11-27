@@ -1,0 +1,137 @@
+// base 期脱糖边界：当前 profile 的 AST 已处于 base 形态，因此本阶段是恒等映射；
+// 但仍扫描池，拒绝任何残留的 full-only 形态，避免内部不一致流入 MIR。
+import types;
+import ast;
+import diag;
+import lextables;
+
+// 3001=SU-1（出现未启用的糖），3002=SU-2（脱糖后仍含非 base 形态）。
+function emit(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+function verify_nodes(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite, nullable: bool, union: bool, text: bool): bool!AllocError {
+    var i: u32 = 0;
+    while i < @len(pool.types) as u32 {
+        let kind: u8 = pool.types[i].kind;
+        // base 只允许 1..7；8=Nullable<T> 属 full-only 内部形态。
+        if kind == 0 || (kind > 7 && !(nullable && kind == 8) && !(union && kind == 9) && !(text && (kind == 10 || kind == 11))) { emit(diags, 3002, pool.types[i].span)?; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(pool.exprs) as u32 {
+        let expr: ast::Expr = pool.exprs[i];
+        let kind: u8 = expr.kind;
+        // 0..5 字面量/名字，13/20..30 base 节点，255 为 parser 错误占位。
+        let base: bool = kind <= 5 || kind == 13 || (kind >= 20 && kind <= 30) || kind == 255 || (nullable && kind == 31) || (union && kind == 32);
+        if !base { emit(diags, 3001, expr.span)?; }
+        // 纯语法糖只提交 AST；原语节点必须引用词法合同中现有的 base 编号。
+        elseif kind == 29 && (expr.data > 65535u64 || !lextables::builtin_is_base(expr.data as u16)) { emit(diags, 3003, expr.span)?; }
+        elseif !nullable && kind == 20 && expr.data < @len(pool.binaries) && pool.binaries[expr.data].op == 36 { emit(diags, 3001, expr.span)?; }
+        elseif !nullable && kind == 23 && expr.data < @len(pool.members) && pool.members[expr.data].optional { emit(diags, 3001, expr.span)?; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(pool.stmts) as u32 {
+        let kind: u8 = pool.stmts[i].kind;
+        // 局部声明为 1，其余 base 语句为 10 至 18；恢复时跳过的语句不进入池。
+        if kind != 1 && (kind < 10 || kind > 18) { emit(diags, 3001, pool.stmts[i].span)?; }
+        i = i + 1;
+    }
+    var item: u32 = 0;
+    while item < @len(file.items) as u32 {
+        let kind: u8 = file.items[item].kind;
+        if kind > 5 { emit(diags, 3001, file.items[item].span)?; }
+        item = item + 1;
+    }
+    return !diag::diagbuf_has_error(diags);
+}
+
+export function verify_base(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    return verify_nodes(file, pool, diags, false, false, false)?;
+}
+
+// 可空节点保留到类型检查；仍对其他未登记的形态执行同一结构校验。
+export function verify_nullable_frontend(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    return verify_nodes(file, pool, diags, pool.option_syntax, false, false)?;
+}
+
+export function verify_union_frontend(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    return verify_nodes(file, pool, diags, pool.option_syntax, pool.union_syntax, false)?;
+}
+
+export function verify_text_frontend(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    return verify_nodes(file, pool, diags, false, false, pool.text_syntax)?;
+}
+
+// 边由名称解析提供。两个端点都是当前模块内顶层绑定的顺序编号。
+export struct InitializerDependency { binding: u32, requires: u32, span: types::Span }
+export struct InitializerPlan { ok: bool, order: u32[] }
+
+// 按声明和引用的源码顺序遍历。先完成依赖再登记绑定，不向调用方交付部分顺序。
+export function plan_initializers(bindings: u32, dependencies: &[InitializerDependency], diags: &diag::DiagBuffer:ReadWrite): InitializerPlan!AllocError {
+    let no_edge: u64 = @len(dependencies);
+    var i: u64 = 0;
+    while i < no_edge {
+        let dep: InitializerDependency = dependencies[i];
+        if dep.binding >= bindings || dep.requires >= bindings {
+            emit(diags, 4002, dep.span)?;
+            return InitializerPlan { ok: false, order: [] };
+        }
+        i = i + 1;
+    }
+    var cursor: u64[] = [];
+    var state: u8[] = [];
+    var next: u64[] = [];
+    var stack: u32[] = [];
+    var order: u32[] = [];
+    var binding: u32 = 0;
+    while binding < bindings {
+        @push(cursor, no_edge)?;
+        @push(state, 0u8)?;
+        binding = binding + 1;
+    }
+    i = 0;
+    while i < no_edge { @push(next, no_edge)?; i = i + 1; }
+    // 反向构建邻接链，正向遍历时保留同一绑定内的引用顺序。
+    while i != 0 {
+        i = i - 1;
+        let dep: InitializerDependency = dependencies[i];
+        next[i] = cursor[dep.binding];
+        cursor[dep.binding] = i;
+    }
+    binding = 0;
+    while binding < bindings {
+        if state[binding] == 0u8 {
+            var depth: u32 = 1;
+            if @len(stack) == 0 { @push(stack, binding)?; }
+            else { stack[0] = binding; }
+            state[binding] = 1u8;
+            while depth != 0 {
+                let current: u32 = stack[depth - 1];
+                let edge: u64 = cursor[current];
+                if edge == no_edge {
+                    state[current] = 2u8;
+                    @push(order, current)?;
+                    depth = depth - 1;
+                } else {
+                    cursor[current] = next[edge];
+                    let target: u32 = dependencies[edge].requires;
+                    if state[target] == 1u8 {
+                        // 回边落在当前路径上，直接定位造成循环的引用。
+                        emit(diags, 3006, dependencies[edge].span)?;
+                        return InitializerPlan { ok: false, order: [] };
+                    }
+                    if state[target] == 0u8 {
+                        state[target] = 1u8;
+                        if (depth as u64) == @len(stack) { @push(stack, target)?; }
+                        else { stack[depth] = target; }
+                        depth = depth + 1;
+                    }
+                }
+            }
+        }
+        binding = binding + 1;
+    }
+    return InitializerPlan { ok: true, order: @move(order) };
+}

@@ -1,0 +1,26 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+enum Failure { Bad }
+function index(ok: bool, count: &u32:ReadWrite): u32!Failure {
+    *count = *count + 1u32;
+    if !ok { return Failure::Bad; }
+    return 0u32;
+}
+function read(data: &Item[]:ReadWrite, ok: bool, count: &u32:ReadWrite): u32!Failure {
+    return (&(*data)[0u32..1u32]:ReadWrite)[0u32].data[index(ok, count)?];
+}
+function recover(e: &Failure): u32 { return 99u32; }
+function main(): void {
+    var items: Item[] = [Item { data: [1u32] }];
+    let parent: &Item[]:ReadWrite = &items:ReadWrite;
+    var count: u32 = 0u32;
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(read(&*parent:ReadWrite, false, &count:ReadWrite).catch(&recover) == 99u32);
+        (*parent)[0u32].data[0u32] = i;
+        assert(read(&*parent:ReadWrite, true, &count:ReadWrite).catch(&recover) == i);
+        i = i + 1u32;
+    }
+    assert(count == 1000u32);
+}

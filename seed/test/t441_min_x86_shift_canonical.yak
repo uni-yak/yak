@@ -1,0 +1,81 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    let bytes: [u8; 46] = [
+        0xd0, 0xe0, 0xd1, 0xe8, 0x48, 0xd1, 0xf8, 0xc0, 0xe0, 0x09, 0x66, 0xc1,
+        0xe8, 0x11, 0x48, 0xc1, 0xf8, 0x21, 0x48, 0xc1, 0xe0, 0x3f, 0xc1, 0xe0,
+        0x00, 0xd3, 0xe0, 0xc0, 0xe0, 0x21, 0x66, 0xc1, 0xe8, 0xe1, 0x48, 0xc1,
+        0xf8, 0x41, 0x41, 0xc1, 0x20, 0x01, 0x48, 0xc0, 0xe0, 0x21];
+    let masked: [u8; 28] = [
+        0xc1, 0xe0, 0x20, 0xc0, 0xe8, 0xff, 0x48, 0xc1, 0xf8, 0x40, 0x41, 0xc1,
+        0x28, 0x22, 0x48, 0xc1, 0xf8, 0xff, 0x48, 0xc0, 0xe0, 0x22, 0x48, 0xc1,
+        0xe0, 0xc1, 0xd0, 0x21];
+    // 合法隐含移位、不同操作数宽度及 CL 形态。
+    encoding(&bytes[0..22]:Read, 0)?;
+    encoding(&bytes[22..25]:Read, 7103)?;
+    encoding(&bytes[25..27]:Read, 0)?;
+    // 有效计数为一时，非隐含形态可缩短。
+    encoding(&bytes[27..30]:Read, 7103)?;
+    encoding(&bytes[30..34]:Read, 7103)?;
+    encoding(&bytes[34..38]:Read, 7103)?;
+    encoding(&bytes[38..42]:Read, 7103)?;
+    encoding(&bytes[42..46]:Read, 7103)?;
+    // 有效零计数的寄存器移位可缩短；其余被屏蔽位是等长别名。
+    encoding(&masked[0..3]:Read, 7103)?;
+    encoding(&masked[3..6]:Read, 7102)?;
+    encoding(&masked[6..10]:Read, 7103)?;
+    encoding(&masked[10..14]:Read, 7102)?;
+    encoding(&masked[14..18]:Read, 7102)?;
+    // 字节宽度不使用 REX.W；冗余前缀优先于移位量别名。
+    encoding(&masked[18..22]:Read, 7103)?;
+    // 截断、无效组不能被别名诊断掩盖。
+    encoding(&masked[22..25]:Read, 7101)?;
+    encoding(&masked[25..28]:Read, 7101)?;
+
+    // 窄寄存器和 64 位移位等价于 NOP，32 位移位保留零扩展；内存仍访问原地址。
+    let zero: [u8; 25] = [0xc0, 0xec, 0x20, 0x66, 0xc1, 0xe8, 0xe0, 0x41, 0xc1, 0xe0, 0x20,
+        0x90, 0x45, 0x89, 0xc0, 0xc1, 0x20, 0, 0x66, 0xc1, 0x28, 0x20, 0x48, 0xc1, 0x38];
+    encoding(&zero[0..3]:Read, 7103)?;
+    encoding(&zero[3..7]:Read, 7103)?;
+    encoding(&zero[7..11]:Read, 7103)?;
+    encoding(&zero[7..10]:Read, 7101)?;
+    encoding(&zero[11..18]:Read, 0)?;
+    encoding(&zero[18..22]:Read, 7102)?;
+    encoding(&zero[22..25]:Read, 7101)?;
+    // 64 位保留低六位，16 位保留低五位；计数 1 使用隐含形态。
+    let production_cases: [u8; 31] = [0x48, 0xc1, 0xf8, 0x02, 0x48, 0xc1, 0xf8, 0x42,
+        0x48, 0xd1, 0xf8, 0x48, 0xc1, 0xf8, 0x41, 0x48, 0xc1, 0xf8, 0x21,
+        0x66, 0xc1, 0xe8, 0x02, 0x66, 0xc1, 0xe8, 0xe2, 0x66, 0xc1, 0xe8, 0x1f];
+    encoding(&production_cases[0..4]:Read, 0)?;
+    encoding(&production_cases[4..8]:Read, 7102)?;
+    encoding(&production_cases[4..7]:Read, 7101)?;
+    encoding(&production_cases[8..11]:Read, 0)?;
+    encoding(&production_cases[11..15]:Read, 7103)?;
+    encoding(&production_cases[11..14]:Read, 7101)?;
+    encoding(&production_cases[15..19]:Read, 0)?;
+    encoding(&production_cases[19..23]:Read, 0)?;
+    encoding(&production_cases[23..27]:Read, 7102)?;
+    encoding(&production_cases[23..26]:Read, 7101)?;
+    encoding(&production_cases[27..31]:Read, 0)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

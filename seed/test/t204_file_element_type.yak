@@ -1,0 +1,5 @@
+// input: src=fixtures/input.txt
+// expected_trap: reference referent type mismatch
+foreign file_read(name: &[u8], offset: u64, buffer: &[u8]:ReadWrite): u32;
+function f(value: &u32): void {}
+function main(): void { var bytes: u8[] = [0]; file_read("src", 0, &bytes[0..1]:ReadWrite); f(&bytes[0]); }

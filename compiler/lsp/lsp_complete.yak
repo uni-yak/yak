@@ -1,0 +1,390 @@
+// P1 补全扩展：支持 `.` 结构体字段成员补全、`::` 枚举变体与模块导出补全、以及跨文件工作区候选。
+// 同时兼容完整分析快照与输入 `.` / `::` 时的临时语法不完整缓冲。
+import positions;
+import types;
+import workspace_index;
+
+const MAX_EXT_ITEMS: u32 = 32;
+
+export struct ExtItem {
+    label: u8[],
+    kind: u8,
+}
+
+// status：0 未命中扩展补全（回退普通补全），2 命中成员/限定补全（替代普通补全）。
+export struct ExtCompletion {
+    status: u8,
+    incomplete: bool,
+    range: positions::Range,
+    items: ExtItem[],
+}
+
+function empty_range(): positions::Range {
+    let zero: positions::Position = positions::Position { line: 0, character: 0 };
+    return positions::Range { start: zero, end: zero };
+}
+
+function none_ext(): ExtCompletion {
+    return ExtCompletion { status: 0, incomplete: false, range: empty_range(), items: [] };
+}
+
+function ident_start(b: u8): bool {
+    return b == 95u8 || (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+function ident_cont(b: u8): bool {
+    return ident_start(b) || (b >= 48u8 && b <= 57u8);
+}
+
+function bytes_equal(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function starts_with(label: &[u8], prefix: &[u8]): bool {
+    if @len(prefix) > @len(label) { return false; }
+    var i: u32 = 0;
+    while i < @len(prefix) as u32 {
+        if label[i] != prefix[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function lexical_before(a: &[u8], b: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(a) as u32 && i < @len(b) as u32 {
+        if a[i] != b[i] { return a[i] < b[i]; }
+        i = i + 1u32;
+    }
+    return @len(a) < @len(b);
+}
+
+function copy_slice(src: &[u8]): u8[]!AllocError {
+    var dst: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(dst, src[i])?; i = i + 1u32; }
+    return @move(dst);
+}
+
+function insert_item(result: &ExtCompletion:ReadWrite, label: &[u8], kind: u8): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(result.items) as u32 {
+        if bytes_equal(&result.items[i].label[0..@len(result.items[i].label)]:Read, label) { return; }
+        i = i + 1u32;
+    }
+    let count: u32 = @len(result.items) as u32;
+    var lo: u32 = 0;
+    while lo < count && lexical_before(&result.items[lo].label[0..@len(result.items[lo].label)]:Read, label) {
+        lo = lo + 1u32;
+    }
+    if count >= MAX_EXT_ITEMS {
+        result.incomplete = true;
+        if lo == count { return; }
+    }
+    var rebuilt: ExtItem[] = [];
+    i = 0u32;
+    while i < lo {
+        let cur: &ExtItem:Read = &result.items[i]:Read;
+        @push(rebuilt, ExtItem { label: copy_slice(&cur.label[0..@len(cur.label)]:Read)?, kind: cur.kind })?;
+        i = i + 1u32;
+    }
+    @push(rebuilt, ExtItem { label: copy_slice(label)?, kind: kind })?;
+    var limit: u32 = count;
+    if limit >= MAX_EXT_ITEMS { limit = MAX_EXT_ITEMS - 1u32; }
+    while i < limit {
+        let cur: &ExtItem:Read = &result.items[i]:Read;
+        @push(rebuilt, ExtItem { label: copy_slice(&cur.label[0..@len(cur.label)]:Read)?, kind: cur.kind })?;
+        i = i + 1u32;
+    }
+    result.items = @move(rebuilt);
+    return;
+}
+
+function skip_trivia(src: &[u8], pos: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    var p: u32 = pos;
+    while p < n {
+        let b: u8 = src[p];
+        if b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 { p = p + 1u32; }
+        elseif b == 47u8 && p + 1u32 < n && src[p + 1u32] == 47u8 {
+            p = p + 2u32;
+            while p < n && src[p] != 10u8 { p = p + 1u32; }
+        } else { break; }
+    }
+    return p;
+}
+
+function word_end(src: &[u8], pos: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    var p: u32 = pos;
+    if p >= n || !ident_start(src[p]) { return pos; }
+    p = p + 1u32;
+    while p < n && ident_cont(src[p]) { p = p + 1u32; }
+    return p;
+}
+
+// 扫描当前文本中的绑定声明 `var/let/参数 name: [&]TypeName`，供临时语法不完整时恢复接收者类型。
+function scan_binding_type(text: &[u8], recv_name: &[u8], before: u32): u8[]!AllocError {
+    var found: u8[] = [];
+    var p: u32 = 0;
+    let limit: u32 = before;
+    while p < limit {
+        if ident_start(text[p]) {
+            let we: u32 = word_end(text, p);
+            if we <= limit && bytes_equal(&text[p..we]:Read, recv_name) {
+                var q: u32 = skip_trivia(text, we);
+                if q < limit && text[q] == 58u8 && (q + 1u32 >= limit || text[q + 1u32] != 58u8) {
+                    q = skip_trivia(text, q + 1u32);
+                    if q < limit && text[q] == 38u8 { q = skip_trivia(text, q + 1u32); }
+                    let ts: u32 = q;
+                    let te: u32 = word_end(text, ts);
+                    if te > ts {
+                        // 跳过基本内建类型，仅保留名义类型名。
+                        let cand: &[u8] = &text[ts..te]:Read;
+                        if !bytes_equal(cand, "u8") && !bytes_equal(cand, "u16") && !bytes_equal(cand, "u32") && !bytes_equal(cand, "u64") && !bytes_equal(cand, "i8") && !bytes_equal(cand, "i16") && !bytes_equal(cand, "i32") && !bytes_equal(cand, "i64") && !bytes_equal(cand, "bool") && !bytes_equal(cand, "char") {
+                            found = copy_slice(cand)?;
+                        }
+                    }
+                }
+            }
+            p = we;
+        } else {
+            p = p + 1u32;
+        }
+    }
+    return @move(found);
+}
+
+// 扫描当前文本中的 `struct TypeName { field: ... }` 字段或 `enum TypeName { Variant, ... }` 变体。
+function scan_local_members(text: &[u8], type_name: &[u8], is_enum: bool, prefix: &[u8], result: &ExtCompletion:ReadWrite): void!AllocError {
+    let n: u32 = @len(text) as u32;
+    var p: u32 = 0;
+    while p < n {
+        p = skip_trivia(text, p);
+        if p >= n { break; }
+        if ident_start(text[p]) {
+            let we: u32 = word_end(text, p);
+            let is_kw: bool = (is_enum && bytes_equal(&text[p..we]:Read, "enum")) || (!is_enum && bytes_equal(&text[p..we]:Read, "struct"));
+            if is_kw {
+                let ns: u32 = skip_trivia(text, we);
+                let ne: u32 = word_end(text, ns);
+                if ne > ns && bytes_equal(&text[ns..ne]:Read, type_name) {
+                    var q: u32 = skip_trivia(text, ne);
+                    if q < n && text[q] == 123u8 {
+                        q = q + 1u32;
+                        var paren: u32 = 0;
+                        var bracket: u32 = 0;
+                        var expect_member: bool = true;
+                        while q < n && text[q] != 125u8 {
+                            q = skip_trivia(text, q);
+                            if q >= n || text[q] == 125u8 { break; }
+                            let b: u8 = text[q];
+                            if b == 40u8 { paren = paren + 1u32; q = q + 1u32; continue; }
+                            if b == 41u8 { if paren > 0u32 { paren = paren - 1u32; } q = q + 1u32; continue; }
+                            if b == 91u8 { bracket = bracket + 1u32; q = q + 1u32; continue; }
+                            if b == 93u8 { if bracket > 0u32 { bracket = bracket - 1u32; } q = q + 1u32; continue; }
+                            if b == 44u8 && paren == 0u32 && bracket == 0u32 {
+                                expect_member = true;
+                                q = q + 1u32;
+                                continue;
+                            }
+                            if expect_member && paren == 0u32 && bracket == 0u32 && ident_start(b) {
+                                let ms: u32 = q;
+                                let me: u32 = word_end(text, ms);
+                                if me > ms {
+                                    let mname: &[u8] = &text[ms..me]:Read;
+                                    if is_enum {
+                                        if starts_with(mname, prefix) { insert_item(result, mname, 20u8)?; }
+                                        expect_member = false;
+                                    } else {
+                                        let after: u32 = skip_trivia(text, me);
+                                        if after < n && text[after] == 58u8 {
+                                            if starts_with(mname, prefix) { insert_item(result, mname, 5u8)?; }
+                                            expect_member = false;
+                                        }
+                                    }
+                                    q = me;
+                                    continue;
+                                }
+                            }
+                            q = q + 1u32;
+                        }
+                        return;
+                    }
+                }
+            }
+            p = we;
+        } else {
+            p = p + 1u32;
+        }
+    }
+    return;
+}
+
+// 尝试执行 `.`（字段成员）或 `::`（枚举变体/工作区模块导出）补全。
+export function member_completion(
+    text: &[u8],
+    index: &positions::Index:Read,
+    defs: &types::DocumentDefinitions:Read,
+    ws: &workspace_index::Index:Read,
+    file: u16,
+    at: u32
+): ExtCompletion!AllocError {
+    let n: u32 = @len(text) as u32;
+    if at > n { return none_ext(); }
+    // 提取光标处已输入的成员前缀。
+    var ps: u32 = at;
+    while ps > 0u32 && ident_cont(text[ps - 1u32]) { ps = ps - 1u32; }
+    var pe: u32 = at;
+    while pe < n && ident_cont(text[pe]) { pe = pe + 1u32; }
+    var p: u32 = ps;
+    while p > 0u32 && (text[p - 1u32] == 32u8 || text[p - 1u32] == 9u8) { p = p - 1u32; }
+    var mode: u8 = 0;
+    if p >= 2u32 && text[p - 1u32] == 58u8 && text[p - 2u32] == 58u8 {
+        mode = 2u8;
+        p = p - 2u32;
+    } elseif p >= 1u32 && text[p - 1u32] == 46u8 && (p < 2u32 || text[p - 2u32] != 46u8) {
+        mode = 1u8;
+        p = p - 1u32;
+    } else {
+        return none_ext();
+    }
+    while p > 0u32 && (text[p - 1u32] == 32u8 || text[p - 1u32] == 9u8) { p = p - 1u32; }
+    let recv_end: u32 = p;
+    var recv_start: u32 = recv_end;
+    while recv_start > 0u32 {
+        let b: u8 = text[recv_start - 1u32];
+        if ident_cont(b) || (mode == 2u8 && b == 58u8) { recv_start = recv_start - 1u32; }
+        else { break; }
+    }
+    if recv_start >= recv_end { return none_ext(); }
+
+    let mapped: positions::RangeResult = positions::span_range(index, text, file, file, ps, pe - ps);
+    if !mapped.valid { return none_ext(); }
+    let prefix: &[u8] = &text[ps..at]:Read;
+    let recv: &[u8] = &text[recv_start..recv_end]:Read;
+    var result: ExtCompletion = ExtCompletion { status: 2, incomplete: false, range: mapped.range, items: [] };
+
+    if mode == 1u8 {
+        // `.` 结构体字段成员补全：先查精确类型绑定表，若当前缓冲语法不完整则回退声明扫描。
+        var type_name: u8[] = [];
+        var i: u32 = 0;
+        while i < @len(defs.binding_types) as u32 {
+            let bt: types::BindingTypeEntry = defs.binding_types[i];
+            if bt.start <= at && at < bt.end &&
+                (bt.name_offset as u64) + (bt.name_length as u64) <= @len(text) &&
+                (bt.type_offset as u64) + (bt.type_length as u64) <= @len(text) &&
+                bytes_equal(&text[bt.name_offset..bt.name_offset + bt.name_length]:Read, recv) {
+                type_name = copy_slice(&text[bt.type_offset..bt.type_offset + bt.type_length]:Read)?;
+            }
+            i = i + 1u32;
+        }
+        if @len(type_name) == 0u64 {
+            type_name = scan_binding_type(text, recv, recv_start)?;
+        }
+        if @len(type_name) > 0u64 {
+            let tn: &[u8] = &type_name[0..@len(type_name)]:Read;
+            var hit_indexed: bool = false;
+            i = 0u32;
+            while i < @len(defs.member_entries) as u32 {
+                let m: types::MemberEntry = defs.member_entries[i];
+                if m.kind == 5u8 &&
+                    (m.owner_offset as u64) + (m.owner_length as u64) <= @len(text) &&
+                    (m.member_offset as u64) + (m.member_length as u64) <= @len(text) &&
+                    bytes_equal(&text[m.owner_offset..m.owner_offset + m.owner_length]:Read, tn) {
+                    hit_indexed = true;
+                    let mname: &[u8] = &text[m.member_offset..m.member_offset + m.member_length]:Read;
+                    if starts_with(mname, prefix) { insert_item(&result:ReadWrite, mname, 5u8)?; }
+                }
+                i = i + 1u32;
+            }
+            if !hit_indexed {
+                scan_local_members(text, tn, false, prefix, &result:ReadWrite)?;
+            }
+        }
+    } else {
+        // `::` 补全：支持本地枚举变体，以及工作区模块导出函数/结构体/枚举。
+        var hit_enum: bool = false;
+        var i: u32 = 0;
+        while i < @len(defs.member_entries) as u32 {
+            let m: types::MemberEntry = defs.member_entries[i];
+            if m.kind == 20u8 &&
+                (m.owner_offset as u64) + (m.owner_length as u64) <= @len(text) &&
+                (m.member_offset as u64) + (m.member_length as u64) <= @len(text) &&
+                bytes_equal(&text[m.owner_offset..m.owner_offset + m.owner_length]:Read, recv) {
+                hit_enum = true;
+                let mname: &[u8] = &text[m.member_offset..m.member_offset + m.member_length]:Read;
+                if starts_with(mname, prefix) { insert_item(&result:ReadWrite, mname, 20u8)?; }
+            }
+            i = i + 1u32;
+        }
+        if !hit_enum {
+            scan_local_members(text, recv, true, prefix, &result:ReadWrite)?;
+        }
+        let ws_slot: u32 = workspace_index::find_file_by_module(ws, recv);
+        if ws_slot < @len(ws.files) as u32 {
+            let f: &workspace_index::WorkspaceFile:Read = &ws.files[ws_slot]:Read;
+            let fsrc: &[u8] = &f.source[0..@len(f.source)]:Read;
+            i = 0u32;
+            while i < @len(f.symbols) as u32 {
+                let sym: workspace_index::ExportSymbol = f.symbols[i];
+                if sym.exported && (sym.name_start as u64) + (sym.name_len as u64) <= @len(fsrc) {
+                    let sname: &[u8] = &fsrc[sym.name_start..sym.name_start + sym.name_len]:Read;
+                    if starts_with(sname, prefix) {
+                        var ckind: u8 = 3u8;
+                        if sym.kind == 10u8 { ckind = 13u8; }
+                        elseif sym.kind == 23u8 { ckind = 22u8; }
+                        elseif sym.kind == 14u8 { ckind = 21u8; }
+                        insert_item(&result:ReadWrite, sname, ckind)?;
+                    }
+                }
+                i = i + 1u32;
+            }
+        }
+    }
+    return @move(result);
+}
+
+// 收集工作区跨文件模块名与导出符号候选，供普通补全合并。
+export function collect_workspace_candidates(
+    ws: &workspace_index::Index:Read,
+    current_uri: &[u8],
+    prefix: &[u8]
+): ExtItem[]!AllocError {
+    var dst: ExtItem[] = [];
+    if @len(prefix) == 0u64 { return @move(dst); }
+    var i: u32 = 0;
+    while i < @len(ws.files) as u32 && @len(dst) < 16u64 {
+        let f: &workspace_index::WorkspaceFile:Read = &ws.files[i]:Read;
+        if f.active && @len(f.module) > 0u64 && !bytes_equal(&f.uri[0..@len(f.uri)]:Read, current_uri) {
+            let mod_name: &[u8] = &f.module[0..@len(f.module)]:Read;
+            if starts_with(mod_name, prefix) {
+                @push(dst, ExtItem { label: copy_slice(mod_name)?, kind: 9u8 })?;
+            }
+            let fsrc: &[u8] = &f.source[0..@len(f.source)]:Read;
+            var j: u32 = 0;
+            while j < @len(f.symbols) as u32 && @len(dst) < 16u64 {
+                let sym: workspace_index::ExportSymbol = f.symbols[j];
+                if sym.exported && (sym.name_start as u64) + (sym.name_len as u64) <= @len(fsrc) {
+                    let sname: &[u8] = &fsrc[sym.name_start..sym.name_start + sym.name_len]:Read;
+                    if starts_with(sname, prefix) {
+                        var ckind: u8 = 3u8;
+                        if sym.kind == 10u8 { ckind = 13u8; }
+                        elseif sym.kind == 23u8 { ckind = 22u8; }
+                        elseif sym.kind == 14u8 { ckind = 21u8; }
+                        @push(dst, ExtItem { label: copy_slice(sname)?, kind: ckind })?;
+                    }
+                }
+                j = j + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+    return @move(dst);
+}

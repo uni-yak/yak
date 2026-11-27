@@ -1,0 +1,87 @@
+// 受限点火宿主封装。契约：spec/proc/host.md。
+foreign args_count(): u32;
+foreign args_len(index: u32): u32;
+foreign args_read(index: u32, buffer: &[u8]:ReadWrite): u32;
+foreign file_size(name: &[u8]): u64;
+foreign file_read(name: &[u8], offset: u64, buffer: &[u8]:ReadWrite): u32;
+foreign file_write(name: &[u8], data: &[u8]): void;
+foreign write(data: &[u8]): void;
+foreign assert(cond: bool): void;
+
+export function arg_count(): u32 {
+    return args_count();
+}
+
+export function arg_bytes(index: u32): u8[]!AllocError {
+    let size: u32 = args_len(index);
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i + 8 <= size {
+        @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?;
+        @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?;
+        i = i + 8;
+    }
+    while i < size {
+        @push(bytes, 0)?;
+        i = i + 1;
+    }
+    assert(args_read(index, &bytes[0..size]:ReadWrite) == size);
+    return bytes;
+}
+
+// 取一份参数表快照，驱动无需依赖 Seed 的索引访问顺序。
+export function load_args(): u8[]!AllocError {
+    var packed: u8[] = [];
+    let argc: u32 = arg_count();
+    var index: u32 = 0;
+    while index < argc {
+        let current: u8[] = arg_bytes(index)?;
+        var i: u64 = 0;
+        while i < @len(current) {
+            @push(packed, current[i])?;
+            i = i + 1;
+        }
+        @push(packed, 0u8)?;
+        index = index + 1;
+    }
+    return packed;
+}
+
+export function input_bytes(name: &[u8]): u8[]!AllocError {
+    let length: u64 = file_size(name);
+    assert(length <= 4294967295);
+    let size: u32 = length as u32;
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i + 8 <= size {
+        @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?;
+        @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?; @push(bytes, 0)?;
+        i = i + 8;
+    }
+    while i < size {
+        @push(bytes, 0)?;
+        i = i + 1;
+    }
+    assert(file_read(name, 0, &bytes[0..size]:ReadWrite) == size);
+    return bytes;
+}
+
+// 诊断不属于非零退出时回滚的登记产物；帧格式与原生流宿主一致。
+function write_frame(bytes: &[u8]): void {
+    let size: u64 = @len(bytes);
+    assert(size <= 4294967295u64);
+    let header: [u8; 4] = [(size & 255) as u8, ((size >> 8) & 255) as u8, ((size >> 16) & 255) as u8, ((size >> 24) & 255) as u8];
+    write(&header[0..4]:Read);
+    write(bytes);
+    return;
+}
+
+export function output_bytes(name: &[u8], bytes: &[u8]): void {
+    if @len(name) == 4 && name[0] == 100 && name[1] == 105 && name[2] == 97 && name[3] == 103 {
+        write_frame(name);
+        write_frame(bytes);
+        return;
+    }
+    file_write(name, bytes);
+    return;
+}

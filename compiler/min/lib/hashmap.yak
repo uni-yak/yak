@@ -1,0 +1,193 @@
+// hashmap.yak —— 名称 intern 与 bridge 查找专用哈希表（lib/README.md 设计）
+// 依赖：buf（buf::ByteBuf/buf_slice）、base 内建类型、@push/@len/@move
+// 规范：symbol.md 11.2（线性探测、装载率≤1/2、命中后原始字节复核）
+// 限制：只在名称 intern 与 import bridge 建立时使用；运行期不调用
+
+import buf;
+
+foreign assert(cond: bool): void;
+
+export struct Slot {
+    hash: u64,
+    name_off: u32,
+    name_len: u16,
+    value: u32,
+    occupied: bool,
+}
+
+export struct HashMap {
+    slots: Slot[],
+    size: u64,
+    cap: u64,
+}
+
+// ── 构造 ──
+
+export function hashmap_new(): HashMap {
+    let map: HashMap = HashMap { slots: [], size: 0, cap: 0 };
+    return map;
+}
+
+// ── 查找 ──
+
+export function hashmap_lookup(
+    map: &HashMap:Read,
+    arena: &buf::ByteBuf:Read,
+    hash: u64,
+    name: &[u8]
+): u32 {
+    if map.cap == 0 {
+        return 0;
+    }
+    let mask: u64 = map.cap - 1;
+    var idx: u64 = hash & mask;
+    while map.slots[idx].occupied {
+        if map.slots[idx].hash == hash && map.slots[idx].name_len as u32 == @len(name) as u32 {
+            // hash 命中——原始字节复核
+            if buf::buf_equals(arena, map.slots[idx].name_off, name) {
+                return map.slots[idx].value;
+            }
+        }
+        idx = (idx + 1) & mask;
+    }
+    return 0;
+}
+
+// ── 插入 ──
+
+export function hashmap_insert(
+    map: &HashMap:ReadWrite,
+    hash: u64,
+    name_off: u32,
+    name_len: u16,
+    value: u32
+): void!AllocError {
+    assert(value != 0);
+    // 扩容检查
+    if map.cap == 0 {
+        hashmap_resize(map, 16)?;
+    } elseif map.size * 2 >= map.cap {
+        hashmap_resize(map, map.cap * 2)?;
+    }
+
+    // 线性探测找空槽
+    let mask: u64 = map.cap - 1;
+    var idx: u64 = hash & mask;
+    while map.slots[idx].occupied {
+        idx = (idx + 1) & mask;
+    }
+
+    // 写入
+    map.slots[idx] = Slot { hash: hash, name_off: name_off, name_len: name_len, value: value, occupied: true };
+    map.size = map.size + 1;
+    return;
+}
+
+// ── 内部：扩容（重新插入全部已有条目）──
+
+function hashmap_resize(map: &HashMap:ReadWrite, new_cap: u64): void!AllocError {
+    var replacement: HashMap = HashMap { slots: [], size: 0, cap: new_cap };
+    var i: u64 = 0;
+    while i < new_cap {
+        @push(replacement.slots, Slot { hash: 0, name_off: 0, name_len: 0, value: 0, occupied: false })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < map.cap {
+        if map.slots[i].occupied {
+            hashmap_insert_raw(&replacement:ReadWrite, map.slots[i].hash, map.slots[i].name_off,
+                map.slots[i].name_len, map.slots[i].value);
+        }
+        i = i + 1;
+    }
+    *map = replacement;
+    return;
+}
+
+// ── 内部：无查重插入（扩容时用，所有键已知唯一）──
+
+function hashmap_insert_raw(
+    map: &HashMap:ReadWrite,
+    hash: u64,
+    name_off: u32,
+    name_len: u16,
+    value: u32
+): void {
+    let mask: u64 = map.cap - 1;
+    var idx: u64 = hash & mask;
+    while map.slots[idx].occupied {
+        idx = (idx + 1) & mask;
+    }
+    map.slots[idx] = Slot { hash: hash, name_off: name_off, name_len: name_len, value: value, occupied: true };
+    map.size = map.size + 1;
+    return;
+}
+
+// 文档驻留共用同一余额；耗尽后的未命中与普通未命中分开处理。
+export struct ProbeBudget { limited: bool, left: u64, stopped: bool }
+
+export function probe_budget(limit: u64): ProbeBudget {
+    return ProbeBudget { limited: limit != 0u64, left: limit, stopped: false };
+}
+
+function probe_charge(work: &ProbeBudget:ReadWrite, units: u64): bool {
+    if work.stopped { return false; }
+    if units > work.left { work.stopped = true; return false; }
+    work.left = work.left - units;
+    return true;
+}
+
+export function hashmap_lookup_metered(map: &HashMap:Read, arena: &buf::ByteBuf:Read, hash: u64, name: &[u8], work: &ProbeBudget:ReadWrite): u32 {
+    if map.cap == 0 { return 0; }
+    let mask: u64 = map.cap - 1;
+    var idx: u64 = hash & mask;
+    while probe_charge(work, 1u64) {
+        let row: Slot = map.slots[idx];
+        if !row.occupied { return 0; }
+        if row.hash == hash && row.name_len as u64 == @len(name) {
+            if !probe_charge(work, @len(name)) { return 0; }
+            if buf::buf_equals(arena, row.name_off, name) { return row.value; }
+        }
+        idx = (idx + 1) & mask;
+    }
+    return 0;
+}
+
+function insert_metered(map: &HashMap:ReadWrite, row: Slot, work: &ProbeBudget:ReadWrite): bool {
+    let mask: u64 = map.cap - 1;
+    var idx: u64 = row.hash & mask;
+    while probe_charge(work, 1u64) {
+        if !map.slots[idx].occupied {
+            map.slots[idx] = row;
+            map.size = map.size + 1;
+            return true;
+        }
+        idx = (idx + 1) & mask;
+    }
+    return false;
+}
+
+export function hashmap_insert_metered(map: &HashMap:ReadWrite, row: Slot, work: &ProbeBudget:ReadWrite): bool!AllocError {
+    assert(row.value != 0 && row.occupied);
+    var cap: u64 = 16;
+    if map.cap != 0 {
+        if map.size * 2 < map.cap { return insert_metered(map, row, work); }
+        cap = map.cap * 2;
+    }
+    // 初始分配及旧桶遍历整批预扣；只有迁移和本次插入均成功才替换原表。
+    if !probe_charge(work, cap + map.cap) { return false; }
+    var replacement: HashMap = HashMap { slots: [], size: 0, cap: cap };
+    var i: u64 = 0;
+    while i < cap {
+        @push(replacement.slots, Slot { hash: 0, name_off: 0, name_len: 0, value: 0, occupied: false })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < map.cap {
+        if map.slots[i].occupied && !insert_metered(&replacement:ReadWrite, map.slots[i], work) { return false; }
+        i = i + 1;
+    }
+    if !insert_metered(&replacement:ReadWrite, row, work) { return false; }
+    *map = replacement;
+    return true;
+}

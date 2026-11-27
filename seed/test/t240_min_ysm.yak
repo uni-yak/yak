@@ -1,0 +1,867 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: ysm=../../compiler/min/src/ysm/ysm.yak
+// module: ysm_validate=../../compiler/min/src/ysm/ysm_validate.yak
+// module: ysm_write=../../compiler/min/src/ysm/ysm_write.yak
+// module: ysm_write_sig=../../compiler/min/src/ysm/ysm_write_sig.yak
+// module: runner=mir_runner.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import iface;
+import iface_write;
+import iface_load;
+import mir;
+import mir_lower;
+import mir_verify;
+import ysm;
+import ysm_validate;
+import ysm_write;
+import runner;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// 一组覆盖常量、算术、分支、循环、调用、聚合的源；模块名唯一，便于并发运行。
+// 视图不可作为返回值（OW-3），故以常量承载，调用点取其切片。
+// 聚合字面量在 MIR 阶段被拒绝，故只声明类型，让类型表覆盖结构体与枚举两类条目。
+const RICH_SOURCE: &[u8] = "struct Point { x: u32, y: u32 } enum Shape { Dot(u32), Empty } function add(a: u32, b: u32): u32 { return a + b; } function calc(x: u32): u32 { var n: u32 = 0; var i: u32 = 0; while i < x { n = add(n, i); i = i + 1; } if n > 10 { return n - 10; } else { return n + 1; } } function bits(): u32 { return ((6u32 & 3u32) | (1u32 << 3u32)) ^ (16u32 >> 2u32); } function narrow(): u8 { let x: u32 = 258u32; return x as u8; }\n";
+// 构造事实：调用方补齐的静态池与依赖表，MIR 视图以独立参数传入。
+function make_input(m: &mir::MirModule:Read, deps: u16): ysm::YsmFacts {
+    var statics: ysm::YsmStatic[] = [];
+    var dependencies: ysm::YsmDependency[] = [];
+    var d: u16 = 0;
+    while d < deps {
+        var digest: u8[] = [];
+        var k: u32 = 0;
+        while k < 32 {
+            @push(digest, (d as u8) + (k as u8))?;
+            k = k + 1;
+        }
+        @push(dependencies, ysm::YsmDependency { dependency_id: d + 1, interface_digest: @move(digest) })?;
+        d = d + 1;
+    }
+    return ysm::YsmFacts {
+        target_profile: 7,
+        statics: @move(statics),
+        dependencies: @move(dependencies),
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+}
+// 断言两次序列化逐字节相同。
+function deterministic(m: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read): u8[]!AllocError {
+    var first: diag::DiagBuffer = diag::diagbuf_new();
+    var second: diag::DiagBuffer = diag::diagbuf_new();
+    let a: ysm::YsmResult = ysm_write::write_module(m, facts, &first:ReadWrite)?;
+    let b: ysm::YsmResult = ysm_write::write_module(m, facts, &second:ReadWrite)?;
+    assert(a.accepted && b.accepted);
+    assert(@len(a.data) == @len(b.data));
+    var i: u32 = 0;
+    while i < @len(a.data) as u32 {
+        assert(a.data[i] == b.data[i]);
+        i = i + 1;
+    }
+    var copy: u8[] = [];
+    var j: u32 = 0;
+    while j < @len(a.data) as u32 {
+        @push(copy, a.data[j])?;
+        j = j + 1;
+    }
+    return @move(copy);
+}
+// 读取 u32 小端。
+function u32_at(data: &[u8], offset: u32): u32 {
+    return (data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24);
+}
+function u16_at(data: &[u8], offset: u32): u16 {
+    return (data[offset] as u16) | ((data[offset + 1] as u16) << 8);
+}
+// 校验 header 与七条目录项的字段。
+function check_layout(data: &[u8]): void {
+    assert(@len(data) >= 176);
+    assert(data[0] == 89 && data[1] == 75 && data[2] == 77 && data[3] == 73);
+    assert(u16_at(data, 4) == 4);
+    assert(u16_at(data, 6) == 0);
+    assert(u16_at(data, 8) == 7);
+    assert(u16_at(data, 10) == 7);
+    assert(u32_at(data, 12) == 64);
+    assert(u32_at(data, 16) == @len(data) as u32);
+    assert(u32_at(data, 60) == 0);
+    var i: u32 = 0;
+    var prev_end: u32 = 176;
+    while i < 7 {
+        let base: u32 = 64 + i * 16;
+        assert(u16_at(data, base) == (i + 1) as u16);
+        assert(u16_at(data, base + 2) == 0);
+        let offset: u32 = u32_at(data, base + 4);
+        let length: u32 = u32_at(data, base + 8);
+        assert(offset >= prev_end);
+        assert(offset + length <= @len(data) as u32);
+        prev_end = offset + length;
+        i = i + 1;
+    }
+    return;
+}
+// 篡改单字节后必须被拒绝，且拒绝码匹配。
+function expect_reject(data: &[u8], offset: u32, value: u8, code: u16): void!AllocError {    var copy: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(data) as u32 {
+        @push(copy, data[i])?;
+        i = i + 1;
+    }
+    copy[offset] = value;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&copy[0..@len(copy) as u32]:Read, &diags:ReadWrite)?;
+    assert(!loaded.accepted);
+    assert(loaded.code.raw == code);
+    assert(diag::diagbuf_count(&diags:Read) == 1);
+    return;
+}
+
+// 篡改一个字节后重新计算并回填 sha256，使后续校验能落到摘要之后的检查。
+function resign(copy: u8[]): u8[]!AllocError {
+    var buf: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(copy) as u32 {
+        @push(buf, copy[i])?;
+        i = i + 1;
+    }
+    var masked: u8[] = [];
+    i = 0;
+    while i < @len(buf) as u32 {
+        if i >= 28 && i < 60 { @push(masked, 0)?; }
+        else { @push(masked, buf[i])?; }
+        i = i + 1;
+    }
+    let digest: u8[] = iface::sha256(&masked[0..@len(masked) as u32]:Read)?;
+    i = 0;
+    while i < 32 {
+        buf[28 + i] = digest[i];
+        i = i + 1;
+    }
+    return @move(buf);
+}
+
+// 篡改单字节并重新签名后，拒绝码应落在摘要之后的检查上。
+function expect_reject_signed(data: &[u8], offset: u32, value: u8, code: u16): void!AllocError {
+    var copy: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(data) as u32 {
+        @push(copy, data[i])?;
+        i = i + 1;
+    }
+    copy[offset] = value;
+    var signed: u8[] = resign(@move(copy))?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&signed[0..@len(signed) as u32]:Read, &diags:ReadWrite)?;
+    assert(!loaded.accepted);
+    assert(loaded.code.raw == code);
+    assert(diag::diagbuf_count(&diags:Read) == 1);
+    return;
+}
+
+// Y-5：块记录 block_id 必须在所属函数段内严格升序，篡改后重新签名必须拒绝。
+function reject_block_order(): void!AllocError {
+    // 单独的单一函数源：函数内 if / else 产生多个块，块号从 0 连续编号。
+    let m_result: mir::MirResult = runner::accepted("function f(x: bool): u32 { if x { return 1; } return 2; }\n", 1260)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 0);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    // 定位 blocks 节：kind 5 的目录项位于索引 4。
+    let blocks_off: u32 = u32_at(&data[0..@len(data) as u32]:Read, 64 + 4 * 16 + 4);
+    let blocks_count: u32 = u32_at(&data[0..@len(data) as u32]:Read, 64 + 4 * 16 + 12);
+    assert(blocks_count >= 2);
+    // 同一个函数内把第二块的 block_id 清零，与首块重复，触发升序违规。
+    let second_id_off: u32 = blocks_off + 24;
+    // rejection_spec: E7027 spec/ir/ysm.md#Y-5
+    expect_reject_signed(&data[0..@len(data) as u32]:Read, second_id_off, 0, 7027)?;
+    return;
+}
+
+// Y-6：function flags 出现未知位必须拒绝。
+function reject_function_flags(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1261)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 0);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    let funcs_off: u32 = u32_at(&data[0..@len(data) as u32]:Read, 64 + 2 * 16 + 4);
+    // flags 位于函数记录偏移 28..30，取低字节写入未知位 0x04。
+    // rejection_spec: E7028 spec/ir/ysm.md#Y-6
+    expect_reject_signed(&data[0..@len(data) as u32]:Read, funcs_off + 28, 4, 7028)?;
+    expect_reject_signed(&data[0..@len(data) as u32]:Read, funcs_off + 28, 1, 7028)?;
+    return;
+}
+
+// Y-8：布局或 ABI 编号任一不同都必须拒绝。
+function expect_profile_mismatch(data: &[u8], expected: u16): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module_for(data, expected, &diags:ReadWrite)?;
+    // rejection_spec: E7030 spec/ir/ysm.md#Y-8
+    assert(!loaded.accepted && loaded.code.raw == 7030);
+    assert(diags.count == 1);
+    return;
+}
+function reject_profile_mismatch(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1262)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    var facts: ysm::YsmFacts = make_input(m, 0);
+    facts.target_profile = 0x0101;
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    let bytes: &[u8] = &data[0..@len(data) as u32]:Read;
+    assert(u16_at(bytes, 10) == 0x0101);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let valid: ysm::YsmLoadResult = ysm::read_module_for(bytes, 0x0101, &diags:ReadWrite)?;
+    assert(valid.accepted && diags.count == 0);
+    expect_profile_mismatch(bytes, 0x0102)?;
+    expect_profile_mismatch(bytes, 0x0201)?;
+    return;
+}
+
+// enum_dispatch 往返：177 及其臂表按 ysm.md 4.13 编码，读回校验通过。
+// 签名与局部类型引用本地 enum，因此事实必须提供导出映射。
+function enum_dispatch_roundtrip(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("enum E { A, B }\nfunction f(x: E): u32 { var r: u32 = 0u32; match x { A => { r = 1u32; }, B => { r = 2u32; } } return r; }\n", 1263)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    assert(@len(m.functions[0].arms) == 2);
+    var defs: u32[] = [];
+    var exports: u32[] = [];
+    @push(defs, m.functions[0].def)?;
+    @push(exports, 1u32)?;
+    var ei: u32 = 0;
+    while ei < @len(m.enums.items) as u32 {
+        @push(defs, m.enums.items[ei].def)?;
+        @push(exports, @len(exports) as u32 + 1)?;
+        ei = ei + 1;
+    }
+    let facts: ysm::YsmFacts = ysm::YsmFacts { target_profile: 7, statics: [], dependencies: [], candidate_digests: [],
+        exports: iface::ExportMap { defs: @move(defs), exports: @move(exports) } };
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&data[0..@len(data) as u32]:Read, &diags:ReadWrite)?;
+    assert(diags.count == 0);
+    assert(loaded.accepted);
+    return;
+}
+
+// 往返：写出后读回，节与记录计数自洽。
+function roundtrip(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted(RICH_SOURCE, 1240)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 2);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    check_layout(&data[0..@len(data) as u32]:Read);
+    assert(u32_at(&data[0..@len(data) as u32]:Read, 20) == @len(m.functions) as u32);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&data[0..@len(data) as u32]:Read, &diags:ReadWrite)?;
+    assert(diags.count == 0);
+    assert(loaded.accepted);
+    assert(loaded.file.header.version == 4);
+    assert(loaded.file.header.target_profile == 7);
+    assert(loaded.file.header.function_count == @len(m.functions) as u32);
+    assert(@len(loaded.file.sections) == 7);
+    assert(@len(loaded.file.functions) as u32 == @len(m.functions) as u32);
+    assert(@len(loaded.file.dependencies) == 2);
+    assert(loaded.file.dependencies[0].dependency_id == 1);
+    assert(loaded.file.dependencies[1].dependency_id == 2);
+    assert(@len(loaded.file.dependencies[0].interface_digest) == 32);
+    // 局部与块总数与 MIR 对账
+    var locals_total: u32 = 0;
+    var blocks_total: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(m.functions) as u32 {
+        locals_total = locals_total + @len(m.functions[i].locals) as u32;
+        blocks_total = blocks_total + @len(m.functions[i].blocks) as u32;
+        i = i + 1;
+    }
+    assert(@len(loaded.file.locals) as u32 == locals_total);
+    assert(@len(loaded.file.blocks) as u32 == blocks_total);
+    assert(@len(loaded.file.type_sigs) > 0);
+    assert(@len(loaded.file.insts) > 0);
+    return;
+}
+
+// 确定性：同一输入两次写出逐字节相同（已在 deterministic 内断言）。
+function determinism(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function one(): u32 { return 1; } function two(): u32 { return 2; }\n", 1241)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 0);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    assert(@len(data) >= 176);
+    assert(u32_at(&data[0..@len(data) as u32]:Read, 24) == 0);
+    return;
+}
+
+// 拒绝码覆盖：header、目录、保留字段、摘要。
+function rejections(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 40 + 2; }\n", 1242)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 1);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    // 将目录标签换成独立符号审计中的 NameId 和 ScopeId 节。
+    // rejection_spec: E7023 spec/ir/ysm.md#Y-1
+    expect_reject_signed(&data[0..@len(data) as u32]:Read, 81, 1, 7023)?;
+    expect_reject_signed(&data[0..@len(data) as u32]:Read, 113, 1, 7023)?;
+    // Y-2：magic 非法
+    // rejection_spec: E7024 spec/ir/ysm.md#Y-2
+    expect_reject(&data[0..@len(data) as u32]:Read, 0, 90, 7024)?;
+    // Y-2：旧 format 3 与未知 format 6 都必须拒绝；format 5 承载逐点陷阱边，由单独用例覆盖。
+    expect_reject(&data[0..@len(data) as u32]:Read, 4, 3, 7024)?;
+    expect_reject(&data[0..@len(data) as u32]:Read, 4, 6, 7024)?;
+    // Y-2：section_count 非法
+    expect_reject(&data[0..@len(data) as u32]:Read, 8, 6, 7024)?;
+    // Y-2：目录 offset 小于 176
+    let first_offset: u32 = u32_at(&data[0..@len(data) as u32]:Read, 68);
+    assert(first_offset == 176);
+    expect_reject(&data[0..@len(data) as u32]:Read, 68, 100, 7024)?;
+    // Y-3：header flags 非零
+    expect_reject(&data[0..@len(data) as u32]:Read, 6, 1, 7025)?;
+    // Y-3：reserved1 非零
+    expect_reject(&data[0..@len(data) as u32]:Read, 60, 1, 7025)?;
+    // Y-3：目录项 flags 非零
+    // rejection_spec: E7025 spec/ir/ysm.md#Y-3
+    expect_reject(&data[0..@len(data) as u32]:Read, 66, 1, 7025)?;
+    // Y-3：摘要被篡改
+    expect_reject(&data[0..@len(data) as u32]:Read, 28, 0xFF, 7025)?;
+    // Y-2：文件长度与 file_size 不一致
+    var shortened: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(data) as u32 - 1 {
+        @push(shortened, data[i])?;
+        i = i + 1;
+    }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&shortened[0..@len(shortened) as u32]:Read, &diags:ReadWrite)?;
+    assert(!loaded.accepted && loaded.code.raw == 7024);
+    return;
+}
+
+// 依赖表排序违规按 Y-7 拒绝。
+function dependency_order(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1243)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    var bad: ysm::YsmDependency[] = [];
+    var digest: u8[] = [];
+    var k: u32 = 0;
+    while k < 32 { @push(digest, k as u8)?; k = k + 1; }
+    // 首个依赖 id 写成 2：不连续，必须拒绝。
+    @push(bad, ysm::YsmDependency { dependency_id: 2, interface_digest: @move(digest) })?;
+    let facts: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: [],
+        dependencies: @move(bad),
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(m, &facts:Read, &diags:ReadWrite)?;
+    // rejection_spec: E7029 spec/ir/ysm.md#Y-7
+    assert(!result.accepted && result.code.raw == 7029);
+    return;
+}
+
+// 摘要长度非 32 字节按 Y-7 拒绝。
+function dependency_digest(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 2; }\n", 1244)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    var bad: ysm::YsmDependency[] = [];
+    var digest: u8[] = [];
+    var k: u32 = 0;
+    while k < 31 { @push(digest, k as u8)?; k = k + 1; }
+    @push(bad, ysm::YsmDependency { dependency_id: 1, interface_digest: @move(digest) })?;
+    let facts: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: [],
+        dependencies: @move(bad),
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(m, &facts:Read, &diags:ReadWrite)?;
+    assert(!result.accepted && result.code.raw == 7029);
+    return;
+}
+
+// 指令体保持透明读入，显式扫描才应拒绝变异后的指令或操作数。
+function reject_signed_instruction(data: &[u8], offset: u32, value: u8): void!AllocError {
+    var copy: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(data) as u32 { @push(copy, data[i])?; i = i + 1; }
+    copy[offset] = value;
+    let signed: u8[] = resign(@move(copy))?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&signed[0..@len(signed) as u32]:Read, &diags:ReadWrite)?;
+    assert(loaded.accepted && diags.count == 0);
+    // rejection_spec: E7026 spec/ir/ysm.md#Y-4
+    assert(ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)? == 7026);
+    assert(diags.count == 1);
+    return;
+}
+
+// 用真实接口和 MIR 构造远程调用，编号与摘要必须落在同一记录。
+function remote_dependency(): void!AllocError {
+    let provider: runner::Loaded = runner::load("export function remote(): void { return; }\n", 1251)?;
+    let empty: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&provider.parsed.file:Read, &provider.parsed.pool:Read, &provider.lexed.names:Read, &empty:Read, "provider", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&provider.parsed.file:Read, &provider.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    let layouts: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    let produced: iface::InterfaceResult = iface_write::write_interface(&provider.parsed.file:Read, &provider.parsed.pool:Read, &refs:Read, &provider.lexed.names:Read, &tc:Read, &layouts:Read, "provider", &diags:ReadWrite)?;
+    let imported: iface::LoadedInterface = iface_load::load_interface(&produced.data.bytes[0..@len(produced.data.bytes)]:Read, &diags:ReadWrite)?;
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    iface_load::add_binary_dependency(&deps:ReadWrite, &imported:Read)?;
+    let unit: runner::Loaded = runner::load("import provider; function f(): void { provider::remote(); return; }\n", 1252)?;
+    let resolved: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "caller", &diags:ReadWrite)?;
+    let typed: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolved:Read, &diags:ReadWrite)?;
+    var result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolved:Read, &typed:Read, &diags:ReadWrite)?;
+    assert(result.accepted && diags.count == 0 && mir_verify::verify_module(&result.module:Read)?);
+    assert(result.module.functions[0].insts[0].op == 151);
+
+    var digest: u8[] = [];
+    var i: u32 = 0;
+    while i < 32 { @push(digest, imported.digest[i])?; i = i + 1; }
+    var facts: ysm::YsmFacts = make_input(&result.module:Read, 0);
+    facts.target_profile = u16_at(&produced.data.bytes[0..@len(produced.data.bytes)]:Read, 8);
+    @push(facts.dependencies, ysm::YsmDependency { dependency_id: 1, interface_digest: @move(digest) })?;
+    let data: u8[] = deterministic(&result.module:Read, &facts:Read)?;
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&data[0..@len(data) as u32]:Read, &diags:ReadWrite)?;
+    assert(loaded.accepted && diags.count == 0);
+    let scanned: u16 = ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)?;
+    assert(scanned == 0 && diags.count == 0);
+    assert(@len(loaded.file.dependencies) == 1 && loaded.file.dependencies[0].dependency_id == 1);
+    i = 0;
+    while i < 32 { assert(loaded.file.dependencies[0].interface_digest[i] == imported.digest[i]); i = i + 1; }
+    let offset: u32 = loaded.file.sections[5].offset + loaded.file.blocks[0].inst_off;
+    assert(data[offset] == 151 && data[offset + 1] == 0);
+    assert(u16_at(&data[0..@len(data) as u32]:Read, offset + 2) == 1);
+    assert(u32_at(&data[0..@len(data) as u32]:Read, offset + 4) == 1);
+    reject_signed_instruction(&data[0..@len(data) as u32]:Read, offset + 2, 0)?;
+    reject_signed_instruction(&data[0..@len(data) as u32]:Read, offset + 2, 2)?;
+    reject_signed_instruction(&data[0..@len(data) as u32]:Read, offset + 4, 0)?;
+
+    let no_deps: ysm::YsmFacts = make_input(&result.module:Read, 0);
+    var missing: diag::DiagBuffer = diag::diagbuf_new();
+    let missing_result: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &no_deps:Read, &missing:ReadWrite)?;
+    assert(!missing_result.accepted && missing_result.code.raw == 7026 && @len(missing_result.data) == 0 && missing.count == 1);
+    result.module.functions[0].insts[0].c = 65537;
+    var wide: diag::DiagBuffer = diag::diagbuf_new();
+    let wide_result: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &wide:ReadWrite)?;
+    assert(!wide_result.accepted && wide_result.code.raw == 7026 && @len(wide_result.data) == 0 && wide.count == 1);
+    return;
+}
+
+// 规格缺口一：错误集类型没有 TypeSig 编码，必须显式拒绝而不是替换成其他形态。
+function reject_errorset(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("enum Code { Bad(u32) } function f(): u32 { return 1; }\n", 1245)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    var entries: typecheck::TypeEntry[] = [];
+    var i: u32 = 0;
+    while i < @len(m.types.entries) as u32 {
+        @push(entries, m.types.entries[i])?;
+        i = i + 1;
+    }
+    // 追加一个独立错误集条目：kind=11，成员指向已有条目。
+    @push(entries, typecheck::TypeEntry {
+        kind: 11, builtin: 0, def: 0, dep: 0, export_id: 0, elem: 0, cap: 0,
+        length: 0, success: 0, members_start: 0, members_count: 1,
+    })?;
+    var members: u32[] = [];
+    var j: u32 = 0;
+    while j < @len(m.types.members) as u32 {
+        @push(members, m.types.members[j])?;
+        j = j + 1;
+    }
+    @push(members, 1)?;
+    let types_table: typecheck::TypeTable = typecheck::TypeTable { entries: @move(entries), members: @move(members) };
+    let facts: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: [],
+        dependencies: [],
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(m, &facts:Read, &diags:ReadWrite)?;
+    // 独立错误集不会被任何 MIR 位置引用，这里以显式拒绝路径覆盖编码器判定。
+    var probe: ysm::YsmStatic[] = [];
+    var bytes: u8[] = [];
+    @push(bytes, 1)?;
+    @push(probe, ysm::YsmStatic { type_sig: @len(m.types.entries) as u32 + 1, bytes: @move(bytes) })?;
+    let facts2: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: @move(probe),
+        dependencies: [],
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+    var diags2: diag::DiagBuffer = diag::diagbuf_new();
+    let second: ysm::YsmResult = ysm_write::write_module(m, &facts2:Read, &diags2:ReadWrite)?;
+    assert(!second.accepted && second.code.raw == 7026);
+    assert(diag::diagbuf_count(&diags2:Read) >= 1);
+    return;
+}
+
+// 格式 6：未导出的本地名义类型以 0x0E local_def 编码，不再依赖 ExportId。
+function private_local_nominal(): void!AllocError {
+    // 结构体字面量在 MIR 阶段尚不支持，这里只声明类型，让类型表留下本地名义条目。
+    let m_result: mir::MirResult = runner::accepted("struct Hidden { v: u32 } function f(): u32 { return 1; }\n", 1246)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    // 导出映射留空：Hidden 的 DefId 查不到 ExportId，编码必须失败。
+    var nominal: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(m.types.entries) as u32 {
+        if m.types.entries[i].kind == 2 { nominal = i + 1; }
+        i = i + 1;
+    }
+    assert(nominal != 0);
+    var statics: ysm::YsmStatic[] = [];
+    var bytes: u8[] = [];
+    @push(bytes, 7)?;
+    @push(statics, ysm::YsmStatic { type_sig: nominal, bytes: @move(bytes) })?;
+    let facts: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: @move(statics),
+        dependencies: [],
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(m, &facts:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error);
+    assert(u16_at(&result.data[0..@len(result.data) as u32]:Read, 4) == 6);
+    assert(u16_at(&result.data[0..@len(result.data) as u32]:Read, 6) == 1);
+    let type_off: u32 = u32_at(&result.data[0..@len(result.data) as u32]:Read, 68);
+    let static_off: u32 = u32_at(&result.data[0..@len(result.data) as u32]:Read, 84);
+    let sig_off: u32 = u32_at(&result.data[0..@len(result.data) as u32]:Read, static_off + 4);
+    assert(result.data[type_off + sig_off] == 14);
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&result.data[0..@len(result.data) as u32]:Read, &diags:ReadWrite)?;
+    assert(loaded.accepted);
+    return;
+}
+
+// 导出映射就绪时本地名义类型可编码。
+function local_nominal_exported(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("struct Shown { v: u32 } function f(): u32 { return 1; }\n", 1247)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    var nominal: u32 = 0;
+    var def: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(m.types.entries) as u32 {
+        if m.types.entries[i].kind == 2 { nominal = i + 1; def = m.types.entries[i].def; }
+        i = i + 1;
+    }
+    assert(nominal != 0 && def != 0);
+    var defs: u32[] = [];
+    var export_ids: u32[] = [];
+    @push(defs, def)?;
+    @push(export_ids, 3)?;
+    var statics: ysm::YsmStatic[] = [];
+    var payload: u8[] = [];
+    @push(payload, 9)?;
+    @push(statics, ysm::YsmStatic { type_sig: nominal, bytes: @move(payload) })?;
+    let facts: ysm::YsmFacts = ysm::YsmFacts {
+        target_profile: 7,
+        statics: @move(statics),
+        dependencies: [],
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: @move(defs), exports: @move(export_ids) },
+    };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: ysm::YsmResult = ysm_write::write_module(m, &facts:Read, &diags:ReadWrite)?;
+    assert(result.accepted);
+    assert(diags.count == 0);
+    assert(u32_at(&result.data[0..@len(result.data) as u32]:Read, 24) == 1);
+    var read_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&result.data[0..@len(result.data) as u32]:Read, &read_diags:ReadWrite)?;
+    assert(loaded.accepted);
+    assert(@len(loaded.file.statics) == 1);
+    assert(@len(loaded.file.static_bytes) == 1);
+    return;
+}
+
+// 空模块也可序列化与读回。
+function empty_module(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function f(): u32 { return 0; }\n", 1248)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 0);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    check_layout(&data[0..@len(data) as u32]:Read);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&data[0..@len(data) as u32]:Read, &diags:ReadWrite)?;
+    assert(loaded.accepted);
+    assert(@len(loaded.file.dependencies) == 0);
+    assert(@len(loaded.file.statics) == 0);
+    // 目录中的超大 count 不得经定长记录乘法回绕为零。
+    expect_reject_signed(&data[0..@len(data) as u32]:Read, 175, 32, 7029)?;
+    return;
+}
+
+// 畸形成员区间必须在序列化入口被拒绝，而不是触发数组越界。
+function reject_type_ranges(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1250)?;
+    let value: u32 = @len(result.module.types.entries) as u32;
+    @push(result.module.types.entries, typecheck::TypeEntry { kind: 11, builtin: 0, def: 0, dep: 0, export_id: 0, elem: 0, cap: 0, length: 0, success: 0, members_start: 4294967295u32, members_count: 1 })?;
+    @push(result.module.types.entries, typecheck::TypeEntry { kind: 9, builtin: 0, def: 0, dep: 0, export_id: 0, elem: value + 1, cap: 0, length: 0, success: 1, members_start: 0, members_count: 0 })?;
+    var statics: ysm::YsmStatic[] = [];
+    @push(statics, ysm::YsmStatic { type_sig: value + 2, bytes: [] })?;
+    let facts: ysm::YsmFacts = ysm::YsmFacts { target_profile: 7, statics: @move(statics), dependencies: [], candidate_digests: [], exports: iface::ExportMap { defs: [], exports: [] } };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let written: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &diags:ReadWrite)?;
+    assert(!written.accepted && written.code.raw == 7026 && @len(written.data) == 0);
+    result.module.types.entries[value].members_start = 0;
+    result.module.types.entries[value].members_count = 0;
+    var empty_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let empty: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &empty_diags:ReadWrite)?;
+    assert(!empty.accepted && empty.code.raw == 7026 && @len(empty.data) == 0);
+    result.module.types.entries[value].members_count = 65537;
+    var large_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let large: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &large_diags:ReadWrite)?;
+    assert(!large.accepted && large.code.raw == 7026 && @len(large.data) == 0);
+    result.module.types.entries[value + 1].kind = 8;
+    result.module.types.entries[value + 1].elem = 1;
+    result.module.types.entries[value + 1].members_start = 4294967295u32;
+    result.module.types.entries[value + 1].members_count = 1;
+    var ref_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let ref_written: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &ref_diags:ReadWrite)?;
+    assert(!ref_written.accepted && ref_written.code.raw == 7026 && @len(ref_written.data) == 0);
+    result.module.types.entries[value + 1].members_start = @len(result.module.types.members) as u32;
+    result.module.types.entries[value + 1].members_count = 0;
+    var valid_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let valid: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &valid_diags:ReadWrite)?;
+    assert(valid.accepted && !valid_diags.has_error);
+    var read_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&valid.data[0..@len(valid.data)]:Read, &read_diags:ReadWrite)?;
+    assert(loaded.accepted && !read_diags.has_error);
+    var n: u32 = 0;
+    while n < 65536 { @push(result.module.types.members, 1)?; n = n + 1; }
+    result.module.types.entries[value + 1].members_count = 65536;
+    var count_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let count: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &count_diags:ReadWrite)?;
+    assert(!count.accepted && count.code.raw == 7026 && @len(count.data) == 0);
+    @push(result.module.types.members, 1)?;
+    result.module.types.entries[value + 1].kind = 9;
+    result.module.types.entries[value + 1].elem = value + 1;
+    result.module.types.entries[value].members_start = 0;
+    result.module.types.entries[value].members_count = 65537;
+    var set_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let set_result: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &set_diags:ReadWrite)?;
+    assert(!set_result.accepted && set_result.code.raw == 7026 && @len(set_result.data) == 0);
+    // 普通固有类型不能作为错误枚举，编码失败不得留下 YSM 产物。
+    result.module.types.entries[value].members_count = 1;
+    result.module.types.entries[value].members_start = 0;
+    result.module.types.members[0] = 1;
+    var member_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let member_result: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &member_diags:ReadWrite)?;
+    assert(!member_result.accepted && member_diags.has_error && @len(member_result.data) == 0);
+    // 重复错误枚举经共享编码器拒绝时，同样不能保留部分产物。
+    @push(result.module.types.entries, typecheck::TypeEntry { kind: 1, builtin: 4108, def: 0, dep: 0, export_id: 0, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    let error_id: u32 = @len(result.module.types.entries) as u32;
+    result.module.types.members[0] = error_id; result.module.types.members[1] = error_id;
+    result.module.types.entries[value].members_count = 2;
+    var duplicate_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let duplicate_result: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &duplicate_diags:ReadWrite)?;
+    assert(!duplicate_result.accepted && duplicate_diags.has_error && @len(duplicate_result.data) == 0);
+    return;
+}
+// 传递类型的内部编号不能越过 YSM 直接依赖表；同时覆盖静态值和嵌套函数签名。
+function reject_type_dependencies(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): u32 { return 1; }\n", 1260)?;
+    let imported: u32 = @len(result.module.types.entries) as u32 + 1;
+    @push(result.module.types.entries, typecheck::TypeEntry { kind: 3, builtin: 0, def: 0, dep: 2, export_id: 1, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    @push(result.module.types.entries, typecheck::TypeEntry { kind: 6, builtin: 0, def: 0, dep: 0, export_id: 0, elem: imported, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    var facts: ysm::YsmFacts = make_input(&result.module:Read, 1);
+    @push(facts.statics, ysm::YsmStatic { type_sig: imported, bytes: [] })?;
+    var static_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let statics: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &static_diags:ReadWrite)?;
+    assert(!statics.accepted && statics.code.raw == 7026 && @len(statics.data) == 0);
+    facts.statics[0].type_sig = result.module.signatures.items[0].ret;
+    result.module.signatures.items[0].ret = imported + 1;
+    var sig_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let signature: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &sig_diags:ReadWrite)?;
+    assert(!signature.accepted && signature.code.raw == 7026 && @len(signature.data) == 0);
+    result.module.types.entries[imported - 1].dep = 1;
+    facts.statics[0].type_sig = imported;
+    var valid_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let valid: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &valid_diags:ReadWrite)?;
+    assert(valid.accepted && !valid_diags.has_error && @len(valid.data) > 0);
+    return;
+}
+
+// 记录真实的四个操作数；篡改步长或局部编号必须被显式扫描拒绝。
+function dyn_push_roundtrip(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = runner::compile("function f(): void!AllocError { var v: u32[] = []; @push(v, 7u32)?; return; }\n", 1264, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error);
+    let m: &mir::MirModule:Read = &result.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 0);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    let bytes: &[u8] = &data[0..@len(data)]:Read;
+    let loaded: ysm::YsmLoadResult = ysm::read_module(bytes, &diags:ReadWrite)?;
+    assert(loaded.accepted && ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)? == 0);
+    let end: u32 = loaded.file.sections[5].offset + loaded.file.blocks[1].inst_off;
+    let at: u32 = end - 9 - 17;
+    assert(bytes[at] == 178 && u32_at(bytes, at + 13) == 4u32);
+    reject_signed_instruction(bytes, at + 13, 0)?;
+    reject_signed_instruction(bytes, at + 1, 0)?;
+    return;
+}
+
+// 函数地址与间接调用往返，随后篡改局部类型和目标编号。
+function function_reference_roundtrip(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = runner::compile("function first(value: &u32): u32 { return *value; } function invoke(value: &u32): u32 { let callback: &function(&u32): u32 = &first; return callback(value); }\n", 1266, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && mir_verify::verify_module(&result.module:Read)?);
+    let module: &mir::MirModule:Read = &result.module:Read;
+    let facts: ysm::YsmFacts = make_input(module, 0);
+    let encoded: u8[] = deterministic(module, &facts:Read)?;
+    let data: &[u8] = &encoded[0..@len(encoded)]:Read;
+    let loaded: ysm::YsmLoadResult = ysm::read_module(data, &diags:ReadWrite)?;
+    assert(loaded.accepted && ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)? == 0);
+    let address: u32 = loaded.file.sections[5].offset + loaded.file.blocks[loaded.file.functions[1].block_start].inst_off;
+    let tail: u32 = loaded.file.functions[1].block_start + 1;
+    let end: u32 = loaded.file.sections[5].offset + loaded.file.blocks[tail].inst_off;
+    let call: u32 = end - 6 - 18;
+    assert(data[address] == 5 && data[call] == 152 && data[call + 1] == 1);
+    assert(u32_at(data, call + 10) == 1 && u32_at(data, call + 6) != 1);
+    reject_signed_instruction(data, address + 1, 1)?;
+    reject_signed_instruction(data, address + 7, 255u8)?;
+    reject_signed_instruction(data, call + 6, 1)?;
+    return;
+}
+
+// 跨帧清理块只能接收调用失败边；把该块改为本地算术陷阱必须拒绝。
+function call_cleanup_roundtrip(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = runner::compile("function leaf(): void { return; } function caller(values: u8[]): void { leaf(); @drop(values); return; }\n", 1267, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error);
+    let module: &mir::MirModule:Read = &result.module:Read;
+    let fn: &mir::MirFunction:Read = &module.functions[1]:Read;
+    var call: u32 = 0;
+    while call < @len(fn.insts) as u32 && fn.insts[call].op != 150 { call = call + 1; }
+    assert(call < @len(fn.insts) as u32 && fn.insts[call].trap != 0);
+    let facts: ysm::YsmFacts = make_input(module, 0);
+    let encoded: u8[] = deterministic(module, &facts:Read)?;
+    let data: &[u8] = &encoded[0..@len(encoded)]:Read;
+    let loaded: ysm::YsmLoadResult = ysm::read_module(data, &diags:ReadWrite)?;
+    assert(loaded.accepted && ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)? == 0);
+    let after: u32 = loaded.file.functions[1].block_start + fn.insts[call].trap;
+    var end: u32 = @len(loaded.file.insts) as u32;
+    if after < @len(loaded.file.blocks) as u32 { end = loaded.file.blocks[after].inst_off; }
+    let reason: u32 = loaded.file.sections[5].offset + end - 1;
+    assert(data[reason - 1] == 195 && data[reason] == 2);
+    reject_signed_instruction(data, reason, 0)?;
+    return;
+}
+
+// 定宽指令被截断时，显式扫描必须在读取操作数之前拒绝。
+function reject_fixed_width_truncation(): void!AllocError {
+    let compiled: mir::MirResult = runner::accepted("function f(): u32 { return 2; }\n", 1265)?;
+    let m: &mir::MirModule:Read = &compiled.module:Read;
+    let facts: ysm::YsmFacts = make_input(m, 0);
+    let data: u8[] = deterministic(m, &facts:Read)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var loaded: ysm::YsmLoadResult = ysm::read_module(&data[0..@len(data)]:Read, &diags:ReadWrite)?;
+    assert(loaded.accepted && diags.count == 0);
+    assert(loaded.file.insts[0] == 1 && ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)? == 0);
+    loaded.file.insts = [1u8];
+    let scanned: u16 = ysm_validate::validate_inst_stream(&loaded.file:Read, &diags:ReadWrite)?;
+    assert(scanned == 7026 && diags.count == 1);
+    return;
+}
+
+// 只改操作码；MIR 与重签后的镜像都不得接受当前未分配的 full 编码。
+function reject_reserved_opcodes(): void!AllocError {
+    var compiled: mir::MirResult = runner::accepted("function f(): u32 { return 2; }\n", 1265)?;
+    let facts: ysm::YsmFacts = make_input(&compiled.module:Read, 0);
+    let data: u8[] = deterministic(&compiled.module:Read, &facts:Read)?;
+    let bytes: &[u8] = &data[0..@len(data) as u32]:Read;
+    let inst_offset: u32 = u32_at(bytes, 64 + 5 * 16 + 4);
+    assert(bytes[inst_offset] == 1 && compiled.module.functions[0].insts[0].op == 1);
+    assert(mir_verify::verify_module(&compiled.module:Read)?);
+    var opcode: u16 = 0xE0;
+    while opcode <= 0xFF {
+        compiled.module.functions[0].insts[0].op = opcode as u8;
+        assert(!mir_verify::verify_module(&compiled.module:Read)?);
+        opcode = opcode + 1;
+    }
+    reject_signed_instruction(bytes, inst_offset, 0xE0)?;
+    reject_signed_instruction(bytes, inst_offset, 0xFF)?;
+    return;
+}
+
+function main(): void {
+    reject_reserved_opcodes()?;
+    reject_fixed_width_truncation()?;
+    dyn_push_roundtrip()?;
+    function_reference_roundtrip()?;
+    call_cleanup_roundtrip()?;
+    reject_type_ranges()?;
+    reject_type_dependencies()?;
+    roundtrip()?;
+    enum_dispatch_roundtrip()?;
+    determinism()?;
+    rejections()?;
+    reject_block_order()?;
+    reject_function_flags()?;
+    reject_profile_mismatch()?;
+    dependency_order()?;
+    dependency_digest()?;
+    remote_dependency()?;
+    reject_errorset()?;
+    private_local_nominal()?;
+    local_nominal_exported()?;
+    empty_module()?;
+    return;
+}

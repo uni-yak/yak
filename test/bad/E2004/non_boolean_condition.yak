@@ -1,0 +1,4 @@
+// expected_code: E2004
+// spec: spec/lang/parse.md P-4
+// 触发：整数条件不可用作布尔条件。
+function main(): void { if 1 { return; } return; }

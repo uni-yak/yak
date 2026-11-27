@@ -1,0 +1,5 @@
+// expected_trap: lex: invalid HashName
+// 触发：HashName 的名字部分含非 ASCII 字符。
+function #名(): void { return; }
+
+function main(): void { return; }

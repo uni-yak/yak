@@ -1,0 +1,103 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+import lex;
+import parse;
+import diag;
+import desugar;
+import types;
+import ast;
+foreign assert(cond: bool): void;
+
+function unknown_syntax(): void!AllocError {
+    let r1: lex::LexResult = lex::lex_scan("function f(x: u32): u32 { if x == 0 { return 1; } return x + 1; }\n", 1100)?;
+    var p1: parse::ParseResult = parse::parse_file(&r1.tokens[0..@len(r1.tokens)]:Read, &r1.names:Read, 1100)?;
+    assert(@len(p1.diagnostics) == 0);
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    assert(desugar::verify_base(&p1.file:Read, &p1.pool:Read, &d1:ReadWrite)?);
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+
+    // 直接注入未登记语句，模拟前序阶段把额外形态送到生产边界。
+    let at: types::Span = p1.pool.stmts[0].span;
+    p1.pool.stmts[0].kind = 19;
+    let allowed: bool = desugar::verify_base(&p1.file:Read, &p1.pool:Read, &d1:ReadWrite)?;
+    // rejection_spec: E3001 spec/lang/sugar.md#SU-1
+    assert(!allowed && diag::diagbuf_count(&d1:Read) == 1 && d1.diags[0].code.raw == 3001);
+    assert(d1.diags[0].span.file == at.file && d1.diags[0].span.offset == at.offset && d1.diags[0].span.length == at.length);
+    return;
+}
+
+function residual_type(): void!AllocError {
+    // 解析恢复保留可空类型节点；脱糖边界单独检查残留。
+    let r2: lex::LexResult = lex::lex_scan("function g(): i32? { return; }\n", 1101)?;
+    assert(@len(r2.diagnostics) == 0);
+    let p2: parse::ParseResult = parse::parse_file(&r2.tokens[0..@len(r2.tokens)]:Read, &r2.names:Read, 1101)?;
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let allowed: bool = desugar::verify_base(&p2.file:Read, &p2.pool:Read, &d2:ReadWrite)?;
+    // rejection_spec: E3002 spec/lang/sugar.md#SU-2
+    assert(!allowed && diag::diagbuf_count(&d2:Read) == 1 && d2.diags[0].code.raw == 3002);
+    assert(d2.diags[0].span.file == 1101 && d2.diags[0].span.offset == 14 && d2.diags[0].span.length == 4);
+    return;
+}
+
+function batch_and_primitives(): void!AllocError {
+    let source: &[u8] = "function drop_batch(a: u8[], b: u8[], c: u8[]): void { let n: u64 = @len(&a[0..0]); @drop(a, b, c); @drop(n); }\n";
+    let lexed: lex::LexResult = lex::lex_scan(source, 1102)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let base: parse::ParseResult = parse::parse_lexed(&lexed:Read, 1102)?;
+    assert(@len(base.diagnostics) == 1 && base.diagnostics[0].code.raw == 3008);
+    let at: u32 = base.diagnostics[0].span.offset;
+    assert(base.diagnostics[0].span.length == 1 && source[at - 1] == 97 && source[at] == 44);
+    var parsed: parse::ParseResult = parse::parse_lexed_batch_drop(&lexed:Read, 1102)?;
+    assert(@len(parsed.diagnostics) == 0 && @len(parsed.pool.blocks) == 1);
+    let block: u32 = parsed.pool.functions[0].body;
+    assert(@len(parsed.pool.blocks[block].stmts) == 5);
+    let order: [u8; 4] = [99, 98, 97, 64];
+    var index: u32 = 1;
+    while index < 5 {
+        let stmt: ast::Stmt = parsed.pool.stmts[parsed.pool.blocks[block].stmts[index]];
+        assert(stmt.kind == 18 && source[stmt.span.offset] == order[index - 1]);
+        index = index + 1;
+    }
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    assert(desugar::verify_base(&parsed.file:Read, &parsed.pool:Read, &diagnostics:ReadWrite)?);
+    assert(diag::diagbuf_count(&diagnostics:Read) == 0);
+
+    index = 0;
+    while index < @len(parsed.pool.exprs) as u32 && parsed.pool.exprs[index].kind != 29 { index = index + 1; }
+    assert(index < @len(parsed.pool.exprs) as u32 && parsed.pool.exprs[index].data == 20486);
+    let origin: types::Span = parsed.pool.exprs[index].span;
+    // 模拟扩展改写把只在 full 登记的 @size_of 混进基础 AST。
+    parsed.pool.exprs[index].data = 20487;
+    let allowed: bool = desugar::verify_base(&parsed.file:Read, &parsed.pool:Read, &diagnostics:ReadWrite)?;
+    // rejection_spec: E3003 spec/lang/sugar.md#SU-3
+    assert(!allowed && diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 3003);
+    let actual: types::Span = diagnostics.diags[0].span;
+    assert(actual.file == origin.file && actual.offset == origin.offset && actual.length == origin.length);
+
+    // 低 16 位等于 @len 也不能使越界编号通过。
+    parsed.pool.exprs[index].data = 65536u64 + 20486;
+    diagnostics = diag::diagbuf_new();
+    assert(!desugar::verify_base(&parsed.file:Read, &parsed.pool:Read, &diagnostics:ReadWrite)?);
+    assert(diag::diagbuf_count(&diagnostics:Read) == 1 && diagnostics.diags[0].code.raw == 3003);
+    return;
+}
+
+function main(): void {
+    unknown_syntax()?;
+    residual_type()?;
+    batch_and_primitives()?;
+    return;
+}

@@ -1,0 +1,49 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+// module: lsp_frontend_cases=lsp_frontend_cases.yak
+import lsp_frontend_cases;
+
+function main(): void {
+    lsp_frontend_cases::copy_walk_limit()?;
+    lsp_frontend_cases::lexical_limits()?;
+    lsp_frontend_cases::layout_graph_depth()?;
+    lsp_frontend_cases::type_depth()?;
+}

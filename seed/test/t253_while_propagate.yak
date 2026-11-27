@@ -1,0 +1,24 @@
+foreign assert(cond: bool): void;
+enum FirstError { Bad, }
+enum LaterError { Bad, }
+
+function condition(n: &u32): bool!(FirstError | LaterError) {
+    if *n == 0 { return FirstError::Bad; }
+    if *n == 3 { return LaterError::Bad; }
+    return *n < 3;
+}
+
+function loop(start: u32): u32!(FirstError | LaterError) {
+    var n: u32 = start;
+    while condition(&n)? { n = n + 1; }
+    return n;
+}
+
+function recover_first(e: &FirstError): u32 { return 10; }
+function recover_later(e: &LaterError): u32 { return 30; }
+
+function main(): void {
+    assert(loop(0).catch(FirstError => &recover_first, LaterError => &recover_later) == 10);
+    assert(loop(1).catch(FirstError => &recover_first, LaterError => &recover_later) == 30);
+    assert(loop(4).catch(FirstError => &recover_first, LaterError => &recover_later) == 4);
+}

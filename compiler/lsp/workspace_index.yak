@@ -1,0 +1,488 @@
+// 工作区 `.yak` 源码轻量索引：从 initialize 根 URI 与工作区同步帧建立跨文件模块导出表。
+// 支持跨文件定义跳转、悬停、成员/模块补全、工作区符号查询与自动导入。
+import json;
+import json_string;
+import positions;
+
+const MAX_ROOTS: u32 = 8;
+const MAX_FILES: u32 = 64;
+const MAX_FILE_BYTES: u32 = 65536;
+const MAX_URI: u32 = 4096;
+const MAX_MODULE: u32 = 256;
+
+// kind：12 函数，10 枚举，23 结构体，14 常量（与 LSP SymbolKind 对齐）。
+export struct ExportSymbol {
+    name_start: u32,
+    name_len: u32,
+    sig_start: u32,
+    sig_len: u32,
+    kind: u8,
+    exported: bool,
+    range: positions::Range,
+}
+
+export struct WorkspaceFile {
+    active: bool,
+    uri: u8[],
+    module: u8[],
+    source: u8[],
+    symbols: ExportSymbol[],
+}
+
+export struct WorkspaceRoot { uri: u8[] }
+
+export struct Index {
+    encoding: u8,
+    roots: WorkspaceRoot[],
+    files: WorkspaceFile[],
+}
+
+export function create(): Index {
+    return Index { encoding: positions::enc_utf16(), roots: [], files: [] };
+}
+
+function empty_range(): positions::Range {
+    let zero: positions::Position = positions::Position { line: 0, character: 0 };
+    return positions::Range { start: zero, end: zero };
+}
+
+function lower_ascii(b: u8): u8 {
+    if b >= 65u8 && b <= 90u8 { return b + 32u8; }
+    return b;
+}
+
+function ident_start(b: u8): bool {
+    return b == 95u8 || (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+function ident_cont(b: u8): bool {
+    return ident_start(b) || (b >= 48u8 && b <= 57u8);
+}
+
+export function bytes_equal(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function bytes_equal_ci_prefix(full: &[u8], prefix: &[u8]): bool {
+    if @len(full) < @len(prefix) { return false; }
+    var i: u32 = 0;
+    while i < @len(prefix) as u32 {
+        if lower_ascii(full[i]) != lower_ascii(prefix[i]) { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function copy_slice(src: &[u8]): u8[]!AllocError {
+    var dst: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(dst, src[i])?; i = i + 1u32; }
+    return @move(dst);
+}
+
+function add_root(ws: &Index:ReadWrite, raw: &[u8]): void!AllocError {
+    if @len(ws.roots) >= (MAX_ROOTS as u64) || @len(raw) == 0u64 { return; }
+    var end: u32 = @len(raw) as u32;
+    while end > 0u32 && raw[end - 1u32] == 47u8 { end = end - 1u32; }
+    if end == 0u32 { return; }
+    var norm: u8[] = [];
+    var i: u32 = 0;
+    while i < end { @push(norm, raw[i])?; i = i + 1u32; }
+    @push(ws.roots, WorkspaceRoot { uri: @move(norm) })?;
+    return;
+}
+
+// 从 URI 与工作区根 URI 推导 Yak 模块名（如 `file:///C:/ws/sub/math.yak` → `sub::math`）。
+export function derive_module(ws: &Index:Read, uri: &[u8]): u8[]!AllocError {
+    let n: u32 = @len(uri) as u32;
+    var rel_start: u32 = 0;
+    var found_root: bool = false;
+    var r: u32 = 0;
+    while r < @len(ws.roots) as u32 {
+        let root: &[u8] = &ws.roots[r].uri[0..@len(ws.roots[r].uri)]:Read;
+        let rn: u32 = @len(root) as u32;
+        if rn < n && uri[rn] == 47u8 && bytes_equal_ci_prefix(uri, root) {
+            rel_start = rn + 1u32;
+            found_root = true;
+            break;
+        }
+        r = r + 1u32;
+    }
+    if !found_root {
+        // 无匹配根时回退取末段文件名作为模块名。
+        var p: u32 = n;
+        while p > 0u32 && uri[p - 1u32] != 47u8 { p = p - 1u32; }
+        rel_start = p;
+    }
+    var rel_end: u32 = n;
+    if rel_end >= rel_start + 4u32 && uri[rel_end - 4u32] == 46u8 && uri[rel_end - 3u32] == 121u8 && uri[rel_end - 2u32] == 97u8 && uri[rel_end - 1u32] == 107u8 {
+        rel_end = rel_end - 4u32;
+    }
+    var dst: u8[] = [];
+    var i: u32 = rel_start;
+    while i < rel_end && @len(dst) < (MAX_MODULE as u64) {
+        let b: u8 = uri[i];
+        if b == 47u8 {
+            if @len(dst) > 0u64 {
+                @push(dst, 58u8)?;
+                @push(dst, 58u8)?;
+            }
+        } elseif ident_cont(b) {
+            @push(dst, b)?;
+        } else {
+            return [];
+        }
+        i = i + 1u32;
+    }
+    return @move(dst);
+}
+
+// 跳过空白与注释（行注释及嵌套块注释）。
+function skip_trivia(src: &[u8], pos: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    var p: u32 = pos;
+    while p < n {
+        let b: u8 = src[p];
+        if b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 {
+            p = p + 1u32;
+        } elseif b == 47u8 && p + 1u32 < n && src[p + 1u32] == 47u8 {
+            p = p + 2u32;
+            while p < n && src[p] != 10u8 { p = p + 1u32; }
+        } elseif b == 47u8 && p + 1u32 < n && src[p + 1u32] == 42u8 {
+            p = p + 2u32;
+            var depth: u32 = 1;
+            while p + 1u32 < n && depth > 0u32 {
+                if src[p] == 47u8 && src[p + 1u32] == 42u8 { depth = depth + 1u32; p = p + 2u32; }
+                elseif src[p] == 42u8 && src[p + 1u32] == 47u8 { depth = depth - 1u32; p = p + 2u32; }
+                else { p = p + 1u32; }
+            }
+        } else {
+            break;
+        }
+    }
+    return p;
+}
+
+function skip_string_or_char(src: &[u8], pos: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    let quote: u8 = src[pos];
+    var p: u32 = pos + 1u32;
+    while p < n {
+        if src[p] == 92u8 && p + 1u32 < n { p = p + 2u32; }
+        elseif src[p] == quote { return p + 1u32; }
+        else { p = p + 1u32; }
+    }
+    return p;
+}
+
+function word_end(src: &[u8], pos: u32): u32 {
+    let n: u32 = @len(src) as u32;
+    var p: u32 = pos;
+    if p < n && src[p] == 35u8 { p = p + 1u32; }
+    if p >= n || !ident_start(src[p]) { return pos; }
+    p = p + 1u32;
+    while p < n && ident_cont(src[p]) { p = p + 1u32; }
+    return p;
+}
+
+function word_is(src: &[u8], start: u32, end: u32, text: &[u8]): bool {
+    return bytes_equal(&src[start..end]:Read, text);
+}
+
+// 轻量扫描源码中的顶层声明（函数、结构体、枚举、常量），用于多文件索引与工作区符号。
+function scan_symbols(src: &[u8], encoding: u8): ExportSymbol[]!AllocError {
+    var dst: ExportSymbol[] = [];
+    let pos_idx: positions::Index = positions::build_encoded(src, encoding)?;
+    if pos_idx.status != 0u8 { return @move(dst); }
+    let n: u32 = @len(src) as u32;
+    var p: u32 = 0;
+    var brace_depth: u32 = 0;
+    var pending_export: bool = false;
+    var decl_start: u32 = 0;
+    while p < n {
+        p = skip_trivia(src, p);
+        if p >= n { break; }
+        let b: u8 = src[p];
+        if b == 34u8 || b == 39u8 {
+            p = skip_string_or_char(src, p);
+            pending_export = false;
+            continue;
+        }
+        if b == 123u8 {
+            brace_depth = brace_depth + 1u32;
+            p = p + 1u32;
+            pending_export = false;
+            continue;
+        }
+        if b == 125u8 {
+            if brace_depth > 0u32 { brace_depth = brace_depth - 1u32; }
+            p = p + 1u32;
+            pending_export = false;
+            continue;
+        }
+        if brace_depth == 0u32 && (ident_start(b) || b == 35u8) {
+            let we: u32 = word_end(src, p);
+            if we > p {
+                if word_is(src, p, we, "export") {
+                    pending_export = true;
+                    decl_start = p;
+                    p = we;
+                    continue;
+                }
+                var kind: u8 = 0;
+                if word_is(src, p, we, "function") { kind = 12u8; }
+                elseif word_is(src, p, we, "struct") { kind = 23u8; }
+                elseif word_is(src, p, we, "enum") { kind = 10u8; }
+                elseif word_is(src, p, we, "const") { kind = 14u8; }
+                if kind != 0u8 {
+                    let sig_start: u32 = p;
+                    if !pending_export { decl_start = p; }
+                    let name_start: u32 = skip_trivia(src, we);
+                    let name_end: u32 = word_end(src, name_start);
+                    if name_end > name_start && @len(dst) < 256u64 {
+                        var sig_end: u32 = name_end;
+                        while sig_end < n && src[sig_end] != 123u8 && src[sig_end] != 59u8 && src[sig_end] != 10u8 && sig_end - sig_start < 256u32 {
+                            sig_end = sig_end + 1u32;
+                        }
+                        while sig_end > sig_start && (src[sig_end - 1u32] == 32u8 || src[sig_end - 1u32] == 9u8 || src[sig_end - 1u32] == 13u8) {
+                            sig_end = sig_end - 1u32;
+                        }
+                        let mapped: positions::RangeResult = positions::span_range(&pos_idx:Read, src, 1u16, 1u16, name_start, name_end - name_start);
+                        if mapped.valid {
+                            @push(dst, ExportSymbol {
+                                name_start: name_start,
+                                name_len: name_end - name_start,
+                                sig_start: sig_start,
+                                sig_len: sig_end - sig_start,
+                                kind: kind,
+                                exported: pending_export,
+                                range: mapped.range,
+                            })?;
+                        }
+                    }
+                    pending_export = false;
+                    p = name_end;
+                    continue;
+                }
+                pending_export = false;
+                p = we;
+                continue;
+            }
+        }
+        pending_export = false;
+        p = p + 1u32;
+    }
+    return @move(dst);
+}
+
+function find_file_by_uri(ws: &Index:Read, uri: &[u8]): u32 {
+    var i: u32 = 0;
+    while i < @len(ws.files) as u32 {
+        if ws.files[i].active && bytes_equal(&ws.files[i].uri[0..@len(ws.files[i].uri)]:Read, uri) { return i; }
+        i = i + 1u32;
+    }
+    return MAX_FILES;
+}
+
+export function find_file_by_module(ws: &Index:Read, module: &[u8]): u32 {
+    var i: u32 = 0;
+    while i < @len(ws.files) as u32 {
+        if ws.files[i].active && bytes_equal(&ws.files[i].module[0..@len(ws.files[i].module)]:Read, module) { return i; }
+        i = i + 1u32;
+    }
+    return MAX_FILES;
+}
+
+export function upsert_file(ws: &Index:ReadWrite, uri: &[u8], explicit_module: &[u8], source: &[u8]): void!AllocError {
+    if @len(uri) == 0u64 || @len(uri) > MAX_URI as u64 || @len(source) > MAX_FILE_BYTES as u64 { return; }
+    var module: u8[] = [];
+    if @len(explicit_module) > 0u64 { module = copy_slice(explicit_module)?; }
+    else { module = derive_module(&*ws:Read, uri)?; }
+    let symbols: ExportSymbol[] = scan_symbols(source, ws.encoding)?;
+    let slot: u32 = find_file_by_uri(&*ws:Read, uri);
+    let entry: WorkspaceFile = WorkspaceFile {
+        active: true,
+        uri: copy_slice(uri)?,
+        module: @move(module),
+        source: copy_slice(source)?,
+        symbols: @move(symbols),
+    };
+    if slot < MAX_FILES {
+        ws.files[slot] = @move(entry);
+        return;
+    }
+    var i: u32 = 0;
+    while i < @len(ws.files) as u32 {
+        if !ws.files[i].active {
+            ws.files[i] = @move(entry);
+            return;
+        }
+        i = i + 1u32;
+    }
+    if @len(ws.files) < (MAX_FILES as u64) {
+        @push(ws.files, @move(entry))?;
+    }
+    return;
+}
+
+export function remove_file(ws: &Index:ReadWrite, uri: &[u8]): void {
+    let slot: u32 = find_file_by_uri(&*ws:Read, uri);
+    if slot < MAX_FILES {
+        ws.files[slot] = WorkspaceFile { active: false, uri: [], module: [], source: [], symbols: [] };
+    }
+    return;
+}
+
+function ingest_file_array(ws: &Index:ReadWrite, doc: &json::Document:Read, src: &[u8], arr_id: u32): void!AllocError {
+    if !json::is_array(doc.nodes[arr_id].kind) { return; }
+    var cur: u32 = arr_id + 1u32;
+    let end: u32 = doc.nodes[arr_id].next;
+    while cur < end {
+        if json::is_object(doc.nodes[cur].kind) {
+            let u: json::Member = json::member(doc, src, cur, "uri");
+            let t: json::Member = json::member(doc, src, cur, "text");
+            let m: json::Member = json::member(doc, src, cur, "module");
+            if u.status == 1u8 && t.status == 1u8 && json::is_string(doc.nodes[u.id].kind) && json::is_string(doc.nodes[t.id].kind) {
+                let uri_dec: json_string::Decoded = json_string::decode(src, doc.nodes[u.id].start, doc.nodes[u.id].end, MAX_URI)?;
+                let text_dec: json_string::Decoded = json_string::decode(src, doc.nodes[t.id].start, doc.nodes[t.id].end, MAX_FILE_BYTES)?;
+                if uri_dec.ok && text_dec.ok {
+                    if m.status == 1u8 && json::is_string(doc.nodes[m.id].kind) {
+                        let mod_dec: json_string::Decoded = json_string::decode(src, doc.nodes[m.id].start, doc.nodes[m.id].end, MAX_MODULE)?;
+                        if mod_dec.ok {
+                            upsert_file(ws, &uri_dec.data[0..@len(uri_dec.data)]:Read, &mod_dec.data[0..@len(mod_dec.data)]:Read, &text_dec.data[0..@len(text_dec.data)]:Read)?;
+                        }
+                    } else {
+                        upsert_file(ws, &uri_dec.data[0..@len(uri_dec.data)]:Read, "", &text_dec.data[0..@len(text_dec.data)]:Read)?;
+                    }
+                }
+            }
+        }
+        cur = doc.nodes[cur].next;
+    }
+    return;
+}
+
+// 从 initialize 参数读取 rootUri、workspaceFolders 与可选 initializationOptions.workspaceFiles。
+export function configure_from_initialize(ws: &Index:ReadWrite, doc: &json::Document:Read, src: &[u8], params: u32, encoding: u8): void!AllocError {
+    ws.encoding = encoding;
+    let folders: json::Member = json::member(doc, src, params, "workspaceFolders");
+    if folders.status == 1u8 && json::is_array(doc.nodes[folders.id].kind) {
+        var cur: u32 = folders.id + 1u32;
+        let end: u32 = doc.nodes[folders.id].next;
+        while cur < end {
+            if json::is_object(doc.nodes[cur].kind) {
+                let u: json::Member = json::member(doc, src, cur, "uri");
+                if u.status == 1u8 && json::is_string(doc.nodes[u.id].kind) {
+                    let dec: json_string::Decoded = json_string::decode(src, doc.nodes[u.id].start, doc.nodes[u.id].end, MAX_URI)?;
+                    if dec.ok { add_root(ws, &dec.data[0..@len(dec.data)]:Read)?; }
+                }
+            }
+            cur = doc.nodes[cur].next;
+        }
+    }
+    let root_uri: json::Member = json::member(doc, src, params, "rootUri");
+    if root_uri.status == 1u8 && json::is_string(doc.nodes[root_uri.id].kind) {
+        let dec: json_string::Decoded = json_string::decode(src, doc.nodes[root_uri.id].start, doc.nodes[root_uri.id].end, MAX_URI)?;
+        if dec.ok { add_root(ws, &dec.data[0..@len(dec.data)]:Read)?; }
+    }
+    let opts: json::Member = json::member(doc, src, params, "initializationOptions");
+    if opts.status == 1u8 && json::is_object(doc.nodes[opts.id].kind) {
+        let files: json::Member = json::member(doc, src, opts.id, "workspaceFiles");
+        if files.status == 1u8 { ingest_file_array(ws, doc, src, files.id)?; }
+    }
+    return;
+}
+
+// 处理 yak/workspaceFiles 增量同步通知（files 增改、remove 移除）。
+export function apply_sync_notice(ws: &Index:ReadWrite, doc: &json::Document:Read, src: &[u8], params: u32): void!AllocError {
+    let files: json::Member = json::member(doc, src, params, "files");
+    if files.status == 1u8 { ingest_file_array(ws, doc, src, files.id)?; }
+    let removed: json::Member = json::member(doc, src, params, "remove");
+    if removed.status == 1u8 && json::is_array(doc.nodes[removed.id].kind) {
+        var cur: u32 = removed.id + 1u32;
+        let end: u32 = doc.nodes[removed.id].next;
+        while cur < end {
+            if json::is_string(doc.nodes[cur].kind) {
+                let dec: json_string::Decoded = json_string::decode(src, doc.nodes[cur].start, doc.nodes[cur].end, MAX_URI)?;
+                if dec.ok { remove_file(ws, &dec.data[0..@len(dec.data)]:Read); }
+            }
+            cur = doc.nodes[cur].next;
+        }
+    }
+    return;
+}
+
+export struct ExportLookup { found: bool, file_slot: u32, symbol_index: u32 }
+
+// 按模块名与导出符号名查找跨文件目标。
+export function lookup_export(ws: &Index:Read, module: &[u8], name: &[u8]): ExportLookup {
+    let slot: u32 = find_file_by_module(ws, module);
+    if slot >= MAX_FILES { return ExportLookup { found: false, file_slot: 0, symbol_index: 0 }; }
+    let file: &WorkspaceFile:Read = &ws.files[slot]:Read;
+    let src: &[u8] = &file.source[0..@len(file.source)]:Read;
+    var i: u32 = 0;
+    while i < @len(file.symbols) as u32 {
+        let sym: ExportSymbol = file.symbols[i];
+        if sym.exported && bytes_equal(&src[sym.name_start..sym.name_start + sym.name_len]:Read, name) {
+            return ExportLookup { found: true, file_slot: slot, symbol_index: i };
+        }
+        i = i + 1u32;
+    }
+    return ExportLookup { found: false, file_slot: 0, symbol_index: 0 };
+}
+
+// 在所有非当前文件的工作区模块中按导出符号名查找（供自动导入使用）。
+export function find_export_by_name(ws: &Index:Read, exclude_uri: &[u8], name: &[u8]): ExportLookup {
+    var i: u32 = 0;
+    while i < @len(ws.files) as u32 {
+        let file: &WorkspaceFile:Read = &ws.files[i]:Read;
+        if file.active && @len(file.module) > 0u64 && !bytes_equal(&file.uri[0..@len(file.uri)]:Read, exclude_uri) {
+            let src: &[u8] = &file.source[0..@len(file.source)]:Read;
+            var j: u32 = 0;
+            while j < @len(file.symbols) as u32 {
+                let sym: ExportSymbol = file.symbols[j];
+                if sym.exported && bytes_equal(&src[sym.name_start..sym.name_start + sym.name_len]:Read, name) {
+                    return ExportLookup { found: true, file_slot: i, symbol_index: j };
+                }
+                j = j + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+    return ExportLookup { found: false, file_slot: 0, symbol_index: 0 };
+}
+
+// 判断给定位置是否处于 `mod::ident` 路径的尾段，若是则提取模块名与符号名范围。
+export struct PathAtOffset { found: bool, mod_start: u32, mod_end: u32, name_start: u32, name_end: u32 }
+
+export function qualified_at(src: &[u8], offset: u32): PathAtOffset {
+    let none: PathAtOffset = PathAtOffset { found: false, mod_start: 0, mod_end: 0, name_start: 0, name_end: 0 };
+    let n: u32 = @len(src) as u32;
+    if offset >= n { return none; }
+    var ns: u32 = offset;
+    if !ident_cont(src[ns]) { return none; }
+    while ns > 0u32 && ident_cont(src[ns - 1u32]) { ns = ns - 1u32; }
+    if ns > 0u32 && src[ns - 1u32] == 35u8 { ns = ns - 1u32; }
+    var ne: u32 = offset + 1u32;
+    while ne < n && ident_cont(src[ne]) { ne = ne + 1u32; }
+    var p: u32 = ns;
+    while p > 0u32 && (src[p - 1u32] == 32u8 || src[p - 1u32] == 9u8) { p = p - 1u32; }
+    if p < 2u32 || src[p - 1u32] != 58u8 || src[p - 2u32] != 58u8 { return none; }
+    p = p - 2u32;
+    while p > 0u32 && (src[p - 1u32] == 32u8 || src[p - 1u32] == 9u8) { p = p - 1u32; }
+    let me: u32 = p;
+    var ms: u32 = me;
+    while ms > 0u32 {
+        let b: u8 = src[ms - 1u32];
+        if ident_cont(b) || b == 58u8 { ms = ms - 1u32; }
+        else { break; }
+    }
+    if ms >= me { return none; }
+    return PathAtOffset { found: true, mod_start: ms, mod_end: me, name_start: ns, name_end: ne };
+}

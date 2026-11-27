@@ -1,0 +1,4 @@
+// expected_trap: argument buffer too small
+// arg: long
+foreign args_read(index: u32, buffer: &[u8]:ReadWrite): u32;
+function main(): void { var b: u8[] = [0]; args_read(0, &b[0..1]:ReadWrite); }

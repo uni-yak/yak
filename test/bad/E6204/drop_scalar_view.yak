@@ -1,0 +1,9 @@
+// expected_code: E6204
+// spec: spec/lang/base.md#R-26、spec/lang/owner.md#OW-7
+// 触发：对非 owning 的标量借用执行显式析构。
+function main(): void {
+    let value: u32 = 1u32;
+    let view: &u32 = &value;
+    @drop(view);
+    return;
+}

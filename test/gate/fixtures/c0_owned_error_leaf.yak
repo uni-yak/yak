@@ -1,0 +1,7 @@
+export enum Fault { Empty, Bytes(u8[]) }
+
+export function read_case(mode: u8): u8[]!Fault {
+    if mode == 1u8 { return Fault::Bytes([21u8]); }
+    if mode == 2u8 { return Fault::Empty; }
+    return [11u8];
+}

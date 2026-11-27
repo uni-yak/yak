@@ -1,0 +1,20 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+function number(ok: bool): i32!Failure { if !ok { return Failure::Bad; } return 5; }
+function forbidden(): i32 { assert(false); return 0; }
+function sink(data: i32[], value: i32, last: i32): i32 { return data[0] + value + last; }
+function attempt(ok: bool): i32!Failure {
+    let data: i32[] = [1, 2, 3, 4];
+    if !ok { return sink(@move(data), number(ok)?, forbidden()); }
+    return sink(@move(data), number(ok)?, 2);
+}
+function recover(e: &Failure): i32 { return 99; }
+function main(): void {
+    assert(attempt(true).catch(&recover) == 8);
+    var i: u32 = 0;
+    while i < 2000 {
+        assert(attempt(false).catch(&recover) == 99);
+        i = i + 1;
+    }
+}

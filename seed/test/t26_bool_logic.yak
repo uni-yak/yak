@@ -1,0 +1,14 @@
+// t26: 布尔字面量与表达式 + assert
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let t: bool = true;
+    let f: bool = false;
+    let and: bool = t && f;
+    let or: bool = t || f;
+    let not: bool = !t;
+    assert(and == false);
+    assert(or == true);
+    assert(not == false);
+    return;
+}

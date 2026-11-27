@@ -1,0 +1,41 @@
+// JSON 和位置映射共享的 UTF-8 标量读取；不规定 Yak 源码的词法限制。
+export struct Scalar { value: u32, width: u32 }
+
+function invalid(): Scalar { return Scalar { value: 0, width: 0 }; }
+
+// 宽度为零表示非法序列或到达末尾；不会读取输入之外的字节。
+export function decode(src: &[u8], pos: u32): Scalar {
+    let len: u64 = @len(src);
+    if (pos as u64) >= len { return invalid(); }
+    let lead: u8 = src[pos];
+    if lead < 128u8 { return Scalar { value: lead as u32, width: 1 }; }
+    var width: u32 = 0;
+    var value: u32 = 0;
+    var minimum: u32 = 0;
+    if lead >= 194u8 && lead <= 223u8 {
+        width = 2;
+        value = (lead & 31u8) as u32;
+        minimum = 128;
+    } elseif lead >= 224u8 && lead <= 239u8 {
+        width = 3;
+        value = (lead & 15u8) as u32;
+        minimum = 2048;
+    } elseif lead >= 240u8 && lead <= 244u8 {
+        width = 4;
+        value = (lead & 7u8) as u32;
+        minimum = 65536;
+    } else {
+        return invalid();
+    }
+    let start: u64 = pos as u64;
+    if len - start < (width as u64) { return invalid(); }
+    var i: u64 = 1;
+    while i < (width as u64) {
+        let byte: u8 = src[start + i];
+        if byte < 128u8 || byte > 191u8 { return invalid(); }
+        value = value * 64 + ((byte & 63u8) as u32);
+        i = i + 1;
+    }
+    if value < minimum || (value >= 55296 && value <= 57343) || value > 1114111 { return invalid(); }
+    return Scalar { value: value, width: width };
+}

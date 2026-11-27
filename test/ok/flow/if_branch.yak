@@ -1,0 +1,15 @@
+// expected_exit: 7
+// spec: spec/lang/base.md 六、控制流与求值
+// if / elseif / else 分支选择：实参取第二分支，退出码 7。
+foreign exit(code: u8): void;
+
+function pick(x: u32): u32 {
+    if x == 1u32 { return 3u32; }
+    elseif x == 2u32 { return 7u32; }
+    else { return 9u32; }
+}
+
+function main(): void {
+    exit(pick(2u32) as u8);
+    return;
+}

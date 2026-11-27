@@ -1,0 +1,2 @@
+export function public_value(): u8 { return 1u8; }
+function helper(): void { return; }

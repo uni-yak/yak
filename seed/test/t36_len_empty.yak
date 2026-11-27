@@ -1,0 +1,9 @@
+// t36: @len 空数组 + assert
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let arr: u8[] = [];
+    let n: u32 = @len(arr) as u32;
+    assert(n == 0);
+    return;
+}

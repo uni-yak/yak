@@ -1,0 +1,8 @@
+// expected_code: E5805
+// spec: spec/lang/type/enum.md EN-3
+// 触发：将布尔值用作要求 u16 的标签载荷。
+enum Record { Payload(u16) }
+
+function make(): Record { return Record::Payload(true); }
+
+function main(): void { return; }

@@ -1,0 +1,141 @@
+// System V 基础整数槽：只搬运单机器字和展开的切片，不赋予聚合或载体 ABI。
+import pe;
+
+// 位置是相对 rbp 的负位移。切片的指针在 slot，长度在 slot - 8。
+export struct Argument { slot: u32, form: u8 }
+export struct Frame { code: u16, local_bytes: u32, outgoing_words: u32, bytes: u32 }
+export struct CallSite { code: u16, at: u32 }
+
+const AL_ALIGN: u16 = 8014;
+const EM_SHAPE: u16 = 8023;
+const FRAME_MAX: u64 = 2147483632u64;
+
+export function word_form(): u8 { return 1; }
+export function slice_form(): u8 { return 2; }
+
+// max_words 是最大调用的展开槽数，没有 Win64 影子区，也不使用红区。
+export function plan(local_bytes: u32, max_words: u32): Frame {
+    var stack_words: u32 = 0;
+    if max_words > 6 { stack_words = max_words - 6; }
+    let needed: u64 = (local_bytes as u64) + (stack_words as u64) * 8u64;
+    if needed > FRAME_MAX {
+        return Frame { code: EM_SHAPE, local_bytes: 0, outgoing_words: 0, bytes: 0 };
+    }
+    let size: u32 = (((needed + 15u64) / 16u64) * 16u64) as u32;
+    return Frame { code: 0, local_bytes: local_bytes, outgoing_words: stack_words, bytes: size };
+}
+
+function check_frame(win64_body: bool, frame: &Frame:Read): u16 {
+    if frame.code != 0 { return frame.code; }
+    if frame.bytes % 16 != 0 { return AL_ALIGN; }
+    if win64_body || frame.outgoing_words > 4294967289u32 { return EM_SHAPE; }
+    let expected: Frame = plan(frame.local_bytes, frame.outgoing_words + 6);
+    if expected.code != 0 || expected.bytes != frame.bytes { return EM_SHAPE; }
+    return 0;
+}
+
+function arg_reg(index: u32): u8 {
+    if index == 0 { return 7; }
+    if index == 1 { return 6; }
+    if index == 2 { return 2; }
+    if index == 3 { return 1; }
+    if index == 4 { return 8; }
+    return 9;
+}
+
+function check_args(frame: &Frame:Read, args: &[Argument], incoming: bool): u16 {
+    if @len(args) > FRAME_MAX / 8u64 { return EM_SHAPE; }
+    let count: u32 = @len(args) as u32;
+    var arg: u32 = 0;
+    var words: u64 = 0;
+    var last: u32 = 0;
+    while arg < count {
+        let item: Argument = args[arg];
+        if item.form != 1 && item.form != 2 { return EM_SHAPE; }
+        let width: u32 = (item.form as u32) * 8;
+        if item.slot < width || item.slot > frame.local_bytes || item.slot % 8 != 0 { return EM_SHAPE; }
+        // 入参局部按分配顺序写入，不允许覆盖先前参数；出参可以重复读取同一局部。
+        if incoming && item.slot - width < last { return EM_SHAPE; }
+        last = item.slot;
+        words = words + (item.form as u64);
+        arg = arg + 1;
+    }
+    if words > FRAME_MAX / 8u64 { return EM_SHAPE; }
+    if !incoming && words > 6u64 + (frame.outgoing_words as u64) { return EM_SHAPE; }
+    return 0;
+}
+
+export function enter(code: &pe::Code:ReadWrite, frame: &Frame:Read): u16!AllocError {
+    let status: u16 = check_frame(code.win64_body, frame);
+    if status != 0 { return status; }
+    pe::push_rbp(code)?;
+    pe::mov_rbp_rsp(code)?;
+    pe::sub_rsp_imm(code, frame.bytes)?;
+    return 0;
+}
+
+export function leave(code: &pe::Code:ReadWrite, frame: &Frame:Read): u16!AllocError {
+    let status: u16 = check_frame(code.win64_body, frame);
+    if status != 0 { return status; }
+    pe::add_rsp_imm(code, frame.bytes)?;
+    pe::pop_rbp(code)?;
+    pe::ret(code)?;
+    return 0;
+}
+
+// 先验证全部形参，再发射，避免在形态拒绝时留下半个调用点。
+export function spill(code: &pe::Code:ReadWrite, frame: &Frame:Read, args: &[Argument]): u16!AllocError {
+    let status: u16 = check_frame(code.win64_body, frame);
+    if status != 0 { return status; }
+    let checked: u16 = check_args(frame, args, true);
+    if checked != 0 { return checked; }
+    let count: u32 = @len(args) as u32;
+    var arg: u32 = 0;
+    var index: u32 = 0;
+    while arg < count {
+        let item: Argument = args[arg];
+        var part: u32 = 0;
+        while part < item.form as u32 {
+            let at: u32 = item.slot - part * 8;
+            if index < 6 { pe::store_slot(code, arg_reg(index), at, 8)?; }
+            else {
+                // 保存的 rbp 和返回地址各八字节，第七个展开槽从 rbp + 16 开始。
+                pe::load_base(code, pe::rax(), pe::rbp(), 16 + (index - 6) * 8, 8)?;
+                pe::store_slot(code, pe::rax(), at, 8)?;
+            }
+            part = part + 1;
+            index = index + 1;
+        }
+        arg = arg + 1;
+    }
+    return 0;
+}
+
+// 返回 call 的四字节占位起点。ELF 层把它绑定到相应的符号和 RELA 加数。
+export function call(code: &pe::Code:ReadWrite, frame: &Frame:Read, args: &[Argument]): CallSite!AllocError {
+    let status: u16 = check_frame(code.win64_body, frame);
+    if status != 0 { return CallSite { code: status, at: 0 }; }
+    let checked: u16 = check_args(frame, args, false);
+    if checked != 0 { return CallSite { code: checked, at: 0 }; }
+    let count: u32 = @len(args) as u32;
+    var arg: u32 = 0;
+    var index: u32 = 0;
+    while arg < count {
+        let item: Argument = args[arg];
+        var part: u32 = 0;
+        while part < item.form as u32 {
+            let at: u32 = item.slot - part * 8;
+            if index < 6 { pe::load_slot(code, arg_reg(index), at, 8)?; }
+            else {
+                // 第七个展开槽就在当前 rsp，栈区位于局部区之外。
+                pe::load_slot(code, pe::rax(), at, 8)?;
+                pe::store_slot(code, pe::rax(), frame.bytes - (index - 6) * 8, 8)?;
+            }
+            part = part + 1;
+            index = index + 1;
+        }
+        arg = arg + 1;
+    }
+    let at: u32 = pe::call_rel32(code)?;
+    return CallSite { code: 0, at: at };
+}

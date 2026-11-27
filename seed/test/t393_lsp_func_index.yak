@@ -1,0 +1,101 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import consteval;
+import typecheck;
+import typecheck_driver;
+import typecheck_body;
+import typecheck_shape;
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let source: &[u8] = "struct Gap { value: u32 }\nfunction first(a: u32): u32 { return a; }\nforeign #exit(status: u8): void;\nconst N: u32 = 1u32;\nfunction last(x: u32): u32 { return first(x) + N; }\n";
+    let lexed: lex::LexResult = lex::lex_scan(source, 117u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 117u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var names: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let res: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &names:ReadWrite)?;
+    assert(names.count == 0u32);
+    var document_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var batch_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let batch: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &res:Read, &batch_diags:ReadWrite)?;
+    var intern: typecheck::InternBudget = typecheck::intern_budget(0u32);
+    var lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(0u32);
+    var material: consteval::MaterialBudget = consteval::material_budget(0u32);
+    var fold: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var probe: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var scan: typecheck_driver::IntegerScanBudget = typecheck_driver::integer_scan_budget(0u32);
+    var body: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let indexed: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit_with_body_budget(&parsed.file:Read, &parsed.pool:Read, &res:Read, &document_diags:ReadWrite, &intern:ReadWrite, &lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe:ReadWrite, &scan:ReadWrite, &body:ReadWrite, true)?;
+    assert(document_diags.count == 0u32 && batch_diags.count == 0u32);
+    assert(@len(indexed.funcs.items) == 3 && @len(batch.funcs.items) == 3);
+    assert(@len(batch.funcs.by_def) == 0 && @len(indexed.funcs.by_def) > 3);
+    assert(typecheck::func_sig(&indexed.funcs:Read, 0u32) == 0u32);
+    var def: u32 = 1u32;
+    var missing: u32 = 0u32;
+    while def <= @len(indexed.funcs.by_def) as u32 {
+        let sig: u32 = typecheck::func_sig(&indexed.funcs:Read, def);
+        assert(sig == typecheck::func_sig(&batch.funcs:Read, def));
+        if sig == 0u32 { missing = missing + 1u32; }
+        else { assert(indexed.funcs.items[sig - 1u32].def == def); }
+        def = def + 1u32;
+    }
+    assert(missing >= 2u32 && typecheck::func_sig(&indexed.funcs:Read, def) == 0u32);
+    assert(indexed.funcs.items[1].service == 1u8 && batch.funcs.items[1].service == 1u8);
+    assert(@len(indexed.def_types.items) == @len(batch.def_types.items));
+    var d: u32 = 0u32;
+    while d < @len(indexed.def_types.items) as u32 {
+        assert(indexed.def_types.items[d] == batch.def_types.items[d]);
+        d = d + 1u32;
+    }
+    assert(@len(indexed.expr_types.items) == @len(batch.expr_types.items));
+    var i: u32 = 0u32;
+    while i < @len(indexed.expr_types.items) as u32 {
+        assert(indexed.expr_types.items[i] == batch.expr_types.items[i]);
+        i = i + 1u32;
+    }
+    return;
+}

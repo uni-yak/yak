@@ -1,0 +1,23 @@
+// t102: 多成员 ErrorSet T!(E1|E2) —— 声明解析 + 成功路径（result.md）
+foreign assert(cond: bool): void;
+enum IoError {
+    Unavailable,
+}
+enum ParseError {
+    Invalid,
+}
+function load(ready: &bool, valid: &bool): u32!(IoError | ParseError) {
+    if !*ready {
+        return IoError::Unavailable;
+    }
+    if !*valid {
+        return ParseError::Invalid;
+    }
+    return 8080;
+}
+function main(): void {
+    let t: bool = true;
+    let n: u32 = load(&t, &t)?;
+    assert(n == 8080);
+    return;
+}

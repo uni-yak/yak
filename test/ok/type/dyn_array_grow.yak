@@ -1,0 +1,22 @@
+// expected_exit: 10
+// spec: spec/lang/base.md 7.16、spec/lang/type/array.md
+// 动态数组四次 push 后索引求和，退出码 10 验证增长、索引读与出口释放。
+foreign exit(code: u8): void;
+
+function fill(): void!AllocError {
+    var a: u8[] = [];
+    @push(a, 1u8)?;
+    @push(a, 2u8)?;
+    @push(a, 3u8)?;
+    @push(a, 4u8)?;
+    let n: u64 = @len(a);
+    if n != 4u64 { exit(99u8); }
+    let s: u32 = (a[0u32] as u32) + (a[1u32] as u32) + (a[2u32] as u32) + (a[3u32] as u32);
+    exit(s as u8);
+    return;
+}
+
+function main(): void {
+    fill();
+    return;
+}

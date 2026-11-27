@@ -1,0 +1,9 @@
+// expected_code: E4008
+// dependency: private_item_dep.yak
+// spec: spec/lang/module.md#N-8、spec/lang/name.md#N-8
+// 触发：导入方引用依赖模块里未导出的函数，应报未导出而不是名字不存在。
+import private_item_dep;
+function main(): void {
+    private_item_dep::helper();
+    return;
+}

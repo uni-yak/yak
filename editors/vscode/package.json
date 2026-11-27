@@ -1,0 +1,126 @@
+{
+  "name": "yak-lang",
+  "displayName": "Yak Language",
+  "description": "Yak 语言语法高亮、编辑配置与原生 LSP 语言服务支持（兼容 CodeBuddy CN 与 VS Code）",
+  "version": "0.1.0",
+  "publisher": "yak-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "yak",
+    "lsp",
+    "syntax",
+    "language-server"
+  ],
+  "activationEvents": [
+    "onLanguage:yak",
+    "workspaceContains:**/*.yak"
+  ],
+  "main": "./src/extension.cjs",
+  "contributes": {
+    "languages": [
+      {
+        "id": "yak",
+        "aliases": [
+          "Yak",
+          "yak"
+        ],
+        "extensions": [
+          ".yak"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "yak",
+        "scopeName": "source.yak",
+        "path": "./syntaxes/yak.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "yak.restartServer",
+        "title": "Yak: 重启语言服务器 (Restart Language Server)"
+      },
+      {
+        "command": "yak.resyncWorkspace",
+        "title": "Yak: 重新同步工作区索引 (Resync Workspace Files)"
+      },
+      {
+        "command": "yak.showOutput",
+        "title": "Yak: 打开语言服务输出日志 (Show Output)"
+      }
+    ],
+    "configurationDefaults": {
+      "[yak]": {
+        "files.eol": "\n",
+        "files.encoding": "utf8",
+        "editor.insertSpaces": true,
+        "editor.tabSize": 4
+      }
+    },
+    "configuration": {
+      "title": "Yak",
+      "properties": {
+        "yak.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 Yak LSP 语言服务器（诊断、跳转、悬停、补全、格式化、重命名与快速修复）。"
+        },
+        "yak.lsp.path": {
+          "type": "string",
+          "default": "",
+          "description": "自定义 yak_lsp.exe 可执行文件路径；留空时优先使用扩展内置的 bin/yak_lsp.exe，并自动探测工作区构建产物。"
+        },
+        "yak.semanticHighlighting.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用服务端返回的 LSP 语义着色叠加（关闭后仅使用 TextMate 词法高亮）。"
+        },
+        "yak.workspace.maxFiles": {
+          "type": "integer",
+          "default": 64,
+          "minimum": 1,
+          "maximum": 64,
+          "description": "向 yak_lsp.exe 同步的最大工作区 .yak 文件数（服务端协议上限为 64）。"
+        },
+        "yak.workspace.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/.git/**",
+            "**/node_modules/**",
+            "**/tmp/**",
+            "**/out/**",
+            "**/seed/test/**",
+            "**/test/gate/tmp/**"
+          ],
+          "description": "扫描工作区 .yak 文件时忽略的 glob 路径模式。"
+        },
+        "yak.trace.server": {
+          "type": "string",
+          "default": "off",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "description": "追踪扩展客户端与 yak_lsp.exe 之间的 JSON-RPC 协议消息。"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  }
+}

@@ -1,0 +1,456 @@
+// 单元类型检查的阶段调度、常量诊断与类型侧表收口。
+import typecheck;
+import type_import;
+import consteval;
+import ast;
+import resolve_refs;
+import diag;
+import types;
+import resolve;
+import typecheck_body;
+import typecheck_shape;
+import typecheck_checks;
+
+const BUILTIN_BOOL: u16 = 4105;
+const BUILTIN_ALLOC_ERROR: u16 = 4108;
+const TK_VOID: u8 = 0;
+const TK_BUILTIN: u8 = 1;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_FALLIBLE: u8 = 9;
+const TK_NULLABLE: u8 = 10;
+const TK_ERROR_SET: u8 = 11;
+
+// 只在有常量或整数试算入口时构建文档快照；字面量范围检查不读取快照。
+export function needs_const_input(pool: &ast::AstPool:Read, tables: &resolve::ResolveTables:Read): bool {
+    return tables.has_constants || @len(pool.casts) != 0 || @len(pool.indices) != 0 || @len(pool.slices) != 0;
+}
+
+export struct ConstSnapshotBudget { limited: bool, remaining: u64, exhausted: bool }
+export function const_snapshot_budget(limit: u64): ConstSnapshotBudget {
+    return ConstSnapshotBudget { limited: limit != 0u64, remaining: limit, exhausted: false };
+}
+
+// 把已规范化的类型表与枚举表折叠成求值器只读快照；求值器不接触解析池之外的可变状态。
+export function const_input_limited(tt: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, defs: &typecheck::DefTypeTable:Read, needed: bool, work: &ConstSnapshotBudget:ReadWrite): consteval::ConstInput!AllocError {
+    var local_work: typecheck_checks::SnapshotBudget = typecheck_checks::SnapshotBudget { limited: work.limited, remaining: work.remaining, exhausted: work.exhausted };
+    let input: consteval::ConstInput = typecheck_checks::build_const_input(tt, enums, defs, needed, &local_work:ReadWrite)?;
+    work.remaining = local_work.remaining;
+    work.exhausted = local_work.exhausted;
+    return input;
+}
+
+// 文档整数诊断外围扫描配额与递归试算分开计量。
+export struct IntegerScanBudget { limited: bool, remaining: u32, exhausted: bool }
+
+export function integer_scan_budget(limit: u32): IntegerScanBudget {
+    return IntegerScanBudget { limited: limit != 0u32, remaining: limit, exhausted: false };
+}
+
+// 语句遍历负责作用域、绑定及递归；表达式推导共享同一份函数体预算。
+function check_return(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, expr_types: &typecheck::ExprTypeTable:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, funcs: &typecheck::FuncTable:Read, defs: &typecheck::DefTypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, ret_type: u32, value: u32, span: types::Span): void!AllocError {
+    if pool.option_syntax && value < @len(pool.exprs) as u32 && pool.exprs[value].kind == 31 && (ret_type == 0 || typecheck::type_is_void(tt, ret_type)) {
+        typecheck::emit(diags, types::error_code(5813), pool.exprs[value].span)?;
+        return;
+    }
+    if ret_type == 0 {
+        if value != 4294967295u32 { typecheck::emit(diags, types::error_code(2005), span)?; }
+        return;
+    }
+    if tt.entries[ret_type - 1].kind == TK_VOID {
+        if value != 4294967295u32 { typecheck::emit(diags, types::error_code(2005), span)?; }
+        return;
+    }
+    if tt.entries[ret_type - 1].kind == TK_FALLIBLE {
+        let success: u32 = tt.entries[ret_type - 1].success;
+        let errorset: u32 = tt.entries[ret_type - 1].elem;
+        if value == 4294967295u32 {
+            if !typecheck::type_is_void(tt, success) { typecheck::emit(diags, types::error_code(2005), span)?; }
+            return;
+        }
+        if typecheck_body::reject_bare_return_error(shape, tt, refs, diags, pool, value, errorset)? { return; }
+        let events: u64 = diag::diagbuf_events(diags);
+        let actual: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, value, success)?;
+        if typecheck::same_type(actual, ret_type) { return; }
+        if actual == 0 && (refs.pending_names != 0 || diag::diagbuf_events(diags) != events || shape.stop != 0) { return; }
+        if typecheck::type_is_void(tt, success) {
+            if actual == 0 || !typecheck::type_is_error_member(tt, errorset, actual) { typecheck::emit(diags, types::error_code(2005), span)?; }
+            return;
+        }
+        if actual != 0 && typecheck::same_type(actual, success) { return; }
+        if actual != 0 && typecheck::type_is_error_member(tt, errorset, actual) { return; }
+        typecheck::emit(diags, types::error_code(2005), span)?;
+        return;
+    }
+    if value == 4294967295u32 { typecheck::emit(diags, types::error_code(2005), span)?; return; }
+    let actual: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, value, ret_type)?;
+    if actual != 0 && !typecheck::same_type(actual, ret_type) { typecheck::emit(diags, types::error_code(2005), span)?; }
+    return;
+}
+function check_block(shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, expr_types: &typecheck::ExprTypeTable:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, funcs: &typecheck::FuncTable:Read, defs: &typecheck::DefTypeTable:ReadWrite, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, refs: &resolve_refs::RefTable:Read, tables: &resolve::ResolveTables:Read, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, block_id: u32, scope: u32, ret_type: u32): void!AllocError {
+    var index: u32 = 0;
+    while index < @len(pool.blocks[block_id].stmts) as u32 {
+        if shape.stop != 0u8 { return; }
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block_id].stmts[index]];
+        if stmt.kind == 1 {
+            let local: ast::LocalDecl = pool.locals[stmt.data];
+            let declared: u32 = typecheck_shape::body_resolve_type_ref(shape, tt, refs, pool, local.type_ref)?;
+            if shape.stop != 0u8 { return; }
+            var def: u32 = 0;
+            if tables.index_locals { def = resolve::local_decl_def(tables, stmt.data, scope, local); }
+            else { def = typecheck::lookup_binding(tables, scope, local.name); }
+            if def != 0 { typecheck::set_def_type(defs, def, declared); }
+            if local.init != 4294967295u32 {
+                let actual: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, local.init, declared)?;
+                typecheck_shape::check_assignable(tt, diags, actual, declared, local.span, types::error_code(5001))?;
+            }
+        } elseif stmt.kind == 10 {
+            check_return(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, stmt.data, stmt.span)?;
+        } elseif stmt.kind == 14 {
+            let if_id: u32 = stmt.data;
+            var branch: u32 = 0;
+            while branch < @len(pool.ifs[if_id].branches) as u32 {
+                let arm: ast::IfBranch = pool.ifs[if_id].branches[branch];
+                if arm.reserved_binding != 0 {
+                    let operand: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, arm.condition, 0)?;
+                    if shape.stop != 0u8 { return; }
+                    var code: u16 = 3008;
+                    if operand != 0 && tt.entries[operand - 1].kind == TK_FALLIBLE { code = 3004; }
+                    typecheck::emit(diags, types::error_code(code), arm.span)?;
+                    branch = branch + 1;
+                    continue;
+                }
+                let bool_type: u32 = typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_BOOL as u32, 0)?;
+                let condition: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, arm.condition, bool_type)?;
+                if shape.stop != 0u8 { return; }
+                if !typecheck::type_is_bool(tt, condition) { typecheck::emit(diags, types::error_code(2004), pool.exprs[arm.condition].span)?; }
+                var narrowed: u32 = 0;
+                var original: u32 = 0;
+                if pool.union_syntax && pool.exprs[arm.condition].kind == 32 {
+                    let site: ast::CastExpr = pool.casts[pool.exprs[arm.condition].data as u32];
+                    if pool.exprs[site.operand].kind == 0 {
+                        let ref: u32 = typecheck::ref_index(refs, 0, site.operand);
+                        if ref != 0 && refs.items[ref - 1].kind == 0 {
+                            let def: u32 = refs.items[ref - 1].x;
+                            let kind: u8 = tables.defs[def - 1].kind;
+                            // 直接的成功分支只收窄不可改写的参数或 let 绑定。
+                            if kind == 7 || kind == 8 {
+                                original = typecheck::def_type(defs, def);
+                                let selected: u32 = typecheck_shape::body_resolve_type_ref(shape, tt, refs, pool, site.target_type)?;
+                                if shape.stop != 0u8 { return; }
+                                if typecheck::plain_union_member(tt, original, selected) {
+                                    narrowed = def;
+                                    typecheck::set_def_type(defs, def, selected);
+                                }
+                            }
+                        }
+                    }
+                }
+                check_block(shape, expr_types, tt, funcs, defs, fields, enums, refs, tables, diags, pool, arm.body, tables.block_scope[arm.body], ret_type)?;
+                if narrowed != 0 { typecheck::set_def_type(defs, narrowed, original); }
+                if shape.stop != 0u8 { return; }
+                branch = branch + 1;
+            }
+            let else_body: u32 = pool.ifs[if_id].else_body;
+            if else_body < @len(pool.blocks) as u32 { check_block(shape, expr_types, tt, funcs, defs, fields, enums, refs, tables, diags, pool, else_body, tables.block_scope[else_body], ret_type)?; }
+        } elseif stmt.kind == 15 {
+            let while_id: u32 = stmt.data;
+            let bool_type: u32 = typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_BOOL as u32, 0)?;
+            let condition: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, pool.whiles[while_id].condition, bool_type)?;
+            if shape.stop != 0u8 { return; }
+            if !typecheck::type_is_bool(tt, condition) { typecheck::emit(diags, types::error_code(2004), pool.exprs[pool.whiles[while_id].condition].span)?; }
+            let body: u32 = pool.whiles[while_id].body;
+            check_block(shape, expr_types, tt, funcs, defs, fields, enums, refs, tables, diags, pool, body, tables.block_scope[body], ret_type)?;
+        } elseif stmt.kind == 16 {
+            let match_id: u32 = stmt.data;
+            let match_value: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, pool.matches[match_id].scrutinee, 0)?;
+            if shape.stop != 0u8 { return; }
+            if match_value != 0 {
+                let match_type: typecheck::TypeEntry = tt.entries[match_value - 1];
+                if pool.union_syntax && typecheck::plain_union_type(tt, match_value) {
+                    typecheck::emit(diags, types::error_code(5820), pool.matches[match_id].span)?;
+                    index = index + 1;
+                    continue;
+                }
+                if match_type.kind == TK_FALLIBLE || match_type.kind == TK_NULLABLE || match_type.kind == TK_ERROR_SET {
+                    typecheck::emit(diags, types::error_code(2012), pool.matches[match_id].span)?;
+                } elseif match_type.kind == TK_LOCAL {
+                    if match_type.def != 0 && match_type.def <= @len(tables.defs) as u32 && tables.defs[match_type.def - 1].kind == 3 { typecheck::emit(diags, types::error_code(6001), pool.matches[match_id].span)?; }
+                } elseif match_type.kind == TK_IMPORTED {
+                    if type_import::imported_struct(refs, match_type) { typecheck::emit(diags, types::error_code(6001), pool.matches[match_id].span)?; }
+                } elseif !(match_type.kind == TK_BUILTIN && match_type.builtin == BUILTIN_ALLOC_ERROR) {
+                    typecheck::emit(diags, types::error_code(6001), pool.matches[match_id].span)?;
+                }
+            }
+            // 收集已覆盖的变体序号，用于穷尽性判定。
+            var covered: u32[] = [];
+            var has_wildcard: bool = false;
+            var arm: u32 = 0;
+            while arm < @len(pool.matches[match_id].arms) as u32 {
+                if shape.stop != 0u8 { return; }
+                if shape.match_limited && !typecheck_shape::match_charge(shape) { return; }
+                let pattern_id: u32 = pool.matches[match_id].arms[arm].pattern;
+                var variant_type: u32 = 0;
+                if pattern_id < @len(pool.patterns) as u32 {
+                    if pool.patterns[pattern_id].kind == 1 {
+                        // 通配臂只允许出现一次，且必须位于最后一个臂。
+                        if has_wildcard { typecheck::emit(diags, types::error_code(2014), pool.patterns[pattern_id].span)?; }
+                        has_wildcard = true;
+                        if arm + 1 < @len(pool.matches[match_id].arms) as u32 { typecheck::emit(diags, types::error_code(2014), pool.patterns[pattern_id].span)?; }
+                    }
+                    let pindex: u32 = typecheck::ref_index(refs, 2, pattern_id);
+                    var ref_kind: u8 = 0;
+                    var x: u32 = 0; var y: u32 = 0; var z: u32 = 0;
+                    if pindex != 0 && refs.items[pindex - 1].kind != 6 {
+                        ref_kind = refs.items[pindex - 1].kind;
+                        x = refs.items[pindex - 1].x; y = refs.items[pindex - 1].y; z = refs.items[pindex - 1].z;
+                    } elseif pool.patterns[pattern_id].kind == 0 && @len(pool.patterns[pattern_id].path) == 1 && match_value != 0 {
+                        // 裸标签只在 scrutinee 的枚举成员表中查找。
+                        let name: u32 = pool.patterns[pattern_id].path[0];
+                        let row: u32 = typecheck::enum_row_of(tt, enums, match_value, shape.ordered_enums);
+                        var searchable: bool = row != 0;
+                        if row != 0 {
+                            let host: u32 = enums.items[row - 1].def;
+                            var m: u32 = 0;
+                            while m < @len(tables.enum_members) as u32 {
+                                if shape.match_limited && !typecheck_shape::match_charge(shape) { return; }
+                                if tables.enum_members[m].host == host && tables.enum_members[m].name == name {
+                                    ref_kind = 3; x = host; y = tables.enum_members[m].variant; break;
+                                }
+                                m = m + 1;
+                            }
+                        } elseif tt.entries[match_value - 1].kind == TK_IMPORTED {
+                            let dep: u16 = tt.entries[match_value - 1].dep;
+                            let export_id: u32 = tt.entries[match_value - 1].export_id;
+                            var m: u32 = 0;
+                            while m < @len(refs.variants) as u32 {
+                                if refs.variants[m].dep == dep && refs.variants[m].export_id == export_id {
+                                    searchable = true;
+                                    if refs.variants[m].name == name { ref_kind = 4; x = dep as u32; y = export_id; z = refs.variants[m].variant; break; }
+                                }
+                                m = m + 1;
+                            }
+                        }
+                        if tt.entries[match_value - 1].kind == TK_BUILTIN && tt.entries[match_value - 1].builtin == BUILTIN_ALLOC_ERROR {
+                            searchable = true;
+                            if pindex != 0 && refs.items[pindex - 1].kind == 6 { ref_kind = 5; x = refs.items[pindex - 1].x; y = refs.items[pindex - 1].y; }
+                        }
+                        if searchable && ref_kind == 0 { typecheck::emit(diags, types::error_code(2013), pool.patterns[pattern_id].span)?; }
+                    }
+                    if ref_kind != 0 {
+                        var host_type: u32 = 0;
+                        var variant: u32 = 0;
+                        var payload_known: bool = false;
+                        var has_payload: bool = false;
+                        if ref_kind == 3 {
+                            let host: u32 = x;
+                            host_type = typecheck_shape::body_intern(shape, tt, TK_LOCAL, host, 0)?;
+                            if shape.stop != 0u8 { return; }
+                            variant = y;
+                            let payload: u32 = typecheck::enum_payload_with_order(enums, host, variant, shape.ordered_enums);
+                            if payload != 4294967295u32 { payload_known = true; variant_type = payload; has_payload = payload != 0; }
+                        } elseif ref_kind == 4 {
+                            let dep: u16 = x as u16;
+                            let export_id: u32 = y;
+                            variant = z;
+                            host_type = typecheck_shape::body_intern(shape, tt, TK_IMPORTED, dep as u32, export_id as u64)?;
+                            if shape.stop != 0u8 { return; }
+                            var v: u32 = 0;
+                            while v < @len(refs.variants) as u32 {
+                                if refs.variants[v].known && refs.variants[v].dep == dep && refs.variants[v].export_id == export_id && refs.variants[v].variant == variant {
+                                    payload_known = true;
+                                    has_payload = @len(refs.variants[v].types) != 0;
+                                    if has_payload { variant_type = type_import::import_slot_type(tt, &refs.variants[v].types[0..@len(refs.variants[v].types)]:Read, refs.variants[v].root, dep)?; }
+                                    break;
+                                }
+                                v = v + 1;
+                            }
+                        }
+                        if ref_kind == 5 && x == BUILTIN_ALLOC_ERROR as u32 {
+                            host_type = typecheck_shape::body_intern(shape, tt, TK_BUILTIN, BUILTIN_ALLOC_ERROR as u32, 0)?;
+                            if shape.stop != 0u8 { return; }
+                            variant = y;
+                            payload_known = true;
+                        }
+                        if host_type != 0 {
+                            if pool.patterns[pattern_id].binding != 0 && payload_known && !has_payload { typecheck::emit(diags, types::error_code(2003), pool.patterns[pattern_id].span)?; }
+                            if match_value != 0 && !typecheck::same_type(match_value, host_type) {
+                                typecheck::emit(diags, types::error_code(2013), pool.patterns[pattern_id].span)?;
+                            } else {
+                                var seen: bool = false;
+                                var c: u32 = 0;
+                                while c < @len(covered) as u32 {
+                                    if shape.match_limited && !typecheck_shape::match_charge(shape) { return; }
+                                    if covered[c] == variant { seen = true; break; }
+                                    c = c + 1;
+                                }
+                                if seen { typecheck::emit(diags, types::error_code(2014), pool.patterns[pattern_id].span)?; }
+                                else { @push(covered, variant)?; }
+                            }
+                        }
+                    }
+                    let binding: u32 = pool.patterns[pattern_id].binding;
+                    if binding != 0 && variant_type != 0 {
+                        let offset: u32 = pool.patterns[pattern_id].span.offset;
+                        if shape.match_limited {
+                            if !typecheck_shape::match_charge(shape) { return; }
+                            let def: u32 = resolve::match_payload_def(tables, pool.matches[match_id].arms[arm].body, scope, binding, offset);
+                            if def != 0u32 { typecheck::set_def_type(defs, def, variant_type); }
+                        } else {
+                            var d: u32 = 0;
+                            while d < @len(tables.defs) as u32 {
+                                if tables.defs[d].kind == 12 && tables.defs[d].name == binding && tables.defs[d].decl_offset == offset { typecheck::set_def_type(defs, d + 1, variant_type); break; }
+                                d = d + 1;
+                            }
+                        }
+                    }
+                }
+                let body: u32 = pool.matches[match_id].arms[arm].body;
+                check_block(shape, expr_types, tt, funcs, defs, fields, enums, refs, tables, diags, pool, body, tables.block_scope[body], ret_type)?;
+                if shape.stop != 0u8 { return; }
+                arm = arm + 1;
+            }
+            // 无通配臂时，scrutinee 的每个标签都必须被覆盖；否则报 P-2。
+            if !has_wildcard {
+                let row: u32 = typecheck::enum_row_of(tt, enums, match_value, shape.ordered_enums);
+                var total: u32 = 0;
+                if row != 0 { total = @len(enums.items[row - 1].payloads) as u32; }
+                elseif match_value != 0 && tt.entries[match_value - 1].kind == TK_BUILTIN && tt.entries[match_value - 1].builtin == BUILTIN_ALLOC_ERROR { total = 1; }
+                elseif match_value != 0 && tt.entries[match_value - 1].kind == TK_IMPORTED {
+                    let dep: u16 = tt.entries[match_value - 1].dep;
+                    let export_id: u32 = tt.entries[match_value - 1].export_id;
+                    var v: u32 = 0;
+                    var complete: bool = true;
+                    while v < @len(refs.variants) as u32 {
+                        if refs.variants[v].dep == dep && refs.variants[v].export_id == export_id {
+                            total = total + 1;
+                            if !refs.variants[v].known { complete = false; }
+                        }
+                        v = v + 1;
+                    }
+                    if !complete { total = 0; }
+                }
+                if total != 0 && (@len(covered) as u32) < total { typecheck::emit(diags, types::error_code(2002), pool.matches[match_id].span)?; }
+            }
+        } elseif stmt.kind == 17 {
+            let assign_id: u32 = stmt.data;
+            let target_expr: u32 = pool.assigns[assign_id].target;
+            let target: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, target_expr, 0)?;
+            if typecheck::expr_array_property(tt, expr_types, pool, target_expr) != 0 {
+                typecheck::emit(diags, types::error_code(2006), pool.exprs[target_expr].span)?;
+            }
+            let actual: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, pool.assigns[assign_id].value, target)?;
+            typecheck_shape::check_assignable(tt, diags, actual, target, pool.assigns[assign_id].span, types::error_code(5001))?;
+        } elseif stmt.kind == 13 || stmt.kind == 18 {
+            let value: u32 = typecheck_body::infer_expr(shape, expr_types, tt, funcs, defs, fields, enums, refs, diags, pool, ret_type, stmt.data, 0)?;
+            if stmt.kind == 18 && typecheck::borrowed_text(tt, value) { typecheck::emit(diags, types::error_code(6204), stmt.span)?; }
+        }
+        index = index + 1;
+    }
+    return;
+}
+
+function empty_result(): typecheck::TypeCheckResult {
+    return typecheck::TypeCheckResult { types: typecheck::new_table(), funcs: typecheck::FuncTable { items: [], by_def: [] }, def_types: typecheck::DefTypeTable { items: [] }, fields: typecheck::FieldTable { items: [] }, enums: typecheck::EnumTable { items: [] }, expr_types: typecheck::ExprTypeTable { items: [], members: [], ctors: [] }, consts: consteval::new_table(), imported_fields: typecheck::ImportedFieldTable { items: [] }, imported_enums: typecheck::ImportedEnumTable { items: [] }, copy_facts: typecheck::CopyFacts { items: [] } };
+}
+
+export function typecheck_unit_with_snapshot_budget(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, work: &typecheck::InternBudget:ReadWrite, init_lookup: &consteval::InitLookupBudget:ReadWrite, material: &consteval::MaterialBudget:ReadWrite, fold: &consteval::FoldBudget:ReadWrite, probe_work: &consteval::FoldBudget:ReadWrite, scan: &IntegerScanBudget:ReadWrite, shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, document: bool, snapshot_work: &ConstSnapshotBudget:ReadWrite): typecheck::TypeCheckResult!AllocError {
+    var tt: typecheck::TypeTable = typecheck::new_table();
+    var funcs: typecheck::FuncTable = typecheck::FuncTable { items: [], by_def: [] };
+    var defs: typecheck::DefTypeTable = typecheck::DefTypeTable { items: [] };
+    var fields: typecheck::FieldTable = typecheck::FieldTable { items: [] };
+    var enums: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    var expr_types: typecheck::ExprTypeTable = typecheck::ExprTypeTable { items: [], members: [], ctors: [] };
+    typecheck::ensure_def_types(&defs:ReadWrite, @len(resolution.result.tables.defs) as u32)?;
+    let tables: &resolve::ResolveTables = &resolution.result.tables:Read;
+    let refs: &resolve_refs::RefTable = &resolution.refs:Read;
+    if (pool.option_syntax || pool.union_syntax) && !typecheck_checks::check_carrier_types(pool, refs, &tt:ReadWrite, work, diags)? { return empty_result(); }
+    typecheck_checks::collect_declarations(file, pool, resolution, tables, refs, &tt:ReadWrite, &funcs:ReadWrite, &defs:ReadWrite, &fields:ReadWrite, &enums:ReadWrite, work, document)?;
+    typecheck::release_intern_index(work);
+    if work.exhausted {
+        return empty_result();
+    }
+    var i: u32 = 0;
+    // 枚举行与名称预留遍历同一顶层序列，按 DefId 严格递增。
+    shape.ordered_enums = document;
+    // 结构体字段沿同一顶层顺序追加，保持 DefId 分组和组内声明顺序。
+    shape.ordered_fields = document;
+    // 索引槽数沿用已通过文档预留的定义数；批处理不分配索引。
+    if document { typecheck::index_func_sigs(&funcs:ReadWrite, @len(tables.defs) as u32)?; }
+    // 服务身份只来自已验证的名称解析结果，后端不按名称或签名猜测。
+    var service: u32 = 0;
+    while service < @len(resolution.services) as u32 {
+        let signature: u32 = typecheck::func_sig(&funcs:Read, resolution.services[service].def);
+        if signature != 0 { funcs.items[signature - 1].service = resolution.services[service].kind; }
+        service = service + 1;
+    }
+    // 先暂存未绑定名字的诊断，覆盖因外层表达式错误而没有推断到的节点。
+    shape.pending_names_base = diag::diagbuf_count(diags);
+    if refs.pending_names != 0 {
+        let pending_kind: u8 = resolve_refs::pending_value_name();
+        i = 0;
+        while i < @len(refs.items) as u32 {
+            let item: resolve_refs::ResolvedRef = refs.items[i];
+            if item.kind == pending_kind { typecheck::emit(diags, types::error_code(item.z as u16), item.span)?; }
+            i = i + 1;
+        }
+    }
+    i = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 0 {
+            let data: u32 = file.items[i].data;
+            let def: u32 = resolution.result.file.items[i].def_id;
+            let sig_index: u32 = typecheck::func_sig(&funcs:Read, def);
+            if sig_index != 0 {
+                let body: u32 = pool.functions[data].body;
+                check_block(shape, &expr_types:ReadWrite, &tt:ReadWrite, &funcs:Read, &defs:ReadWrite, &fields:Read, &enums:Read, refs, tables, diags, pool, body, tables.block_scope[body], funcs.items[sig_index - 1].ret)?;
+            }
+        } elseif file.items[i].kind == 3 {
+            let data: u32 = file.items[i].data;
+            let def: u32 = resolution.result.file.items[i].def_id;
+            let declared: u32 = typecheck::def_type(&defs:Read, def);
+            let actual: u32 = typecheck_body::infer_expr(shape, &expr_types:ReadWrite, &tt:ReadWrite, &funcs:Read, &defs:Read, &fields:Read, &enums:Read, refs, diags, pool, 0, pool.consts[data].init, declared)?;
+            typecheck_shape::check_assignable(&tt:ReadWrite, diags, actual, declared, pool.consts[data].span, types::error_code(5001))?;
+        }
+        if shape.stop != 0u8 { return empty_result(); }
+        i = i + 1;
+    }
+    let snapshot: consteval::ConstInput = const_input_limited(&tt:Read, &enums:Read, &defs:Read, !document || needs_const_input(pool, tables), snapshot_work)?;
+    if snapshot_work.exhausted { return empty_result(); }
+    var consts: consteval::ConstTable = consteval::new_table();
+    if !document || tables.has_constants {
+        consts = consteval::evaluate_limited(file, pool, resolution, &snapshot:Read, diags, init_lookup, material, fold)?;
+    }
+    if init_lookup.exhausted || material.exhausted || fold.exhausted { return empty_result(); }
+    var local_scan: typecheck_checks::ScanBudget = typecheck_checks::ScanBudget { limited: scan.limited, remaining: scan.remaining, exhausted: scan.exhausted };
+    typecheck_checks::run_integer_checks(pool, &tt:Read, &expr_types:Read, refs, &snapshot:Read, &consts:ReadWrite, diags, probe_work, &local_scan:ReadWrite, document)?;
+    scan.remaining = local_scan.remaining;
+    scan.exhausted = local_scan.exhausted;
+    if probe_work.exhausted || scan.exhausted { return empty_result(); }
+    let imported_fields: typecheck::ImportedFieldTable = type_import::imported_field_types(refs, &tt:ReadWrite)?;
+    let imported_enums: typecheck::ImportedEnumTable = type_import::imported_enum_variants(refs, &tt:ReadWrite)?;
+    // MIR 也会登记未被调用的导入签名；先收齐其类型，确保这些载体使用同一标签序。
+    typecheck_checks::intern_import_slots(refs, &tt:ReadWrite)?;
+    typecheck::canonicalize_error_sets(&tt:ReadWrite, &resolution.enum_identities[0..@len(resolution.enum_identities)]:Read)?;
+    return typecheck::TypeCheckResult { types: tt, funcs: funcs, def_types: defs, fields: fields, enums: enums, expr_types: expr_types, consts: consts, imported_fields: imported_fields, imported_enums: imported_enums, copy_facts: typecheck::CopyFacts { items: [] } };
+}
+
+export function typecheck_unit_with_body_budget(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, work: &typecheck::InternBudget:ReadWrite, init_lookup: &consteval::InitLookupBudget:ReadWrite, material: &consteval::MaterialBudget:ReadWrite, fold: &consteval::FoldBudget:ReadWrite, probe_work: &consteval::FoldBudget:ReadWrite, scan: &IntegerScanBudget:ReadWrite, shape: &typecheck_shape::BodyInferenceBudget:ReadWrite, document: bool): typecheck::TypeCheckResult!AllocError {
+    var snapshot_work: ConstSnapshotBudget = const_snapshot_budget(0u64);
+    return typecheck_unit_with_snapshot_budget(file, pool, resolution, diags, work, init_lookup, material, fold, probe_work, scan, shape, document, &snapshot_work:ReadWrite)?;
+}
+
+export function typecheck_unit_limited(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, work: &typecheck::InternBudget:ReadWrite, init_lookup: &consteval::InitLookupBudget:ReadWrite, material: &consteval::MaterialBudget:ReadWrite, fold: &consteval::FoldBudget:ReadWrite, probe_work: &consteval::FoldBudget:ReadWrite, scan: &IntegerScanBudget:ReadWrite): typecheck::TypeCheckResult!AllocError {
+    var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    return typecheck_unit_with_body_budget(file, pool, resolution, diags, work, init_lookup, material, fold, probe_work, scan, &shape:ReadWrite, false)?;
+}
+
+export function typecheck_unit(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite): typecheck::TypeCheckResult!AllocError {
+    var work: typecheck::InternBudget = typecheck::declaration_intern_budget(0u32);
+    var init_lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(0u32);
+    var material: consteval::MaterialBudget = consteval::material_budget(0u32);
+    var fold: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var probe_work: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var scan: IntegerScanBudget = integer_scan_budget(0u32);
+    return typecheck_unit_limited(file, pool, resolution, diags, &work:ReadWrite, &init_lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe_work:ReadWrite, &scan:ReadWrite)?;
+}

@@ -1,0 +1,2 @@
+// 叶单元提供中间单元使用的固定值。
+export function base_value(): u32 { return 17u32; }

@@ -1,0 +1,2 @@
+// expected_trap: null nullable value
+function main(): void { let a: i64? = null; a.unwrap(); }

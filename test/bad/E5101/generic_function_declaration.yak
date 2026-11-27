@@ -1,0 +1,6 @@
+// expected_code: E5101
+// spec: spec/lang/base.md#R-17
+// 触发：在 base 函数声明中使用仅 full 层支持的泛型形参。
+function generic<T>(): void { return; }
+
+function main(): void { return; }

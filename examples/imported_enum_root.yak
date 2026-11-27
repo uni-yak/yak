@@ -1,0 +1,19 @@
+// 导入枚举样例的根单元：构造导入变体、match 导入枚举并复用 Copy 值。
+// 退出码 24 = pick(Empty)=0 + pick(make_choice(24))*2 - 24。
+import imported_enum_dep;
+foreign exit(code: u8): void;
+
+function pick(c: imported_enum_dep::Choice): u32 {
+    match c {
+        Empty => { return 0u32; },
+        Small(v) => { return v; }
+    }
+}
+
+function main(): void {
+    let a: imported_enum_dep::Choice = imported_enum_dep::Choice::Empty;
+    let b: imported_enum_dep::Choice = imported_enum_dep::make_choice(24u32);
+    let value: u32 = pick(a) + pick(b) + pick(b);
+    exit((value - 24u32) as u8);
+    return;
+}

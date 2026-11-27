@@ -1,0 +1,328 @@
+// 将已校验的接口签名、结构字段和枚举载荷映射到消费方类型表。
+import resolve_refs;
+import typecheck;
+
+const BUILTIN_VOID: u16 = 4107;
+const TK_IMPORTED: u8 = 3;
+
+// 接口桥接按依赖编号递增追加签名；组内查找保留原始次序。
+export function import_signature(refs: &resolve_refs::RefTable:Read, dep: u16, export_id: u32): u32 {
+    let total: u32 = @len(refs.imports) as u32;
+    var low: u32 = 0;
+    var high: u32 = total;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2;
+        if refs.imports[mid].dep < dep { low = mid + 1; }
+        else { high = mid; }
+    }
+    while low < total {
+        if refs.imports[low].dep != dep { break; }
+        if refs.imports[low].export_id == export_id { return low + 1; }
+        low = low + 1;
+    }
+    return 0;
+}
+export struct SlotCache {
+    builtins: [u32; 16],
+    imp_keys: u64[],
+    imp_vals: u32[],
+    wrap_keys: u64[],
+    wrap_vals: u32[],
+}
+
+export function new_slot_cache(): SlotCache!AllocError {
+    var imp_keys: u64[] = [];
+    var imp_vals: u32[] = [];
+    var wrap_keys: u64[] = [];
+    var wrap_vals: u32[] = [];
+    var i: u32 = 0;
+    while i < 128 {
+        @push(imp_keys, 0u64)?;
+        @push(imp_vals, 0u32)?;
+        @push(wrap_keys, 0u64)?;
+        @push(wrap_vals, 0u32)?;
+        i = i + 1;
+    }
+    return SlotCache {
+        builtins: [0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32],
+        imp_keys: @move(imp_keys), imp_vals: @move(imp_vals),
+        wrap_keys: @move(wrap_keys), wrap_vals: @move(wrap_vals)
+    };
+}
+
+function import_slot_cached_inner(tt: &typecheck::TypeTable:ReadWrite, cache: &SlotCache:ReadWrite, slots: &[resolve_refs::ImportType]:Read, index: u32, dep: u16, depth: u32): u32!AllocError {
+    if index >= @len(slots) as u32 || depth > resolve_refs::signature_depth_limit() { return 0; }
+    let slot: resolve_refs::ImportType = slots[index];
+    if slot.kind == 0 {
+        let hit: u32 = cache.builtins[11];
+        if hit != 0 { return hit; }
+        let id: u32 = typecheck::intern_builtin(tt, BUILTIN_VOID)?;
+        cache.builtins[11] = id;
+        return id;
+    }
+    if slot.kind == 1 {
+        let b: u16 = slot.a as u16;
+        if b >= 4097 && b <= 4108 {
+            let bi: u32 = (b - 4096) as u32;
+            let hit: u32 = cache.builtins[bi];
+            if hit != 0 { return hit; }
+            let id: u32 = typecheck::intern_builtin(tt, b)?;
+            cache.builtins[bi] = id;
+            return id;
+        }
+        return typecheck::intern_builtin(tt, b)?;
+    }
+    if slot.kind == 2 || slot.kind == 3 {
+        var d: u16 = dep;
+        var e: u32 = slot.a;
+        if slot.kind == 3 { d = slot.a as u16; e = slot.b; }
+        let key: u64 = ((d as u64) << 32u64) | (e as u64);
+        let h: u32 = (((d as u32) * 31u32) ^ e) & 127u32;
+        if cache.imp_keys[h] == key && cache.imp_vals[h] != 0 { return cache.imp_vals[h]; }
+        let id: u32 = typecheck::intern_imported(tt, d, e)?;
+        cache.imp_keys[h] = key;
+        cache.imp_vals[h] = id;
+        return id;
+    }
+    if slot.kind == 7 || slot.kind == 8 || slot.kind == 6 {
+        var child: u32 = slot.b;
+        var cap: u8 = slot.a as u8;
+        if slot.kind == 6 { child = slot.a; cap = 0; }
+        let elem: u32 = import_slot_cached_inner(tt, cache, slots, child, dep, depth + 1)?;
+        if elem == 0 { return 0; }
+        let key: u64 = ((slot.kind as u64) << 40u64) | ((cap as u64) << 32u64) | (elem as u64);
+        let h: u32 = (((slot.kind as u32) * 53u32) ^ ((cap as u32) * 17u32) ^ elem) & 127u32;
+        if cache.wrap_keys[h] == key && cache.wrap_vals[h] != 0 { return cache.wrap_vals[h]; }
+        var id: u32 = 0;
+        if slot.kind == 7 { id = typecheck::intern_ref(tt, cap, elem)?; }
+        elseif slot.kind == 8 { id = typecheck::intern_slice(tt, cap, elem)?; }
+        else { id = typecheck::intern_dyn_array(tt, elem)?; }
+        cache.wrap_keys[h] = key;
+        cache.wrap_vals[h] = id;
+        return id;
+    }
+    if slot.kind == 5 {
+        let elem: u32 = import_slot_cached_inner(tt, cache, slots, slot.a, dep, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_fixed_array(tt, elem, slot.c)?;
+    }
+    if slot.kind == 11 {
+        let elem: u32 = import_slot_cached_inner(tt, cache, slots, slot.a, dep, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_nullable(tt, elem)?;
+    }
+    if slot.kind == 9 {
+        let success: u32 = import_slot_cached_inner(tt, cache, slots, slot.a, dep, depth + 1)?;
+        if success == 0 { return 0; }
+        var members: u32[] = [];
+        var i: u32 = 0;
+        while i < slot.c as u32 {
+            let member: u32 = import_slot_cached_inner(tt, cache, slots, slot.b + i, dep, depth + 1)?;
+            if member == 0 { return 0; }
+            @push(members, member)?;
+            i = i + 1;
+        }
+        let errorset: u32 = typecheck::intern_error_set(tt, @move(members))?;
+        return typecheck::intern_fallible(tt, success, errorset)?;
+    }
+    if slot.kind == 10 {
+        var params: u32[] = [];
+        var i: u32 = 0;
+        while i < slot.b {
+            let param: u32 = import_slot_cached_inner(tt, cache, slots, slot.a + i, dep, depth + 1)?;
+            if param == 0 { return 0; }
+            @push(params, param)?;
+            i = i + 1;
+        }
+        let ret: u32 = import_slot_cached_inner(tt, cache, slots, slot.c as u32, dep, depth + 1)?;
+        if ret == 0 { return 0; }
+        return typecheck::intern_fn_ref(tt, @move(params), ret)?;
+    }
+    return 0;
+}
+
+export function import_slot_type_cached(tt: &typecheck::TypeTable:ReadWrite, cache: &SlotCache:ReadWrite, slots: &[resolve_refs::ImportType]:Read, index: u32, dep: u16): u32!AllocError {
+    return import_slot_cached_inner(tt, cache, slots, index, dep, 1)?;
+}
+
+// 导出方的本地名义类型在导入方以该依赖和导出编号标识。
+// 类型槽必须来自已完成边界与深度校验的接口解码，不能直接接收不可信槽图。
+export function import_slot_type(tt: &typecheck::TypeTable:ReadWrite, slots: &[resolve_refs::ImportType]:Read, index: u32, dep: u16): u32!AllocError {
+    let empty: u32[] = [];
+    return specialize_slot(tt, slots, index, dep, &empty[0..0]:Read, 1)?;
+}
+
+export function specialize_slot(tt: &typecheck::TypeTable:ReadWrite, slots: &[resolve_refs::ImportType]:Read, index: u32, dep: u16, args: &[u32], depth: u32): u32!AllocError {
+    if index >= @len(slots) as u32 || depth > resolve_refs::signature_depth_limit() { return 0; }
+    let slot: resolve_refs::ImportType = slots[index];
+    if slot.kind == 0 { return typecheck::intern_builtin(tt, BUILTIN_VOID)?; }
+    if slot.kind == 1 { return typecheck::intern_builtin(tt, slot.a as u16)?; }
+    if slot.kind == 2 { return typecheck::intern_imported(tt, dep, slot.a)?; }
+    if slot.kind == 3 { return typecheck::intern_imported(tt, slot.a as u16, slot.b)?; }
+    if slot.kind == 4 {
+        if slot.a >= @len(args) as u32 { return 0; }
+        return args[slot.a];
+    }
+    if slot.kind == 7 {
+        let elem: u32 = specialize_slot(tt, slots, slot.b, dep, args, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_ref(tt, slot.a as u8, elem)?;
+    }
+    if slot.kind == 8 {
+        let elem: u32 = specialize_slot(tt, slots, slot.b, dep, args, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_slice(tt, slot.a as u8, elem)?;
+    }
+    if slot.kind == 5 {
+        let elem: u32 = specialize_slot(tt, slots, slot.a, dep, args, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_fixed_array(tt, elem, slot.c)?;
+    }
+    if slot.kind == 6 {
+        let elem: u32 = specialize_slot(tt, slots, slot.a, dep, args, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_dyn_array(tt, elem)?;
+    }
+    if slot.kind == 11 {
+        let elem: u32 = specialize_slot(tt, slots, slot.a, dep, args, depth + 1)?;
+        if elem == 0 { return 0; }
+        return typecheck::intern_nullable(tt, elem)?;
+    }
+    if slot.kind == 9 {
+        let success: u32 = specialize_slot(tt, slots, slot.a, dep, args, depth + 1)?;
+        if success == 0 { return 0; }
+        var members: u32[] = [];
+        var i: u32 = 0;
+        while i < slot.c as u32 {
+            let member: u32 = specialize_slot(tt, slots, slot.b + i, dep, args, depth + 1)?;
+            if member == 0 { return 0; }
+            @push(members, member)?;
+            i = i + 1;
+        }
+        let errorset: u32 = typecheck::intern_error_set(tt, @move(members))?;
+        return typecheck::intern_fallible(tt, success, errorset)?;
+    }
+    if slot.kind == 10 {
+        var params: u32[] = [];
+        var i: u32 = 0;
+        while i < slot.b {
+            let param: u32 = specialize_slot(tt, slots, slot.a + i, dep, args, depth + 1)?;
+            if param == 0 { return 0; }
+            @push(params, param)?;
+            i = i + 1;
+        }
+        let ret: u32 = specialize_slot(tt, slots, slot.c as u32, dep, args, depth + 1)?;
+        if ret == 0 { return 0; }
+        return typecheck::intern_fn_ref(tt, @move(params), ret)?;
+    }
+    return 0;
+}
+// 接口桥接按依赖编号递增追加字段；组内不要求导出编号有序。
+// 导入字段名为零表示该名称未在当前单元出现。
+export function import_field(refs: &resolve_refs::RefTable:Read, dep: u16, export_id: u32, name: u32): u32 {
+    if name == 0 { return 0; }
+    let total: u32 = @len(refs.fields) as u32;
+    var low: u32 = 0;
+    var high: u32 = total;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2;
+        if refs.fields[mid].dep < dep { low = mid + 1; }
+        else { high = mid; }
+    }
+    while low < total {
+        if refs.fields[low].dep != dep { break; }
+        if refs.fields[low].export_id == export_id && refs.fields[low].name == name { return low + 1; }
+        low = low + 1;
+    }
+    return 0;
+}
+// 把已载入接口的结构体字段签名映射为消费方类型。
+// 输出与 refs.fields 同序；同一 (dep, export_id) 内按 1 基声明序编号。
+// 缺签名的字段保留 type=0，由布局与 MIR 按未知失败关闭，不伪造类型。
+export function imported_field_types(refs: &resolve_refs::RefTable:Read, tt: &typecheck::TypeTable:ReadWrite): typecheck::ImportedFieldTable!AllocError {
+    var table: typecheck::ImportedFieldTable = typecheck::ImportedFieldTable { items: [] };
+    let total: u32 = @len(refs.fields) as u32;
+    if total == 0 { return table; }
+    var cache: SlotCache = new_slot_cache()?;
+    var i: u32 = 0;
+    while i < total {
+        let field: &resolve_refs::ImportField:Read = &refs.fields[i]:Read;
+        var field_type: u32 = 0;
+        if field.root != 0 || @len(field.types) != 0 {
+            field_type = import_slot_type_cached(tt, &cache:ReadWrite, &field.types[0..@len(field.types)]:Read, field.root, field.dep)?;
+        }
+        @push(table.items, typecheck::ImportedFieldType { dep: field.dep, export_id: field.export_id, field: field.field + 1, value_type_id: field_type })?;
+        i = i + 1;
+    }
+    return table;
+}
+// 把已载入接口的枚举变体载荷映射为消费方类型。
+// 变体顺序沿用接口的声明序；缺签名或载荷映射失败时 known=false。
+export function imported_enum_variants(refs: &resolve_refs::RefTable:Read, tt: &typecheck::TypeTable:ReadWrite): typecheck::ImportedEnumTable!AllocError {
+    var table: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    let total: u32 = @len(refs.variants) as u32;
+    if total == 0 { return table; }
+    var cache: SlotCache = new_slot_cache()?;
+    var i: u32 = 0;
+    while i < total {
+        let variant: &resolve_refs::ImportVariant:Read = &refs.variants[i]:Read;
+        var payload: u32 = 0;
+        var known: bool = variant.known;
+        if known && (variant.root != 0 || @len(variant.types) != 0) {
+            payload = import_slot_type_cached(tt, &cache:ReadWrite, &variant.types[0..@len(variant.types)]:Read, variant.root, variant.dep)?;
+            if payload == 0 { known = false; }
+        }
+        @push(table.items, typecheck::ImportedEnumVariant { dep: variant.dep, export_id: variant.export_id, variant: variant.variant, payload: payload, known: known })?;
+        i = i + 1;
+    }
+    return table;
+}
+
+function imported_struct_id(refs: &resolve_refs::RefTable:Read, dep: u16, export_id: u32): bool {
+    var i: u32 = 0;
+    while i < @len(refs.structs) as u32 {
+        if refs.structs[i].dep == dep && refs.structs[i].export_id == export_id { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+export function imported_struct(refs: &resolve_refs::RefTable:Read, entry: typecheck::TypeEntry): bool {
+    return entry.kind == TK_IMPORTED && imported_struct_id(refs, entry.dep, entry.export_id);
+}
+// 枚举载荷可能引用另一依赖的名义类型；按依赖编号与导出编号去重。
+export function imported_uncomparable_payload(refs: &resolve_refs::RefTable:Read, entry: typecheck::TypeEntry): bool!AllocError {
+    if entry.kind != TK_IMPORTED { return false; }
+    var pending: resolve_refs::ImportEnum[] = [];
+    @push(pending, resolve_refs::ImportEnum { dep: entry.dep, export_id: entry.export_id })?;
+    var next: u32 = 0;
+    while next < @len(pending) as u32 {
+        let current: resolve_refs::ImportEnum = pending[next];
+        var i: u32 = 0;
+        while i < @len(refs.variants) as u32 {
+            let variant: &resolve_refs::ImportVariant:Read = &refs.variants[i]:Read;
+            if variant.dep == current.dep && variant.export_id == current.export_id && variant.known && variant.root < @len(variant.types) as u32 {
+                let slot: resolve_refs::ImportType = variant.types[variant.root];
+                if slot.kind == 5 || slot.kind == 6 { return true; }
+                if slot.kind == 2 || slot.kind == 3 {
+                    var dep: u16 = current.dep;
+                    var export_id: u32 = slot.a;
+                    if slot.kind == 3 { dep = slot.a as u16; export_id = slot.b; }
+                    if imported_struct_id(refs, dep, export_id) { return true; }
+                    var e: u32 = 0;
+                    while e < @len(refs.enums) as u32 {
+                        if refs.enums[e].dep == dep && refs.enums[e].export_id == export_id {
+                            var seen: u32 = 0;
+                            while seen < @len(pending) as u32 && !(pending[seen].dep == dep && pending[seen].export_id == export_id) { seen = seen + 1; }
+                            if seen == @len(pending) as u32 { @push(pending, resolve_refs::ImportEnum { dep: dep, export_id: export_id })?; }
+                            break;
+                        }
+                        e = e + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        next = next + 1;
+    }
+    return false;
+}

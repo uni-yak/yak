@@ -1,0 +1,17 @@
+import c0_ref_leaf;
+foreign assert(cond: bool): void;
+
+function local_get(src: &c0_ref_leaf::Cell:Read): u32 {
+    return c0_ref_leaf::get(src);
+}
+
+function main(): void {
+    var cell: c0_ref_leaf::Cell = c0_ref_leaf::Cell { pad: 123456u64, value: 7 };
+    assert(local_get(&cell:Read) == 7);
+    c0_ref_leaf::update(1, 2, 3, 4, &cell:ReadWrite);
+    assert(cell.pad == 123456u64 && cell.value == 37);
+    assert(c0_ref_leaf::get(&cell:Read) == 37);
+    assert(c0_ref_leaf::get_pad(&cell.pad:Read) == 123456u64);
+    c0_ref_leaf::set_pad(&cell.pad:ReadWrite, 789u64);
+    assert(cell.pad == 789u64 && cell.value == 37);
+}

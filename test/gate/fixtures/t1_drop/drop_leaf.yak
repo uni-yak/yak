@@ -1,0 +1,2 @@
+// 两个非空成员使析构顺序与字段布局可观察。
+export struct Leaf { first: u32[], second: u32[] }

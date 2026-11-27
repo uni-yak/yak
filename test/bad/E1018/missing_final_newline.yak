@@ -1,0 +1,4 @@
+// expected_code: E1018
+// spec: spec/lang/lex.md L-18
+// 触发：源码末尾省略唯一的换行。
+function main(): void { return; }

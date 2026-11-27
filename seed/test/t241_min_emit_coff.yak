@@ -1,0 +1,1369 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+import mir_verify;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// module: runner=mir_runner.yak
+import runner;
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+// module: coff_code=../../compiler/min/src/emit/coff_code.yak
+// module: coff_state=../../compiler/min/src/emit/coff_state.yak
+// module: coff_call=../../compiler/min/src/emit/coff_call.yak
+// module: coff_place=../../compiler/min/src/emit/coff_place.yak
+// module: coff_inst=../../compiler/min/src/emit/coff_inst.yak
+// module: coff_carrier=../../compiler/min/src/emit/coff_carrier.yak
+// module: coff_func=../../compiler/min/src/emit/coff_func.yak
+// module: coff_layout=../../compiler/min/src/emit/coff_layout.yak
+// module: coff=../../compiler/min/src/emit/coff.yak
+// module: coff_symbols=../../compiler/min/src/emit/coff_symbols.yak
+// module: elf=../../compiler/min/src/emit/elf.yak
+// module: elf_backend=../../compiler/min/src/emit/elf_backend.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+import coff_code;
+import coff;
+import coff_symbols;
+import coff_state;
+import coff_inst;
+import elf;
+import elf_backend;
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+import iface;
+import iface_write;
+import iface_load;
+// module: link_names=../../compiler/min/src/link/link_names.yak
+import link_names;
+
+// 取出 COFF 字符串表/头部字段：小端读 16 位与 32 位。
+function u16_at(data: &u8[]:Read, at: u32): u16 {
+    return (data[at] as u16) | ((data[at + 1] as u16) << 8u16);
+}
+function u32_at(data: &u8[]:Read, at: u32): u32 {
+    return (data[at] as u32) | ((data[at + 1] as u32) << 8u32)
+        | ((data[at + 2] as u32) << 16u32) | ((data[at + 3] as u32) << 24u32);
+}
+
+// 一个最小模块：add(a,b) 与调用 add 的 f()。
+function sample(): mir::MirResult!AllocError {
+    let source: &[u8] = "function add(a: u32, b: u32): u32 { return a + b; } function f(): u32 { return add(17, 5); }\n";
+    return runner::accepted(source, 1300)?;
+}
+
+// 登记两个本地函数符号：DefId 1 为 add、DefId 4 为 f（pe.md 3.2 符号表）。
+function links(): coff_state::LinkTable!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var a: u8[] = []; @push(a, 97u8)?; @push(a, 100u8)?; @push(a, 100u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: 1u64, kind: 0u8, name: @move(a) })?;
+    var f: u8[] = []; @push(f, 102u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: 4u64, kind: 0u8, name: @move(f) })?;
+    return table;
+}
+
+// 头字段：Machine=0x8664、节数=3、TimeDateStamp=0、符号表指针非零。
+function coff_header(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    assert(coff_code::bytes_len(&res.bytes:Read) >= 20);
+    // IMAGE_FILE_MACHINE_AMD64 = 0x8664，小端写作 64 86。
+    assert(u16_at(&res.bytes.data:Read, 0) == 34404);
+    assert(res.bytes.data[0] == 100 && res.bytes.data[1] == 134);
+    assert(u16_at(&res.bytes.data:Read, 2) == 3);
+    assert(u32_at(&res.bytes.data:Read, 4) == 0);
+    assert(u16_at(&res.bytes.data:Read, 16) == 0);
+    return;
+}
+
+// 节表：.text 的节名与属性（读 + 执行 = 0x60000020）、.rdata（0x40000040）、.data（0xC0000040）。
+function coff_sections(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    // 节表从 20 开始，每项 40 字节；节名 8 字节定长，短名右侧补 0。
+    assert(res.bytes.data[20] == 46 && res.bytes.data[21] == 116 && res.bytes.data[22] == 101);
+    assert(res.bytes.data[23] == 120 && res.bytes.data[24] == 116 && res.bytes.data[25] == 0);
+    assert(u32_at(&res.bytes.data:Read, 56) == 1610612768);
+    assert(res.bytes.data[60] == 46 && res.bytes.data[61] == 114 && res.bytes.data[62] == 100);
+    assert(res.bytes.data[63] == 97 && res.bytes.data[64] == 116 && res.bytes.data[65] == 97 && res.bytes.data[66] == 0);
+    assert(u32_at(&res.bytes.data:Read, 96) == 1073741888);
+    assert(res.bytes.data[100] == 46 && res.bytes.data[101] == 100 && res.bytes.data[102] == 97);
+    assert(res.bytes.data[103] == 116 && res.bytes.data[104] == 97 && res.bytes.data[105] == 0);
+    assert(u32_at(&res.bytes.data:Read, 136) == 3221225536);
+    return;
+}
+
+// 空字符串表也必须写出含自身的 4 字节长度头，不能省略到文件尾。
+function coff_empty_string_table(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    let sym_ptr: u32 = u32_at(&res.bytes.data:Read, 8);
+    let sym_count: u32 = u32_at(&res.bytes.data:Read, 12);
+    let str_ptr: u32 = sym_ptr + sym_count * 18;
+    // 同一节中的第二个函数须保留非零入口偏移。
+    assert(sym_count == 2 && u32_at(&res.bytes.data:Read, sym_ptr + 8) == 0);
+    assert(u32_at(&res.bytes.data:Read, sym_ptr + 26) > 0);
+    assert(u32_at(&res.bytes.data:Read, sym_ptr + 26) < u32_at(&res.bytes.data:Read, 36));
+    assert(u32_at(&res.bytes.data:Read, str_ptr) == 4);
+    assert(coff_code::bytes_len(&res.bytes:Read) == str_ptr + 4);
+    return;
+}
+
+// 确定性：同一 MirModule 两次发射逐字节相同（fixpoint.md 比对对象）。
+function coff_deterministic(): void!AllocError {
+    let a: mir::MirResult = sample()?;
+    let b: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    let one: coff::EmitResult = coff::emit_object(&a.module:Read, &table:Read, coff::profile_win64_pe())?;
+    let two: coff::EmitResult = coff::emit_object(&b.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(one.ok && two.ok);
+    assert(coff_code::bytes_len(&one.bytes:Read) == coff_code::bytes_len(&two.bytes:Read));
+    var i: u32 = 0;
+    while i < coff_code::bytes_len(&one.bytes:Read) {
+        assert(one.bytes.data[i] == two.bytes.data[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// EM-4：未知目标 profile 必须拒绝（emitter.md 2.1）。
+function reject_unknown_profile(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, 99u16)?;
+    // rejection_spec: E8005 spec/target/emitter.md#EM-4
+    assert(!res.ok && res.code.raw == 8005 && @len(res.bytes.data) == 0);
+    let supported: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(supported.ok && supported.code.raw == 0 && @len(supported.bytes.data) > 0);
+    return;
+}
+
+// EM-1：链接符号 def 为 0 视为未定义。
+function reject_undefined_link(): void!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var name: u8[] = []; @push(name, 97u8)?; @push(name, 100u8)?; @push(name, 100u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: 0u64, kind: 0u8, name: @move(name) })?;
+    assert(coff_symbols::validate_links(&table:Read) == coff_symbols::e_em1());
+    return;
+}
+
+// EM-2：即使名字不同，同一链接键也不得定义两次。
+function reject_duplicate_link(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    var table: coff_state::LinkTable = links()?;
+    let other: u64 = table.symbols[1].def;
+    table.symbols[1].def = table.symbols[0].def;
+    let duplicate: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    // rejection_spec: E8003 spec/target/emitter.md#EM-2
+    assert(!duplicate.ok && duplicate.code.raw == 8003 && @len(duplicate.bytes.data) == 0);
+    assert(coff_symbols::validate_links(&table:Read) == 8003);
+    table.symbols[1].def = other;
+    let distinct: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(distinct.ok && distinct.code.raw == 0 && @len(distinct.bytes.data) > 0);
+    return;
+}
+
+// EM-5 的两条判定：wrap_* 是回绕运算、不得发溢出跳转；比较按符号性选条件码。
+function em5_classification(): void {
+    assert(coff_inst::is_wrap_arith(22) && coff_inst::is_wrap_arith(23) && coff_inst::is_wrap_arith(24));
+    assert(!coff_inst::is_wrap_arith(16));
+    assert(coff_inst::wrap_base(22) == 16 && coff_inst::wrap_base(23) == 17 && coff_inst::wrap_base(24) == 18);
+    assert(coff_state::cmp_condition(48, true) == 4 && coff_state::cmp_condition(48, false) == 4);
+    assert(coff_state::cmp_condition(50, true) == 12 && coff_state::cmp_condition(50, false) == 2);
+    assert(coff_state::cmp_condition(51, true) == 14 && coff_state::cmp_condition(51, false) == 6);
+    assert(coff_state::cmp_condition(52, true) == 15 && coff_state::cmp_condition(52, false) == 7);
+    assert(coff_state::cmp_condition(53, true) == 13 && coff_state::cmp_condition(53, false) == 3);
+    return;
+}
+
+// 机器码编码原语：常用指令的字节形态（x86.md 4.1-4.4）。
+function encoding_basics(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::mov_imm64(&code:ReadWrite, pe::rax(), 7u64)?;
+    assert(pe::code_len(&code:Read) == 10);
+    assert(pe::code_get(&code:Read, 0) == 72 && pe::code_get(&code:Read, 1) == 184);
+    var low: pe::Code = pe::code_new();
+    pe::mov_imm64(&low:ReadWrite, pe::rcx(), 1u64)?;
+    assert(low.bytes[0] == 72 && low.bytes[1] == 185);
+    var ret_code: pe::Code = pe::code_new();
+    pe::ret(&ret_code:ReadWrite)?;
+    assert(pe::code_len(&ret_code:Read) == 1 && ret_code.bytes[0] == 195);
+    var frame: pe::Code = pe::code_new();
+    pe::push_rbp(&frame:ReadWrite)?;
+    pe::mov_rbp_rsp(&frame:ReadWrite)?;
+    pe::pop_rbp(&frame:ReadWrite)?;
+    assert(frame.bytes[0] == 85 && frame.bytes[1] == 72 && frame.bytes[2] == 137 && frame.bytes[3] == 229);
+    // 小帧保留旧序言；整页、短尾、长尾均采用确定编码。
+    var small: pe::Code = pe::code_new();
+    pe::alloc_stack_frame(&small:ReadWrite, 4080u32)?;
+    assert(pe::code_len(&small:Read) == 7 && small.bytes[2] == 236 && small.bytes[3] == 240 && small.bytes[4] == 15);
+    var page: pe::Code = pe::code_new();
+    pe::alloc_stack_frame(&page:ReadWrite, 4096u32)?;
+    let expected: [u8; 31] = [73, 137, 226, 65, 187, 1, 0, 0, 0, 73, 129, 234, 0, 16, 0, 0, 65, 246, 2, 255, 65, 255, 203, 117, 240, 72, 129, 236, 0, 16, 0];
+    assert(pe::code_len(&page:Read) == 32);
+    var i: u32 = 0;
+    while i < 31u32 { assert(page.bytes[i] == expected[i]); i = i + 1u32; }
+    assert(page.bytes[31] == 0);
+    var short: pe::Code = pe::code_new();
+    pe::alloc_stack_frame(&short:ReadWrite, 8320u32)?;
+    assert(pe::code_len(&short:Read) == 37 && short.bytes[5] == 2);
+    assert(short.bytes[25] == 65 && short.bytes[26] == 246 && short.bytes[27] == 66 && short.bytes[28] == 128 && short.bytes[29] == 255);
+    var wide: pe::Code = pe::code_new();
+    pe::alloc_stack_frame(&wide:ReadWrite, 8336u32)?;
+    assert(pe::code_len(&wide:Read) == 40 && wide.bytes[5] == 2);
+    assert(wide.bytes[27] == 130 && wide.bytes[28] == 112 && wide.bytes[29] == 255 && wide.bytes[30] == 255 && wide.bytes[31] == 255 && wide.bytes[32] == 255);
+    return;
+}
+
+function shortest_x86_forms(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::load_base(&code:ReadWrite, pe::rax(), pe::rbx(), 0, 8)?;
+    pe::load_base(&code:ReadWrite, pe::rax(), pe::r13(), 0, 8)?;
+    pe::load_base(&code:ReadWrite, pe::rax(), pe::rsp(), 127, 8)?;
+    pe::load_base(&code:ReadWrite, pe::r8(), pe::r12(), 128, 8)?;
+    pe::load_base(&code:ReadWrite, pe::rax(), pe::rbx(), 4294967168u32, 1)?;
+    pe::load_base(&code:ReadWrite, pe::rcx(), pe::rbx(), 4294967167u32, 2)?;
+    pe::store_base(&code:ReadWrite, pe::rsi(), pe::rbx(), 0, 1)?;
+    pe::call_rm64(&code:ReadWrite, pe::r11())?;
+    pe::jmp_rm64(&code:ReadWrite, pe::rdx())?;
+    let expected: [u8; 39] = [72, 139, 3, 73, 139, 69, 0, 72, 139, 68, 36, 127,
+        77, 139, 132, 36, 128, 0, 0, 0, 15, 182, 67, 128, 15, 183, 139, 127, 255, 255, 255,
+        64, 136, 51, 65, 255, 211, 255, 226];
+    assert(pe::code_len(&code:Read) == 39);
+    var i: u32 = 0;
+    while i < 39 { assert(code.bytes[i] == expected[i]); i = i + 1; }
+
+    var stack: pe::Code = pe::code_new();
+    pe::sub_rsp_imm(&stack:ReadWrite, 127)?;
+    pe::add_rsp_imm(&stack:ReadWrite, 128)?;
+    assert(pe::code_len(&stack:Read) == 11 && stack.bytes[1] == 131 && stack.bytes[3] == 127
+        && stack.bytes[5] == 129 && stack.bytes[7] == 128);
+
+    var repeat: pe::Code = pe::code_new();
+    i = 0;
+    while i < 126 { pe::nop(&repeat:ReadWrite)?; i = i + 1; }
+    pe::jump_to(&repeat:ReadWrite, 0)?;
+    assert(pe::code_len(&repeat:Read) == 128 && repeat.bytes[126] == 235 && repeat.bytes[127] == 128);
+    repeat = pe::code_new();
+    i = 0;
+    while i < 127 { pe::nop(&repeat:ReadWrite)?; i = i + 1; }
+    pe::jump_to(&repeat:ReadWrite, 0)?;
+    assert(pe::code_len(&repeat:Read) == 132 && repeat.bytes[127] == 233
+        && repeat.bytes[128] == 124 && repeat.bytes[129] == 255 && repeat.bytes[130] == 255 && repeat.bytes[131] == 255);
+
+    var long_frame: pe::Code = pe::code_new();
+    let overlong: [u8; 11] = [85, 72, 137, 229, 72, 129, 236, 64, 0, 0, 0];
+    pe::code_bytes(&long_frame:ReadWrite, &overlong[0..11])?;
+    let noncanonical: u16 = pe::validate_win64_entry(&long_frame:Read, 0, 11, 64, 16, 2);
+    // rejection_spec: E7103 spec/target/x86.md#X-3
+    assert(noncanonical == 7103);
+
+    var redundant: pe::Code = pe::code_new();
+    let prefix: [u8; 7] = [64, 72, 131, 196, 64, 93, 195];
+    pe::code_bytes(&redundant:ReadWrite, &prefix[0..7])?;
+    assert(pe::validate_win64_exit(&redundant:Read, 0, 7, 64) == 7103);
+
+    var alternate: pe::Code = pe::code_new();
+    pe::win64_enter(&alternate:ReadWrite, 64, 16, 2)?;
+    assert(pe::win64_status(&alternate:Read) == 0);
+    alternate.bytes[2] = 139;
+    alternate.bytes[3] = 236;
+    let alias_form: u16 = pe::validate_win64_entry(&alternate:Read, 0, 8, 64, 16, 2);
+    // rejection_spec: E7102 spec/target/x86.md#X-2
+    assert(alias_form == 7102);
+    return;
+}
+
+function relax_branch_boundaries(): void!AllocError {
+    var count: u32 = 127;
+    while count <= 128 {
+        var code: pe::Code = pe::code_new();
+        pe::begin_layout(&code:ReadWrite);
+        let forward: u32 = pe::jcc_rel32(&code:ReadWrite, pe::cc_e())?;
+        var i: u32 = 0;
+        while i < count { pe::nop(&code:ReadWrite)?; i = i + 1; }
+        let target: u32 = pe::code_len(&code:Read);
+        pe::patch_rel32(&code:ReadWrite, forward, target);
+        assert(pe::finish_layout(&code:ReadWrite, 0));
+        if count == 127 {
+            assert(code.used == 129 && code.bytes[0] == 116 && code.bytes[1] == 127);
+        } else {
+            assert(code.used == 134 && code.bytes[0] == 15 && code.bytes[1] == 132 && code.bytes[2] == 128 && code.bytes[3] == 0);
+        }
+        count = count + 1;
+    }
+    // 两条分支相互跨越，单独缩短任一条都无法满足范围，两条一起缩短则可达。
+    var crossed: pe::Code = pe::code_new();
+    pe::begin_layout(&crossed:ReadWrite);
+    let ahead: u32 = pe::jcc_rel32(&crossed:ReadWrite, pe::cc_ne())?;
+    var i: u32 = 0;
+    while i < 124 { pe::nop(&crossed:ReadWrite)?; i = i + 1; }
+    pe::jump_to(&crossed:ReadWrite, 0)?;
+    let end: u32 = pe::code_len(&crossed:Read);
+    pe::patch_rel32(&crossed:ReadWrite, ahead, end);
+    assert(pe::finish_layout(&crossed:ReadWrite, 0));
+    assert(crossed.used == 128 && crossed.bytes[0] == 117 && crossed.bytes[1] == 126
+        && crossed.bytes[126] == 235 && crossed.bytes[127] == 128);
+
+    // 第二条分支超界后，扩展的四个字节会让第一条在下一轮超界。
+    var cascade: pe::Code = pe::code_new();
+    pe::begin_layout(&cascade:ReadWrite);
+    let first: u32 = pe::jmp_rel32(&cascade:ReadWrite)?;
+    let second: u32 = pe::jcc_rel32(&cascade:ReadWrite, pe::cc_ne())?;
+    i = 0;
+    while i < 124 { pe::nop(&cascade:ReadWrite)?; i = i + 1; }
+    let near: u32 = pe::code_len(&cascade:Read);
+    while i < 128 { pe::nop(&cascade:ReadWrite)?; i = i + 1; }
+    let far: u32 = pe::code_len(&cascade:Read);
+    pe::patch_rel32(&cascade:ReadWrite, first, near);
+    pe::patch_rel32(&cascade:ReadWrite, second, far);
+    assert(pe::finish_layout(&cascade:ReadWrite, 0));
+    assert(cascade.used == 139 && cascade.bytes[0] == 233 && cascade.bytes[1] == 130
+        && cascade.bytes[5] == 15 && cascade.bytes[6] == 133 && cascade.bytes[7] == 128);
+    return;
+}
+
+function branch_to_next_block(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function pick(flag: bool): u32 { if flag { return 17u32; } else { return 23u32; } }\n", 1307)?;
+    let blocks: u32 = @len(result.module.functions[0].blocks) as u32;
+    var origin: u32 = 0;
+    while origin < blocks && result.module.functions[0].blocks[origin].terminator.op != coff_state::mop_branch() {
+        origin = origin + 1;
+    }
+    let next: u32 = origin + 1;
+    assert(next < blocks);
+    let term: mir::MirTerminator = result.module.functions[0].blocks[origin].terminator;
+    assert(term.b == next || term.c == next);
+    var other: u32 = term.b;
+    if term.b == next { other = term.c; }
+    assert(other != next);
+
+    result.module.functions[0].blocks[origin].terminator.b = next;
+    result.module.functions[0].blocks[origin].terminator.c = other;
+    let true_next: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    result.module.functions[0].blocks[origin].terminator.b = other;
+    result.module.functions[0].blocks[origin].terminator.c = next;
+    let false_next: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(true_next.rejected == 0 && false_next.rejected == 0 && @len(true_next.text) == @len(false_next.text));
+    var changes: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(true_next.text) as u32 {
+        if true_next.text[i] != false_next.text[i] {
+            // 顺行边交换后，唯一变化应是 JE 与 JNE 的条件码。
+            assert(true_next.text[i] == 0x74 && false_next.text[i] == 0x75);
+            changes = changes + 1;
+        }
+        i = i + 1;
+    }
+    assert(changes == 1);
+
+    result.module.functions[0].blocks[origin].terminator.b = next;
+    let same: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(same.rejected == 0 && @len(same.text) + 9 == @len(true_next.text));
+    return;
+}
+
+function relax_branch_relocations(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::begin_layout(&code:ReadWrite);
+    let jump: u32 = pe::jmp_rel32(&code:ReadWrite)?;
+    let external_site: u32 = pe::call_rel32(&code:ReadWrite)?;
+    let lea: u32 = pe::lea_rip(&code:ReadWrite, pe::rcx())?;
+    let conditional: u32 = pe::jcc_rel32(&code:ReadWrite, pe::cc_e())?;
+    let table: u32 = pe::code_len(&code:Read);
+    pe::code_u32(&code:ReadWrite, 0)?;
+    pe::nop(&code:ReadWrite)?;
+    let target: u32 = pe::code_len(&code:Read);
+    pe::ret(&code:ReadWrite)?;
+    pe::patch_rel32(&code:ReadWrite, jump, target);
+    pe::patch_rel32(&code:ReadWrite, conditional, target);
+    pe::patch_relative(&code:ReadWrite, lea, lea + 4, table)?;
+    pe::patch_relative(&code:ReadWrite, table, table, target)?;
+    assert(pe::finish_layout(&code:ReadWrite, 0));
+    let expected: [u8; 22] = [235, 19, 232, 0, 0, 0, 0, 72, 141, 13, 2, 0, 0, 0, 116, 5, 5, 0, 0, 0, 144, 195];
+    assert(code.used == 22 && pe::layout_position(&code:Read, external_site) == 3);
+    var i: u32 = 0;
+    while i < 22 { assert(code.bytes[i] == expected[i]); i = i + 1; }
+    pe::begin_layout(&code:ReadWrite);
+    pe::nop(&code:ReadWrite)?;
+    assert(pe::finish_layout(&code:ReadWrite, 22));
+    assert(code.used == 23 && code.bytes[21] == 195 && code.bytes[22] == 144);
+    return;
+}
+
+function reject_x86_instruction_stream(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::begin_layout(&code:ReadWrite);
+    // 同样的 CPUID 字节出现在立即数和跳转表数据中时属于操作数。
+    pe::mov_imm64(&code:ReadWrite, pe::rax(), 0xa20f)?;
+    let branch: u32 = pe::jmp_rel32(&code:ReadWrite)?;
+    pe::jmp_rm64(&code:ReadWrite, pe::rdx())?;
+    let table: u32 = pe::code_len(&code:Read);
+    pe::code_u32(&code:ReadWrite, 0xcc90a20f)?;
+    pe::mark_jump_table(&code:ReadWrite, table)?;
+    let target: u32 = pe::code_len(&code:Read);
+    pe::patch_rel32(&code:ReadWrite, branch, target);
+    pe::nop(&code:ReadWrite)?;
+    assert(pe::finish_layout(&code:ReadWrite, 0));
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    assert(code.tables[0].start == 14 && code.tables[0].end == 18);
+    pe::code_u8(&code:ReadWrite, 0x0f)?;
+    pe::code_u8(&code:ReadWrite, 0xa2)?;
+    let rejected: u16 = x86_validate::validate(&code:Read, 0)?;
+    // rejection_spec: E7101 spec/target/x86.md#X-1
+    assert(rejected == 7101);
+
+    // 截断的访存、算术组里的 DIV，以及带 B 位的 90（XCHG）都必须拒绝。
+    let invalid: [u8; 9] = [0x48, 0x8b, 0x04, 0x48, 0xf7, 0xf1, 0x41, 0x90, 0xc3];
+    var i: u32 = 0;
+    while i < 9 {
+        code = pe::code_new();
+        pe::code_bytes(&code:ReadWrite, &invalid[i..i + 3]:Read)?;
+        assert(x86_validate::validate(&code:Read, 0)? == 7101);
+        i = i + 3;
+    }
+    return;
+}
+
+function reject_noncanonical_x86_body(): void!AllocError {
+    let alternate: [u8; 3] = [0x48, 0x03, 0xc1];
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &alternate[0..3]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7102);
+
+    let excess: [u8; 28] = [0x40, 0x90, 0x66, 0xcc, 0x42, 0x8b, 0x01, 0x48, 0x8b, 0x41, 0,
+        0x48, 0x8b, 0x81, 0x80, 0xff, 0xff, 0xff, 0x48, 0x81, 0xc0, 0x7f, 0, 0, 0, 0xc0, 0xe0, 1];
+    let ends: [u32; 7] = [2, 4, 7, 11, 18, 25, 28];
+    var start: u32 = 0;
+    var i: u32 = 0;
+    while i < 7 {
+        let end: u32 = ends[i];
+        code = pe::code_new();
+        pe::code_bytes(&code:ReadWrite, &excess[start..end]:Read)?;
+        assert(x86_validate::validate(&code:Read, 0)? == 7103);
+        start = end;
+        i = i + 1;
+    }
+    let near: [u8; 5] = [0xe9, 0, 0, 0, 0];
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &near[0..5]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7103);
+
+    // 写入 SIL 的裸 REX 与不跨越签名边界的 128 位移必须保留。
+    let necessary: [u8; 10] = [0x40, 0x88, 0x31, 0x48, 0x8b, 0x81, 0x80, 0, 0, 0];
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &necessary[0..10]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    return;
+}
+
+function typed_immediate_encoding(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::mov_int(&code:ReadWrite, pe::rax(), 0x80, 1)?;
+    pe::mov_int(&code:ReadWrite, pe::rax(), 0x8000, 2)?;
+    pe::mov_int(&code:ReadWrite, pe::rax(), 0x80000000, 4)?;
+    pe::mov_int(&code:ReadWrite, pe::rax(), 0x8000000000000000, 8)?;
+    pe::mov_int(&code:ReadWrite, pe::r10(), 0, 8)?;
+    pe::add_imm32(&code:ReadWrite, pe::rax(), 128)?;
+    let expected: [u8; 30] = [0xb0, 0x80, 0x66, 0xb8, 0, 0x80, 0xb8, 0, 0, 0, 0x80,
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x45, 0x31, 0xd2, 0x48, 0x05, 0x80, 0, 0, 0];
+    assert(pe::code_len(&code:Read) == 30 && x86_validate::validate(&code:Read, 0)? == 0);
+    var i: u32 = 0;
+    while i < 30 { assert(code.bytes[i] == expected[i]); i = i + 1; }
+    return;
+}
+
+function reject_win64_frames(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::win64_enter(&code:ReadWrite, 64u32, 16u64, 2u32)?;
+    let body: u32 = pe::code_len(&code:Read);
+    assert(pe::win64_status(&code:Read) == 0);
+    assert(pe::validate_win64_entry(&code:Read, 0, body, 64, 16, 2) == 0);
+
+    // 改真实栈调整量。56 字节未对齐；48 字节对齐但只为被调方留下 16 字节。
+    code.bytes[body - 1] = 56;
+    let misaligned: u16 = pe::validate_win64_entry(&code:Read, 0, body, 64, 16, 2);
+    // rejection_spec: E8006 spec/target/abi-win.md#AW-1
+    assert(misaligned == 8006);
+    code.bytes[body - 1] = 48;
+    let short_home: u16 = pe::validate_win64_entry(&code:Read, 0, body, 64, 16, 2);
+    // rejection_spec: E8007 spec/target/abi-win.md#AW-2
+    assert(short_home == 8007);
+    code.bytes[body - 1] = 64;
+
+    // 正常调用后恢复保存值；把 pop rbp 换成 pop rbx 必须拒绝。
+    let call: u32 = pe::call_rel32(&code:ReadWrite)?;
+    assert(call == body + 1);
+    let tail: u32 = pe::code_len(&code:Read);
+    pe::win64_leave(&code:ReadWrite)?;
+    let end: u32 = pe::code_len(&code:Read);
+    assert(pe::validate_win64_exit(&code:Read, tail, end, 64) == 0);
+    code.bytes[end - 2] = 91;
+    let not_restored: u16 = pe::validate_win64_exit(&code:Read, tail, end, 64);
+    // rejection_spec: E8008 spec/target/abi-win.md#AW-3
+    assert(not_restored == 8008);
+
+    // 读非易失寄存器是合法的；通用指令不得将其当成临时目的寄存器。
+    var clobber: pe::Code = pe::code_new();
+    pe::win64_enter(&clobber:ReadWrite, 32, 0, 0)?;
+    pe::mov_rr(&clobber:ReadWrite, pe::r10(), pe::r12())?;
+    pe::cmp_rr(&clobber:ReadWrite, pe::r12(), pe::r10())?;
+    assert(pe::win64_status(&clobber:Read) == 0);
+    pe::xor_rr(&clobber:ReadWrite, pe::r12(), pe::r12())?;
+    pe::win64_leave(&clobber:ReadWrite)?;
+    assert(pe::win64_status(&clobber:Read) == 8008);
+    pe::win64_enter(&clobber:ReadWrite, 32, 0, 0)?;
+    pe::add_rr(&clobber:ReadWrite, pe::rsp(), pe::r10())?;
+    assert(pe::win64_status(&clobber:Read) == 8006);
+    return;
+}
+
+function reject_sysv_frames(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::sysv_enter(&code:ReadWrite, 32, 8, 1)?;
+    let body: u32 = pe::code_len(&code:Read);
+    assert(pe::win64_status(&code:Read) == 0);
+    code.bytes[body - 1] = 24;
+    let alignment: u16 = pe::validate_sysv_entry(&code:Read, 0, body, 32, 8, 1);
+    // rejection_spec: E8014 spec/target/abi-linux.md#AL-1
+    assert(alignment == 8014);
+    code.bytes[body - 1] = 32;
+    pe::sysv_leave(&code:ReadWrite)?;
+    let end: u32 = pe::code_len(&code:Read);
+    code.bytes[end - 2] = 91;
+    let saved: u16 = pe::validate_sysv_exit(&code:Read, body, end, 32);
+    // rejection_spec: E8015 spec/target/abi-linux.md#AL-2
+    assert(saved == 8015);
+    return;
+}
+
+// 文件头指针字段与重定位表：.text 的节内数据紧接节表，
+// 重定位表紧随 .text，符号表紧随重定位表——三者偏移必须首尾相接，不能留 0 或错位。
+function coff_relocs_and_symtab(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    // 文件头 20 + 3×40 节表 = 140：.text 原始数据从此开始。
+    let text_ptr: u32 = u32_at(&res.bytes.data:Read, 20 + 20);
+    assert(text_ptr == 140);
+    let text_size: u32 = u32_at(&res.bytes.data:Read, 20 + 16);
+    assert(text_size > 0);
+    // .text 节表项里的重定位指针与条数：f() 调用 add() 恰有一条 REL32。
+    let reloc_ptr: u32 = u32_at(&res.bytes.data:Read, 20 + 24);
+    let reloc_count: u16 = u16_at(&res.bytes.data:Read, 20 + 32);
+    assert(reloc_count == 1);
+    assert(reloc_ptr == text_ptr + text_size);
+    // 重定位条目：地址在 .text 内，符号下标 1 基，类型 4 = IMAGE_REL_AMD64_REL32。
+    assert(u32_at(&res.bytes.data:Read, reloc_ptr) < text_size);
+    // 重定位符号序号以符号表零基下标书写（PE/COFF 对象格式）。
+    assert(u32_at(&res.bytes.data:Read, reloc_ptr + 4) == 0);
+    assert(u16_at(&res.bytes.data:Read, reloc_ptr + 8) == 4);
+    // 符号表紧接重定位之后（每条重定位 10 字节），条数与文件头一致。
+    let sym_ptr: u32 = u32_at(&res.bytes.data:Read, 8);
+    let sym_count: u32 = u32_at(&res.bytes.data:Read, 12);
+    assert(sym_count == 2);
+    assert(sym_ptr == reloc_ptr + reloc_count as u32 * 10);
+    // 符号按 DefId 升序排列（add 的 DefId 为 1、f 的为 4），故第 1 条是 add、第 2 条是 f。
+    // 每条 18 字节；名字以 8 字节内联存放，ASCII 之后以 0 填充。
+    assert(res.bytes.data[sym_ptr] == 97);       // 'a'
+    assert(res.bytes.data[sym_ptr + 1] == 100);  // 'd'
+    assert(res.bytes.data[sym_ptr + 2] == 100);  // 'd'
+    assert(res.bytes.data[sym_ptr + 3] == 0);
+    assert((res.bytes.data[sym_ptr + 18] as u32) == 102);  // 'f'
+    assert(res.bytes.data[sym_ptr + 19] == 0);
+    // value 字段（偏移 +8）：已定义函数的节内入口偏移，绝不能全为 0。
+    // add 是 .text 里的第一个函数，入口为 0；f 在其后，入口必须严格大于 0。
+    let add_value: u32 = u32_at(&res.bytes.data:Read, sym_ptr + 8);
+    let f_value: u32 = u32_at(&res.bytes.data:Read, sym_ptr + 18 + 8);
+    assert(add_value == 0);
+    assert(f_value > 0);
+    assert(f_value < text_size);
+    // 节号（偏移 +12）为 1 表示 .text；类型（+14）为 0x20 表示函数。
+    assert(u16_at(&res.bytes.data:Read, sym_ptr + 12) == 1);
+    assert(u16_at(&res.bytes.data:Read, sym_ptr + 14) == 0x20);
+    assert(u16_at(&res.bytes.data:Read, sym_ptr + 18 + 12) == 1);
+    assert(u16_at(&res.bytes.data:Read, sym_ptr + 18 + 14) == 0x20);
+    return;
+}
+
+// 从真实接口读出函数签名，再替换导出编号模拟高位身份。
+function add_import(deps: &resolve_refs::DependencySet:ReadWrite, name: &[u8], export_id: u32): void!AllocError {
+    let dep: runner::Loaded = runner::load("export function value(): u32 { return 1; }\n", 1304)?;
+    let empty: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&dep.parsed.file:Read, &dep.parsed.pool:Read, &dep.lexed.names:Read, &empty:Read, name, &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&dep.parsed.file:Read, &dep.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let layouts: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    let data: iface::InterfaceResult = iface_write::write_interface(&dep.parsed.file:Read, &dep.parsed.pool:Read, &resolution:Read, &dep.lexed.names:Read, &tc:Read, &layouts:Read, name, &diags:ReadWrite)?;
+    let loaded: iface::LoadedInterface = iface_load::load_interface(&data.data.bytes[0..@len(data.data.bytes)]:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(loaded.exports) == 1);
+    iface_load::add_binary_dependency(deps, &loaded:Read)?;
+    if export_id != 1 {
+        // 人工创建的稀疏编号不再具备原接口摘要的证明。
+        let i: u64 = @len(deps.ifaces) - 1;
+        deps.ifaces[i].digest = [];
+        deps.ifaces[i].exports[0].export_id = export_id;
+    }
+    return;
+}
+
+// 重名采用最先登记的键；同键与未知名字分别保持输入次序。
+function stable_symbol_order(): void!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var first: u8[] = [];
+    @push(first, 97u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: 9u64, kind: 1u8, name: @move(first) })?;
+    var repeated: u8[] = [];
+    @push(repeated, 97u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: 1u64, kind: 1u8, name: @move(repeated) })?;
+    var other: u8[] = [];
+    @push(other, 98u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: 4u64, kind: 1u8, name: @move(other) })?;
+    let labels: [u8; 5] = [99u8, 97u8, 98u8, 97u8, 100u8];
+    var symbols: coff_symbols::OutSymbol[] = [];
+    var i: u32 = 0;
+    while i < 5 {
+        var label: u8[] = [];
+        @push(label, labels[i])?;
+        @push(symbols, coff_symbols::OutSymbol { def: i as u64, name: @move(label), value: i, section: 0i16, kind: 0u16, storage: 2u8 })?;
+        i = i + 1;
+    }
+    let ordered: coff_symbols::OutSymbol[] = coff_symbols::sorted_symbols(&symbols[0..5]:Read, &table:Read)?;
+    assert(@len(ordered) == 5);
+    assert(ordered[0].value == 2 && ordered[1].value == 1 && ordered[2].value == 3);
+    assert(ordered[3].value == 0 && ordered[4].value == 4);
+    return;
+}
+
+// 非零链接键按完整 64 位判等；跨越两次扩容后仍能识别重复项。
+function numeric_symbol_keys(): void!AllocError {
+    var keys: coff_symbols::SymbolKeys = coff_symbols::symbol_keys_new();
+    let zero: bool = coff_symbols::symbol_key_add(&keys:ReadWrite, 0u64)?;
+    assert(!zero);
+    var i: u32 = 1;
+    while i <= 40 {
+        let key: u64 = coff_state::import_symbol_def(i, 65537u32);
+        let inserted: bool = coff_symbols::symbol_key_add(&keys:ReadWrite, key)?;
+        assert(inserted);
+        i = i + 1;
+    }
+    i = 40;
+    while i > 0 {
+        let key: u64 = coff_state::import_symbol_def(i, 65537u32);
+        let inserted: bool = coff_symbols::symbol_key_add(&keys:ReadWrite, key)?;
+        assert(!inserted);
+        i = i - 1;
+    }
+    let local_key: bool = coff_symbols::symbol_key_add(&keys:ReadWrite, 65537u64)?;
+    assert(local_key);
+    assert(coff_state::import_symbol_def(65535u32, 4294967295u32) == 281474976710655u64);
+    assert(coff_state::import_symbol_def(65536u32, 1u32) == 0u64);
+    assert(coff_state::import_symbol_def(0u32, 1u32) == 0u64);
+    return;
+}
+
+// (1, 65537) 与 (2, 1) 在旧打包方式下冲突；重复调用首个目标只登记一次。
+function check_decorated_rejection(module: &mir::MirModule:Read, table: &coff_state::LinkTable:Read): void!AllocError {
+    let win: coff::EmitResult = coff::emit_object(module, table, coff::profile_win64_pe())?;
+    assert(!win.ok && win.code.raw == 8009 && @len(win.bytes.data) == 0);
+    let sysv: elf::ObjectResult = elf_backend::emit_object(module, table)?;
+    assert(sysv.code == 8017 && @len(sysv.bytes.data) == 0);
+    return;
+}
+
+function wide_import_relocs(): void!AllocError {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    add_import(&deps:ReadWrite, "first", 65537)?;
+    add_import(&deps:ReadWrite, "second", 1)?;
+    let unit: runner::Loaded = runner::load("import first; import second; function f(): u32 { return first::value() + second::value() + first::value(); }\n", 1305)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "user", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    var result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && mir_verify::verify_module(&result.module:Read)?);
+    let exports: iface::ExportMap = iface::ExportMap { defs: [], exports: [] };
+    let missing: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..1]:Read)?;
+    assert(!missing.ok && missing.code.raw == coff_symbols::e_em1());
+    var call: u32 = 0;
+    while !mir::is_far_call(result.module.functions[0].insts[call].op) { call = call + 1; }
+    let original: mir::MirInst = result.module.functions[0].insts[call];
+    assert(original.c == 1 && original.b == 65537);
+    // 另一依赖的导出编号和本地编号不能直接塞进此依赖的 ImportRef。
+    result.module.functions[0].insts[call].b = deps.ifaces[1].exports[0].export_id;
+    let unbridged: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    // rejection_spec: E7006 spec/lang/symbol.md#S-6
+    assert(!unbridged.ok && unbridged.code.raw == 7006 && @len(unbridged.table.symbols) == 0);
+    result.module.functions[0].insts[call] = original;
+    deps.ifaces[0].exports[0].kind = 3u8;
+    let noncallable: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    assert(!noncallable.ok && noncallable.code.raw == 7006 && @len(noncallable.table.symbols) == 0);
+    deps.ifaces[0].exports[0].kind = 1u8;
+    result.module.functions[0].insts[call].c = 65537u32;
+    let widened: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    // rejection_spec: E7009 spec/lang/symbol.md#S-9
+    assert(!widened.ok && widened.code.raw == 7009 && @len(widened.table.symbols) == 0);
+    result.module.functions[0].insts[call] = original;
+    var link: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    assert(link.ok && @len(link.table.symbols) == 3);
+    // 模块名不能混入修饰分隔符；即使已有本地符号和首个依赖符号，拒绝也不返回半张表。
+    let bad_local: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user$bad", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    assert(!bad_local.ok && bad_local.code.raw == 8009 && @len(bad_local.table.symbols) == 0);
+    let root_def: u32 = result.module.functions[0].def;
+    let bad_root: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user$bad", root_def, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    assert(!bad_root.ok && bad_root.code.raw == 8009 && @len(bad_root.table.symbols) == 0);
+    let second_initial: u8 = deps.ifaces[1].module[0];
+    deps.ifaces[1].module[0] = 36u8;
+    let bad_dependency: link_names::LinkBuild = link_names::build(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read)?;
+    // rejection_spec: E8009 spec/target/abi-win.md#AW-4
+    assert(!bad_dependency.ok && bad_dependency.code.raw == 8009 && @len(bad_dependency.table.symbols) == 0);
+    let bad_sysv_name: link_names::LinkBuild = link_names::build_target(&result.module:Read, &exports:Read, "user", 0, &refs.services[0..@len(refs.services)]:Read, &deps.ifaces[0..2]:Read, true)?;
+    // rejection_spec: E8017 spec/target/abi-linux.md#AL-4
+    assert(!bad_sysv_name.ok && bad_sysv_name.code.raw == 8017 && @len(bad_sysv_name.table.symbols) == 0);
+    deps.ifaces[1].module[0] = second_initial;
+    let target: u64 = link.table.symbols[1].def;
+    link.table.symbols[1].def = coff_state::import_symbol_def(1, 65538);
+    let bad: coff::EmitResult = coff::emit_object(&result.module:Read, &link.table:Read, coff::profile_win64_pe())?;
+    // rejection_spec: E8002 spec/target/emitter.md#EM-1
+    assert(!bad.ok && bad.code.raw == 8002 && @len(bad.bytes.data) == 0);
+    link.table.symbols[1].def = target;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &link.table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    // 对象入口直接接收的名字也必须符合保留修饰名的语法。
+    link.table.symbols[1].name = coff_state::copy_u8s("yak$first:$f65537")?;
+    check_decorated_rejection(&result.module:Read, &link.table:Read)?;
+    link.table.symbols[1].name = coff_state::copy_u8s("yak$first$f065537")?;
+    check_decorated_rejection(&result.module:Read, &link.table:Read)?;
+    link.table.symbols[1].name = coff_state::copy_u8s("yak$first$f4294967296")?;
+    check_decorated_rejection(&result.module:Read, &link.table:Read)?;
+    link.table.symbols[1].name = coff_state::copy_u8s("yak$first$f65537$i0123456789abcdef")?;
+    check_decorated_rejection(&result.module:Read, &link.table:Read)?;
+    link.table.symbols[1].name = coff_state::copy_u8s("yak$first::nested$f65537")?;
+    let scoped: coff::EmitResult = coff::emit_object(&result.module:Read, &link.table:Read, coff::profile_win64_pe())?;
+    assert(scoped.ok && @len(scoped.bytes.data) > 0);
+    let scoped_elf: elf::ObjectResult = elf_backend::emit_object(&result.module:Read, &link.table:Read)?;
+    assert(scoped_elf.code == 0 && @len(scoped_elf.bytes.data) > 0);
+    let reloc: u32 = u32_at(&res.bytes.data:Read, 44);
+    let symbols: u32 = u32_at(&res.bytes.data:Read, 8);
+    let count: u32 = u32_at(&res.bytes.data:Read, 12);
+    assert(count == 3 && u16_at(&res.bytes.data:Read, 52) == 3);
+    let strings: u32 = symbols + count * 18;
+    var i: u32 = 0;
+    while i < 3 {
+        let index: u32 = u32_at(&res.bytes.data:Read, reloc + i * 10 + 4);
+        assert(index < count && u16_at(&res.bytes.data:Read, reloc + i * 10 + 8) == 4);
+        let sym: u32 = symbols + index * 18;
+        assert(u32_at(&res.bytes.data:Read, sym) == 0 && u16_at(&res.bytes.data:Read, sym + 12) == 0);
+        let name: u32 = strings + u32_at(&res.bytes.data:Read, sym + 4);
+        var expected: &[u8] = "yak$first$f65537";
+        if i == 1 { expected = "yak$second$f1"; }
+        var j: u32 = 0;
+        while j < @len(expected) as u32 { assert(res.bytes.data[name + j] == expected[j]); j = j + 1; }
+        assert(res.bytes.data[name + j] == 0);
+        i = i + 1;
+    }
+    return;
+}
+
+// EM-3：重定位位宽判定——只有与 REL32/ADDR32NB（4 字节）或 ADDR64（8 字节）相符才合法，
+// 未知类型与宽度不符都必须拒绝，不得静默截断。
+function reloc_width_rules(): void {
+    assert(coff::reloc_width(coff::rel_rel32()) == 4);
+    assert(coff::reloc_width(coff::rel_addr32nb()) == 4);
+    assert(coff::reloc_width(coff::rel_addr64()) == 8);
+    assert(coff::reloc_width(9999) == 0);
+    assert(coff::reloc_width_legal(4, coff::rel_rel32()));
+    assert(coff::reloc_width_legal(8, coff::rel_addr64()));
+    assert(!coff::reloc_width_legal(8, coff::rel_rel32()));
+    assert(!coff::reloc_width_legal(4, coff::rel_addr64()));
+    assert(!coff::reloc_width_legal(4, 9999));
+    // 站点范围：越界与不足宽度都不可施加。
+    assert(coff::reloc_site_legal(0, 10, coff::rel_rel32()));
+    assert(coff::reloc_site_legal(6, 10, coff::rel_rel32()));
+    assert(!coff::reloc_site_legal(7, 10, coff::rel_rel32()));
+    assert(!coff::reloc_site_legal(11, 10, coff::rel_rel32()));
+    assert(coff::reloc_site_legal(0, 8, coff::rel_addr64()));
+    assert(!coff::reloc_site_legal(1, 8, coff::rel_addr64()));
+    return;
+}
+
+// 在实际函数布局上缩短 REL32 位移字段，装配不能留下已写入的头或节内容。
+function reject_short_reloc(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = links()?;
+    var layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(@len(layout.functions) == 2 && @len(layout.functions[1].calls) == 1);
+    assert(coff::validate_reloc_sites(&layout:Read) == 0);
+    let original: u32 = layout.functions[1].calls[0].at;
+    let size: u32 = @len(layout.functions[1].code) as u32;
+    assert(size >= 4);
+    layout.functions[1].calls[0].at = size - 3;
+    let reason: u16 = coff::validate_reloc_sites(&layout:Read);
+    let broken: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    // rejection_spec: E8004 spec/target/emitter.md#EM-3
+    assert(reason == 8004 && @len(broken.data) == 0);
+    layout.functions[1].calls[0].at = original;
+    let restored: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    assert(@len(restored.data) > 0);
+    return;
+}
+
+// 连续文本保留函数范围，不让站点借下一函数或物理尾部补足指令。
+function sysv_stream_boundaries(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    var layout: coff_state::ObjectLayout = coff::build_sysv_layout(&result.module:Read)?;
+    assert(layout.rejected == 0 && @len(layout.functions) == 2);
+    let first: u32 = layout.functions[0].code_size;
+    let second: u32 = layout.functions[1].code_size;
+    assert(first >= 4 && second >= 4);
+    assert(layout.functions[0].text_offset == 0 && layout.functions[1].text_offset == first);
+    assert(@len(layout.functions[0].code) == 0 && @len(layout.functions[1].code) == 0);
+    assert(@len(layout.text) == (first as u64) + (second as u64));
+    assert(layout.text[0] == 0x55 && layout.text[first] == 0x55);
+    assert(layout.text[first - 1] == 0xc3 && layout.text[first + second - 1] == 0xc3);
+    assert(@len(layout.functions[1].calls) == 1);
+    assert(coff::validate_stream_reloc_sites(&layout:Read) == 0);
+    @push(layout.functions[0].data_refs, coff_state::DataRef { at: first - 4, index: 0 })?;
+    assert(coff::validate_stream_reloc_sites(&layout:Read) == 0);
+    layout.functions[0].data_refs[0].at = first - 3;
+    assert(coff::validate_stream_reloc_sites(&layout:Read) == coff::e_em3());
+    layout.functions[0].data_refs[0].at = first - 4;
+    layout.functions[1].calls[0].at = second - 3;
+    assert(coff::validate_stream_reloc_sites(&layout:Read) == coff::e_em3());
+    return;
+}
+
+// 函数起点非零、物理缓冲仍有尾部时也按有效边界解码。
+function x86_stream_boundaries(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::nop(&code:ReadWrite)?;
+    pe::code_u32(&code:ReadWrite, 0x24048b48u32)?;
+    code.used = 4;
+    assert(x86_validate::validate(&code:Read, 1)? == 7101);
+    code.used = 5;
+    assert(x86_validate::validate(&code:Read, 1)? == 0);
+    assert(x86_validate::validate(&code:Read, 5)? == 7101);
+    return;
+}
+
+// 只改合法 MIR 的返回槽，使发射器看到按值返回的切片参数。
+function reject_slice_value_return(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(s: &[u8], n: u32): u32 { let length: u64 = @len(s); @drop(length); return n; }\n", 1370)?;
+    let table: coff_state::LinkTable = all_links(&result.module:Read)?;
+    let bcount: u32 = @len(result.module.functions[0].blocks) as u32;
+    var b: u32 = 0;
+    while b < bcount && result.module.functions[0].blocks[b].terminator.op != coff_state::mop_ret() { b = b + 1; }
+    assert(b < bcount && @len(result.module.functions[0].params) == 2);
+    let slice_slot: u32 = result.module.functions[0].params[0];
+    let original: u32 = result.module.functions[0].blocks[b].terminator.a;
+    assert(original != 0 && original != slice_slot);
+    result.module.functions[0].blocks[b].terminator.a = slice_slot;
+    let bad: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    // rejection_spec: E8023 spec/target/emitter.md#EM-6
+    assert(!bad.ok && bad.code.raw == 8023 && @len(bad.bytes.data) == 0);
+    result.module.functions[0].blocks[b].terminator.a = original;
+    let restored: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(restored.ok && restored.code.raw == 0 && @len(restored.bytes.data) > 0);
+    return;
+}
+
+// 无长立即数的定向函数中，按小端字样检查相邻的两字节操作码。
+function code_has_pair(data: &u8[]:Read, pair: u16): bool {
+    var i: u32 = 0;
+    let size: u32 = @len((*data)) as u32;
+    while i + 1 < size {
+        if u16_at(data, i) == pair { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+function code_has_overflow_jump(data: &u8[]:Read): bool {
+    var i: u32 = 0;
+    let size: u32 = @len((*data)) as u32;
+    while i + 1 < size {
+        if (*data)[i] == 112 || u16_at(data, i) == 0x800fu16 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+function wrap_without_overflow_jump(): void!AllocError {
+    let source: &[u8] = "function add(a: i64, b: i64): i64 { return a + b; } function sub(a: i64, b: i64): i64 { return a - b; } function mul(a: i64, b: i64): i64 { return a * b; } function wa(a: i64, b: i64): i64 { return @wrap_add(a, b); } function ws(a: i64, b: i64): i64 { return @wrap_sub(a, b); } function wm(a: i64, b: i64): i64 { return @wrap_mul(a, b); }\n";
+    let result: mir::MirResult = runner::accepted(source, 1371)?;
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0 && @len(layout.functions) == 6);
+    // 每对同宽运算中，只有检查溢出的版本发射 jo。
+    var i: u32 = 0;
+    while i < 3 {
+        assert(code_has_overflow_jump(&layout.functions[i].code:Read));
+        assert(!code_has_overflow_jump(&layout.functions[i + 3].code:Read));
+        i = i + 1;
+    }
+    return;
+}
+
+function reject_mixed_ordered_compare(): void!AllocError {
+    let source: &[u8] = "function cmp_i(a: i32, b: i32, other: u32): bool { @drop(other); return a < b; } function cmp_u(a: u32, b: u32): bool { return a < b; }\n";
+    var result: mir::MirResult = runner::accepted(source, 1372)?;
+    let table: coff_state::LinkTable = all_links(&result.module:Read)?;
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0 && @len(layout.functions) == 2);
+    // 存储比较结果用短形 jl 或 jb 跳过两字节的清零，按比较签名区分符号性。
+    assert(code_has_pair(&layout.functions[0].code:Read, 0x027cu16));
+    assert(!code_has_pair(&layout.functions[0].code:Read, 0x0272u16));
+    assert(code_has_pair(&layout.functions[1].code:Read, 0x0272u16));
+    assert(!code_has_pair(&layout.functions[1].code:Read, 0x027cu16));
+    let count: u32 = @len(result.module.functions[0].insts) as u32;
+    var i: u32 = 0;
+    while i < count && result.module.functions[0].insts[i].op != coff_state::mop_lt() { i = i + 1; }
+    assert(i < count && @len(result.module.functions[0].params) == 3);
+    let original: u32 = result.module.functions[0].insts[i].c;
+    let other: u32 = result.module.functions[0].params[2];
+    assert(other != original);
+    result.module.functions[0].insts[i].c = other;
+    let bad: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    // rejection_spec: E8022 spec/target/emitter.md#EM-5
+    assert(!bad.ok && bad.code.raw == 8022 && @len(bad.bytes.data) == 0);
+    result.module.functions[0].insts[i].c = original;
+    let restored: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(restored.ok && restored.code.raw == 0 && @len(restored.bytes.data) > 0);
+    return;
+}
+
+// 符号装配的前提不成立时必须拒绝，不能写出占位条目；
+// 长名（超过 8 字节）不是拒绝形态，而是经 COFF 字符串表表达。
+function reject_unassemblable_symbols(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    // 超过 8 字节的符号名：符号名写 4 字节零 + 4 字节相对偏移，字符串表紧随符号表。
+    var long_table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var long_name: u8[] = [];
+    var i: u32 = 0;
+    while i < 12 {
+        @push(long_name, 97u8)?;
+        i = i + 1;
+    }
+    @push(long_table.symbols, coff_state::LinkSymbol { def: 1u64, kind: 0u8, name: @move(long_name) })?;
+    let long_res: coff::EmitResult = coff::emit_object(&result.module:Read, &long_table:Read, coff::profile_win64_pe())?;
+    assert(long_res.ok);
+    let long_sym_ptr: u32 = u32_at(&long_res.bytes.data:Read, 8);
+    let long_sym_count: u32 = u32_at(&long_res.bytes.data:Read, 12);
+    assert(long_sym_count == 1);
+    // 第一条符号名前 4 字节为 0、后 4 字节为字符串表内相对偏移 4。
+    assert(u32_at(&long_res.bytes.data:Read, long_sym_ptr) == 0);
+    assert(u32_at(&long_res.bytes.data:Read, long_sym_ptr + 4) == 4);
+    // 字符串表紧随符号表：首 4 字节总长为 4 + 12 + 1 = 17，内容为 12 个 'a' 加结尾 0。
+    let str_ptr: u32 = long_sym_ptr + long_sym_count * 18;
+    assert(u32_at(&long_res.bytes.data:Read, str_ptr) == 17);
+    var k: u32 = 0;
+    while k < 12 { assert(long_res.bytes.data[str_ptr + 4 + k] == 97); k = k + 1; }
+    assert(long_res.bytes.data[str_ptr + 16] == 0);
+    // DefId 99 不在本对象布局里：链接输入与模块不一致。
+    var bad_table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var bad_name: u8[] = []; @push(bad_name, 120u8)?;
+    @push(bad_table.symbols, coff_state::LinkSymbol { def: 99u64, kind: 0u8, name: @move(bad_name) })?;
+    let bad_res: coff::EmitResult = coff::emit_object(&result.module:Read, &bad_table:Read, coff::profile_win64_pe())?;
+    assert(!bad_res.ok);
+    // 已定义符号在布局中找不到即未定义链接符号，拒绝码为 EM-1。
+    assert(bad_res.code.raw == coff_symbols::e_em1());
+    assert(@len(bad_res.bytes.data) == 0);
+    return;
+}
+
+// 未知指令或终结指令不能生成成功对象，零操作码也必须保留拒绝状态。
+function reject_unknown_ops(): void!AllocError {
+    let table: coff_state::LinkTable = links()?;
+    var result: mir::MirResult = sample()?;
+    result.module.functions[0].blocks[0].terminator.op = 0;
+    let term_zero: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!term_zero.ok && term_zero.code.raw == coff::e_em4() && @len(term_zero.bytes.data) == 0);
+    result.module.functions[0].blocks[0].terminator.op = 255;
+    let term_other: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!term_other.ok && term_other.code.raw == coff::e_em4() && @len(term_other.bytes.data) == 0);
+    var inst_result: mir::MirResult = sample()?;
+    let original_term: u8 = inst_result.module.functions[0].blocks[0].terminator.op;
+    inst_result.module.functions[0].insts[0].op = 0;
+    let inst_zero: coff::EmitResult = coff::emit_object(&inst_result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!inst_zero.ok && inst_zero.code.raw == coff::e_em4() && @len(inst_zero.bytes.data) == 0);
+    inst_result.module.functions[0].blocks[0].terminator.op = 254;
+    let first: coff_state::ObjectLayout = coff::build_layout(&inst_result.module:Read)?;
+    assert(first.rejected == 255 && first.reject_kind == 0);
+    inst_result.module.functions[0].blocks[0].terminator.op = original_term;
+    inst_result.module.functions[0].insts[0].op = 255;
+    let inst_other: coff::EmitResult = coff::emit_object(&inst_result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!inst_other.ok && inst_other.code.raw == coff::e_em4() && @len(inst_other.bytes.data) == 0);
+    return;
+}
+
+// 超出栈槽范围的合法布局必须明确拒绝，而不是在规划时溢出。
+function reject_huge_slot(): void!AllocError {
+    let result: mir::MirResult = runner::accepted("function f(x: [u8; 18446744073709551615u64]): void { @drop(x); return; }\n", 1301)?;
+    let plan: coff_state::SlotPlan = coff_state::plan_slots(&result.module.functions[0]:Read, &result.module:Read)?;
+    assert(@len(plan.slots) < @len(result.module.functions[0].locals));
+    let table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    let emitted: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!emitted.ok && emitted.code.raw == coff::e_em4() && @len(emitted.bytes.data) == 0);
+    let within: u32[] = [2147483600u32];
+    let beyond: u32[] = [2147483616u32];
+    assert(coff_state::plan_frame(&within[0..@len(within)]:Read) == 2147483632u32);
+    assert(coff_state::plan_frame(&beyond[0..@len(beyond)]:Read) == 0);
+    let cumulative: mir::MirResult = runner::accepted("function f(x: [u8; 4294967288u64], y: u8): void { @drop(x); @drop(y); return; }\n", 1303)?;
+    let cumulative_plan: coff_state::SlotPlan = coff_state::plan_slots(&cumulative.module.functions[0]:Read, &cumulative.module:Read)?;
+    assert(@len(cumulative_plan.slots) < @len(cumulative.module.functions[0].locals));
+    let near: mir::MirResult = runner::accepted("function f(x: [u8; 4294967264u64]): void { @drop(x); return; }\n", 1302)?;
+    let near_emitted: coff::EmitResult = coff::emit_object(&near.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!near_emitted.ok && near_emitted.code.raw == coff::e_em4() && @len(near_emitted.bytes.data) == 0);
+    return;
+}
+// Win64 聚合按值 ABI：12 字节 struct 与 6 字节定长数组走隐藏返回缓冲区 + 指针实参。
+function aggregate_abi(): void!AllocError {
+    let source: &[u8] = "struct Pair { a: u32, b: u32, c: u32 }\nfunction make(x: u32): Pair { return Pair { a: x, b: x + 1u32, c: x + 2u32 }; }\nfunction sum(p: Pair): u32 { return p.a + p.b + p.c; }\nfunction small(): [u16; 3] { return [1u16, 2u16, 3u16]; }\nfunction use_small(x: [u16; 3]): u32 { return x[0u32] as u32; }\nfunction main(): u32 { let p: Pair = make(7u32); let s: [u16; 3] = small(); return sum(p) + use_small(s); }\n";
+    let result: mir::MirResult = runner::accepted(source, 1305)?;
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var i: u32 = 0;
+    while i < @len(result.module.functions) as u32 {
+        var name: u8[] = [];
+        @push(name, 102u8)?;
+        @push(table.symbols, coff_state::LinkSymbol { def: result.module.functions[i].def as u64, kind: 0u8, name: @move(name) })?;
+        i = i + 1;
+    }
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    assert(coff_code::bytes_len(&res.bytes:Read) > 0);
+    // 同一多函数对象走公开布局和直接拼接两条路径，段内容、重定位及符号必须逐字节相同。
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    let explicit_object: coff_code::Bytes = coff::assemble(&layout:Read, &table:Read)?;
+    assert(@len(res.bytes.data) == @len(explicit_object.data));
+    i = 0;
+    while i < @len(res.bytes.data) as u32 {
+        assert(res.bytes.data[i] == explicit_object.data[i]);
+        i = i + 1;
+    }
+    // 按指针返回的函数必须规划隐藏返回指针槽。
+    let probe: mir::MirResult = runner::accepted("struct Pair { a: u32, b: u32, c: u32 }\nfunction make(): Pair { return Pair { a: 1u32, b: 2u32, c: 3u32 }; }\n", 1306)?;
+    let probe_plan: coff_state::SlotPlan = coff_state::plan_slots(&probe.module.functions[0]:Read, &probe.module:Read)?;
+    assert(probe_plan.sret != 0);
+    var ret_local: u32 = 0;
+    var bi: u32 = 0;
+    while bi < @len(probe.module.functions[0].blocks) as u32 {
+        let t: mir::MirTerminator = probe.module.functions[0].blocks[bi].terminator;
+        if t.op == 194 && t.a != 0 { ret_local = t.a; }
+        bi = bi + 1;
+    }
+    assert(ret_local != 0);
+    assert(probe_plan.by_ptr[ret_local - 1]);
+    return;
+}
+
+// enum_dispatch 跳转表：单函数 pick(x: E)，发射应成功且两次产物逐字节一致。
+function dispatch_object(): void!AllocError {
+    let source: &[u8] = "enum E { A, B, C }\nfunction pick(x: E): u32 { var r: u32 = 0u32; match x { A => { r = 1u32; }, B => { r = 2u32; }, C => { r = 3u32; } } return r; }\n";
+    let result: mir::MirResult = runner::accepted(source, 1304)?;
+    assert(runner::term_count(&result.module.functions[0]:Read, 177) == 1);
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var name: u8[] = [];
+    @push(name, 112u8)?; @push(name, 105u8)?; @push(name, 99u8)?; @push(name, 107u8)?;
+    // 符号表按函数实际 DefId 登记（enum 与参数同样占用 DefId）。
+    let fn_def: u64 = result.module.functions[0].def as u64;
+    @push(table.symbols, coff_state::LinkSymbol { def: fn_def, kind: 0u8, name: @move(name) })?;
+    let first: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(first.ok);
+    assert(coff_code::bytes_len(&first.bytes:Read) > 0);
+    let second: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(second.ok && coff_code::bytes_len(&second.bytes:Read) == coff_code::bytes_len(&first.bytes:Read));
+    var i: u32 = 0;
+    while i < coff_code::bytes_len(&first.bytes:Read) {
+        assert(first.bytes.data[i] == second.bytes.data[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// 为源内全部函数登记链接符号；测试只关心对象能否确定性产出。
+function emit_all(src: &[u8], file: u16): coff::EmitResult!AllocError {
+    let result: mir::MirResult = runner::accepted(src, file)?;
+    return emit_all_module(&result.module:Read)?;
+}
+function emit_all_module(module: &mir::MirModule:Read): coff::EmitResult!AllocError {
+    let table: coff_state::LinkTable = all_links(module)?;
+    return coff::emit_object(module, &table:Read, coff::profile_win64_pe())?;
+}
+
+function all_links(module: &mir::MirModule:Read): coff_state::LinkTable!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        var name: u8[] = [];
+        @push(name, 102u8)?;
+        @push(name, 48u8 + (i as u8 % 10u8))?;
+        @push(table.symbols, coff_state::LinkSymbol { def: module.functions[i].def as u64, kind: 0u8, name: @move(name) })?;
+        i = i + 1;
+    }
+    return table;
+}
+
+// 176 构造 / 177 分派 / 160 成功载体 / 161 错误载体 / 162 带载荷分派均可发射。
+function enum_carrier_object(): void!AllocError {
+    let r1: coff::EmitResult = emit_all("enum E { A, B } function make(x: u32): E { if x == 0 { return E::A; } return E::B; } function pick(x: E): u32 { match x { A => { return 1u32; }, B => { return 2u32; } } }\n", 1310)?;
+    assert(r1.ok && coff_code::bytes_len(&r1.bytes:Read) > 0);
+    let r2: coff::EmitResult = emit_all("enum E { Bad } function ok(): u32!E { return 1u32; } function bad(): u32!E { return E::Bad; }\n", 1311)?;
+    assert(r2.ok && coff_code::bytes_len(&r2.bytes:Read) > 0);
+    let r3: coff::EmitResult = emit_all("enum E { Bad } function base(x: u32): u32!E { if x == 0 { return E::Bad; } return x; } function chain(x: u32): u32!E { let a: u32 = base(x)?; return a + 1; }\n", 1312)?;
+    assert(r3.ok && coff_code::bytes_len(&r3.bytes:Read) > 0);
+    // 177 臂载荷桩：Code(v) 绑定臂先跳桩取载荷，再跳臂块。
+    let r4: coff::EmitResult = emit_all("enum E { Empty, Code(u32) } function pick(x: u32): u32 { var e: E = E::Empty; if x != 0 { e = E::Code(x); } var r: u32 = 0u32; match e { Empty => { r = 7u32; }, Code(v) => { r = v + 1u32; } } return r; }\n", 1313)?;
+    assert(r4.ok && coff_code::bytes_len(&r4.bytes:Read) > 0);
+    // 178 的动态数组发射由真实 EXE 用例 examples/dyn_array.yak 覆盖
+    // （参考解释器不执行动态数组，故不进入 runner::accepted）。
+    return;
+}
+
+// 显式析构直接消费参数和可变槽，不先载入副本。
+function explicit_drop_locals(): void!AllocError {
+    let result: mir::MirResult = runner::accepted("function f(x: u32): void { var y: u32 = 1u32; @drop(y); @drop(x); }\n", 1314)?;
+    let fn: &mir::MirFunction:Read = &result.module.functions[0]:Read;
+    var drops: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(fn.insts) as u32 {
+        let inst: mir::MirInst = fn.insts[i];
+        assert(inst.op != 80);
+        if inst.op == 115 {
+            if drops == 0 { assert(fn.locals[inst.b - 1].kind == 2); }
+            else { assert(drops == 1 && inst.b == fn.params[0]); }
+            drops = drops + 1;
+        }
+        i = i + 1;
+    }
+    assert(drops == 2);
+    return;
+}
+
+// 两个同型槽避免类型错误掩盖状态验证；分别篡改调用、提取顺序和被调方提交。
+function out_slot_flow(): void!AllocError {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    var r: mir::MirResult = runner::compile("function fill(a: &u32:Write, b: &u32:Write): void { *a = 4u32; *b = 8u32; } function observe(): u32 { out a: u32; out b: u32; fill(out a, out b); let v: u32 = @move(a); let w: u32 = @move(b); return v + w; }\n", 1315, &d:ReadWrite)?;
+    assert(r.accepted && !d.has_error && mir_verify::verify_module(&r.module:Read)?);
+    var call: u32 = 0;
+    while r.module.functions[1].insts[call].op != 150 { call = call + 1; }
+    let call_inst: mir::MirInst = r.module.functions[1].insts[call];
+    let start: u32 = call_inst.args_start;
+    let second: u32 = r.module.functions[1].args[start + 1];
+    r.module.functions[1].args[start + 1] = r.module.functions[1].args[start];
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[1].args[start + 1] = second;
+    let take: mir::MirInst = r.module.functions[1].insts[call + 1];
+    assert(take.op == 210 && take.b == r.module.functions[1].args[start]);
+    r.module.functions[1].insts[call] = take;
+    r.module.functions[1].insts[call + 1] = call_inst;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[1].insts[call] = call_inst;
+    r.module.functions[1].insts[call + 1] = take;
+    assert(mir_verify::verify_module(&r.module:Read)?);
+    var i: u32 = 0;
+    while r.module.functions[0].insts[i].op != 209 { i = i + 1; }
+    let first: u32 = r.module.functions[0].insts[i].b;
+    i = i + 1;
+    while r.module.functions[0].insts[i].op != 209 { i = i + 1; }
+    r.module.functions[0].insts[i].b = first;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    return;
+}
+
+// 未接入异常回滚时，满 owning 槽不能越过另一次调用。
+function owning_slot_flow(): void!AllocError {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    var r: mir::MirResult = runner::compile("struct S { values: u32[] } function fill(v: &S:Write): void { *v = S { values: [] }; } function witness(): void { return; } function observe(): void { out x: S; fill(out x); let s: S = @move(x); witness(); @drop(s); return; }\n", 1316, &d:ReadWrite)?;
+    assert(r.accepted && !d.has_error);
+    var i: u32 = 0;
+    while r.module.functions[2].insts[i].op != 210 { i = i + 1; }
+    let take: mir::MirInst = r.module.functions[2].insts[i];
+    let bind: mir::MirInst = r.module.functions[2].insts[i + 1];
+    let call: mir::MirInst = r.module.functions[2].insts[i + 2];
+    assert(bind.op == 112 && bind.b == take.a && call.op == 150 && call.args_count == 0);
+    assert(mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[2].insts[i] = call;
+    r.module.functions[2].insts[i + 1] = take;
+    r.module.functions[2].insts[i + 2] = bind;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[2].insts[i] = take;
+    r.module.functions[2].insts[i + 1] = bind;
+    r.module.functions[2].insts[i + 2] = call;
+    assert(mir_verify::verify_module(&r.module:Read)?);
+    return;
+}
+
+// 待判定的 out 借出必须在调用块立即按同一载体分流。
+function fallible_slot_flow(): void!AllocError {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    var r: mir::MirResult = runner::compile("enum E { Bad } function witness(): void { return; } function fill(p: bool, x: &u32:Write): void!E { if p { return E::Bad; } *x = 7u32; return; } function observe(p: bool): u32!E { out x: u32; witness(); fill(p, out x)?; let value: u32 = @move(x); return value; }\n", 1316, &d:ReadWrite)?;
+    assert(r.accepted && !d.has_error && mir_verify::verify_module(&r.module:Read)?);
+    var i: u32 = 0;
+    while r.module.functions[2].blocks[i].terminator.op != 162 { i = i + 1; }
+    let block: mir::MirBlock = r.module.functions[2].blocks[i];
+    // 两条载体分支都不得把不可编码的块号截断为低 16 位。
+    r.module.functions[2].blocks[i].terminator.b = 65536u32;
+    let bad_ok: coff::EmitResult = emit_all_module(&r.module:Read)?;
+    assert(!bad_ok.ok && coff_code::bytes_len(&bad_ok.bytes:Read) == 0);
+    r.module.functions[2].blocks[i].terminator.b = block.terminator.b;
+    r.module.functions[2].blocks[i].terminator.c = 65536u32;
+    let bad_err: coff::EmitResult = emit_all_module(&r.module:Read)?;
+    assert(!bad_err.ok && coff_code::bytes_len(&bad_err.bytes:Read) == 0);
+    r.module.functions[2].blocks[i].terminator.c = block.terminator.c;
+    let restored: coff::EmitResult = emit_all_module(&r.module:Read)?;
+    assert(restored.ok && coff_code::bytes_len(&restored.bytes:Read) > 0);
+    let call_index: u32 = block.inst_start + block.inst_count - 1;
+    let call: mir::MirInst = r.module.functions[2].insts[call_index];
+    var witness_index: u32 = block.inst_start;
+    while r.module.functions[2].insts[witness_index].op != 150 { witness_index = witness_index + 1; }
+    let witness: mir::MirInst = r.module.functions[2].insts[witness_index];
+    assert(witness_index < call_index && witness.a == 0 && witness.args_count == 0 && call.op == 150 && call.a == block.terminator.a);
+    var j: u32 = witness_index;
+    while j < call_index {
+        r.module.functions[2].insts[j] = r.module.functions[2].insts[j + 1];
+        j = j + 1;
+    }
+    r.module.functions[2].insts[call_index] = witness;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    while j > witness_index {
+        r.module.functions[2].insts[j] = r.module.functions[2].insts[j - 1];
+        j = j - 1;
+    }
+    r.module.functions[2].insts[witness_index] = witness;
+    assert(mir_verify::verify_module(&r.module:Read)?);
+    return;
+}
+
+// 错误返回的回滚必须是完整的逆序后缀；元素步长必须等于布局尺寸。
+function owning_rollback_flow(): void!AllocError {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    var r: mir::MirResult = runner::compile("struct S { values: u32[] } function fill(p: bool, a: &S:Write, b: &S:Write): void!AllocError { var v: u32[] = []; @push(v, 7u32)?; *a = S { values: @move(v) }; *b = S { values: [] }; if p { return AllocError::OutOfMemory; } return; }\n", 1317, &d:ReadWrite)?;
+    assert(r.accepted && !d.has_error && mir_verify::verify_module(&r.module:Read)?);
+    var i: u32 = 0;
+    while r.module.functions[0].insts[i].op != 178 { i = i + 1; }
+    assert(r.module.functions[0].insts[i].value == 4u64);
+    r.module.functions[0].insts[i].value = 8u64;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[0].insts[i].value = 4u64;
+    i = i + 1;
+    while r.module.functions[0].insts[i].op != 115 { i = i + 1; }
+    let right: mir::MirInst = r.module.functions[0].insts[i];
+    let left: mir::MirInst = r.module.functions[0].insts[i + 1];
+    assert(right.b == r.module.functions[0].params[2]);
+    assert(left.op == 115 && left.b == r.module.functions[0].params[1]);
+    r.module.functions[0].insts[i] = left;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[0].insts[i + 1] = right;
+    assert(!mir_verify::verify_module(&r.module:Read)?);
+    r.module.functions[0].insts[i] = right;
+    r.module.functions[0].insts[i + 1] = left;
+    assert(mir_verify::verify_module(&r.module:Read)?);
+    return;
+}
+
+function reject_mixed_link_domains(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let module: mir::MirResult = runner::compile("function f(): void { return; }\n", 1322, &diags:ReadWrite)?;
+    assert(module.accepted && !diags.has_error);
+    let imported: u64 = coff_state::import_symbol_def(1u32, 1u32);
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var name: u8[] = [];
+    @push(name, 102u8)?;
+    @push(table.symbols, coff_state::LinkSymbol { def: imported, kind: 0u8, name: @move(name) })?;
+    let mixed: coff::EmitResult = coff::emit_object(&module.module:Read, &table:Read, coff::profile_win64_pe())?;
+    // rejection_spec: E7001 spec/lang/symbol.md#S-1
+    assert(!mixed.ok && mixed.code.raw == 7001 && @len(mixed.bytes.data) == 0);
+    assert(coff_symbols::validate_links(&table:Read) == mixed.code.raw);
+    table.symbols[0].kind = 1u8;
+    assert(coff_symbols::validate_links(&table:Read) == 0);
+    table.symbols[0].def = 4294967296u64;
+    assert(coff_symbols::validate_links(&table:Read) == 7001);
+    return;
+}
+
+function main(): void {
+    reject_sysv_frames()?;
+    reject_mixed_link_domains()?;
+    owning_rollback_flow()?;
+    fallible_slot_flow()?;
+    owning_slot_flow()?;
+    out_slot_flow()?;
+    explicit_drop_locals()?;
+    reject_huge_slot()?;
+    reject_unknown_ops()?;
+    coff_header()?; coff_sections()?; coff_empty_string_table()?; coff_deterministic()?;
+    coff_relocs_and_symtab()?; numeric_symbol_keys()?; stable_symbol_order()?; wide_import_relocs()?;
+    reject_unknown_profile()?; reject_undefined_link()?; reject_duplicate_link()?;
+    reject_unassemblable_symbols()?;
+    em5_classification(); reloc_width_rules(); encoding_basics()?; reject_win64_frames()?; shortest_x86_forms()?;
+    relax_branch_boundaries()?; branch_to_next_block()?; relax_branch_relocations()?;
+    reject_x86_instruction_stream()?; reject_noncanonical_x86_body()?; typed_immediate_encoding()?;
+    reject_short_reloc()?; reject_slice_value_return()?; wrap_without_overflow_jump()?;
+    sysv_stream_boundaries()?; x86_stream_boundaries()?;
+    reject_mixed_ordered_compare()?;
+    dispatch_object()?;
+    aggregate_abi()?;
+    enum_carrier_object()?;
+    return;
+}

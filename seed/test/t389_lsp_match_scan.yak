@@ -1,0 +1,288 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+import buf;
+import lex;
+import diag;
+import pipeline;
+import consteval;
+import typecheck;
+import typecheck_driver;
+import typecheck_body;
+import typecheck_shape;
+import parse;
+import resolve;
+import resolve_refs;
+import resolve_unit;
+foreign assert(cond: bool): void;
+
+
+// 用逐步增长的配额检查每次停点，不足时不得返回部分类型表。
+function small_steps(src: &[u8], base: u32, binding: bool, expected_code: u16): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(src, 111u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 111u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var name_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let res: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &name_diags:ReadWrite)?;
+    assert(name_diags.count == 0u32);
+    var steps: u32 = base;
+    var payload: u32 = 0u32;
+    var payload_type: u32 = 0u32;
+    if binding {
+        // 核对同一绑定的批处理 DefId、臂作用域归属与文档固定一步的成本。
+        let pat: u32 = parsed.pool.matches[0].arms[0].pattern;
+        let body: u32 = parsed.pool.matches[0].arms[0].body;
+        let name: u32 = parsed.pool.patterns[pat].binding;
+        let offset: u32 = parsed.pool.patterns[pat].span.offset;
+        let tables: &resolve::ResolveTables = &res.result.tables:Read;
+        let arm: u32 = tables.scopes[tables.block_scope[body] - 1u32].parent;
+        let enclosing: u32 = tables.scopes[arm - 1u32].parent;
+        payload = resolve::match_payload_def(tables, body, enclosing, name, offset);
+        assert(payload != 0u32 && payload == resolve::binding_in_scope(tables, arm, name));
+        assert(resolve::match_payload_def(tables, body, arm, name, offset) == 0u32);
+        assert(resolve::match_payload_def(tables, body, enclosing, name, offset + 1u32) == 0u32);
+        assert(resolve::match_payload_def(tables, 4294967295u32, enclosing, name, offset) == 0u32);
+        assert(resolve::match_payload_def(tables, parsed.pool.matches[0].arms[1].body, enclosing, name, offset) == 0u32);
+        let batch: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &res:Read, &name_diags:ReadWrite)?;
+        payload_type = typecheck::def_type(&batch.def_types:Read, payload);
+        assert(payload_type != 0u32 && name_diags.count == 0u32);
+        steps = steps + 1u32;
+    }
+    var limit: u32 = 1u32;
+    while limit <= steps {
+        var diags: diag::DiagBuffer = diag::diagbuf_new();
+        var intern: typecheck::InternBudget = typecheck::intern_budget(0u32);
+        var lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(0u32);
+        var material: consteval::MaterialBudget = consteval::material_budget(0u32);
+        var fold: consteval::FoldBudget = consteval::fold_budget(0u32);
+        var probe: consteval::FoldBudget = consteval::fold_budget(0u32);
+        var scan: typecheck_driver::IntegerScanBudget = typecheck_driver::integer_scan_budget(0u32);
+        var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, limit, 0u32, 0u32, 0u32);
+        let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit_with_body_budget(&parsed.file:Read, &parsed.pool:Read, &res:Read, &diags:ReadWrite, &intern:ReadWrite, &lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe:ReadWrite, &scan:ReadWrite, &shape:ReadWrite, false)?;
+        assert(typecheck_shape::body_match_exceeded(&shape:Read) == (limit < steps));
+        assert(shape.match_remaining == 0u32);
+        if expected_code == 0u16 { assert(diags.count == 0u32); }
+        elseif limit == steps { assert(diags.count == 1u32 && diags.diags[0].code.raw == expected_code); }
+        if limit < steps { assert(@len(checked.expr_types.items) == 0); }
+        else {
+            assert(@len(checked.expr_types.items) == @len(parsed.pool.exprs));
+            if binding { assert(typecheck::def_type(&checked.def_types:Read, payload) == payload_type); }
+        }
+        limit = limit + 1u32;
+    }
+    return;
+}
+
+function boundary(src: &[u8], over: bool, bad: bool): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    if bad { buf::buf_push_bytes(&text:ReadWrite, "function broken(): void { let n: bool = 1u32; if n { return; } }\n")?; }
+    buf::buf_push_bytes(&text:ReadWrite, src)?;
+    let input: &[u8] = &text.data[0..text.pos]:Read;
+    let checked: pipeline::DocumentAnalysis = pipeline::run_document_frontend(input, 114u16)?;
+    if over {
+        assert(pipeline::analysis_match_scan_exceeded(checked.status));
+        assert(checked.diagnostics.count == 0u32 && !checked.diagnostics.truncated);
+    } elseif bad {
+        assert(checked.diagnostics.count == 1u32 && checked.diagnostics.diags[0].code.raw == 5001u16);
+    } else {
+        assert(pipeline::analysis_checked(checked.status) && checked.diagnostics.count == 0u32);
+    }
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let accepted: bool = pipeline::run_frontend(input, 114u16, &batch:ReadWrite)?;
+    assert(accepted == !bad);
+    if bad { assert(batch.count == 1u32 && batch.diags[0].code.raw == 5001u16); }
+    else { assert(batch.count == 0u32); }
+    return;
+}
+
+function run_boundary(over: bool, bad: bool, payload: bool): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "enum Pad { P }\nenum E { A0")?;
+    if payload { buf::buf_push_bytes(&text:ReadWrite, "(u16)")?; }
+    buf::buf_push_bytes(&text:ReadWrite, ", A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21, A22, A23, A24, A25, A26, A27, A28, A29, A30 }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function f(p: Pad, e: E): void { @drop(p); match e { A0")?;
+    if payload { buf::buf_push_bytes(&text:ReadWrite, "(v) => { let n: u16 = v; @drop(n); }")?; }
+    else { buf::buf_push_bytes(&text:ReadWrite, " => {}")?; }
+    buf::buf_push_bytes(&text:ReadWrite, ", A1 => {}, A2 => {}, A3 => {}, A4 => {}, A5 => {}, A6 => {}, A7 => {}, A8 => {}, A9 => {}, A10 => {}, A11 => {}, A12 => {}, A13 => {}, A14 => {}, A15 => {}, A16 => {}, A17 => {}, A18 => {}, A19 => {}, A20 => {}, A21 => {}, A22 => {}, A23 => {}, A24 => {}, A25 => {}, A26 => {}, A27 => {}, A28 => {}, A29 => {}, A30 => {}")?;
+    if !payload { buf::buf_push_bytes(&text:ReadWrite, ", _ => {}")?; }
+    buf::buf_push_bytes(&text:ReadWrite, " } }\n")?;
+    if over { buf::buf_push_bytes(&text:ReadWrite, "function g(e: E): void { match e { _ => {} } }\n")?; }
+    boundary(&text.data[0..text.pos]:Read, over, bad)?;
+    return;
+}
+
+// 臂体入口保持载荷绑定，子块遮蔽不会影响臂体和兄弟臂。
+function owner_entry_defs(): void!AllocError {
+    let src: &[u8] = "enum E { A(u32[]), B(u32[]) } function f(e: E): void { match e { A(v) => { if true { let v: bool = true; if v {} } @drop(v); }, B(v) => { @drop(v); } } }\n";
+    let lexed: lex::LexResult = lex::lex_scan(src, 112u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 112u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let res: resolve::ResolveResult = resolve::reserve_module(&parsed.file:Read, &parsed.pool:Read, &diags:ReadWrite)?;
+    assert(diags.count == 0u32);
+    let tables: &resolve::ResolveTables = &res.tables:Read;
+    let first: u32 = parsed.pool.matches[0].arms[0].body;
+    let second: u32 = parsed.pool.matches[0].arms[1].body;
+    let first_pattern: u32 = parsed.pool.matches[0].arms[0].pattern;
+    let second_pattern: u32 = parsed.pool.matches[0].arms[1].pattern;
+    let name: u32 = parsed.pool.patterns[first_pattern].binding;
+    let first_offset: u32 = parsed.pool.patterns[first_pattern].span.offset;
+    let second_offset: u32 = parsed.pool.patterns[second_pattern].span.offset;
+    let block: u32 = tables.block_scope[first];
+    let arm: u32 = tables.scopes[block - 1u32].parent;
+    let enclosing: u32 = tables.scopes[arm - 1u32].parent;
+    let branch: u32 = parsed.pool.stmts[parsed.pool.blocks[first].stmts[0]].data;
+    let nested: u32 = tables.block_scope[parsed.pool.ifs[branch].branches[0].body];
+    let payload: u32 = resolve::match_payload_def(tables, first, enclosing, name, first_offset);
+    let local: u32 = resolve::binding_in_scope(tables, nested, name);
+    let other: u32 = resolve::match_payload_def(tables, second, enclosing, name, second_offset);
+    assert(name == parsed.pool.patterns[second_pattern].binding);
+    assert(payload != 0u32 && local != 0u32 && other != 0u32);
+    assert(payload != local && other != payload && other != local);
+    assert(resolve::binding_in_scope(tables, block, name) == 0u32);
+    assert(resolve::match_arm_entry_def(tables, first, enclosing, name, first_offset) == payload);
+    assert(resolve::match_arm_entry_def(tables, second, enclosing, name, second_offset) == other);
+    assert(resolve::lookup_binding(tables, block, name) == payload);
+    assert(resolve::lookup_binding(tables, nested, name) == local);
+    assert(resolve::lookup_binding(tables, tables.block_scope[second], name) == other);
+    assert(resolve::match_arm_entry_def(tables, first, enclosing, name, second_offset) == 0u32);
+    assert(resolve::match_arm_entry_def(tables, second, arm, name, second_offset) == 0u32);
+    return;
+}
+
+// 有效输入和重复释放均与批处理对拍，包含完整诊断元组。
+function owner_diagnostics(src: &[u8], good: bool): void!AllocError {
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(src, 113u16, &batch:ReadWrite)?;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(src, 113u16)?;
+    assert(ok == good && pipeline::analysis_checked(doc.status) == good);
+    if good { assert(batch.count == 0u32 && doc.diagnostics.count == 0u32); }
+    else {
+        assert(pipeline::analysis_rejected(doc.status));
+        assert(batch.count == 1u32 && doc.diagnostics.count == 1u32);
+        let left: diag::Diag = batch.diags[0];
+        let right: diag::Diag = doc.diagnostics.diags[0];
+        assert(left.code.raw == 6003u16 && right.code.raw == left.code.raw && right.unit == left.unit && right.severity == left.severity);
+        assert(right.span.file == left.span.file && right.span.offset == left.span.offset && right.span.length == left.span.length);
+    }
+    return;
+}
+
+// 枚举行排序来自声明遍历，不要求 DefId 连续；文档与批处理必须得到同样的类型。
+function sparse_enum_types(): void!AllocError {
+    let src: &[u8] = "enum First { Full(bool), Empty }\nstruct Gap { item: u32 }\nfunction gap(x: u32): u32 { return x; }\nenum Middle { Full(u32), Empty }\nconst N: u32 = 1u32;\nenum Last { Full(u16), Empty }\nfunction make(flag: bool): First { if flag { return First::Full(flag); } return First::Empty; }\nfunction extract(flag: bool): u16 { var e: Last = Last::Empty; if flag { e = Last::Full(1u16); } match e { Full(v) => { return v; }, Last::Empty => { return gap(N) as u16; } } }\n";
+    let lexed: lex::LexResult = lex::lex_scan(src, 114u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 114u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var names: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let res: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &names:ReadWrite)?;
+    assert(names.count == 0u32);
+    var batch_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let batch: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &res:Read, &batch_diags:ReadWrite)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var intern: typecheck::InternBudget = typecheck::intern_budget(0u32);
+    var lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(0u32);
+    var material: consteval::MaterialBudget = consteval::material_budget(0u32);
+    var fold: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var probe: consteval::FoldBudget = consteval::fold_budget(0u32);
+    var scan: typecheck_driver::IntegerScanBudget = typecheck_driver::integer_scan_budget(0u32);
+    // 两个臂槽、五个裸标签候选、载荷绑定及判重各一步。
+    var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, 9u32, 0u32, 0u32, 0u32);
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit_with_body_budget(&parsed.file:Read, &parsed.pool:Read, &res:Read, &diags:ReadWrite, &intern:ReadWrite, &lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe:ReadWrite, &scan:ReadWrite, &shape:ReadWrite, true)?;
+    assert(batch_diags.count == 0u32 && diags.count == 0u32);
+    assert(!typecheck_shape::body_match_exceeded(&shape:Read) && shape.match_remaining == 0u32);
+    assert(@len(checked.enums.items) == 3 && @len(batch.enums.items) == 3);
+    let enums: &typecheck::EnumTable = &checked.enums:Read;
+    let first: u32 = enums.items[0].def;
+    let middle: u32 = enums.items[1].def;
+    let last: u32 = enums.items[2].def;
+    assert(first + 1u32 < middle && middle + 1u32 < last);
+    var def: u32 = 0u32;
+    while def <= last + 1u32 {
+        let row: u32 = typecheck::enum_row(enums, def, true);
+        assert(row == typecheck::enum_row(&batch.enums:Read, def, false));
+        if def == first || def == middle || def == last {
+            assert(row != 0u32 && enums.items[row - 1u32].def == def);
+            let payload: u32 = typecheck::enum_payload_with_order(enums, def, 0u32, true);
+            assert(payload != 0u32 && payload != 4294967295u32);
+            assert(payload == typecheck::enum_payload_type(&batch.enums:Read, def, 0u32));
+            assert(typecheck::enum_payload_with_order(enums, def, 1u32, true) == 0u32);
+        } else { assert(row == 0u32); }
+        assert(typecheck::enum_payload_with_order(enums, def, 2u32, true) == 4294967295u32);
+        def = def + 1u32;
+    }
+    assert(typecheck::enum_payload_with_order(enums, first + 1u32, 0u32, true) == 4294967295u32);
+    assert(@len(checked.def_types.items) == @len(batch.def_types.items));
+    var d: u32 = 0u32;
+    while d < @len(checked.def_types.items) as u32 {
+        assert(checked.def_types.items[d] == batch.def_types.items[d]);
+        d = d + 1u32;
+    }
+    assert(@len(checked.expr_types.items) == @len(batch.expr_types.items));
+    var i: u32 = 0u32;
+    while i < @len(checked.expr_types.items) as u32 {
+        assert(checked.expr_types.items[i] == batch.expr_types.items[i]);
+        i = i + 1u32;
+    }
+    return;
+}
+
+function main(): void {
+    sparse_enum_types()?;
+    owner_entry_defs()?;
+    owner_diagnostics("enum E { A(u32[]), B(u32[]) } function f(e: E): void { match e { A(v) => { if true { let v: bool = true; if v {} } @drop(v); }, B(v) => { @drop(v); } } }\n", true)?;
+    owner_diagnostics("enum E { A(u32[]), B(u32[]) } function f(e: E): void { match e { A(v) => { if true { let v: bool = true; if v {} } @drop(v); }, B(v) => { @drop(v); @drop(v); } } }\n", false)?;
+    // 两个臂槽、三行裸标签查找、一行判重，以及一步载荷绑定定位。
+    small_steps("enum E { A(u16), B } function f(e: E): u16 { match e { A(v) => { return v; }, B => { return 0; } } }\n", 6u32, true, 0u16)?;
+    // 重复变体只探测一行覆盖表，预算内保留真实诊断。
+    small_steps("enum E { A } function f(e: E): void { match e { A => { return; }, E::A => { return; } } }\n", 4u32, false, 2014u16)?;
+    // 首个标签未命中也扫描所有候选，通配臂只用一个臂槽。
+    small_steps("enum E { A, B } function f(e: E): void { match e { Missing => { return; }, _ => { return; } } }\n", 4u32, false, 2013u16)?;
+    run_boundary(false, false, false)?;
+    run_boundary(true, false, false)?;
+    run_boundary(true, true, false)?;
+    run_boundary(false, true, false)?;
+    run_boundary(false, false, true)?;
+    run_boundary(true, true, true)?;
+    run_boundary(false, true, true)?;
+    return;
+}

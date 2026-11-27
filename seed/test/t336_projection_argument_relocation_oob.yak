@@ -1,0 +1,9 @@
+// expected_trap: index out of bounds
+struct Item { data: u32[] }
+function clear(items: &Item[]:ReadWrite): u32 { *items = []; return 0u32; }
+function read(value: &u32): u32 { return *value; }
+function main(): void {
+    var items: Item[] = [Item { data: [1u32] }];
+    let view: &Item[]:ReadWrite = &items:ReadWrite;
+    let unused: u32 = read((*view)[0u32].data[clear(view)]);
+}

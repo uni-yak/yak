@@ -1,0 +1,9 @@
+// t93: 数组字面量元素移动 owning（owner.md 2.3）
+foreign assert(cond: bool): void;
+function main(): void {
+    let a: u32[] = [1, 2];
+    let b: u32[][] = [a];
+    assert(@len(b) == 1);
+    assert(@len(b[0]) == 2);
+    return;
+}

@@ -1,0 +1,24 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+import lex;
+foreign assert(cond: bool): void;
+function main(): void {
+    let r: lex::LexResult = lex::lex_scan("0b101u8 0o77u16 0xFFu32 18446744073709551615u64 128i8 32768i16 2147483648i32 9223372036854775808i64 0 42 1..2\n", 0)?;
+    assert(@len(r.diagnostics) == 0);
+    var i: u32 = 0;
+    while i < 8 {
+        assert(r.tokens[i].kind == 2);
+        assert(r.tokens[i].integer_suffix == (i + 1) as u8);
+        i = i + 1;
+    }
+    assert(r.tokens[0].payload == 5 && r.tokens[1].payload == 63);
+    assert(r.tokens[2].payload == 255);
+    assert(r.tokens[3].payload == 18446744073709551615u64);
+    assert(r.tokens[7].payload == 9223372036854775808u64);
+    assert(r.tokens[8].integer_suffix == 0 && r.tokens[9].payload == 42);
+    assert(r.tokens[11].kind == 7 && r.tokens[11].payload == 10);
+}

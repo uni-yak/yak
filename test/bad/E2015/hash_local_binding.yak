@@ -1,0 +1,4 @@
+// expected_code: E2015
+// spec: spec/lang/parse.md P-15
+// 触发：带井号名称只能出现在 callable 声明名处，不能作为局部绑定名。
+function main(): void { let #x: i32 = 1; return; }

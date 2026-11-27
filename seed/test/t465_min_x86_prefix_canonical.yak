@@ -1,0 +1,54 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(word: u32, size: u32, expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    var i: u32 = 0;
+    while i < size {
+        pe::code_u8(&code:ReadWrite, (word >> (i * 8u32)) as u8)?;
+        i = i + 1;
+    }
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // AH 与 SPL 不等价：两种编码都合法，但 SPL 必须有 REX。
+    encoding(0xe088u32, 2, 0)?;
+    encoding(0xe08840u32, 3, 0)?;
+    encoding(0xc48840u32, 3, 0)?;
+    encoding(0xc08844u32, 3, 0)?;
+    encoding(0xc08841u32, 3, 0)?;
+    encoding(0xc888u32, 2, 0)?;
+    encoding(0xc88840u32, 3, 7103)?;
+    // 无 SIB 则不使用 X；有 SIB 时，X 可把无索引标记变成真实 R12。
+    encoding(0x18bu32, 2, 0)?;
+    encoding(0x18b42u32, 3, 7103)?;
+    encoding(0x21048b42u32, 4, 0)?;
+    encoding(0x18b41u32, 3, 0)?;
+    // 仍需要 B、R 或低字节选择时，只清除无效的 REX 位，指令长度不变。
+    encoding(0x18b43u32, 3, 7102)?;
+    encoding(0xc0884cu32, 3, 7102)?;
+    encoding(0xe08842u32, 3, 7102)?;
+    // 只保留生效的操作数宽度前缀；截断先报无效指令。
+    encoding(0xc88966u32, 3, 0)?;
+    encoding(0xc8896666u32, 4, 7103)?;
+    encoding(0xc8894866u32, 4, 7103)?;
+    encoding(0xc8896648u32, 4, 7103)?;
+    encoding(0x42u32, 1, 7101)?;
+    encoding(0x8b42u32, 2, 7101)?;
+    encoding(0x896666u32, 3, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

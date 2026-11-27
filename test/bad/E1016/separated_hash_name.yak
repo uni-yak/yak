@@ -1,0 +1,4 @@
+// expected_code: E1016
+// spec: spec/lang/lex.md L-16
+// 触发：# 后有空格，不能组成 HashName。
+function # main(): void { return; }

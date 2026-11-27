@@ -1,0 +1,438 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+// module: coff_code=../../compiler/min/src/emit/coff_code.yak
+// module: coff_state=../../compiler/min/src/emit/coff_state.yak
+// module: coff_call=../../compiler/min/src/emit/coff_call.yak
+// module: coff_place=../../compiler/min/src/emit/coff_place.yak
+// module: coff_inst=../../compiler/min/src/emit/coff_inst.yak
+// module: coff_carrier=../../compiler/min/src/emit/coff_carrier.yak
+// module: coff_func=../../compiler/min/src/emit/coff_func.yak
+// module: coff_layout=../../compiler/min/src/emit/coff_layout.yak
+// module: coff=../../compiler/min/src/emit/coff.yak
+// module: coff_symbols=../../compiler/min/src/emit/coff_symbols.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+import mir_verify;
+import coff_code;
+import coff;
+import coff_state;
+import pe;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// module: runner=mir_runner.yak
+import runner;
+
+// 发射边界定向用例：非 8 倍数聚合槽占用、切片胖指针双字搬运与 @len 一致性、
+// 切片按值返回的 EM-6 拒绝，以及 Win64 聚合按值 ABI（隐藏返回缓冲区与副本指针）。
+// 每条断言都对应一类曾经出现过的缺陷：聚合槽按精确字节分配导致块搬运越界、
+// 切片退化成单字搬运丢掉长度字、返回或按值传参大聚合静默发出坏机器码。
+
+// [u16; 3]：布局尺寸 6 字节，栈槽必须按 8 字节对齐分配。复制后逐元素读回，
+// 元素值正确即证明取整槽上的构造、块搬运与索引读全部落在合法范围内。
+const ARRAY_SOURCE: &[u8] = "function probe(): u32 { let a: [u16; 3] = [9u16, 8u16, 7u16]; let b: [u16; 3] = @copy(a); return (b[0u32] as u32) * 100 + (b[1u32] as u32) * 10 + (b[2u32] as u32); }\n";
+
+// 字段尺寸合计 7 的结构体（u8+u16+u32，字段偏移 0/2/4，布局含尾填充 8 字节）：
+// 复制后逐字段读回，验证聚合槽占用与字段偏移读写不串位。
+const STRUCT_SOURCE: &[u8] = "struct S { a: u8, b: u16, c: u32 } function probe(): u32 { let s: S = S { a: 7u8, b: 8u16, c: 9u32 }; let t: S = @copy(s); return (t.a as u32) * 100 + (t.b as u32) * 10 + (t.c as u32); }\n";
+
+// 切片形参移动到新局部后取长度：运行器端与发射端共用同一份 MIR 文本，
+// 证明两端对切片胖指针（低 8 字节地址、高 8 字节长度）的字段约定一致。
+const SLICE_SOURCE: &[u8] = "function plen(t: &[u8]): u64 { let r: &[u8] = @move(t); return @len(r); }\n";
+
+// 返回切片局部：发射期必须拒绝（EM-6），不得静默发出按值搬地址的机器码。
+const RET_SLICE_SOURCE: &[u8] = "function f(): &[u8] { let s: &[u8] = \"x\"; return s; }\n";
+
+// 返回 16 字节聚合局部：不属于 1/2/4/8 字节分类，走隐藏返回缓冲区，必须发射成功。
+const RET_AGG_SOURCE: &[u8] = "function f(): [u32; 4] { let a: [u32; 4] = [1u32, 2u32, 3u32, 4u32]; return a; }\n";
+
+// 按值传 16 字节聚合实参：以调用方副本指针传递，必须发射成功。
+const ARG_AGG_SOURCE: &[u8] = "function g(a: [u32; 4]): u32 { return a[0u32]; } function f(): u32 { let a: [u32; 4] = [1u32, 2u32, 3u32, 4u32]; return g(a); }\n";
+
+// 字符串字面量局部经 @len 取长度：静态池字节串的长度字写入槽位高 8 字节，
+// 该路径必须保持可发射，EM-6 不得误伤 const_bytes 的合法形态。
+// 同一函数内先撞上 EM-6（超过 4096 字节的按值聚合形参，长期失败关闭），
+// 函数体后部的 162 臂载荷错误不得覆盖它。拒绝报告必须描述首个被拒形态。
+const MIXED_REJECT_SOURCE: &[u8] = "enum E { Bad } struct Big { a: [u8; 4097] } function base(x: u32): u32!E { if x == 0 { return E::Bad; } return x; } function f(x: Big): u32!E { let n: u32 = base(x.a[0u32] as u32)?; return n; }\n";
+
+const SLICE_LEN_SOURCE: &[u8] = "function f(): u64 { let s: &[u8] = \"abcd\"; return @len(s); }\n";
+
+// 走带静态池的解析入口，其余阶段与运行器保持一致。
+function compile(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", diags)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, diags)?;
+    return mir_lower::build_mir(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &tc:Read, diags)?;
+}
+
+// 统计模块内某 opcode 的出现次数。
+function count_op(m: &mir::MirModule:Read, op: u8): u32 {
+    var n: u32 = 0;
+    var f: u32 = 0;
+    while f < @len(m.functions) as u32 {
+        var k: u32 = 0;
+        while k < @len(m.functions[f].insts) as u32 {
+            if m.functions[f].insts[k].op == op { n = n + 1; }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    return n;
+}
+
+// 追加一段 ASCII 字节。
+function push_text(dst: &u8[]:ReadWrite, text: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(text) as u32 { @push(*dst, text[i])?; i = i + 1; }
+    return;
+}
+
+
+// 诊断缓冲是否为空。
+function diags_empty(diags: &diag::DiagBuffer:Read): bool {
+    return @len(diags.diags) == 0;
+}
+
+// 把模块内全部函数登记为本地符号（名字仅要求非空），
+// 调用目标与导出校验因此都能走到发射期 ABI 检查而不是链接拒绝。
+function link_all(module: &mir::MirModule:Read): coff_state::LinkTable!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        var entry: u8[] = [];
+        @push(entry, (102u32 + i) as u8)?;
+        @push(table.symbols, coff_state::LinkSymbol { def: module.functions[i].def as u64, kind: 0u8, name: @move(entry) })?;
+        i = i + 1;
+    }
+    return table;
+}
+
+// 在代码字节里找 mov rax, [rbp-disp]（REX.W + 8B + modrm + 位移）。
+// 槽位移 1..128 走 disp8 单字节（modrm 0x45），其余走 disp32 四字节（modrm 0x85），
+// 与发射器 modrm_rbp 的分派规则完全一致。
+function has_load_rax(code: &[u8], disp: u32): bool {
+    var i: u32 = 0;
+    while i + 4 <= @len(code) as u32 {
+        if code[i] == 72 && code[i + 1] == 139 {
+            if code[i + 2] == 69 && disp <= 128 {
+                if code[i + 3] == pe::neg_disp8(disp) { return true; }
+            }
+            if code[i + 2] == 133 && disp > 128 && i + 7 <= @len(code) as u32 {
+                let want: u32 = pe::neg_disp32(disp);
+                if code[i + 3] == (want & 255u32) as u8 && code[i + 4] == ((want / 256u32) & 255u32) as u8
+                    && code[i + 5] == ((want / 65536u32) & 255u32) as u8
+                    && code[i + 6] == ((want / 16777216u32) & 255u32) as u8 {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 在代码字节里找 mov [rbp-disp], rax（REX.W + 89 + modrm + 位移）。
+function has_store_rax(code: &[u8], disp: u32): bool {
+    var i: u32 = 0;
+    while i + 4 <= @len(code) as u32 {
+        if code[i] == 72 && code[i + 1] == 137 {
+            if code[i + 2] == 69 && disp <= 128 {
+                if code[i + 3] == pe::neg_disp8(disp) { return true; }
+            }
+            if code[i + 2] == 133 && disp > 128 && i + 7 <= @len(code) as u32 {
+                let want: u32 = pe::neg_disp32(disp);
+                if code[i + 3] == (want & 255u32) as u8 && code[i + 4] == ((want / 256u32) & 255u32) as u8
+                    && code[i + 5] == ((want / 65536u32) & 255u32) as u8
+                    && code[i + 6] == ((want / 16777216u32) & 255u32) as u8 {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 运行器端逐元素验证：非 8 倍数聚合在 8 字节对齐槽上复制后元素值不串位。
+// 证伪路径：若槽位改回按精确字节（6 字节）分配，复制块搬运会越界或覆盖
+// 相邻槽，元素读回值必然偏离 987。
+function array_rounded_slot(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(ARRAY_SOURCE, 1252, &diags:ReadWrite)?;
+    assert(diags_empty(&diags:Read));
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    // 构造一条、三次索引读；整块搬运共三条：两个不可变局部的声明各一条，
+    // 外加 @copy 原语本身一条（见 mir.yak 的局部声明与 @copy 降级路径）。
+    assert(count_op(&result.module:Read, 97u8) == 1);
+    assert(count_op(&result.module:Read, 113u8) == 3);
+    assert(count_op(&result.module:Read, 83u8) == 3);
+    assert(count_op(&result.module:Read, 80u8) == 3);
+    // 运行器求值：复制后逐元素读回应得 987。
+    runner::expect0(&result.module:Read, 0, 987)?;
+    return;
+}
+
+// 发射端验证：6 字节聚合的栈槽按 8 字节对齐分配，两个数组局部各自独立。
+// 证伪路径：若槽位改回精确字节 6，下面的下界断言立即失败。
+function array_slot_layout(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(ARRAY_SOURCE, 1253, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0);
+    assert(@len(layout.functions) == 1);
+    // 局部 0、1 是两个 [u16; 3] 数组（源与复制目标），槽位都不得小于 8。
+    assert(layout.functions[0].slots[0] >= 8);
+    assert(layout.functions[0].slots[1] >= 8);
+    assert(layout.functions[0].slots[1] != layout.functions[0].slots[0]);
+    return;
+}
+
+// 运行器端验证：字段合计 7 字节的结构体复制后逐字段读回不串位。
+// 证伪路径：若聚合槽或字段偏移计算退化，读回值偏离 789。
+function struct_fields_roundtrip(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(STRUCT_SOURCE, 1255, &diags:ReadWrite)?;
+    assert(diags_empty(&diags:Read));
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    assert(count_op(&result.module:Read, 96u8) == 1);
+    // 三个字段读取：82 求地址三条 + 80 载入三条。
+    assert(count_op(&result.module:Read, 82u8) == 3);
+    // 7 * 100 + 8 * 10 + 9 = 789。
+    runner::expect0(&result.module:Read, 0, 789)?;
+    return;
+}
+
+// 发射端验证：7 字节合计的结构体（布局 8 字节含尾填充）槽位安全且可正常发射，
+// 不得被大聚合拒绝路径误伤。
+function struct_slot_layout(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(STRUCT_SOURCE, 1256, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0);
+    assert(layout.functions[0].slots[0] >= 8);
+    let table: coff_state::LinkTable = link_all(&result.module:Read)?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    return;
+}
+
+// 切片移动与 @len 的一致性（运行器端）。
+// 运行器把切片形参按 16 字节胖指针块写入（低 8 字节地址、高 8 字节长度），
+// @move 整块复制后 @len 读块内偏移 8——输入只填了低 8 字节，长度字为 0。
+// 证伪路径：若 @len 改读块内偏移 0（地址），结果变成非零输入 9090909090，
+// 断言立即失败；这钉死「@len 读偏移 8 的长度字」的字段约定。
+function slice_len_runner(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(SLICE_SOURCE, 1257, &diags:ReadWrite)?;
+    assert(diags_empty(&diags:Read));
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    // 移动一条(112)、取长度一条(146 call_builtin)：降级形态与规格一致。
+    // @len 在 mir.md 4.10 里统一走 call_builtin，不带 BuiltinId 分派之外的专用 opcode。
+    assert(count_op(&result.module:Read, 112u8) == 1);
+    assert(count_op(&result.module:Read, 146u8) == 1);
+    runner::expect1(&result.module:Read, 0, 9090909090, 0)?;
+    return;
+}
+
+// 切片移动与 @len 的一致性（发射端）：双字搬运必须同时搬地址字与长度字。
+// 切片局部占 16 字节槽：地址在槽基址、长度在槽基址 - 8。
+// 证伪路径：若切片搬运退化回单字（只搬地址不搬长度字），源槽基址 - 8 的
+// 读取指令消失，对应字节扫描断言失败；若切片槽位从 16 改回 8，下界断言失败。
+function slice_len_emit(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(SLICE_SOURCE, 1258, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0);
+    assert(@len(layout.functions) == 1);
+    // 局部 0 是切片形参 t、局部 1 是移动目标 r：两者都必须按 16 字节占槽。
+    let t_slot: u32 = layout.functions[0].slots[0];
+    let r_slot: u32 = layout.functions[0].slots[1];
+    assert(t_slot >= 16);
+    assert(r_slot >= 16);
+    assert(r_slot != t_slot);
+    let code_len: u32 = @len(layout.functions[0].code) as u32;
+    let code_ref: &[u8] = &layout.functions[0].code[0..code_len]:Read;
+    // 源切片两个字的读取：地址字（槽基址）与长度字（槽基址 - 8）都要出现。
+    assert(has_load_rax(code_ref, t_slot));
+    assert(has_load_rax(code_ref, t_slot - 8));
+    // 目标切片两个字的写入：两个字分别落到目标槽基址与基址 - 8。
+    assert(has_store_rax(code_ref, r_slot));
+    assert(has_store_rax(code_ref, r_slot - 8));
+    return;
+}
+
+// 返回视图切片在解析期即被拒绝（P-9 / 2009），到不了发射器，
+// 因此这里验证解析诊断而不是发射期拒绝；发射器 lower_ret 的切片检查属于纵深防御。
+// 证伪路径：若去掉返回位置的视图判据，诊断数量会变成 0。
+function reject_ret_slice(): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(RET_SLICE_SOURCE, 1259)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 1259)?;
+    assert(@len(parsed.diagnostics) == 1);
+    assert(parsed.diagnostics[0].code.raw == 2009);
+    return;
+}
+
+// Win64 聚合按值 ABI：16 字节聚合返回走隐藏返回缓冲区，必须发射成功。
+function accept_ret_aggregate(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(RET_AGG_SOURCE, 1260, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let table: coff_state::LinkTable = link_all(&result.module:Read)?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    assert(coff_code::bytes_len(&res.bytes:Read) > 0);
+    return;
+}
+
+// Win64 聚合按值 ABI：16 字节聚合实参以调用方副本指针传递，必须发射成功。
+// 两个函数都要登记，避免先撞上链接未定义（EM-1）。
+function accept_arg_aggregate(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(ARG_AGG_SOURCE, 1261, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let table: coff_state::LinkTable = link_all(&result.module:Read)?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    assert(coff_code::bytes_len(&res.bytes:Read) > 0);
+    return;
+}
+
+// 拒绝类别与首个被拒形态必须一致：先撞上 EM-6（超限聚合形参复制），
+// 后续拒绝（162 臂载荷，当前 EM-4）不能覆盖首个拒绝码。
+// 证伪路径：把 reject_kind 改成「最后写入者胜」，本用例会变成 EM-4。
+function reject_kind_first_wins(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(MIXED_REJECT_SOURCE, 1263, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let table: coff_state::LinkTable = link_all(&result.module:Read)?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(!res.ok);
+    assert(res.code.raw == coff::e_em6());
+    assert(res.rejection.kind == 6);
+    assert(coff_code::bytes_len(&res.bytes:Read) == 0);
+    return;
+}
+
+// 字面量切片取长度的合法形态不被 EM-6 误伤：整条路径可发射成功。
+function slice_len_literal_emits(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(SLICE_LEN_SOURCE, 1262, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let table: coff_state::LinkTable = link_all(&result.module:Read)?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    return;
+}
+
+// 真实下标必须在截断为帧地址之前检查，陷阱也不能在调用链中变成正常返回。
+function index_traps(): void!AllocError {
+    let src: &[u8] = "foreign args_len(index: u32): u32; function item(i: u64): u8 { let a: [u8; 2] = [7u8, 9u8]; return a[i]; } function outer(i: u64): u32 { let x: u8 = item(i); return args_len(x as u32); } function signed(i: i8): u8 { let a: [u8; 2] = [7u8, 9u8]; return a[i]; }\n";
+    let result: mir::MirResult = runner::accepted(src, 1263)?;
+    let m: &mir::MirModule:Read = &result.module:Read;
+    var args: runner::Value[] = [];
+    @push(args, runner::scalar(runner::type_for(m, 4100), 0))?;
+    var state: runner::Execution = runner::execution_new();
+    let first: runner::Value = runner::execute(m, 0, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(!state.trapped && first.bits == 7);
+    args[0].bits = 1; state = runner::execution_new();
+    let last: runner::Value = runner::execute(m, 0, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(!state.trapped && last.bits == 9);
+    args[0].bits = 4294967296u64; state = runner::execution_new();
+    let large: runner::Value = runner::execute(m, 1, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(state.trapped && state.foreign_calls == 0);
+    args[0].bits = 0;
+    let stopped: runner::Value = runner::execute(m, 1, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(state.trapped && state.foreign_calls == 0);
+    args[0].bits = 18446744073709551615u64; state = runner::execution_new();
+    let maximum: runner::Value = runner::execute(m, 0, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(state.trapped);
+    args[0] = runner::scalar(runner::type_for(m, 4101), 255); state = runner::execution_new();
+    let negative: runner::Value = runner::execute(m, 2, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(state.trapped);
+    args[0].bits = 256; state = runner::execution_new();
+    let narrow: runner::Value = runner::execute(m, 2, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(!state.trapped && narrow.bits == 7);
+    args[0].bits = 2; state = runner::execution_new();
+    let past: runner::Value = runner::execute(m, 2, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    assert(state.trapped);
+    return;
+}
+
+function main(): void {
+    index_traps()?;
+    array_rounded_slot()?;
+    array_slot_layout()?;
+    struct_fields_roundtrip()?;
+    struct_slot_layout()?;
+    slice_len_runner()?;
+    slice_len_emit()?;
+    reject_ret_slice()?;
+    accept_ret_aggregate()?;
+    accept_arg_aggregate()?;
+    slice_len_literal_emits()?;
+    reject_kind_first_wins()?;
+    return;
+}

@@ -1,0 +1,8 @@
+// expected_code: E5811
+// spec: spec/lang/type/result.md RE-8
+// 触发：直接 owning 的可错载体不得用作按值形参。
+enum Failure { Bad }
+
+function invalid(arg: u32!Failure): void { return; }
+
+function main(): void { return; }

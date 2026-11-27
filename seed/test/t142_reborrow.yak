@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { var x: i64 = 7; { let r: &i64:ReadWrite = &x:ReadWrite; { let q: &i64 = &*r; assert(*q == 7); } *r = 9; } assert(x == 9); }

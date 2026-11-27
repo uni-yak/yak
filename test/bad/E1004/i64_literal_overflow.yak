@@ -1,0 +1,7 @@
+// expected_code: E1004
+// spec: spec/lang/type/i64.md L-4
+// 触发：带类型后缀的数值 9223372036854775809 超出 i64 的正值上界。
+function main(): void {
+    @drop(9223372036854775809i64);
+    return;
+}

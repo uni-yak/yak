@@ -1,0 +1,8 @@
+// expected_code: E7020
+// spec: spec/lang/base.md R-29；spec/ir/mir.md M-7
+// 触发：无增函数中的非空动态数组字面量需要堆分配。
+foreign exit(code: u8): void;
+
+function #make(): u64 { let values: u32[] = [1u32]; return @len(values); }
+
+function main(): void { exit(make() as u8); return; }

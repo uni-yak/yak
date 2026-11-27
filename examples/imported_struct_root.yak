@@ -1,0 +1,13 @@
+// 导入结构体样例的根单元：按值调用依赖导出结构体，并直接读取其字段。
+// 退出码 39 = 依赖求和的 24（7 + 8 + 9）再加根读取 a + b 的 15。
+import imported_struct_dep;
+foreign exit(code: u8): void;
+
+function main(): void {
+    let p: imported_struct_dep::Pair = imported_struct_dep::Pair { c: 9u32, a: 7u32, b: 8u32 };
+    let q: imported_struct_dep::Pair = imported_struct_dep::make(7u32);
+    let head: u32 = q.a + p.b;
+    let total: u32 = imported_struct_dep::sum(p) + head;
+    exit(total as u8);
+    return;
+}

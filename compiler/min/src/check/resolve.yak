@@ -1,0 +1,507 @@
+// 预留前序与作用域绑定（symbol.md 3.3-3.6，name.md 五）。
+// 覆盖模块 / 函数 / 块 / match arm 作用域；引用解析随后进行。
+import types;
+import ast;
+import diag;
+
+// 定义种类 DefKind（symbol.md 3.5）：1=函数 2=枚举 3=结构体 4=常量 5=foreign 6=import
+// 7=参数 8=let 9=var 10=out 11=泛型参数 12=match 绑定 13=合成
+// 作用域种类 ScopeKind：1=模块 2=泛型 3=函数 4=块 5=arm
+export struct DefEntry { name: u32, scope: u32, decl_offset: u32, kind: u8, flags: u8, import_dependency: u16, used: bool }
+export struct ScopeEntry { parent: u32, owner: u32, binding_start: u32, binding_count: u32, kind: u8 }
+export struct BindingEntry { name: u32, def: u32 }
+export struct EnumMemberBinding { host: u32, name: u32, variant: u32 }
+export struct StructFieldBinding { host: u32, name: u32, field: u32 }
+export struct ScopedBinding { scope: u32, name: u32, def: u32, next: u32 }
+export struct ConstInit { def: u32, expr: u32 }
+export struct ResolveTables {
+    defs: DefEntry[], scopes: ScopeEntry[], bindings: BindingEntry[],
+    enum_members: EnumMemberBinding[], struct_fields: StructFieldBinding[],
+    block_scope: u32[],        // 块 AST 下标 → ScopeId（0=无）
+    scoped: ScopedBinding[],   // 内部暂存；返回前清空
+    local_defs: u32[],        // 文档局部声明 AST 下标 → DefId（0=无）
+    index_locals: bool,        // 启用文档声明侧表
+    const_inits: ConstInit[],  // 成功绑定的常量，按 DefId 递增
+    has_constants: bool,      // 预留定义是否含顶层或局部常量
+    reserved_if_bindings: u32[], // 诊断专用条件绑定，按 DefId 递增
+}
+export struct ResolvedItem { def_id: u32, kind: u8, span: types::Span }
+export struct ResolvedFile { items: ResolvedItem[], file: u16 }
+export struct ResolveResult { tables: ResolveTables, file: ResolvedFile }
+
+// 仅文档引用解析计量；声明定位及批处理使用不设限实例。
+export struct LookupBudget { limited: bool, remaining: u32, exhausted: bool, contextual_enum_labels: bool, enum_limited: bool, enum_remaining: u32, enum_exhausted: bool }
+export function lookup_budget(limit: u32, enum_limit: u32): LookupBudget {
+    return LookupBudget { limited: limit != 0u32, remaining: limit, exhausted: false, contextual_enum_labels: false, enum_limited: enum_limit != 0u32, enum_remaining: enum_limit, enum_exhausted: false };
+}
+// 复用引用遍历的中止标志，同时保留独立的超限原因。
+export function visit_enum_lookup(work: &LookupBudget:ReadWrite): bool {
+    if !work.enum_limited { return true; }
+    if work.enum_remaining == 0u32 { work.enum_exhausted = true; work.exhausted = true; return false; }
+    work.enum_remaining = work.enum_remaining - 1u32;
+    return true;
+}
+function visit_lookup(work: &LookupBudget:ReadWrite): bool {
+    if !work.limited { return true; }
+    if work.remaining == 0u32 { work.exhausted = true; return false; }
+    work.remaining = work.remaining - 1u32;
+    return true;
+}
+
+// 每个已完成作用域内的绑定按 NameId 严格递增（symbol.md 3.6）。
+function binding_in_range(tables: &ResolveTables:Read, work: &LookupBudget:ReadWrite, entry: ScopeEntry, name: u32): u32 {
+    var lo: u32 = entry.binding_start;
+    let total: u32 = @len(tables.bindings) as u32;
+    if lo > total || entry.binding_count > total - lo { return 0; }
+    var hi: u32 = lo + entry.binding_count;
+    while lo < hi {
+        if !visit_lookup(work) { return 0; }
+        let mid: u32 = lo + (hi - lo) / 2;
+        let binding: BindingEntry = tables.bindings[mid];
+        if binding.name < name { lo = mid + 1; }
+        elseif binding.name > name { hi = mid; }
+        else { return binding.def; }
+    }
+    return 0;
+}
+
+// 声明定位只查指定作用域，不把父级同名绑定当成本地声明。
+export function binding_in_scope(tables: &ResolveTables:Read, scope: u32, name: u32): u32 {
+    if scope == 0 || scope > @len(tables.scopes) as u32 { return 0; }
+    var work: LookupBudget = lookup_budget(0, 0);
+    return binding_in_range(tables, &work:ReadWrite, tables.scopes[scope - 1], name);
+}
+
+// 引用定位从最内层向外查找，首个命中决定遮蔽；访问作用域与绑定行之前各扣一步。
+export function lookup_binding_limited(tables: &ResolveTables:Read, work: &LookupBudget:ReadWrite, scope: u32, name: u32): u32 {
+    var current: u32 = scope;
+    while current != 0 && current <= @len(tables.scopes) as u32 {
+        if !visit_lookup(work) { return 0; }
+        let entry: ScopeEntry = tables.scopes[current - 1];
+        let def: u32 = binding_in_range(tables, work, entry, name);
+        if def != 0 || work.exhausted { return def; }
+        current = entry.parent;
+    }
+    return 0;
+}
+
+export function lookup_binding(tables: &ResolveTables:Read, scope: u32, name: u32): u32 {
+    var work: LookupBudget = lookup_budget(0, 0);
+    return lookup_binding_limited(tables, &work:ReadWrite, scope, name);
+}
+
+function def_kind(item_kind: u8): u8 {
+    if item_kind == 0 { return 1; }
+    if item_kind == 1 { return 2; }
+    if item_kind == 2 { return 3; }
+    if item_kind == 3 { return 4; }
+    if item_kind == 4 { return 5; }
+    if item_kind == 5 { return 6; }
+    return 0;
+}
+function local_kind(is_out: bool, is_var: bool, is_const: bool): u8 {
+    if is_out { return 10; }
+    if is_const { return 4; }
+    if is_var { return 9; }
+    return 8;
+}
+function item_name(pool: &ast::AstPool:Read, item_kind: u8, data: u32): u32 {
+    if item_kind == 0 { return pool.functions[data].name; }
+    if item_kind == 1 { return pool.enums[data].name; }
+    if item_kind == 2 { return pool.structs[data].name; }
+    if item_kind == 3 { return pool.consts[data].name; }
+    if item_kind == 4 { return pool.foreigns[data].name; }
+    if item_kind == 5 {
+        if @len(pool.imports[data].path) > 0 { return pool.imports[data].path[0]; }
+    }
+    return 0;
+}
+function item_no_alloc(pool: &ast::AstPool:Read, item_kind: u8, data: u32): bool {
+    if item_kind == 0 { return pool.functions[data].is_hash; }
+    if item_kind == 4 { return pool.foreigns[data].is_hash; }
+    return false;
+}
+function emit(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+// 只有确实持有 DefId 的调用点传引用表；旧路径保持空表，绝不拿 NameId 或 ScopeId 顶替。
+function emit_refs(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span, refs: diag::DiagRefs): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0, refs: refs, args: diag::diag_args_none() })?;
+    return;
+}
+function new_scope(tables: &ResolveTables:ReadWrite, parent: u32, owner: u32, kind: u8): u32!AllocError {
+    let id: u32 = @len(tables.scopes) as u32 + 1;
+    @push(tables.scopes, ScopeEntry { parent: parent, owner: owner, binding_start: 0, binding_count: 0, kind: kind })?;
+    return id;
+}
+function add_def(tables: &ResolveTables:ReadWrite, name: u32, scope: u32, decl_offset: u32, kind: u8): u32!AllocError {
+    let id: u32 = @len(tables.defs) as u32 + 1;
+    @push(tables.defs, DefEntry { name: name, scope: scope, decl_offset: decl_offset, kind: kind, flags: 0, import_dependency: 0, used: false })?;
+    if kind == 4u8 { tables.has_constants = true; }
+    return id;
+}
+function set_block_scope(tables: &ResolveTables:ReadWrite, block_id: u32, scope: u32): void!AllocError {
+    while @len(tables.block_scope) as u32 <= block_id { @push(tables.block_scope, 0)?; }
+    tables.block_scope[block_id] = scope;
+    return;
+}
+// 声明预留与引用查找独立计费，批处理不设限。
+export struct ReservationBudget { limited: bool, remaining: u32, exhausted: bool, index_locals: bool, module_bindings: u32[] }
+export function reservation_budget(limit: u32): ReservationBudget {
+    return ReservationBudget { limited: limit != 0u32, remaining: limit, exhausted: false, index_locals: false, module_bindings: [] };
+}
+function visit_reservation(work: &ReservationBudget:ReadWrite): bool {
+    if !work.limited { return true; }
+    if work.remaining == 0u32 { work.exhausted = true; return false; }
+    work.remaining = work.remaining - 1u32;
+    return true;
+}
+
+const rejected_arm_binding_flag: u8 = 128u8;
+
+export function is_rejected_arm_binding(def: DefEntry): bool {
+    return (def.flags & rejected_arm_binding_flag) != 0u8;
+}
+
+// 直接臂体与模式共享重名限制；保留两层作用域供名称查找和文档侧表使用。
+function arm_payload_conflict(tables: &ResolveTables:Read, work: &ReservationBudget:ReadWrite, scope: u32, name: u32): u32 {
+    let body: ScopeEntry = tables.scopes[scope - 1u32];
+    if body.kind != 4u8 || body.parent == 0u32 { return 0u32; }
+    let arm: ScopeEntry = tables.scopes[body.parent - 1u32];
+    if arm.kind != 5u8 || arm.binding_start == 0u32 { return 0u32; }
+    // 模式至多绑定一个载荷；比较计入同一预留预算。
+    if !visit_reservation(work) { return 0u32; }
+    let payload: ScopedBinding = tables.scoped[arm.binding_start - 1u32];
+    if payload.name == name { return payload.def; }
+    return 0u32;
+}
+
+// N-1（E4001）同作用域重复声明；N-10（E4010）match 绑定同臂冲突；
+// N-11（E4011）参数重名。
+function bind(tables: &ResolveTables:ReadWrite, work: &ReservationBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, scope: u32, name: u32, def: u32, span: types::Span): void!AllocError {
+    // 预留时区间字段暂存声明链的头和尾，下标加一，零为链尾。
+    let scope_index: u32 = scope - 1;
+    var old_def: u32 = 0;
+    if scope == 1 && !work.limited && name != 0 {
+        // 批处理模块声明按 NameId 直查，避免大模块逐个回扫声明链。
+        while @len(work.module_bindings) < name as u64 { @push(work.module_bindings, 0)?; }
+        old_def = work.module_bindings[name - 1];
+        if old_def == 0 { work.module_bindings[name - 1] = def; }
+    } else {
+        var cursor: u32 = tables.scopes[scope_index].binding_start;
+        while cursor != 0 {
+            if !visit_reservation(work) { return; }
+            let entry: ScopedBinding = tables.scoped[cursor - 1];
+            if entry.name == name { old_def = entry.def; break; }
+            cursor = entry.next;
+        }
+    }
+    if old_def != 0 {
+        let old_kind: u8 = tables.defs[old_def - 1].kind;
+        let new_kind: u8 = tables.defs[def - 1].kind;
+        var code: u16 = 4001;
+        if old_kind == 6 || new_kind == 6 { code = 4006; }
+        elseif old_kind == 12 || new_kind == 12 { code = 4010; }
+        elseif old_kind == 7 && new_kind == 7 { code = 4011; }
+        // 重复声明两侧都是真实 DefId：旧定义在前、新定义在后。
+        emit_refs(diags, code, span, diag::diag_refs_def_pair(old_def, def))?;
+        return;
+    }
+    let tail: u32 = tables.scopes[scope_index].binding_count;
+    let added: u32 = @len(tables.scoped) as u32 + 1;
+    @push(tables.scoped, ScopedBinding { scope: scope, name: name, def: def, next: 0 })?;
+    if tail == 0 { tables.scopes[scope_index].binding_start = added; }
+    else { tables.scoped[tail - 1].next = added; }
+    tables.scopes[scope_index].binding_count = added;
+    return;
+}
+function enum_member_duplicate(members: &[EnumMemberBinding]:Read, work: &ReservationBudget:ReadWrite, name: u32): bool {
+    var i: u32 = 0;
+    while i < @len(members) as u32 {
+        if !visit_reservation(work) { return false; }
+        if members[i].name == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function reserve_if(tables: &ResolveTables:ReadWrite, work: &ReservationBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, if_id: u32, parent: u32): void!AllocError {
+    var branch: u32 = 0;
+    while branch < @len(pool.ifs[if_id].branches) as u32 {
+        let arm: ast::IfBranch = pool.ifs[if_id].branches[branch];
+        var enclosing: u32 = parent;
+        if arm.reserved_binding != 0 {
+            // 保留语法的绑定仅在对应分支可见，使名字解析能到达载体诊断。
+            enclosing = new_scope(tables, parent, 0, 4)?;
+            let def: u32 = add_def(tables, arm.reserved_binding, enclosing, arm.binding_span.offset, 8)?;
+            bind(tables, work, diags, enclosing, arm.reserved_binding, def, arm.binding_span)?;
+            if work.exhausted { return; }
+            @push(tables.reserved_if_bindings, def)?;
+        }
+        let scope: u32 = new_scope(tables, enclosing, 0, 4)?;
+        set_block_scope(tables, arm.body, scope)?;
+        reserve_block(tables, work, diags, pool, arm.body, scope)?;
+        if work.exhausted { return; }
+        branch = branch + 1;
+    }
+    let else_body: u32 = pool.ifs[if_id].else_body;
+    if else_body < @len(pool.blocks) as u32 {
+        let scope: u32 = new_scope(tables, parent, 0, 4)?;
+        set_block_scope(tables, else_body, scope)?;
+        reserve_block(tables, work, diags, pool, else_body, scope)?;
+        if work.exhausted { return; }
+    }
+    return;
+}
+function reserve_match(tables: &ResolveTables:ReadWrite, work: &ReservationBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, match_id: u32, parent: u32): void!AllocError {
+    var arm: u32 = 0;
+    while arm < @len(pool.matches[match_id].arms) as u32 {
+        let scope: u32 = new_scope(tables, parent, 0, 5)?;
+        let pattern_id: u32 = pool.matches[match_id].arms[arm].pattern;
+        if pattern_id < @len(pool.patterns) as u32 {
+            let binding: u32 = pool.patterns[pattern_id].binding;
+            if binding != 0 {
+                let def: u32 = add_def(tables, binding, scope, pool.patterns[pattern_id].span.offset, 12)?;
+                bind(tables, work, diags, scope, binding, def, pool.patterns[pattern_id].span)?;
+                if work.exhausted { return; }
+            }
+        }
+        let body_scope: u32 = new_scope(tables, scope, 0, 4)?;
+        set_block_scope(tables, pool.matches[match_id].arms[arm].body, body_scope)?;
+        reserve_block(tables, work, diags, pool, pool.matches[match_id].arms[arm].body, body_scope)?;
+        if work.exhausted { return; }
+        arm = arm + 1;
+    }
+    return;
+}
+// 仅成功写入声明链的定义可进入文档侧表。
+function last_binding_is(tables: &ResolveTables:Read, def: u32): bool {
+    let count: u32 = @len(tables.scoped) as u32;
+    return count != 0u32 && tables.scoped[count - 1u32].def == def;
+}
+function record_local_def(tables: &ResolveTables:ReadWrite, id: u32, def: u32, kind: u8, init: u32): void!AllocError {
+    if !last_binding_is(tables, def) { return; }
+    if kind == 4u8 { @push(tables.const_inits, ConstInit { def: def, expr: init })?; }
+    while @len(tables.local_defs) as u32 <= id { @push(tables.local_defs, 0u32)?; }
+    tables.local_defs[id] = def;
+    return;
+}
+
+function reserve_block(tables: &ResolveTables:ReadWrite, work: &ReservationBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, block_id: u32, scope: u32): void!AllocError {
+    var index: u32 = 0;
+    while index < @len(pool.blocks[block_id].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block_id].stmts[index]];
+        if stmt.kind == 1 {
+            let local: ast::LocalDecl = pool.locals[stmt.data];
+            let kind: u8 = local_kind(local.is_out, local.is_var, local.is_const);
+            let def: u32 = add_def(tables, local.name, scope, local.span.offset, kind)?;
+            let conflict: u32 = arm_payload_conflict(tables, work, scope, local.name);
+            if work.exhausted { return; }
+            if conflict != 0u32 {
+                tables.defs[def - 1u32].flags = rejected_arm_binding_flag;
+                emit_refs(diags, 4010u16, local.span, diag::diag_refs_def_pair(conflict, def))?;
+            } else {
+                bind(tables, work, diags, scope, local.name, def, local.span)?;
+            }
+            if work.exhausted { return; }
+            if tables.index_locals { record_local_def(tables, stmt.data, def, kind, local.init)?; }
+        } elseif stmt.kind == 14 {
+            reserve_if(tables, work, diags, pool, stmt.data, scope)?;
+            if work.exhausted { return; }
+        } elseif stmt.kind == 15 {
+            let body_scope: u32 = new_scope(tables, scope, 0, 4)?;
+            set_block_scope(tables, pool.whiles[stmt.data].body, body_scope)?;
+            reserve_block(tables, work, diags, pool, pool.whiles[stmt.data].body, body_scope)?;
+            if work.exhausted { return; }
+        } elseif stmt.kind == 16 {
+            reserve_match(tables, work, diags, pool, stmt.data, scope)?;
+            if work.exhausted { return; }
+        }
+        index = index + 1;
+    }
+    return;
+}
+function reserve_function(tables: &ResolveTables:ReadWrite, work: &ReservationBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, func_def: u32, data: u32): void!AllocError {
+    let scope: u32 = new_scope(tables, 1, func_def, 3)?;
+    var param: u32 = 0;
+    while param < @len(pool.functions[data].params) as u32 {
+        let name: u32 = pool.functions[data].params[param].name;
+        let span: types::Span = pool.functions[data].params[param].span;
+        let def: u32 = add_def(tables, name, scope, span.offset, 7)?;
+        bind(tables, work, diags, scope, name, def, span)?;
+        if work.exhausted { return; }
+        param = param + 1;
+    }
+    let body_scope: u32 = scope;
+    set_block_scope(tables, pool.functions[data].body, body_scope)?;
+    reserve_block(tables, work, diags, pool, pool.functions[data].body, body_scope)?;
+    if work.exhausted { return; }
+    return;
+}
+function scoped_before(a: ScopedBinding, b: ScopedBinding): bool {
+    if a.scope != b.scope { return a.scope < b.scope; }
+    return a.name < b.name;
+}
+function reserve_items(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite, work: &ReservationBudget:ReadWrite, tables: &ResolveTables:ReadWrite, resolved: &ResolvedFile:ReadWrite): void!AllocError {
+    // 模块根 ScopeId = 1（scopes[0]）。
+    var module_scope: u32 = new_scope(tables, 0, 0, 1)?;
+    var index: u32 = 0;
+    while index < @len(file.items) as u32 {
+        let item: ast::AstItem = file.items[index];
+        let kind: u8 = def_kind(item.kind);
+        let name: u32 = item_name(pool, item.kind, item.data);
+        var flags: u8 = 0;
+        if item_no_alloc(pool, item.kind, item.data) { flags = 1; }
+        let def_id: u32 = @len(tables.defs) as u32 + 1;
+        // 模块图 / iface 提供 DependencyId 之前，import_dependency 保持 0。
+        @push(tables.defs, DefEntry { name: name, scope: module_scope, decl_offset: item.span.offset, kind: kind, flags: flags, import_dependency: 0, used: false })?;
+        if kind == 4u8 { tables.has_constants = true; }
+        @push(resolved.items, ResolvedItem { def_id: def_id, kind: kind, span: item.span })?;
+        bind(tables, work, diags, module_scope, name, def_id, item.span)?;
+        if work.exhausted { return; }
+        if tables.index_locals && kind == 4u8 && last_binding_is(tables, def_id) {
+            @push(tables.const_inits, ConstInit { def: def_id, expr: pool.consts[item.data].init })?;
+        }
+        if item.kind == 0 {
+            reserve_function(tables, work, diags, pool, def_id, item.data)?;
+            if work.exhausted { return; }
+        } elseif item.kind == 1 {
+            let member_start: u32 = @len(tables.enum_members) as u32;
+            var variant: u32 = 0;
+            while variant < @len(pool.enums[item.data].variants) as u32 {
+                let variant_name: u32 = pool.enums[item.data].variants[variant].name;
+                let variant_span: types::Span = pool.enums[item.data].variants[variant].span;
+                let duplicate: bool = enum_member_duplicate(&tables.enum_members[member_start..@len(tables.enum_members)]:Read, work, variant_name);
+                if work.exhausted { return; }
+                if duplicate {
+                    emit(diags, 5803, variant_span)?;
+                } else {
+                    @push(tables.enum_members, EnumMemberBinding { host: def_id, name: variant_name, variant: variant })?;
+                }
+                variant = variant + 1;
+            }
+        } elseif item.kind == 2 {
+            var field: u32 = 0;
+            while field < @len(pool.structs[item.data].fields) as u32 {
+                let field_name: u32 = pool.structs[item.data].fields[field].name;
+                @push(tables.struct_fields, StructFieldBinding { host: def_id, name: field_name, field: field })?;
+                field = field + 1;
+            }
+        }
+        index = index + 1;
+    }
+    return;
+}
+
+// BindingEntry 区间按 (scope, NameId) 升序（symbol.md 3.6）。
+function sort_scoped(tables: &ResolveTables:ReadWrite, work: &ReservationBudget:ReadWrite): void {
+    var sorted: u32 = 1;
+    while sorted < @len(tables.scoped) as u32 {
+        let key: ScopedBinding = tables.scoped[sorted];
+        var cursor: u32 = sorted;
+        while cursor > 0 {
+            if !visit_reservation(work) { return; }
+            let previous: ScopedBinding = tables.scoped[cursor - 1];
+            if !scoped_before(key, previous) { break; }
+            tables.scoped[cursor] = previous;
+            cursor = cursor - 1;
+        }
+        tables.scoped[cursor] = key;
+        sorted = sorted + 1;
+    }
+}
+
+// 未完成预留不能暴露声明链头尾作为可查找的绑定区间。
+function clear_reservation_ranges(tables: &ResolveTables:ReadWrite): void {
+    tables.local_defs = [];
+    tables.const_inits = [];
+    var scope_index: u32 = 0;
+    while scope_index < @len(tables.scopes) as u32 {
+        tables.scopes[scope_index].binding_start = 0;
+        tables.scopes[scope_index].binding_count = 0;
+        scope_index = scope_index + 1;
+    }
+}
+
+export function reserve_module_limited(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite, work: &ReservationBudget:ReadWrite): ResolveResult!AllocError {
+    var tables: ResolveTables = ResolveTables { defs: [], scopes: [], bindings: [], enum_members: [], struct_fields: [], block_scope: [], scoped: [], local_defs: [], index_locals: work.index_locals, const_inits: [], has_constants: false, reserved_if_bindings: [] };
+    var resolved: ResolvedFile = ResolvedFile { items: [], file: file.file };
+    work.module_bindings = [];
+    reserve_items(file, pool, diags, work, &tables:ReadWrite, &resolved:ReadWrite)?;
+    work.module_bindings = [];
+    if !work.exhausted { sort_scoped(&tables:ReadWrite, work); }
+    if work.exhausted { clear_reservation_ranges(&tables:ReadWrite); }
+    if work.exhausted { return ResolveResult { tables: tables, file: resolved }; }
+    var bindings: BindingEntry[] = [];
+    var scoped_index: u32 = 0;
+    var scope_id: u32 = 1;
+    while scope_id <= @len(tables.scopes) as u32 {
+        let start: u32 = @len(bindings) as u32;
+        var count: u32 = 0;
+        while scoped_index < @len(tables.scoped) as u32 && tables.scoped[scoped_index].scope == scope_id {
+            @push(bindings, BindingEntry { name: tables.scoped[scoped_index].name, def: tables.scoped[scoped_index].def })?;
+            scoped_index = scoped_index + 1;
+            count = count + 1;
+        }
+        tables.scopes[scope_id - 1].binding_start = start;
+        tables.scopes[scope_id - 1].binding_count = count;
+        scope_id = scope_id + 1;
+    }
+    tables.bindings = bindings;
+    tables.scoped = [];
+    return ResolveResult { tables: tables, file: resolved };
+}
+
+export function reserve_module(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): ResolveResult!AllocError {
+    var work: ReservationBudget = reservation_budget(0);
+    return reserve_module_limited(file, pool, diags, &work:ReadWrite)?;
+}
+
+// 局部编号只在同一解析代有效；核对定义身份，不向父作用域回退。
+export function local_decl_def(tables: &ResolveTables:Read, id: u32, scope: u32, local: ast::LocalDecl): u32 {
+    if id >= @len(tables.local_defs) as u32 || scope == 0u32 { return 0u32; }
+    let def: u32 = tables.local_defs[id];
+    if def == 0u32 || def > @len(tables.defs) as u32 { return 0u32; }
+    let entry: DefEntry = tables.defs[def - 1u32];
+    if entry.scope == scope && entry.name == local.name && entry.decl_offset == local.span.offset && entry.kind == local_kind(local.is_out, local.is_var, local.is_const) { return def; }
+    return 0u32;
+}
+
+// 名称解析成功后，函数定义后紧跟按源码顺序预留的形参。
+export function function_param_def(tables: &ResolveTables:Read, func_def: u32, scope: u32, ordinal: u32, name: u32): u32 {
+    let count: u32 = @len(tables.defs) as u32;
+    if scope == 0u32 || scope > @len(tables.scopes) as u32 { return 0u32; }
+    if func_def == 0u32 || func_def >= count || ordinal >= count - func_def { return 0u32; }
+    let owner: ScopeEntry = tables.scopes[scope - 1u32];
+    if owner.kind != 3u8 || owner.owner != func_def { return 0u32; }
+    let index: u32 = func_def + ordinal;
+    let entry: DefEntry = tables.defs[index];
+    if entry.kind == 7u8 && entry.scope == scope && entry.name == name { return index + 1u32; }
+    return 0u32;
+}
+
+// 匹配臂体自身可有局部声明；载荷绑定是其父级臂作用域的唯一绑定。
+export function match_payload_def(tables: &ResolveTables:Read, body: u32, enclosing: u32, name: u32, offset: u32): u32 {
+    if name == 0u32 || body >= @len(tables.block_scope) as u32 { return 0u32; }
+    let count: u32 = @len(tables.scopes) as u32;
+    let block: u32 = tables.block_scope[body];
+    if block == 0u32 || block > count || tables.scopes[block - 1u32].kind != 4u8 { return 0u32; }
+    let arm: u32 = tables.scopes[block - 1u32].parent;
+    if arm == 0u32 || arm > count { return 0u32; }
+    let scope: ScopeEntry = tables.scopes[arm - 1u32];
+    if scope.kind != 5u8 || scope.parent != enclosing || scope.binding_count != 1u32 || scope.binding_start >= @len(tables.bindings) as u32 { return 0u32; }
+    let row: BindingEntry = tables.bindings[scope.binding_start];
+    if row.name != name || row.def == 0u32 || row.def > @len(tables.defs) as u32 { return 0u32; }
+    let entry: DefEntry = tables.defs[row.def - 1u32];
+    if entry.kind == 12u8 && entry.scope == arm && entry.name == name && entry.decl_offset == offset { return row.def; }
+    return 0u32;
+}
+
+// 保持从臂体查名的遮蔽顺序，不向匹配外继续查找。
+export function match_arm_entry_def(tables: &ResolveTables:Read, body: u32, enclosing: u32, name: u32, offset: u32): u32 {
+    let payload: u32 = match_payload_def(tables, body, enclosing, name, offset);
+    if payload == 0u32 { return 0u32; }
+    let local: u32 = binding_in_scope(tables, tables.block_scope[body], name);
+    if local != 0u32 { return local; }
+    return payload;
+}

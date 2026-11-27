@@ -1,0 +1,24 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+import lex;
+foreign assert(cond: bool): void;
+function main(): void {
+    let r: lex::LexResult = lex::lex_scan("function foo #foo foo true false _ _x u32 @wrap_mul Read move\n", 2)?;
+    assert(@len(r.diagnostics) == 0);
+    assert(@len(r.tokens) == 13 && @len(r.names.entries) == 5);
+    assert(r.tokens[0].kind == 6 && r.tokens[0].payload == 0);
+    assert(r.tokens[1].payload == 1 && r.tokens[2].payload == 1 && r.tokens[3].payload == 1);
+    assert(r.tokens[2].kind == 1 && r.tokens[2].span.length == 4);
+    assert(r.tokens[4].kind == 3 && r.tokens[4].payload == 1);
+    assert(r.tokens[5].kind == 3 && r.tokens[5].payload == 0);
+    assert(r.tokens[6].kind == 10 && r.tokens[7].kind == 0);
+    assert(r.names.entries[0].text_len == 3);
+    assert(r.names.entries[2].builtin_id == 4099);
+    assert(r.names.entries[4].builtin_id == 0);
+    assert(r.tokens[9].kind == 8 && r.tokens[9].payload == 20495);
+    assert(r.tokens[10].kind == 0 && r.tokens[11].kind == 0);
+}

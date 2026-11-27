@@ -1,0 +1,8 @@
+// expected_code: E4002
+// expected_diagnostics: E4002 E4002
+// module_graph: scan
+// spec: spec/lang/module.md N-2
+// 触发：图验证时两个导入既不在源根下，也不是已登记单元。
+import absent;
+import other_missing;
+function main(): void { return; }

@@ -1,0 +1,2 @@
+// expected_trap: fixed array length mismatch
+function main(): void { let a: [u8; 2] = [1]; }

@@ -1,0 +1,109 @@
+// 将模块的声明、布局、所有权与控制流转换为可发射的单元产物。
+import host;
+import lex;
+import buf;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import layout;
+import owner;
+import mir;
+import mir_lower;
+import iface;
+import iface_layout;
+import iface_load;
+import driver_diag;
+import driver_deps;
+import driver_front;
+
+foreign exit(code: u8): void;
+foreign write(data: &[u8]): void;
+
+export struct UnitAnalysis {
+    resolution: resolve_refs::Resolution,
+    checked: typecheck::TypeCheckResult,
+    layout_data: iface::LayoutData,
+    lowered: mir::MirResult,
+    entry_def: u32
+}
+
+function pack_layout_data(table: &layout::LayoutTable:Read): iface::LayoutData!AllocError {
+    var sizes: u64[] = [];
+    var aligns: u8[] = [];
+    var known: bool[] = [];
+    var li: u32 = 0;
+    let total: u32 = @len(table.items) as u32;
+    while li < total {
+        @push(sizes, table.items[li].size)?;
+        @push(aligns, table.items[li].align)?;
+        @push(known, table.items[li].known)?;
+        li = li + 1;
+    }
+    return iface::LayoutData { sizes: sizes, aligns: aligns, known: known };
+}
+
+function lower_unit_mir(parsed: &parse::ParseResult:Read, resolution: &resolve_refs::Resolution:Read, checked: &typecheck::TypeCheckResult:Read, imported_layouts: &layout::ImportedLayoutTable:Read, imported_fields: &layout::ImportedFieldLayoutTable:Read, owned: &owner::OwnerResult:Read, jsonl_mode: bool, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let flat_drops: u32[] = owner::encode_drop_plans(&owned.drop_plans:Read)?;
+    let lowered: mir::MirResult = mir_lower::build_mir_with_drops(&parsed.file:Read, &parsed.pool:Read, resolution, checked, &flat_drops:Read, imported_layouts, imported_fields, &checked.imported_enums:Read, diags)?;
+    if !lowered.accepted {
+        if diag::diagbuf_has_error(&*diags:Read) {
+            driver_front::fail(diags, jsonl_mode, module_name)?;
+        }
+        if jsonl_mode {
+            // 未登记的错误码不得自造；此处只交回空诊断，不与终端路径争用 stderr。
+            var mir_body: buf::ByteBuf = buf::buf_new();
+            host::output_bytes("diag", &mir_body.data[0..@len(mir_body.data)]:Read);
+            exit(1);
+        }
+        driver_diag::report_mir(lowered.rejection.kind, lowered.rejection.span)?;
+        exit(1);
+    }
+    return lowered;
+}
+
+export function analyze(parsed: &parse::ParseResult:Read, names: &lex::NameTable:Read, module_name: &[u8], jsonl_mode: bool, is_root: bool, loaded: &driver_deps::Dependencies:Read, diags: &diag::DiagBuffer:ReadWrite): UnitAnalysis!AllocError {
+    let direct_count: u32 = @len(loaded.order) as u32;
+    let assembly: &iface_load::DependencyAssembly:Read = &loaded.assembly:Read;
+    let deps: &resolve_refs::DependencySet:Read = &(*assembly).deps:Read;
+    let targets: &[u32]:Read = &(*assembly).targets[0..@len((*assembly).targets)]:Read;
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit_for_check(&parsed.file:Read, &parsed.pool:Read, names, deps, direct_count, module_name, diags)?;
+    if diag::diagbuf_has_error(&*diags:Read) {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, diags)?;
+    if diag::diagbuf_has_error(&*diags:Read) {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    let imported_layouts: layout::ImportedLayoutTable = iface_layout::imported_layouts(&loaded.candidates[0..@len(loaded.candidates)]:Read, &loaded.order[0..direct_count]:Read, targets)?;
+    let layouts: layout::LayoutResult = layout::layout_unit_with_imports(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, &imported_layouts:Read, &checked.imported_enums:Read, diags)?;
+    if diag::diagbuf_has_error(&*diags:Read) {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    // 导入结构体字段偏移：把已重映射的字段类型与摘要组合成逐字段偏移表。
+    // 缺摘要、缺字段或推导尺寸与摘要不一致时整组保持未知，后续阶段失败关闭。
+    let imported_fields: layout::ImportedFieldLayoutTable = layout::imported_field_layouts(&checked.imported_fields:Read, &layouts.table:Read, &imported_layouts:Read)?;
+    // 布局先排除按值递归，所有权分类才能安全递归检查成员类型。
+    let owned: owner::OwnerResult = owner::check_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &checked:Read, diags)?;
+    if diag::diagbuf_has_error(&*diags:Read) {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    let entry_def: u32 = driver_front::find_root_main(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, names, &checked:Read);
+    if is_root && entry_def == 0 {
+        // 入口缺失没有对应错误码，不为它自造码位；JSONL 模式只交回空诊断。
+        if jsonl_mode {
+            var empty_body: buf::ByteBuf = buf::buf_new();
+            host::output_bytes("diag", &empty_body.data[0..@len(empty_body.data)]:Read);
+            exit(1);
+        }
+        write("错误：根单元必须定义入口 function main(): void\n");
+        exit(1);
+    }
+    // .iface 的类型摘要按布局表逐项登记，供依赖方校验签名与布局。
+    let layout_data: iface::LayoutData = pack_layout_data(&layouts.table:Read)?;
+    let lowered: mir::MirResult = lower_unit_mir(parsed, &resolution:Read, &checked:Read, &imported_layouts:Read, &imported_fields:Read, &owned:Read, jsonl_mode, module_name, diags)?;
+    return UnitAnalysis { resolution: @move(resolution), checked: @move(checked),
+        layout_data: @move(layout_data), lowered: @move(lowered), entry_def: entry_def };
+}

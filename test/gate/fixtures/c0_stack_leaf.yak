@@ -1,0 +1,24 @@
+// 覆盖 Win64 展开实参超过四个后的顺序，以及切片与隐藏返回指针的组合。
+export struct Triple { x: u32, y: u32, z: u32 }
+
+export function six(a: u32, b: u32, c: u32, d: u32, e: u32, f: u32): u32 {
+    return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
+}
+
+export function slice_end(a: u32, b: u32, c: u32, data: &[u8], z: u32): u32 {
+    return a + b * 2 + c * 3 + (@len(data) as u32) * 5 + (data[1u64] as u32) + z * 7;
+}
+
+export function aggregate(a: u32, b: u32, c: u32, d: u32, src: Triple): Triple {
+    return Triple { x: src.x + a, y: src.y + b, z: src.z + c * 2 + d * 3 };
+}
+
+// 大帧跨多个栈页；校验栈上实参及深处局部槽不受序言探测影响。
+export function large_frame(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64): u64 {
+    let row: [u64; 32] = [a, b, c, d, e, f, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+    let first: [[u64; 32]; 16] = [row, row, row, row, row, row, row, row, row, row, row, row, row, row, row, row];
+    let second: [[u64; 32]; 16] = first;
+    let third: [[u64; 32]; 16] = second;
+    let fourth: [[u64; 32]; 16] = third;
+    return first[0u64][0u64] + second[5u64][1u64] + third[10u64][2u64] + fourth[15u64][3u64] + fourth[15u64][4u64] + fourth[15u64][5u64];
+}

@@ -1,0 +1,197 @@
+// 将泛型函数签名中的参数槽替换为规范类型；具体签名由后续实例体检查使用。
+import diag;
+import resolve_refs;
+import type_import;
+import typecheck;
+import types;
+
+const TK_VOID: u8 = 0;
+const TK_BUILTIN: u8 = 1;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FN_REF: u8 = 8;
+const TK_FALLIBLE: u8 = 9;
+const TK_NULLABLE: u8 = 10;
+const TK_ERROR_SET: u8 = 11;
+
+const POS_OWNED: u8 = 0;
+const POS_RETURN: u8 = 1;
+const POS_PARAM: u8 = 2;
+const POS_REFERENT: u8 = 3;
+const POS_OPTIONAL: u8 = 4;
+const POS_SUCCESS: u8 = 5;
+const POS_OPTIONAL_OWNED: u8 = 6;
+
+export struct Requirement { parameter: u16, interface_def: u32 }
+export struct Implementation { type_id: u32, interface_def: u32 }
+export struct Constraints { required: Requirement[], checked: Implementation[] }
+export struct InstanceSignature { ok: bool, arguments: u32[], params: u32[], result: u32 }
+
+function valid_id(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    return id != 0 && (id as u64) <= @len(tt.entries);
+}
+
+function valid_members(tt: &typecheck::TypeTable:Read, entry: typecheck::TypeEntry): bool {
+    return (entry.members_start as u64) + (entry.members_count as u64) <= @len(tt.members);
+}
+
+function is_nominal(entry: typecheck::TypeEntry): bool {
+    return (entry.kind == TK_LOCAL && entry.def != 0) || (entry.kind == TK_IMPORTED && entry.dep != 0 && entry.export_id != 0);
+}
+
+function nominal_errors(tt: &typecheck::TypeTable:Read, id: u32, success: u32): bool {
+    if !valid_id(tt, id) { return false; }
+    let set: typecheck::TypeEntry = tt.entries[id - 1];
+    if set.kind != TK_ERROR_SET || set.members_count == 0 || !valid_members(tt, set) { return false; }
+    var i: u32 = 0;
+    while i < set.members_count {
+        let member: u32 = tt.members[set.members_start + i];
+        if !valid_id(tt, member) || member == success { return false; }
+        let entry: typecheck::TypeEntry = tt.entries[member - 1];
+        if !is_nominal(entry) && !(entry.kind == TK_BUILTIN && entry.builtin == 4108) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 在代换后复核位置约束；参数原来占据合法位置，不代表具体类型也可出现在该处。
+function concrete_at(tt: &typecheck::TypeTable:Read, id: u32, position: u8, depth: u32): bool {
+    if depth > resolve_refs::signature_depth_limit() || !valid_id(tt, id) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    if entry.kind == TK_VOID { return position == POS_RETURN || position == POS_SUCCESS; }
+    if entry.kind == TK_BUILTIN { return entry.builtin != 0 && entry.builtin != 4107; }
+    if entry.kind == TK_LOCAL || entry.kind == TK_IMPORTED { return is_nominal(entry); }
+    if entry.kind == TK_REF || entry.kind == TK_SLICE {
+        if position != POS_PARAM || entry.cap > 2 { return false; }
+        if entry.kind == TK_REF { return concrete_at(tt, entry.elem, POS_REFERENT, depth + 1); }
+        return concrete_at(tt, entry.elem, POS_OWNED, depth + 1);
+    }
+    if entry.kind == TK_DYN_ARRAY || entry.kind == TK_FIXED_ARRAY {
+        return (entry.kind != TK_FIXED_ARRAY || entry.length != 0) && concrete_at(tt, entry.elem, POS_OWNED, depth + 1);
+    }
+    if entry.kind == TK_FN_REF {
+        if position == POS_SUCCESS || position == POS_OPTIONAL || position == POS_OPTIONAL_OWNED || !valid_members(tt, entry) { return false; }
+        var i: u32 = 0;
+        while i < entry.members_count {
+            if !concrete_at(tt, tt.members[entry.members_start + i], POS_PARAM, depth + 1) { return false; }
+            i = i + 1;
+        }
+        return concrete_at(tt, entry.elem, POS_RETURN, depth + 1);
+    }
+    if entry.kind == TK_FALLIBLE {
+        return (position == POS_RETURN || position == POS_REFERENT || position == POS_OPTIONAL) &&
+            concrete_at(tt, entry.success, POS_SUCCESS, depth + 1) && nominal_errors(tt, entry.elem, entry.success);
+    }
+    if entry.kind == TK_NULLABLE {
+        if position == POS_OPTIONAL || position == POS_OPTIONAL_OWNED { return false; }
+        if position == POS_RETURN || position == POS_REFERENT { return concrete_at(tt, entry.elem, POS_OPTIONAL, depth + 1); }
+        return concrete_at(tt, entry.elem, POS_OPTIONAL_OWNED, depth + 1);
+    }
+    return false;
+}
+
+// 收集来自形参和返回上下文的等式。只有遇到参数槽才改变解；固定类型在代换后比较。
+function infer_slot(tt: &typecheck::TypeTable:Read, sig: &resolve_refs::FunctionTemplate:Read, slot_id: u32, id: u32, args: &u32[]:ReadWrite, depth: u32): bool {
+    if id == 0 { return true; }
+    if !valid_id(tt, id) || slot_id >= @len(sig.types) as u32 || depth > resolve_refs::signature_depth_limit() { return false; }
+    let pattern: resolve_refs::ImportType = sig.types[slot_id];
+    if pattern.kind == 4 {
+        if pattern.a >= @len(*args) as u32 { return false; }
+        let prior: u32 = (*args)[pattern.a];
+        if prior != 0 { return prior == id; }
+        (*args)[pattern.a] = id;
+        return true;
+    }
+    let actual: typecheck::TypeEntry = tt.entries[id - 1];
+    if (pattern.kind == 5 && actual.kind == TK_FIXED_ARRAY && pattern.c == actual.length) ||
+        (pattern.kind == 6 && actual.kind == TK_DYN_ARRAY) || (pattern.kind == 11 && actual.kind == TK_NULLABLE) {
+        return infer_slot(tt, sig, pattern.a, actual.elem, args, depth + 1);
+    }
+    if ((pattern.kind == 7 && actual.kind == TK_REF) || (pattern.kind == 8 && actual.kind == TK_SLICE)) && pattern.a == actual.cap as u32 {
+        return infer_slot(tt, sig, pattern.b, actual.elem, args, depth + 1);
+    }
+    if pattern.kind == 9 && actual.kind == TK_FALLIBLE {
+        return infer_slot(tt, sig, pattern.a, actual.success, args, depth + 1);
+    }
+    if pattern.kind == 10 && actual.kind == TK_FN_REF && actual.members_count == pattern.b && valid_members(tt, actual) {
+        var i: u32 = 0;
+        while i < pattern.b {
+            if !infer_slot(tt, sig, pattern.a + i, tt.members[actual.members_start + i], args, depth + 1) { return false; }
+            i = i + 1;
+        }
+        return infer_slot(tt, sig, pattern.c as u32, actual.elem, args, depth + 1);
+    }
+    return true;
+}
+
+function meets_constraints(constraints: &Constraints:Read, args: &[u32]): bool {
+    var i: u64 = 0;
+    while i < @len(constraints.required) {
+        let req: Requirement = constraints.required[i];
+        if (req.parameter as u64) >= @len(args) || req.interface_def == 0 { return false; }
+        var found: bool = false;
+        var j: u64 = 0;
+        while j < @len(constraints.checked) && !found {
+            let fact: Implementation = constraints.checked[j];
+            found = fact.interface_def == req.interface_def && fact.type_id == args[req.parameter];
+            j = j + 1;
+        }
+        if !found { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function refuse(diags: &diag::DiagBuffer:ReadWrite, span: types::Span): InstanceSignature!AllocError {
+    typecheck::emit(diags, types::error_code(3007), span)?;
+    return InstanceSignature { ok: false, arguments: [], params: [], result: 0 };
+}
+
+// 已定型的调用参数应完成能力适配；0 表示尚无类型的表达式。无显式实参时按可用事实推导。
+// 只有实参全部确定、约束成立且具体签名通过校验，才交付可供实例体使用的结果。
+export function instantiate_signature(tt: &typecheck::TypeTable:ReadWrite, sig: &resolve_refs::FunctionTemplate:Read, explicit_args: &[u32], operands: &[u32], expected: u32, constraints: &Constraints:Read, span: types::Span, diags: &diag::DiagBuffer:ReadWrite): InstanceSignature!AllocError {
+    let explicit: bool = @len(explicit_args) != 0;
+    if !sig.valid || sig.arity == 0 || @len(operands) != sig.param_count as u64 || (explicit && @len(explicit_args) != sig.arity as u64) {
+        return refuse(diags, span)?;
+    }
+    var args: u32[] = [];
+    var i: u32 = 0;
+    while i < sig.arity as u32 {
+        var arg: u32 = 0;
+        if explicit {
+            arg = explicit_args[i];
+            if !valid_id(&*tt:Read, arg) { return refuse(diags, span)?; }
+        }
+        @push(args, arg)?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < sig.param_count as u32 {
+        if !infer_slot(&*tt:Read, sig, i, operands[i], &args:ReadWrite, 1) { return refuse(diags, span)?; }
+        i = i + 1;
+    }
+    if !infer_slot(&*tt:Read, sig, sig.ret_slot, expected, &args:ReadWrite, 1) { return refuse(diags, span)?; }
+    i = 0;
+    while i < @len(args) as u32 {
+        if !concrete_at(&*tt:Read, args[i], POS_OWNED, 1) { return refuse(diags, span)?; }
+        i = i + 1;
+    }
+    if !meets_constraints(constraints, &args[0..@len(args)]:Read) { return refuse(diags, span)?; }
+
+    let slots: &[resolve_refs::ImportType] = &sig.types[0..@len(sig.types)]:Read;
+    var params: u32[] = [];
+    i = 0;
+    while i < sig.param_count as u32 {
+        let value: u32 = type_import::specialize_slot(tt, slots, i, sig.dep, &args[0..@len(args)]:Read, 1)?;
+        if !concrete_at(&*tt:Read, value, POS_PARAM, 1) || (operands[i] != 0 && value != operands[i]) { return refuse(diags, span)?; }
+        @push(params, value)?;
+        i = i + 1;
+    }
+    let result: u32 = type_import::specialize_slot(tt, slots, sig.ret_slot, sig.dep, &args[0..@len(args)]:Read, 1)?;
+    if !concrete_at(&*tt:Read, result, POS_RETURN, 1) || (expected != 0 && result != expected) { return refuse(diags, span)?; }
+    return InstanceSignature { ok: true, arguments: @move(args), params: @move(params), result: result };
+}

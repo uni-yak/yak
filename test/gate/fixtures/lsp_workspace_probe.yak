@@ -1,0 +1,56 @@
+// 测试宿主在读取协议帧前登记固定的 URI、构建材料和目标位置。
+import configured_service;
+import diag;
+import document_deps;
+import documents;
+import iface;
+import iface_write;
+import lex;
+import parse;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import workspace_snapshot;
+import workspace_targets;
+foreign exit(code: u8): void;
+
+function copy_bytes(input: &[u8]): u8[]!AllocError {
+    var result: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(input) as u32 { @push(result, input[i])?; i = i + 1u32; }
+    return result;
+}
+
+function start(): void!AllocError {
+    let target_source: &[u8] = "export function run(x: u32): u32 { return hidden(x); }\nfunction hidden(x: u32): u32 { return x; }\n";
+    let lexed: lex::LexResult = lex::lex_scan(target_source, 1330u16)?;
+    let parsed: parse::ParseResult = parse::parse_file(&lexed.tokens[0..@len(lexed.tokens)]:Read, &lexed.names:Read, 1330u16)?;
+    if @len(lexed.diagnostics) != 0u64 || @len(parsed.diagnostics) != 0u64 { exit(1u8); return; }
+    var build: diag::DiagBuffer = diag::diagbuf_new();
+    let no_deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &no_deps:Read, "service", &build:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &build:ReadWrite)?;
+    let info: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    let written: iface::InterfaceResult = iface_write::write_interface(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &lexed.names:Read, &checked:Read, &info:Read, "service", &build:ReadWrite)?;
+    let bytes: &[u8]:Read = &written.data.bytes[0..@len(written.data.bytes)]:Read;
+    let digest: u8[] = iface::sha256_zero_header_digest(bytes, 24u32)?;
+    if build.has_error { exit(1u8); return; }
+    let source_id: u8[] = iface::sha256(target_source)?;
+    var targets: documents::DefinitionTarget[] = [];
+    @push(targets, workspace_targets::build("file:///a%20service.yak", "service", &source_id[0..32]:Read, &digest[0..32]:Read, target_source, bytes)?)?;
+    if targets[0].status != 0u8 { exit(1u8); return; }
+    var materials: document_deps::Material[] = [];
+    @push(materials, document_deps::Material { module: copy_bytes("service")?, digest: copy_bytes(&digest[0..32]:Read)?, bytes: copy_bytes(bytes)? })?;
+    var registered: workspace_snapshot::Registration[] = [];
+    @push(registered, workspace_snapshot::Registration { uri: copy_bytes("file:///z%20consumer.yak")?, module: copy_bytes("consumer")?, materials: @move(materials), direct: [0u32] })?;
+    @push(registered, workspace_snapshot::Registration { uri: copy_bytes("file:///a%20service.yak")?, module: copy_bytes("service")?, materials: [], direct: [] })?;
+    configured_service::run_with_symbols(&registered[0..2]:Read, "fixture", 1u64, &targets[0..1]:Read, true);
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = start();
+    @drop(result);
+    exit(1u8);
+}

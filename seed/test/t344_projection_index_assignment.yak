@@ -1,0 +1,12 @@
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+function replace(items: &Item[]:ReadWrite): u32 {
+    *items = [Item { data: [41u32] }];
+    return 0u32;
+}
+function main(): void {
+    var items: Item[] = [Item { data: [1u32] }];
+    let view: &Item[]:ReadWrite = &items:ReadWrite;
+    (*view)[0u32].data[replace(view)] = 42u32;
+    assert((*view)[0u32].data[0u32] == 42u32);
+}

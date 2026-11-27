@@ -1,0 +1,7 @@
+// expected_code: E1004
+// spec: spec/lang/type/i16.md L-4
+// 触发：带类型后缀的数值 32769 超出 i16 的正值上界。
+function main(): void {
+    @drop(32769i16);
+    return;
+}

@@ -1,0 +1,3 @@
+export struct Inner { value: u32, data: u32[] }
+export struct Outer { inner: Inner }
+export function make(): Outer { return Outer { inner: Inner { value: 71u32, data: [8u32] } }; }

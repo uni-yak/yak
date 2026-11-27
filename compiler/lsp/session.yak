@@ -1,0 +1,484 @@
+// 单帧会话边界：提交文档状态或写出请求响应，再交付处理结果。
+import frame;
+import json;
+import rpc;
+import rpc_reply;
+import rpc_reply_ext;
+import documents;
+import json_string;
+import positions;
+import types;
+import workspace_index;
+import lsp_complete;
+import lsp_format;
+import lsp_edit;
+
+export struct CancelledId { bytes: u8[] }
+
+export struct State {
+    phase: u8,
+    full_sync: bool,
+    definitions: bool,
+    diagnostic_versions: bool,
+    hierarchical_symbols: bool,
+    position_encoding: u8,
+    store: documents::Store,
+    workspace: workspace_index::Index,
+    cancelled: CancelledId[],
+    cancel_cursor: u32,
+}
+// 状态 3 继续读取；0、1、2 对应既有探针的退出码。
+export struct Step { status: u8, event: documents::Event }
+
+export function create(active_budget: u32): State {
+    return create_configured(active_budget, false);
+}
+
+export function create_configured(active_budget: u32, full_sync: bool): State {
+    return State {
+        phase: 0,
+        full_sync: full_sync,
+        definitions: full_sync,
+        diagnostic_versions: false,
+        hierarchical_symbols: false,
+        position_encoding: positions::enc_utf16(),
+        store: documents::create(active_budget),
+        workspace: workspace_index::create(),
+        cancelled: [],
+        cancel_cursor: 0,
+    };
+}
+
+function finished(status: u8): Step {
+    return Step { status: status, event: documents::no_event() };
+}
+
+// 仅唯一对象层级中的真值启用可选版本字段，未知或不完整的能力保持默认。
+function diagnostic_versions(doc: &json::Document:Read, src: &[u8], params: u32): bool {
+    let client: json::Member = json::member(doc, src, params, "capabilities");
+    if client.status != 1u8 { return false; }
+    let text: json::Member = json::member(doc, src, client.id, "textDocument");
+    if text.status != 1u8 { return false; }
+    let publish: json::Member = json::member(doc, src, text.id, "publishDiagnostics");
+    if publish.status != 1u8 { return false; }
+    let version: json::Member = json::member(doc, src, publish.id, "versionSupport");
+    return version.status == 1u8 && json::is_true(doc.nodes[version.id].kind);
+}
+
+// 只有明确声明层级文档符号的客户端才收到声明和选择两个范围。
+function hierarchical_symbols(doc: &json::Document:Read, src: &[u8], params: u32): bool {
+    let client: json::Member = json::member(doc, src, params, "capabilities");
+    if client.status != 1u8 { return false; }
+    let text: json::Member = json::member(doc, src, client.id, "textDocument");
+    if text.status != 1u8 { return false; }
+    let symbols: json::Member = json::member(doc, src, text.id, "documentSymbol");
+    if symbols.status != 1u8 { return false; }
+    let hierarchy: json::Member = json::member(doc, src, symbols.id, "hierarchicalDocumentSymbolSupport");
+    return hierarchy.status == 1u8 && json::is_true(doc.nodes[hierarchy.id].kind);
+}
+
+// 按客户端 capabilities.general.positionEncodings 偏好顺序协商位置编码。
+function negotiate_encoding(doc: &json::Document:Read, src: &[u8], params: u32): u8 {
+    let client: json::Member = json::member(doc, src, params, "capabilities");
+    if client.status != 1u8 { return positions::enc_utf16(); }
+    let general: json::Member = json::member(doc, src, client.id, "general");
+    if general.status != 1u8 { return positions::enc_utf16(); }
+    let encs: json::Member = json::member(doc, src, general.id, "positionEncodings");
+    if encs.status != 1u8 || !json::is_array(doc.nodes[encs.id].kind) { return positions::enc_utf16(); }
+    var cur: u32 = encs.id + 1u32;
+    let end: u32 = doc.nodes[encs.id].next;
+    while cur < end {
+        let node: json::Node = doc.nodes[cur];
+        if json::is_string(node.kind) {
+            if json_string::equals(src, node.start, node.end, "utf-8") { return positions::enc_utf8(); }
+            if json_string::equals(src, node.start, node.end, "utf-16") { return positions::enc_utf16(); }
+            if json_string::equals(src, node.start, node.end, "utf-32") { return positions::enc_utf32(); }
+        }
+        cur = node.next;
+    }
+    return positions::enc_utf16();
+}
+
+function send_reply(reply: &rpc_reply::Reply:Read): bool {
+    if reply.status != 1u8 { return reply.status == 0u8; }
+    return frame::write_frame(&reply.bytes[0..@len(reply.bytes)]:Read);
+}
+
+function record_cancel(state: &State:ReadWrite, doc: &json::Document:Read, src: &[u8], params: u32): void!AllocError {
+    let id: json::Member = json::member(doc, src, params, "id");
+    if id.status != 1u8 { return; }
+    let node: json::Node = doc.nodes[id.id];
+    if node.end <= node.start || node.end - node.start > 256u32 { return; }
+    var raw: u8[] = [];
+    var i: u32 = node.start;
+    while i < node.end { @push(raw, src[i])?; i = i + 1u32; }
+    if @len(state.cancelled) >= 32u64 {
+        let idx: u32 = state.cancel_cursor % 32u32;
+        state.cancelled[idx] = CancelledId { bytes: @move(raw) };
+        state.cancel_cursor = (idx + 1u32) % 32u32;
+    } else {
+        @push(state.cancelled, CancelledId { bytes: @move(raw) })?;
+    }
+    return;
+}
+
+function cancelled_entry_matches(entry: &CancelledId:Read, raw_id: &[u8]): bool {
+    return workspace_index::bytes_equal(&entry.bytes[0..@len(entry.bytes)]:Read, raw_id);
+}
+
+function consume_cancelled(state: &State:ReadWrite, raw_id: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(state.cancelled) as u32 {
+        if cancelled_entry_matches(&state.cancelled[i]:Read, raw_id) {
+            state.cancelled[i] = CancelledId { bytes: [] };
+            return true;
+        }
+        i = i + 1u32;
+    }
+    return false;
+}
+
+// 使用当前目标集合与工作区索引编码定义响应；本函数不读写宿主。
+export function definition_reply(store: &documents::Store:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8],
+    targets: &[documents::DefinitionTarget]:Read): rpc_reply::Reply!AllocError {
+    let empty_ws: workspace_index::Index = workspace_index::create();
+    return definition_reply_ws(store, &empty_ws:Read, action, doc, src, targets)?;
+}
+
+function definition_reply_ws(store: &documents::Store:Read, ws: &workspace_index::Index:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8],
+    targets: &[documents::DefinitionTarget]:Read): rpc_reply::Reply!AllocError {
+    let result: documents::Definition = documents::definition_with_targets(store, doc, src, action.params_id, targets)?;
+    if result.status == 2u8 {
+        if result.external {
+            let target: &documents::DefinitionTarget:Read = &targets[result.slot]:Read;
+            return rpc_reply::encode_definition(action, src, result.status, &target.uri[0..@len(target.uri)]:Read, result.range)?;
+        }
+        let uri: &json_string::Decoded:Read = &store.slots[result.slot].uri:Read;
+        return rpc_reply::encode_definition(action, src, result.status, &uri.data[0..@len(uri.data)]:Read, result.range)?;
+    }
+    if result.status == 1u8 {
+        // 回退检查工作区跨文件 `mod::Item` 定义跳转。
+        let at: documents::QueryPosition = documents::query_position(store, doc, src, action.params_id)?;
+        if at.status == 2u8 {
+            let snap: &documents::Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+            let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+            let qual: workspace_index::PathAtOffset = workspace_index::qualified_at(text, at.offset);
+            if qual.found {
+                let hit: workspace_index::ExportLookup = workspace_index::lookup_export(ws, &text[qual.mod_start..qual.mod_end]:Read, &text[qual.name_start..qual.name_end]:Read);
+                if hit.found {
+                    let wf: &workspace_index::WorkspaceFile:Read = &ws.files[hit.file_slot]:Read;
+                    return rpc_reply::encode_definition(action, src, 2u8, &wf.uri[0..@len(wf.uri)]:Read, wf.symbols[hit.symbol_index].range)?;
+                }
+            }
+        }
+    }
+    return rpc_reply::encode_definition(action, src, result.status, "", result.range)?;
+}
+
+function hover_reply_ws(store: &documents::Store:Read, ws: &workspace_index::Index:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    let result: documents::Hover = documents::hover(store, doc, src, action.params_id)?;
+    if result.status == 2u8 {
+        let index: &types::DocumentDefinitions:Read = &store.slots[result.slot].snapshot.definitions:Read;
+        let text: &[u8] = &index.hover_text[result.text_at..result.text_at + result.text_length]:Read;
+        return rpc_reply::encode_hover(action, src, result.status, text, result.range)?;
+    }
+    if result.status == 1u8 {
+        let at: documents::QueryPosition = documents::query_position(store, doc, src, action.params_id)?;
+        if at.status == 2u8 {
+            let snap: &documents::Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+            let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+            let qual: workspace_index::PathAtOffset = workspace_index::qualified_at(text, at.offset);
+            if qual.found {
+                let hit: workspace_index::ExportLookup = workspace_index::lookup_export(ws, &text[qual.mod_start..qual.mod_end]:Read, &text[qual.name_start..qual.name_end]:Read);
+                if hit.found {
+                    let wf: &workspace_index::WorkspaceFile:Read = &ws.files[hit.file_slot]:Read;
+                    let sym: workspace_index::ExportSymbol = wf.symbols[hit.symbol_index];
+                    let fsrc: &[u8] = &wf.source[0..@len(wf.source)]:Read;
+                    let file_id: u16 = (at.slot + 1u32) as u16;
+                    let rng: positions::RangeResult = positions::span_range(&snap.index:Read, text, file_id, file_id, qual.name_start, qual.name_end - qual.name_start);
+                    if rng.valid && (sym.sig_start as u64) + (sym.sig_len as u64) <= @len(fsrc) {
+                        return rpc_reply::encode_hover(action, src, 2u8, &fsrc[sym.sig_start..sym.sig_start + sym.sig_len]:Read, rng.range)?;
+                    }
+                }
+            }
+        }
+    }
+    return rpc_reply::encode_hover(action, src, result.status, "", result.range)?;
+}
+
+function completion_reply_ws(store: &documents::Store:Read, ws: &workspace_index::Index:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    let at: documents::QueryPosition = documents::query_position(store, doc, src, action.params_id)?;
+    if at.status == 2u8 {
+        let snap: &documents::Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+        let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+        let file_id: u16 = (at.slot + 1u32) as u16;
+        let ext: lsp_complete::ExtCompletion = lsp_complete::member_completion(text, &snap.index:Read, &snap.definitions:Read, ws, file_id, at.offset)?;
+        if ext.status == 2u8 {
+            return rpc_reply_ext::encode_ext_completion(action, src, &ext:Read)?;
+        }
+    }
+    let result: documents::Completion = documents::completion(store, doc, src, action.params_id)?;
+    if result.status == 2u8 {
+        let snap: &documents::Snapshot:Read = &store.slots[result.slot].snapshot:Read;
+        let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+        let words: &[u8] = &snap.definitions.completion_keywords[0..@len(snap.definitions.completion_keywords)]:Read;
+        let uri: &[u8] = &store.slots[result.slot].uri.data[0..@len(store.slots[result.slot].uri.data)]:Read;
+        let start_off: positions::OffsetResult = positions::to_offset(&snap.index:Read, text, result.range.start.line, result.range.start.character);
+        // 分支只保存偏移，切片在使用它的作用域中取得。
+        var prefix_start: u32 = 0;
+        var prefix_end: u32 = 0;
+        if at.status == 2u8 && start_off.valid && start_off.offset <= at.offset && at.offset <= @len(text) as u32 {
+            prefix_start = start_off.offset;
+            prefix_end = at.offset;
+        }
+        let prefix: &[u8] = &text[prefix_start..prefix_end]:Read;
+        let extra: lsp_complete::ExtItem[] = lsp_complete::collect_workspace_candidates(ws, uri, prefix)?;
+        return rpc_reply_ext::encode_merged_completion(action, src, &result:Read, text, words, &extra[0..@len(extra)]:Read)?;
+    }
+    return rpc_reply::encode_completion(action, src, &result:Read, "", "")?;
+}
+
+function symbols_reply(store: &documents::Store:Read, ws: &workspace_index::Index:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8],
+    targets: &[documents::DefinitionTarget]:Read, strict_targets: bool): rpc_reply::Reply!AllocError {
+    let member: json::Member = json::member(doc, src, action.params_id, "query");
+    if member.status == 1u8 && json::is_string(doc.nodes[member.id].kind) {
+        let node: json::Node = doc.nodes[member.id];
+        let query: json_string::Decoded = json_string::decode(src, node.start, node.end, 256u32)?;
+        if query.ok {
+            if strict_targets && @len(targets) > 0u64 {
+                let result: documents::SymbolResult = documents::symbols(store, targets, &query.data[0..@len(query.data)]:Read)?;
+                return rpc_reply::encode_workspace_symbols(action, src, &result:Read, targets)?;
+            }
+            return rpc_reply_ext::encode_default_workspace_symbols(action, src, store, ws, &query.data[0..@len(query.data)]:Read)?;
+        }
+    }
+    let invalid: documents::SymbolResult = documents::SymbolResult { status: 1, covered: 0, shadowed: 0, hits: [] };
+    return rpc_reply::encode_workspace_symbols(action, src, &invalid:Read, targets)?;
+}
+
+function formatting_reply(store: &documents::Store:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    let slot: u32 = documents::query_slot(store, doc, src, action.params_id)?;
+    if slot > 32u32 {
+        let bad: lsp_format::FormatResult = lsp_format::FormatResult { status: 0, changed: false, range: positions::Range { start: positions::Position { line: 0, character: 0 }, end: positions::Position { line: 0, character: 0 } }, new_text: [] };
+        return rpc_reply_ext::encode_formatting(action, src, &bad:Read)?;
+    }
+    if slot == 32u32 {
+        let miss: lsp_format::FormatResult = lsp_format::FormatResult { status: 1, changed: false, range: positions::Range { start: positions::Position { line: 0, character: 0 }, end: positions::Position { line: 0, character: 0 } }, new_text: [] };
+        return rpc_reply_ext::encode_formatting(action, src, &miss:Read)?;
+    }
+    var tab_size: u32 = 4;
+    var use_spaces: bool = true;
+    let opts: json::Member = json::member(doc, src, action.params_id, "options");
+    if opts.status == 1u8 && json::is_object(doc.nodes[opts.id].kind) {
+        let ts: json::Member = json::member(doc, src, opts.id, "tabSize");
+        if ts.status == 1u8 && json::is_number(doc.nodes[ts.id].kind) {
+            let tn: json::Node = doc.nodes[ts.id];
+            var v: u32 = 0;
+            var k: u32 = tn.start;
+            while k < tn.end && src[k] >= 48u8 && src[k] <= 57u8 && v < 16u32 {
+                v = v * 10u32 + (src[k] - 48u8) as u32;
+                k = k + 1u32;
+            }
+            if v >= 1u32 && v <= 8u32 { tab_size = v; }
+        }
+        let sp: json::Member = json::member(doc, src, opts.id, "insertSpaces");
+        if sp.status == 1u8 && !json::is_true(doc.nodes[sp.id].kind) { use_spaces = false; }
+    }
+    let snap: &documents::Snapshot:Read = &store.slots[slot].snapshot:Read;
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let fmt: lsp_format::FormatResult = lsp_format::format_document(text, &snap.index:Read, tab_size, use_spaces)?;
+    return rpc_reply_ext::encode_formatting(action, src, &fmt:Read)?;
+}
+
+function prepare_rename_reply(store: &documents::Store:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    let at: documents::QueryPosition = documents::query_position(store, doc, src, action.params_id)?;
+    if at.status != 2u8 {
+        let res: lsp_edit::PrepareRenameResult = lsp_edit::PrepareRenameResult { status: at.status, range: positions::Range { start: positions::Position { line: 0, character: 0 }, end: positions::Position { line: 0, character: 0 } }, offset: 0, length: 0 };
+        return rpc_reply_ext::encode_prepare_rename(action, src, &res:Read, "")?;
+    }
+    let snap: &documents::Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let prep: lsp_edit::PrepareRenameResult = lsp_edit::prepare_rename(&snap.definitions:Read, &snap.index:Read, text, (at.slot + 1u32) as u16, at.offset);
+    return rpc_reply_ext::encode_prepare_rename(action, src, &prep:Read, text)?;
+}
+
+function rename_reply(store: &documents::Store:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    let at: documents::QueryPosition = documents::query_position(store, doc, src, action.params_id)?;
+    let nm: json::Member = json::member(doc, src, action.params_id, "newName");
+    if at.status == 0u8 || nm.status != 1u8 || !json::is_string(doc.nodes[nm.id].kind) {
+        let bad: lsp_edit::RenameResult = lsp_edit::RenameResult { status: 0, ranges: [], new_name: [] };
+        return rpc_reply_ext::encode_rename(action, src, &bad:Read, "")?;
+    }
+    let decoded: json_string::Decoded = json_string::decode(src, doc.nodes[nm.id].start, doc.nodes[nm.id].end, 128u32)?;
+    if !decoded.ok {
+        let bad: lsp_edit::RenameResult = lsp_edit::RenameResult { status: 0, ranges: [], new_name: [] };
+        return rpc_reply_ext::encode_rename(action, src, &bad:Read, "")?;
+    }
+    if at.status != 2u8 {
+        let miss: lsp_edit::RenameResult = lsp_edit::RenameResult { status: 1, ranges: [], new_name: [] };
+        return rpc_reply_ext::encode_rename(action, src, &miss:Read, "")?;
+    }
+    let snap: &documents::Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let uri: &[u8] = &store.slots[at.slot].uri.data[0..@len(store.slots[at.slot].uri.data)]:Read;
+    let ren: lsp_edit::RenameResult = lsp_edit::compute_rename(&snap.definitions:Read, &snap.index:Read, text, (at.slot + 1u32) as u16, at.offset, &decoded.data[0..@len(decoded.data)]:Read)?;
+    return rpc_reply_ext::encode_rename(action, src, &ren:Read, uri)?;
+}
+
+function code_action_reply(store: &documents::Store:Read, ws: &workspace_index::Index:Read, action: &rpc::Route:Read, doc: &json::Document:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    let slot: u32 = documents::query_slot(store, doc, src, action.params_id)?;
+    let range_m: json::Member = json::member(doc, src, action.params_id, "range");
+    if slot > 32u32 || range_m.status != 1u8 {
+        let bad: lsp_edit::CodeActionResult = lsp_edit::CodeActionResult { status: 0, items: [] };
+        return rpc_reply_ext::encode_code_actions(action, src, &bad:Read, "")?;
+    }
+    let rf: documents::RangeField = documents::parse_range(doc, src, range_m.id);
+    if !rf.ok {
+        let bad: lsp_edit::CodeActionResult = lsp_edit::CodeActionResult { status: 0, items: [] };
+        return rpc_reply_ext::encode_code_actions(action, src, &bad:Read, "")?;
+    }
+    if slot == 32u32 {
+        let empty: lsp_edit::CodeActionResult = lsp_edit::CodeActionResult { status: 2, items: [] };
+        return rpc_reply_ext::encode_code_actions(action, src, &empty:Read, "")?;
+    }
+    let snap: &documents::Snapshot:Read = &store.slots[slot].snapshot:Read;
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let uri: &[u8] = &store.slots[slot].uri.data[0..@len(store.slots[slot].uri.data)]:Read;
+    let diags: &[types::DocumentDiag]:Read = &snap.definitions.diagnostics[0..@len(snap.definitions.diagnostics)]:Read;
+    let ca: lsp_edit::CodeActionResult = lsp_edit::compute_code_actions(uri, text, (slot + 1u32) as u16, &snap.index:Read, diags, ws, rf.range)?;
+    return rpc_reply_ext::encode_code_actions(action, src, &ca:Read, uri)?;
+}
+
+// 默认入口没有经授权的目标集合。文档事件的发布策略由调用方决定。
+export function advance(state: &State:ReadWrite): Step!AllocError {
+    let targets: documents::DefinitionTarget[] = [];
+    return advance_with_targets(state, &targets[0..0]:Read)?;
+}
+
+export function advance_with_targets(state: &State:ReadWrite, targets: &[documents::DefinitionTarget]:Read): Step!AllocError {
+    return advance_workspace(state, targets, false)?;
+}
+
+export function advance_workspace(state: &State:ReadWrite, targets: &[documents::DefinitionTarget]:Read, workspace_symbols: bool): Step!AllocError {
+    let size: u32 = frame::read_header()?;
+    if frame::end_of_stream(size) { return finished(1u8); }
+    if frame::invalid_header(size) { return finished(2u8); }
+    let body: u8[] = frame::read_body(size)?;
+    if @len(body) != (size as u64) { return finished(2u8); }
+    let source: &[u8] = &body[0..size]:Read;
+    let doc: json::Document = json::parse(source)?;
+    let action: rpc::Route = rpc::classify_workspace(&doc:Read, source, state.phase, state.definitions, workspace_symbols);
+    if action.kind == 5u8 { return finished(action.exit_code); }
+    if action.kind == 16u8 {
+        record_cancel(state, &doc:Read, source, action.params_id)?;
+        return finished(3u8);
+    }
+    if action.kind == 17u8 {
+        workspace_index::apply_sync_notice(&state.workspace:ReadWrite, &doc:Read, source, action.params_id)?;
+        return finished(3u8);
+    }
+    let method: u8 = rpc::document_method(action.kind);
+    if method != 0u8 {
+        let incremental: bool = state.full_sync;
+        let event: documents::Event = documents::apply_with_sync_mode(&state.store:ReadWrite, &doc:Read, source, action.params_id, method, incremental)?;
+        if event.status == 1u8 && state.definitions {
+            let s: u32 = event.ticket.slot;
+            var uri_copy: u8[] = [];
+            var k: u32 = 0;
+            while k < @len(state.store.slots[s].uri.data) as u32 {
+                @push(uri_copy, state.store.slots[s].uri.data[k])?;
+                k = k + 1u32;
+            }
+            var txt_copy: u8[] = [];
+            k = 0u32;
+            while k < @len(state.store.slots[s].snapshot.text.data) as u32 {
+                @push(txt_copy, state.store.slots[s].snapshot.text.data[k])?;
+                k = k + 1u32;
+            }
+            workspace_index::upsert_file(&state.workspace:ReadWrite, &uri_copy[0..@len(uri_copy)]:Read, "", &txt_copy[0..@len(txt_copy)]:Read)?;
+        }
+        return Step { status: 3, event: @move(event) };
+    }
+    if action.id_end > action.id_start && action.kind >= 9u8 {
+        if consume_cancelled(state, &source[action.id_start..action.id_end]:Read) {
+            let cancelled: rpc_reply::Reply = rpc_reply_ext::encode_cancelled(&action:Read, source)?;
+            if !send_reply(&cancelled:Read) { return finished(2u8); }
+            return finished(3u8);
+        }
+    }
+    if action.kind == 9u8 {
+        let reply: rpc_reply::Reply = definition_reply_ws(&state.store:Read, &state.workspace:Read, &action:Read, &doc:Read, source, targets)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 10u8 {
+        let reply: rpc_reply::Reply = hover_reply_ws(&state.store:Read, &state.workspace:Read, &action:Read, &doc:Read, source)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 11u8 {
+        let reply: rpc_reply::Reply = completion_reply_ws(&state.store:Read, &state.workspace:Read, &action:Read, &doc:Read, source)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 12u8 {
+        let result: documents::SemanticTokens = documents::semantic_tokens(&state.store:Read, &doc:Read, source, action.params_id)?;
+        let reply: rpc_reply::Reply = rpc_reply::encode_semantic_tokens(&action:Read, source, &result:Read)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 13u8 || action.kind == 14u8 {
+        let symbols: bool = action.kind == 13u8;
+        let result: documents::Structure = documents::structure(&state.store:Read, &doc:Read, source, action.params_id, symbols)?;
+        if result.status == 2u8 && symbols {
+            let hierarchy: bool = state.hierarchical_symbols;
+            let snap: &documents::Snapshot:Read = &state.store.slots[result.slot].snapshot:Read;
+            let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+            let uri: &json_string::Decoded:Read = &state.store.slots[result.slot].uri:Read;
+            let reply: rpc_reply::Reply = rpc_reply::encode_structure(&action:Read, source, &result:Read, text, &uri.data[0..@len(uri.data)]:Read, hierarchy)?;
+            if !send_reply(&reply:Read) { return finished(2u8); }
+        } else {
+            let reply: rpc_reply::Reply = rpc_reply::encode_structure(&action:Read, source, &result:Read, "", "", false)?;
+            if !send_reply(&reply:Read) { return finished(2u8); }
+        }
+        return finished(3u8);
+    }
+    if action.kind == 15u8 {
+        let reply: rpc_reply::Reply = symbols_reply(&state.store:Read, &state.workspace:Read, &action:Read, &doc:Read, source, targets, workspace_symbols)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 18u8 {
+        let reply: rpc_reply::Reply = formatting_reply(&state.store:Read, &action:Read, &doc:Read, source)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 19u8 {
+        let reply: rpc_reply::Reply = prepare_rename_reply(&state.store:Read, &action:Read, &doc:Read, source)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 20u8 {
+        let reply: rpc_reply::Reply = rename_reply(&state.store:Read, &action:Read, &doc:Read, source)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    if action.kind == 21u8 {
+        let reply: rpc_reply::Reply = code_action_reply(&state.store:Read, &state.workspace:Read, &action:Read, &doc:Read, source)?;
+        if !send_reply(&reply:Read) { return finished(2u8); }
+        return finished(3u8);
+    }
+    var enc: u8 = state.position_encoding;
+    if action.kind == 2u8 {
+        enc = negotiate_encoding(&doc:Read, source, action.params_id);
+        state.position_encoding = enc;
+        documents::set_encoding(&state.store:ReadWrite, enc);
+        state.diagnostic_versions = diagnostic_versions(&doc:Read, source, action.params_id);
+        state.hierarchical_symbols = hierarchical_symbols(&doc:Read, source, action.params_id);
+        workspace_index::configure_from_initialize(&state.workspace:ReadWrite, &doc:Read, source, action.params_id, enc)?;
+    }
+    let reply: rpc_reply::Reply = rpc_reply::encode_initialize(&action:Read, source, state.full_sync, state.definitions, workspace_symbols, enc)?;
+    if !send_reply(&reply:Read) { return finished(2u8); }
+    state.phase = action.phase;
+    return finished(3u8);
+}

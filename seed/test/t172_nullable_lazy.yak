@@ -1,0 +1,3 @@
+foreign assert(cond: bool): void;
+function fail(): i64 { assert(false); return 0; }
+function main(): void { let a: i64? = 42; assert((a ?? fail()) == 42); }

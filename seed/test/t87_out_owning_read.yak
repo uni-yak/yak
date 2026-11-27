@@ -1,0 +1,12 @@
+// t87: owning out 槽位 full 后未 @move 直接读 → trap（owner.md 4.3）
+// expected_trap: must @move to extract owning out value
+function make_arr(out a: u32[]): void {
+    a = [1];
+    return;
+}
+function main(): void {
+    out arr: u32[];
+    make_arr( out arr);
+    let n: u32 = @len( out arr);
+    return;
+}

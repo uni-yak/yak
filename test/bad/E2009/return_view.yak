@@ -1,0 +1,10 @@
+// expected_code: E2009
+// spec: spec/lang/parse.md P-9
+// 触发：返回值位置书写引用视图类型。
+function f(): &u32 {
+    return;
+}
+
+function main(): void {
+    return;
+}

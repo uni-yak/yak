@@ -1,0 +1,1180 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+import iface;
+import iface_write;
+import iface_load;
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+import mir_verify;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// module: runner=mir_runner.yak
+import runner;
+function scalar_arithmetic(): void!AllocError {
+    let source: &[u8] = "function add(a: u32, b: u32): u32 { return a + b; } function f(): u32 { return add(17, 5) * 3 - 7 / 2 + 7 % 2; }\n";
+    let a_result: mir::MirResult = runner::accepted(source, 1200)?;
+    let a: &mir::MirModule:Read = &a_result.module:Read;
+    let b_result: mir::MirResult = runner::accepted(source, 1200)?;
+    let b: &mir::MirModule:Read = &b_result.module:Read;
+    runner::same_module(a, b);
+    assert(@len(a.functions) == 2 && a.functions[0].def == 1 && a.functions[1].def == 4);
+    let value: runner::Value = runner::run0(a, 1)?; assert(value.tag == 0 && value.bits == 64);
+    return;
+}
+// 保持操作数、结果及签名类型一致，验证运算自身的整数类型约束。
+function arithmetic_type_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(a: u32, b: u32): u32 { return a + b; }\n", 1282)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 16 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let value_type_id: u32 = result.module.functions[0].insts[i].value_type_id;
+    let right: u32 = result.module.functions[0].insts[i].c;
+    var op: u8 = 16;
+    while op <= 36 {
+        if op <= 24 || op >= 32 {
+            result.module.functions[0].insts[i].op = op;
+            if op == 21 { result.module.functions[0].insts[i].c = 0; } else { result.module.functions[0].insts[i].c = right; }
+            assert(mir_verify::verify_module(&result.module:Read)?);
+            result.module.types.entries[value_type_id - 1].builtin = 4105;
+            assert(!mir_verify::verify_module(&result.module:Read)?);
+            result.module.types.entries[value_type_id - 1].builtin = 4106;
+            assert(!mir_verify::verify_module(&result.module:Read)?);
+            result.module.types.entries[value_type_id - 1].builtin = 4099;
+        }
+        op = op + 1;
+    }
+    result.module.functions[0].insts[i].op = 16;
+    result.module.functions[0].insts[i].c = right;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+function scalar_casts(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function narrow(): u8 { let x: u32 = 258u32; return x as u8; } function signed(): i32 { let x: i8 = -7i8; return x as i32; } function letter(): u32 { let c: char = '界'; return c as u32; } function bits(): u32 { return ((6u32 & 3u32) | (1u32 << 3u32)) ^ (16u32 >> 2u32); } function unary(): bool { return !(-2i32 < -1i32); }\n", 1201)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    runner::expect0(m, 0, 2)?; runner::expect0(m, 1, 4294967289)?;
+    runner::expect0(m, 2, 30028)?; runner::expect0(m, 3, 14)?; runner::expect0(m, 4, 0)?;
+    return;
+}
+// 保持其余 MIR 结构不变，单独验证转换源与目标的白名单。
+function cast_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(a: u32, b: bool, c: u8, d: char): u16 { b; c; d; return a as u16; } function g(a: u32, b: u8): char { b; return a as char; }\n", 1280)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 64 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    var original: u32 = result.module.functions[0].insts[i].b;
+    result.module.functions[0].insts[i].b = result.module.functions[0].params[1];
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].b = result.module.functions[0].params[3];
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].b = result.module.functions[0].params[2];
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].b = original;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    i = 0;
+    while i < @len(result.module.functions[1].insts) as u32 && result.module.functions[1].insts[i].op != 64 { i = i + 1; }
+    assert(i < @len(result.module.functions[1].insts) as u32);
+    original = result.module.functions[1].insts[i].b;
+    result.module.functions[1].insts[i].b = result.module.functions[1].params[1];
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[1].insts[i].b = original;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 字符常量必须是 Unicode 标量，边界之外不能进入后端。
+function char_constant_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(): char { return 'a'; }\n", 1281)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 1 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    result.module.functions[0].insts[i].value = 55295; assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 55296; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 57343; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 57344; assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 1114111; assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 1114112; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 4294967296u64; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 0; assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 改变比较指令而保留操作数和结果，单独验证布尔顺序比较。
+function bool_comparison_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(a: bool, b: bool): bool { return a == b; }\n", 1283)?;
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 48 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    var op: u8 = 48;
+    while op <= 53 {
+        result.module.functions[0].insts[i].op = op;
+        if op <= 49 { assert(mir_verify::verify_module(&result.module:Read)?); }
+        else { assert(!mir_verify::verify_module(&result.module:Read)?); }
+        op = op + 1;
+    }
+    result.module.functions[0].insts[i].op = 48;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 只替换操作数，确保切片比较本身由验证器拒绝。
+function slice_comparison_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("foreign write(data: &[u8]): void; function f(a: u32, b: u32): bool { write(\"a\"); write(\"b\"); return a == b; }\n", 1284)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 48 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let left: u32 = result.module.functions[0].insts[i].b;
+    let right: u32 = result.module.functions[0].insts[i].c;
+    var s: u32 = 0;
+    while s < i && result.module.functions[0].insts[s].op != 3 { s = s + 1; }
+    assert(s < i);
+    let slice: u32 = result.module.functions[0].insts[s].a;
+    result.module.functions[0].insts[i].b = slice;
+    result.module.functions[0].insts[i].c = slice;
+    var compare: u8 = 48;
+    while compare <= 53 {
+        result.module.functions[0].insts[i].op = compare;
+        assert(!mir_verify::verify_module(&result.module:Read)?);
+        compare = compare + 1;
+    }
+    result.module.functions[0].insts[i].op = 48;
+    result.module.functions[0].insts[i].b = left;
+    result.module.functions[0].insts[i].c = right;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 使用已定义的定长数组参数，单独检验比较指令的类型约束。
+function array_comparison_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(a: u32, b: u32, x: [u32; 2]): bool { let value: bool = a == b; @drop(x); return value; }\n", 1285)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 48 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let left: u32 = result.module.functions[0].insts[i].b;
+    let right: u32 = result.module.functions[0].insts[i].c;
+    let array: u32 = result.module.functions[0].params[2];
+    result.module.functions[0].insts[i].b = array;
+    result.module.functions[0].insts[i].c = array;
+    var compare: u8 = 48;
+    while compare <= 53 {
+        result.module.functions[0].insts[i].op = compare;
+        assert(!mir_verify::verify_module(&result.module:Read)?);
+        compare = compare + 1;
+    }
+    result.module.functions[0].insts[i].op = 48;
+    result.module.functions[0].insts[i].b = left;
+    result.module.functions[0].insts[i].c = right;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 将已定义的本地结构体用作操作数，验证比较指令被拒绝。
+function struct_comparison_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("struct P { x: u32 } function f(a: u32, b: u32, p: P): bool { let value: bool = a == b; @drop(p); return value; }\n", 1287)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 48 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let left: u32 = result.module.functions[0].insts[i].b;
+    let right: u32 = result.module.functions[0].insts[i].c;
+    let value: u32 = result.module.functions[0].params[2];
+    result.module.functions[0].insts[i].b = value;
+    result.module.functions[0].insts[i].c = value;
+    var compare: u8 = 48;
+    while compare <= 53 {
+        result.module.functions[0].insts[i].op = compare;
+        assert(!mir_verify::verify_module(&result.module:Read)?);
+        compare = compare + 1;
+    }
+    result.module.functions[0].insts[i].op = 48;
+    result.module.functions[0].insts[i].b = left;
+    result.module.functions[0].insts[i].c = right;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var enums: mir::MirResult = runner::accepted("struct P { x: u32 } enum E { A, B(u32) } function f(a: E, b: E): bool { return a == b; } function g(a: E, b: E): bool { return a != b; }\n", 1288)?;
+    assert(mir_verify::verify_module(&enums.module:Read)?);
+    i = 0;
+    while i < @len(enums.module.functions[0].insts) as u32 && enums.module.functions[0].insts[i].op != 48 { i = i + 1; }
+    assert(i < @len(enums.module.functions[0].insts) as u32);
+    // 在有效枚举操作数上逐个验证四种顺序比较。
+    var op: u8 = 50;
+    while op <= 53 {
+        enums.module.functions[0].insts[i].op = op;
+        assert(!mir_verify::verify_module(&enums.module:Read)?);
+        op = op + 1;
+    }
+    enums.module.functions[0].insts[i].op = 48;
+    assert(mir_verify::verify_module(&enums.module:Read)?);
+    return;
+}
+// 验证器独立入口区分普通引用和函数引用的比较规则。
+function reference_comparison_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(a: u32, b: u32): bool { return a == b; }\n", 1286)?;
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 48 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let ty: u32 = result.module.functions[0].locals[result.module.functions[0].params[0] - 1].value_type_id;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.types.entries[ty - 1].kind = 4;
+    var op: u8 = 48;
+    while op <= 53 {
+        result.module.functions[0].insts[i].op = op;
+        assert(!mir_verify::verify_module(&result.module:Read)?);
+        op = op + 1;
+    }
+    result.module.types.entries[ty - 1].kind = 8;
+    op = 48;
+    while op <= 53 {
+        result.module.functions[0].insts[i].op = op;
+        if op <= 49 { assert(mir_verify::verify_module(&result.module:Read)?); }
+        else { assert(!mir_verify::verify_module(&result.module:Read)?); }
+        op = op + 1;
+    }
+    result.module.types.entries[ty - 1].kind = 1;
+    result.module.functions[0].insts[i].op = 48;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    // 保持操作数和签名一致，区分内建整数的顺序比较与内置枚举的相等比较。
+    let builtin: u16 = result.module.types.entries[ty - 1].builtin;
+    op = 48;
+    while op <= 53 {
+        result.module.functions[0].insts[i].op = op;
+        assert(mir_verify::verify_module(&result.module:Read)?);
+        op = op + 1;
+    }
+    result.module.types.entries[ty - 1].builtin = 4108;
+    op = 48;
+    while op <= 53 {
+        result.module.functions[0].insts[i].op = op;
+        if op <= 49 { assert(mir_verify::verify_module(&result.module:Read)?); }
+        else { assert(!mir_verify::verify_module(&result.module:Read)?); }
+        op = op + 1;
+    }
+    result.module.types.entries[ty - 1].builtin = builtin;
+    result.module.functions[0].insts[i].op = 48;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+function scalar_comparisons(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function less(x: u32): bool { return 1 < x; } function compare(x: i32): bool { return x != -1i32 && x >= -2i32 && x <= 3i32 && x > -3i32 && x == 2i32; }\n", 1202)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    runner::expect1(m, 0, 0, 0)?; runner::expect1(m, 0, 2, 1)?;
+    runner::expect1(m, 1, 2, 1)?; runner::expect1(m, 1, 3, 0)?;
+    return;
+}
+function scalar_branches(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function both(x: bool): u32 { if x { return 11; } else { return 22; } } function chain(x: u32): u32 { var n: u32 = 5; if x == 0 { n = 10; } elseif x == 1 { n = 20; } else { n = 30; } return n + 1; } function mixed(x: u32): u32 { if x == 0 { return 7; } if x == 1 { return 8; } return 9; }\n", 1203)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    assert(@len(m.functions[0].blocks) == 3);
+    runner::expect1(m, 0, 0, 22)?; runner::expect1(m, 0, 1, 11)?;
+    runner::expect1(m, 1, 0, 11)?; runner::expect1(m, 1, 1, 21)?; runner::expect1(m, 1, 9, 31)?;
+    runner::expect1(m, 2, 0, 7)?; runner::expect1(m, 2, 1, 8)?; runner::expect1(m, 2, 2, 9)?;
+    return;
+}
+function scalar_loops(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function spin(x: u32): u32 { var n: u32 = 0; var total: u32 = 0; while n < x { n = n + 1; if n == 2 { continue; } if n == 5 { break; } total = total + n; } return total; } function labels(): u32 { var i: u32 = 0; var n: u32 = 0; outer: while i < 4 { i = i + 1; var j: u32 = 0; inner: while j < 4 { j = j + 1; if i == 2 { continue outer; } if i == 4 { break outer; } if j == 2 { continue inner; } if j == 4 { break inner; } n = n + 1; } } return n; }\n", 1204)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    runner::expect1(m, 0, 0, 0)?; runner::expect1(m, 0, 3, 4)?; runner::expect1(m, 0, 8, 8)?;
+    runner::expect0(m, 1, 4)?;
+    assert(runner::op_count(&m.functions[0]:Read, 80) > 0 && runner::op_count(&m.functions[0]:Read, 81) > 0);
+    return;
+}
+function scalar_short_circuit(): void!AllocError {
+    // 右支含整除零：短路若失效，执行器会在该处陷入，测试随即失败。
+    let m_result: mir::MirResult = runner::accepted("function zero(): bool { return false && 1u32 / 0u32 == 0u32; } function one(): bool { return true || 1u32 / 0u32 == 0u32; } function guarded(a: bool): bool { return a && 1u32 / 0u32 == 0u32; } function fallback(a: bool): bool { return a || 1u32 / 0u32 == 0u32; }\n", 1205)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    runner::expect0(m, 0, 0)?; runner::expect0(m, 1, 1)?;
+    runner::expect1(m, 2, 0, 0)?; runner::expect1(m, 3, 1, 1)?;
+    // 每条短路表达式至少有一个条件分支终止符，且结果只经单一 place 汇合。
+    assert(runner::term_count(&m.functions[0]:Read, 193) >= 1 && runner::term_count(&m.functions[1]:Read, 193) >= 1);
+    assert(runner::op_count(&m.functions[2]:Read, 81) >= 1 && runner::op_count(&m.functions[3]:Read, 81) >= 1);
+    return;
+}
+function scalar_calls(): void!AllocError {
+    // 嵌套调用须先完成内层求值，且内外层实参区间互不掺杂；void 调用不产生结果局部。
+    let m_result: mir::MirResult = runner::accepted("foreign assert(cond: bool): void; function pair(a: u32, b: u32): u32 { return a * 10 + b; } function note(): void { assert(true); } function f(): u32 { note(); return pair(1, pair(2, 3)); }\n", 1206)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let args: runner::Value[] = []; var state: runner::Execution = runner::execution_new();
+    let result: runner::Value = runner::execute(m, 2, &args[0..0]:Read, &state:ReadWrite, 0)?;
+    assert(result.bits == 33 && state.foreign_calls == 1);
+    // 外来声明不生成 MIR 函数：0 为 pair，1 为 note，2 为 f。
+    // call_foreign 的结果局部在 a（void 为 0），DefId 在 b，实参经 args 区给出。
+    var foreign_calls: u32 = 0; var foreign_def: u32 = 0; var foreign_args: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(m.functions[1].insts) as u32 {
+        if mir::is_foreign_call(m.functions[1].insts[i].op) {
+            foreign_calls = foreign_calls + 1;
+            foreign_def = m.functions[1].insts[i].b;
+            foreign_args = m.functions[1].insts[i].args_count;
+        }
+        i = i + 1;
+    }
+    assert(foreign_calls == 1 && foreign_args == 1 && foreign_def != 0);
+    var j: u32 = 0; var matched: bool = false;
+    while j < @len(m.signatures.items) as u32 {
+        if m.signatures.items[j].def == foreign_def { assert(m.signatures.items[j].service == 2); matched = true; }
+        j = j + 1;
+    }
+    assert(matched);
+    assert(runner::op_count(&m.functions[2]:Read, 150) == 3);
+    return;
+}
+function scalar_recursion(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function #sum(n: u32): u32 { if n == 0 { return 0; } return n + sum(n - 1); } function even(n: u32): bool { if n == 0 { return true; } return odd(n - 1); } function odd(n: u32): bool { if n == 0 { return false; } return even(n - 1); }\n", 1207)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    assert(m.functions[0].declared_no_alloc && m.functions[0].no_alloc);
+    assert(!m.functions[1].declared_no_alloc && m.functions[1].no_alloc && m.functions[2].no_alloc);
+    runner::expect1(m, 0, 4, 10)?; runner::expect1(m, 1, 4, 1)?; runner::expect1(m, 2, 4, 0)?;
+    return;
+}
+function missing_signature(): void!AllocError {
+    // 未登记 foreign 是 F-1 拒绝形态，在名称解析阶段即被拒绝，不会到达 MIR；
+    // 后端不得为无签名外来目标伪造签名表条目。
+    let loaded: runner::Loaded = runner::load("foreign target(x: u32): u32; function entry(): u32 { return target(9); }\n", 1211)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == 8001);
+    var service_index: u32 = 0;
+    var known_service: bool = false;
+    while service_index < @len(resolution.services) as u32 {
+        if resolution.services[service_index].kind != 0 { known_service = true; }
+        service_index = service_index + 1;
+    }
+    assert(!known_service);
+    return;
+}
+function scalar_wrap(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("function add(): u8 { return @wrap_add(255u8, 2u8); } function sub(): u16 { return @wrap_sub(0u16, 2u16); } function mul(): u8 { return @wrap_mul(128u8, 3u8); }\n", 1212)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    runner::expect0(m, 0, 1)?; runner::expect0(m, 1, 65534)?; runner::expect0(m, 2, 128)?;
+    return;
+}
+// 空返回类型已缓存时，同一个类型仍不能充当值形参。
+function void_type_cache(): void!AllocError {
+    let loaded: runner::Loaded = runner::load("function clear(): void { return; } function use(x: u32): u32 { return x; }\n", 1285)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    var checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let normal: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(normal.accepted && @len(normal.module.functions) == 2);
+    let first: u32 = normal.module.functions[0].signature - 1;
+    let second: u32 = normal.module.functions[1].signature - 1;
+    let empty: u32 = checked.funcs.items[first].ret;
+    checked.funcs.items[second].params[0] = empty;
+    let invalid: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(!invalid.accepted && invalid.rejection.kind == 3 && @len(invalid.module.functions) == 0);
+    assert(invalid.rejection.span.offset == loaded.parsed.pool.functions[1].params[0].span.offset);
+    return;
+}
+// 绑定表命中名称时，仍需检查记录是否属于正在降低的声明。
+function binding_decl_identity(): void!AllocError {
+    let loaded: runner::Loaded = runner::load("function f(): u32 { let x: u32 = 7; return x; }\n", 1286)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let normal: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(normal.accepted);
+    runner::expect0(&normal.module:Read, 0, 7)?;
+    let offset: u32 = resolution.result.tables.defs[1].decl_offset;
+    resolution.result.tables.defs[1].decl_offset = offset + 1;
+    let invalid: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(!invalid.accepted && invalid.rejection.kind == 7 && @len(invalid.module.functions) == 0);
+    return;
+}
+function rejection_cases(): void!AllocError {
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let r1: mir::MirResult = runner::compile("function f(x: bool): u32 { if x { return 1; } }\n", 1208, &d1:ReadWrite)?;
+    assert(!r1.accepted && r1.rejection.kind == 7 && @len(r1.module.functions) == 0);
+    assert(diag::diagbuf_count(&d1:Read) > 0 && d1.diags[0].code.raw == 2005);
+    // 聚合值已纳入 MIR：结构体构造与字段读取必须真实取值，而不是一律拒绝。
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: mir::MirResult = runner::compile("struct P { x: u32, y: u32 } function f(): u32 { let p: P = P { x: 7, y: 9 }; return p.x + p.y * 2; }\n", 1209, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 0);
+    assert(r2.accepted && r2.rejection.kind == 0 && @len(r2.module.functions) == 1);
+    runner::expect0(&r2.module:Read, 0, 25)?;
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let r3: mir::MirResult = runner::compile("function good(): u32 { return 1; } function bad(): u32 { return @clone(1u32); }\n", 1210, &d3:ReadWrite)?;
+    assert(!r3.accepted && r3.rejection.kind != 0 && @len(r3.module.functions) == 0);
+    // 隐式 Read 实参经临时位置取址，并以引用类型进入调用。
+    var read_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let read: mir::MirResult = runner::compile("function f(): u8 { return peek(7); } function peek(x: &u8): u8 { return *x; }\n", 1284, &read_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&read_diags:Read) == 0);
+    assert(read.accepted && @len(read.module.functions) == 2);
+    assert(mir_verify::verify_module(&read.module:Read)?);
+    let function_body: &mir::MirFunction:Read = &read.module.functions[0]:Read;
+    var i: u32 = 0;
+    while i < @len(function_body.insts) as u32 && function_body.insts[i].op != 150 { i = i + 1; }
+    assert(i < @len(function_body.insts) as u32);
+    let call: mir::MirInst = function_body.insts[i];
+    assert(call.args_count == 1);
+    let id: u32 = mir::local_type(function_body, function_body.args[call.args_start]);
+    assert(id != 0 && read.module.types.entries[id - 1].kind == 4);
+    return;
+}
+// 从真实写出的接口构造已验证的标志，避免把测试建立在手工桥接事实之上。
+function add_dependency(deps: &resolve_refs::DependencySet:ReadWrite, name: &[u8], flag: u8, source: &[u8]): void!AllocError {
+    let dep: runner::Loaded = runner::load(source, 1220)?;
+    let empty: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&dep.parsed.file:Read, &dep.parsed.pool:Read, &dep.lexed.names:Read, &empty:Read, name, &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&dep.parsed.file:Read, &dep.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let layouts: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    let result: iface::InterfaceResult = iface_write::write_interface(&dep.parsed.file:Read, &dep.parsed.pool:Read, &resolution:Read, &dep.lexed.names:Read, &tc:Read, &layouts:Read, name, &diags:ReadWrite)?;
+    assert(!diags.has_error && result.export_count > 0);
+    var bytes: u8[] = [];
+    var i: u32 = 0; while i < @len(result.data.bytes) as u32 { @push(bytes, result.data.bytes[i])?; i = i + 1; }
+    let off: u32 = bytes[108] as u32 | (bytes[109] as u32 << 8) | (bytes[110] as u32 << 16) | (bytes[111] as u32 << 24);
+    i = 0; while i < result.export_count { bytes[off + i * 32 + 7] = flag; i = i + 1; }
+    i = 24; while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0; while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    let loaded: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(loaded.exports) == result.export_count as u64);
+    i = 0; while i < result.export_count { assert(loaded.exports[i].flags == flag); i = i + 1; }
+    iface_load::add_binary_dependency(deps, &loaded:Read)?;
+    return;
+}
+function imported_params(): void!AllocError {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    add_dependency(&deps:ReadWrite, "typed", 0, "export function f(x: u32, y: bool): u32 { if y { return x; } return 0; }\n")?;
+    let unit: runner::Loaded = runner::load("import typed; function f(x: u32, y: bool): u32 { return typed::f(x, y); }\n", 1228)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "user", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    var result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0; while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 151 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let start: u32 = result.module.functions[0].insts[i].args_start;
+    let first: u32 = result.module.functions[0].args[start];
+    let second: u32 = result.module.functions[0].args[start + 1];
+    result.module.functions[0].args[start] = second; result.module.functions[0].args[start + 1] = first;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].args[start] = first; result.module.functions[0].args[start + 1] = second;
+    result.module.functions[0].args[start] = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].args[start] = @len(result.module.functions[0].locals) as u32 + 1; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].args[start] = first;
+    let ps: u32 = result.module.imports[0].param_start;
+    let saved: u32 = result.module.import_params[ps];
+    result.module.import_params[ps] = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.import_params[ps] = saved;
+    result.module.imports[0].param_start = @len(result.module.import_params) as u32; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imports[0].param_start = ps;
+    refs.refs.imports[0].types[refs.refs.imports[0].param_start].a = 0;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 不同长度或不同元素类型的数组不能交换作为导入调用实参。
+function imported_arrays(): void!AllocError {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    add_dependency(&deps:ReadWrite, "arrays", 0, "export function f(x: [u8; 2], y: [u8; 3], z: [u16; 2]): u32 { return x[0] as u32 + y[0] as u32 + z[0] as u32; }\n")?;
+    let unit: runner::Loaded = runner::load("import arrays; function f(x: [u8; 2], y: [u8; 3], z: [u16; 2]): u32 { return arrays::f(x, y, z); }\n", 1230)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "user", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    var result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0; while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 151 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let start: u32 = result.module.functions[0].insts[i].args_start;
+    let first: u32 = result.module.functions[0].args[start];
+    let second: u32 = result.module.functions[0].args[start + 1];
+    result.module.functions[0].args[start] = second; result.module.functions[0].args[start + 1] = first;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].args[start] = first; result.module.functions[0].args[start + 1] = second;
+    let third: u32 = result.module.functions[0].args[start + 2];
+    result.module.functions[0].args[start] = third; result.module.functions[0].args[start + 2] = first;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].args[start] = first; result.module.functions[0].args[start + 2] = third;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 同一导出编号在不同依赖中必须匹配各自的签名。
+function imported_identity(): void!AllocError {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    add_dependency(&deps:ReadWrite, "numbers", 0, "export function f(x: u32): u32 { return x; }\n")?;
+    add_dependency(&deps:ReadWrite, "flags", 0, "export function f(x: bool): u32 { if x { return 1; } return 0; }\n")?;
+    let unit: runner::Loaded = runner::load("import numbers; import flags; function f(x: u32, y: bool): u32 { return numbers::f(x) + flags::f(y); }\n", 1229)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "user", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    var result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && mir_verify::verify_module(&result.module:Read)?);
+    var first: u32 = 0; while first < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[first].op != 151 { first = first + 1; }
+    var second: u32 = first + 1; while second < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[second].op != 151 { second = second + 1; }
+    assert(second < @len(result.module.functions[0].insts) as u32);
+    assert(result.module.functions[0].insts[first].b == result.module.functions[0].insts[second].b);
+    let dep: u32 = result.module.functions[0].insts[first].c;
+    assert(dep != result.module.functions[0].insts[second].c);
+    result.module.functions[0].insts[first].c = result.module.functions[0].insts[second].c;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[first].c = dep;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+function imported_no_alloc(): void!AllocError {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    add_dependency(&deps:ReadWrite, "safe", 1, "export function f(): u32 { return 1; }\n")?;
+    add_dependency(&deps:ReadWrite, "risky", 0, "export function f(): u32 { return 1; }\n")?;
+    let unit: runner::Loaded = runner::load("import safe; import risky; function a(): u32 { let x: u32 = 1; return safe::f() + x; } function b(): u32 { return risky::f(); } function c(): u32 { return a(); } function d(): u32 { return b(); }\n", 1221)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "user", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(resolution.bridges.items) == 2);
+    var result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolution:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && @len(result.module.functions) == 4);
+    // 对真实接口生成的远程调用逐项变异，只验证模块实际持有的结构信息。
+    var call: u32 = 0;
+    while call < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[call].op != 151 { call = call + 1; }
+    assert(call < @len(result.module.functions[0].insts) as u32 && mir_verify::verify_module(&result.module:Read)?);
+    let original: mir::MirInst = result.module.functions[0].insts[call];
+    // 返回类型快照必须与调用结果一致，未知类型不得放行。
+    let saved_ret: u32 = result.module.imports[0].ret;
+    assert(saved_ret == original.value_type_id);
+    result.module.imports[0].ret = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    var other: u32 = 1;
+    while other <= @len(result.module.types.entries) as u32 && (other == saved_ret || result.module.types.entries[other - 1].kind != 1) { other = other + 1; }
+    assert(other <= @len(result.module.types.entries) as u32);
+    result.module.imports[0].ret = other; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.imports[0].ret = saved_ret; assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call].b = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call].b = 4294967295u32; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call].b = original.b;
+    result.module.functions[0].insts[call].c = 65535; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call].c = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call].c = 65536; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call] = original;
+    result.module.functions[0].insts[call].value = 1; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call] = original;
+    result.module.functions[0].insts[call].a = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call] = original;
+    result.module.functions[0].insts[call].args_count = 1; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[call] = original;
+    // 即使实参局部真实存在并支配调用，也不能绕过接口形参数量。
+    @push(result.module.functions[0].args, result.module.functions[0].insts[0].a)?;
+    result.module.functions[0].insts[call].args_start = @len(result.module.functions[0].args) as u32 - 1;
+    result.module.functions[0].insts[call].args_count = 1;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    // 人工扩展第一条签名时，下一条空签名也必须紧随形参池；恢复时清空临时池。
+    assert(@len(result.module.imports) == 2 && @len(result.module.import_params) == 0);
+    result.module.import_params = [result.module.functions[0].locals[result.module.functions[0].insts[0].a - 1].value_type_id];
+    result.module.imports[0].param_count = 1;
+    result.module.imports[1].param_start = 1;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.import_params = [];
+    result.module.imports[0].param_count = 0;
+    result.module.imports[1].param_start = 0;
+    result.module.functions[0].insts[call] = original; assert(mir_verify::verify_module(&result.module:Read)?);
+    resolution.refs.imports[0].param_count = 1; assert(mir_verify::verify_module(&result.module:Read)?);
+    resolution.refs.imports[0].param_count = 0;
+    assert(result.module.functions[0].no_alloc && !result.module.functions[1].no_alloc);
+    assert(result.module.functions[2].no_alloc && !result.module.functions[3].no_alloc);
+    // 分别覆盖前向链、指向已完成分量的边，以及返回后仍在 Tarjan 栈内的目标。
+    let graph: runner::Loaded = runner::load("import safe; import risky; function first(): u32 { return second(); } function second(): u32 { return third(); } function third(): u32 { return risky::f(); } function cycle_a(n: u32): u32 { if n == 0 { return first(); } return cycle_b(n - 1) + cycle_c(n - 1); } function cycle_b(n: u32): u32 { if n == 0 { return good_a(0); } return cycle_a(n - 1); } function cycle_c(n: u32): u32 { return cycle_b(n); } function good_a(n: u32): u32 { if n == 0 { return safe::f(); } return good_b(n - 1) + good_c(n - 1); } function good_b(n: u32): u32 { return good_a(n); } function good_c(n: u32): u32 { return good_b(n); } function last(): u32 { return cycle_a(0); }\n", 1225)?;
+    var graph_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var graph_refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&graph.parsed.file:Read, &graph.parsed.pool:Read, &graph.lexed.names:Read, &deps:Read, "user", &graph_diags:ReadWrite)?;
+    var graph_types: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&graph.parsed.file:Read, &graph.parsed.pool:Read, &graph_refs:Read, &graph_diags:ReadWrite)?;
+    let graph_mir: mir::MirResult = mir_lower::build_mir(&graph.parsed.file:Read, &graph.parsed.pool:Read, &graph_refs:Read, &graph_types:Read, &graph_diags:ReadWrite)?;
+    assert(graph_mir.accepted && !graph_diags.has_error && @len(graph_mir.module.functions) == 10);
+    assert(!graph_mir.module.functions[0].no_alloc && !graph_mir.module.functions[1].no_alloc && !graph_mir.module.functions[2].no_alloc);
+    assert(!graph_mir.module.functions[3].no_alloc && !graph_mir.module.functions[4].no_alloc && !graph_mir.module.functions[5].no_alloc);
+    assert(graph_mir.module.functions[6].no_alloc && graph_mir.module.functions[7].no_alloc && graph_mir.module.functions[8].no_alloc);
+    assert(!graph_mir.module.functions[9].no_alloc);
+    // 签名虽存在，越界 DefId 也不能进入私有调用索引。
+    let invalid: u32 = @len(graph_refs.result.tables.defs) as u32 + 1;
+    let last_item: u32 = @len(graph_refs.result.file.items) as u32 - 1;
+    graph_refs.result.file.items[last_item].def_id = invalid;
+    graph_types.funcs.items[graph_mir.module.functions[9].signature - 1].def = invalid;
+    let malformed: mir::MirResult = mir_lower::build_mir(&graph.parsed.file:Read, &graph.parsed.pool:Read, &graph_refs:Read, &graph_types:Read, &graph_diags:ReadWrite)?;
+    assert(!malformed.accepted && malformed.rejection.kind == 7 && malformed.rejection.span.offset == graph.parsed.file.items[last_item].span.offset);
+    // 不安全事实跨多层前向调用后必须拒绝显式无增契约。
+    let chain: runner::Loaded = runner::load("import risky; function #first(): u32 { return second(); } function second(): u32 { return third(); } function third(): u32 { return risky::f(); }\n", 1226)?;
+    var chain_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let chain_refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&chain.parsed.file:Read, &chain.parsed.pool:Read, &chain.lexed.names:Read, &deps:Read, "user", &chain_diags:ReadWrite)?;
+    let chain_types: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&chain.parsed.file:Read, &chain.parsed.pool:Read, &chain_refs:Read, &chain_diags:ReadWrite)?;
+    let chain_mir: mir::MirResult = mir_lower::build_mir(&chain.parsed.file:Read, &chain.parsed.pool:Read, &chain_refs:Read, &chain_types:Read, &chain_diags:ReadWrite)?;
+    assert(!chain_mir.accepted && chain_diags.has_error && chain_diags.diags[0].code.raw == 7020);
+    assert(@len(chain_diags.diags) == 1 && chain_diags.diags[0].span.file == 1226 && chain_diags.diags[0].span.offset == 132 && chain_diags.diags[0].span.length == 10);
+    assert(chain_mir.rejection.span.offset == chain_diags.diags[0].span.offset);
+    // 同一身份的冲突标志不能凭借首条记录放行。
+    let duplicate: resolve_refs::BridgeRecord = resolution.bridges.items[0];
+    @push(resolution.bridges.items, resolve_refs::BridgeRecord { import_def: duplicate.import_def, name: duplicate.name, dependency: duplicate.dependency, export_id: duplicate.export_id, kind: duplicate.kind, flags: 0 })?;
+    let conflict: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolution:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(conflict.accepted && !conflict.module.functions[0].no_alloc && !conflict.module.functions[2].no_alloc);
+    // 缺失桥接事实时不得将未知导入目标误认为安全。
+    resolution.bridges.items[0].dependency = 0;
+    resolution.bridges.items[@len(resolution.bridges.items) - 1].dependency = 0;
+    let unknown: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolution:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(unknown.accepted && !unknown.module.functions[0].no_alloc && !unknown.module.functions[2].no_alloc);
+    let declared: runner::Loaded = runner::load("import safe; function #checked(): u32 { return safe::f(); }\n", 1222)?;
+    var check_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let check_resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&declared.parsed.file:Read, &declared.parsed.pool:Read, &declared.lexed.names:Read, &deps:Read, "user", &check_diags:ReadWrite)?;
+    let check_tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&declared.parsed.file:Read, &declared.parsed.pool:Read, &check_resolution:Read, &check_diags:ReadWrite)?;
+    let checked: mir::MirResult = mir_lower::build_mir(&declared.parsed.file:Read, &declared.parsed.pool:Read, &check_resolution:Read, &check_tc:Read, &check_diags:ReadWrite)?;
+    assert(checked.accepted && !check_diags.has_error && checked.module.functions[0].no_alloc);
+    // 使用真实解析签名模拟链接键编号的规格上限。
+    var boundary: resolve_refs::Resolution = resolve_unit::resolve_unit(&declared.parsed.file:Read, &declared.parsed.pool:Read, &declared.lexed.names:Read, &deps:Read, "user", &check_diags:ReadWrite)?;
+    var bi: u32 = 0;
+    while bi < @len(boundary.refs.items) as u32 {
+        if boundary.refs.items[bi].kind == 2 {
+            boundary.refs.items[bi].x = 65535;
+            boundary.refs.items[bi].y = 4294967295u32;
+        }
+        bi = bi + 1;
+    }
+    boundary.refs.imports[0].dep = 65535;
+    boundary.refs.imports[0].export_id = 4294967295u32;
+    boundary.bridges.items[0].dependency = 65535;
+    boundary.bridges.items[0].export_id = 4294967295u32;
+    let boundary_ok: mir::MirResult = mir_lower::build_mir(&declared.parsed.file:Read, &declared.parsed.pool:Read, &boundary:Read, &check_tc:Read, &check_diags:ReadWrite)?;
+    assert(boundary_ok.accepted && !check_diags.has_error && boundary_ok.module.functions[0].no_alloc);
+    assert(mir_verify::verify_module(&boundary_ok.module:Read)?);
+    assert(boundary_ok.module.imports[0].dep == 65535 && boundary_ok.module.imports[0].export_id == 4294967295u32);
+    bi = 0;
+    while bi < @len(boundary.refs.items) as u32 { if boundary.refs.items[bi].kind == 2 { boundary.refs.items[bi].x = 65536; } bi = bi + 1; }
+    let boundary_bad: mir::MirResult = mir_lower::build_mir(&declared.parsed.file:Read, &declared.parsed.pool:Read, &boundary:Read, &check_tc:Read, &check_diags:ReadWrite)?;
+    assert(!boundary_bad.accepted && check_diags.has_error && check_diags.diags[0].code.raw == 9001);
+    assert(check_diags.diags[0].span.offset > 0 && check_diags.diags[0].span.length > 0);
+    let rejected: runner::Loaded = runner::load("import risky; function #checked(): u32 { return risky::f(); }\n", 1223)?;
+    var reject_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let reject_resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&rejected.parsed.file:Read, &rejected.parsed.pool:Read, &rejected.lexed.names:Read, &deps:Read, "user", &reject_diags:ReadWrite)?;
+    let reject_tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&rejected.parsed.file:Read, &rejected.parsed.pool:Read, &reject_resolution:Read, &reject_diags:ReadWrite)?;
+    let denied: mir::MirResult = mir_lower::build_mir(&rejected.parsed.file:Read, &rejected.parsed.pool:Read, &reject_resolution:Read, &reject_tc:Read, &reject_diags:ReadWrite)?;
+    assert(!denied.accepted && reject_diags.has_error && reject_diags.diags[0].code.raw == 7020);
+    assert(@len(reject_diags.diags) == 1 && reject_diags.diags[0].span.file == 1223 && reject_diags.diags[0].span.offset == 48 && reject_diags.diags[0].span.length == 10);
+    assert(denied.rejection.span.offset == reject_diags.diags[0].span.offset);
+    // 非无增导入经本地函数传播时，同样不能满足无增契约。
+    let transit: runner::Loaded = runner::load("import risky; function helper(): u32 { return risky::f(); } function #checked(): u32 { return helper(); }\n", 1224)?;
+    var transit_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let transit_resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&transit.parsed.file:Read, &transit.parsed.pool:Read, &transit.lexed.names:Read, &deps:Read, "user", &transit_diags:ReadWrite)?;
+    let transit_tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&transit.parsed.file:Read, &transit.parsed.pool:Read, &transit_resolution:Read, &transit_diags:ReadWrite)?;
+    let transit_result: mir::MirResult = mir_lower::build_mir(&transit.parsed.file:Read, &transit.parsed.pool:Read, &transit_resolution:Read, &transit_tc:Read, &transit_diags:ReadWrite)?;
+    assert(!transit_result.accepted && transit_diags.has_error && transit_diags.diags[0].code.raw == 7020);
+    assert(@len(transit_diags.diags) == 1 && transit_diags.diags[0].span.file == 1224 && transit_diags.diags[0].span.offset == 46 && transit_diags.diags[0].span.length == 10);
+    assert(transit_result.rejection.span.offset == transit_diags.diags[0].span.offset);
+    return;
+}
+function expect_no_alloc_cause(deps: &resolve_refs::DependencySet:Read, source: &[u8], offset: u32, length: u32): void!AllocError {
+    let unit: runner::Loaded = runner::load(source, 1230)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, deps, "user", &diags:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error);
+    let result: mir::MirResult = mir_lower::build_mir(&unit.parsed.file:Read, &unit.parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(!result.accepted && @len(diags.diags) == 1 && diags.diags[0].code.raw == 7020);
+    assert(diags.diags[0].span.file == 1230 && diags.diags[0].span.offset == offset && diags.diags[0].span.length == length);
+    return;
+}
+function no_alloc_cause_order(): void!AllocError {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    add_dependency(&deps:ReadWrite, "risky", 0, "export function f(): u32 { return 1; }\n")?;
+    add_dependency(&deps:ReadWrite, "other", 0, "export function f(x: u32): u32 { return x; } export function z(x: u32): u32 { return x; }\n")?;
+    // 分别钉住本地目标顺序、递归回边、导入身份、完整调用位置和块内顺序。
+    expect_no_alloc_cause(&deps:Read, "import risky; function earlier(): u32 { return risky::f(); } function later(): u32 { return risky::f(); } function #checked(): u32 { return later() + earlier(); }\n", 47, 10)?;
+    expect_no_alloc_cause(&deps:Read, "import risky; function helper(): u32 { return risky::f(); } function #checked(): u32 { return risky::f() + helper(); }\n", 46, 10)?;
+    expect_no_alloc_cause(&deps:Read, "import risky; function #checked(n: u32): u32 { return cycle(n); } function cycle(n: u32): u32 { if n == 0 { return checked(1); } return risky::f(); }\n", 136, 10)?;
+    expect_no_alloc_cause(&deps:Read, "import risky; import other; function #checked(): u32 { return other::f(7) + risky::f(); }\n", 76, 10)?;
+    expect_no_alloc_cause(&deps:Read, "import other; function #checked(): u32 { return other::f(7); }\n", 48, 11)?;
+    // if 的合流块编号较小，即使其中的调用写在分支之后。
+    expect_no_alloc_cause(&deps:Read, "import risky; function #checked(n: u32): u32 { if n == 0 { return risky::f(); } return risky::f(); }\n", 87, 10)?;
+    expect_no_alloc_cause(&deps:Read, "import other; function #checked(): u32 { return other::z(7) + other::f(8); }\n", 62, 11)?;
+    expect_no_alloc_cause(&deps:Read, "import risky; function identity(n: u32): u32 { return n; } function #checked(n: u32): u32 { return identity(n) + risky::f(); }\n", 113, 10)?;
+    // 双分支已终结，死合流块中的不安全导入不进入无增调用图。
+    let dead: runner::Loaded = runner::load("import risky; function #checked(n: u32): u32 { if n == 0 { return 1; } else { return 2; } return risky::f(); }\n", 1231)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&dead.parsed.file:Read, &dead.parsed.pool:Read, &dead.lexed.names:Read, &deps:Read, "user", &diags:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&dead.parsed.file:Read, &dead.parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let result: mir::MirResult = mir_lower::build_mir(&dead.parsed.file:Read, &dead.parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(result.accepted && !diags.has_error && result.module.functions[0].no_alloc);
+    return;
+}
+// 同时篡改借用指令和结果类型，仍不能把只读投影伪装成可写地址。
+function reference_projection_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("struct Cell { value: u64 } struct Box { cell: Cell } function read(src: &Box:Read): u64 { let view: &u64:Read = &src.cell.value:Read; return *view; }\n", 1285)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    var projections: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 128 {
+        if result.module.functions[0].insts[i].op == 82 { projections = projections + 1; }
+        i = i + 1;
+    }
+    assert(i < @len(result.module.functions[0].insts) as u32 && projections == 2);
+    let ty: u32 = result.module.functions[0].insts[i].value_type_id;
+    result.module.functions[0].insts[i].op = 129;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.types.entries[ty - 1].cap = 1;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].op = 128;
+    result.module.types.entries[ty - 1].cap = 0;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 保持操作数类型一致，只改变它的定义位置。
+function use_before_definition_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(a: u32, b: u32): u32 { let first: u32 = a + b; return first + b; }\n", 1289)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var first: u32 = 0;
+    while first < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[first].op != 16 { first = first + 1; }
+    var later: u32 = first + 1;
+    while later < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[later].op != 16 { later = later + 1; }
+    assert(later < @len(result.module.functions[0].insts) as u32);
+    let original: u32 = result.module.functions[0].insts[first].b;
+    result.module.functions[0].insts[first].b = result.module.functions[0].insts[later].a;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[first].b = original;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+// 分支内同类型的值不能用作汇合块的返回操作数。
+function non_dominating_branch_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(flag: bool, a: u32, b: u32): u32 { if flag { let first: u32 = a + b; @drop(first); } return a + b; }\n", 1290)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var block: u32 = 0;
+    var branch_value: u32 = 0;
+    var returning: u32 = 4294967295u32;
+    while block < @len(result.module.functions[0].blocks) as u32 {
+        let entry: mir::MirBlock = result.module.functions[0].blocks[block];
+        if entry.terminator.op == 194 { returning = block; }
+        else {
+            var j: u32 = 0;
+            while j < entry.inst_count {
+                let inst: mir::MirInst = result.module.functions[0].insts[entry.inst_start + j];
+                if inst.op == 16 { branch_value = inst.a; }
+                j = j + 1;
+            }
+        }
+        block = block + 1;
+    }
+    assert(branch_value != 0 && returning != 4294967295u32);
+    let original: u32 = result.module.functions[0].blocks[returning].terminator.a;
+    result.module.functions[0].blocks[returning].terminator.a = branch_value;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].blocks[returning].terminator.a = original;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    return;
+}
+function unreachable_block_validation(): void!AllocError {
+    var mir_result: mir::MirResult = runner::accepted("function f(): void { return; }\n", 1290)?;
+    let next: u32 = @len(mir_result.module.functions[0].blocks) as u32;
+    let inst_end: u32 = @len(mir_result.module.functions[0].insts) as u32;
+    let entry: u16 = mir_result.module.functions[0].entry;
+    let term: mir::MirTerminator = mir_result.module.functions[0].blocks[entry].terminator;
+    @push(mir_result.module.functions[0].blocks, mir::MirBlock { id: next as u16, inst_start: inst_end, inst_count: 0, terminator: term, payload: 0, entry_view_ends: 0 })?;
+    let checked: mir_verify::Validation = mir_verify::validate_module(&mir_result.module:Read)?;
+    // rejection_spec: E7034 spec/ir/mir.md#M-4
+    assert(!checked.ok && checked.code.raw == 7034);
+    return;
+}
+function dispatch_validation(): void!AllocError {
+    var enum_result: mir::MirResult = runner::accepted("enum Choice { Empty, Small(u32) } function f(c: Choice): u32 { match c { Empty => { return 0u32; }, Small(v) => { return v; } } }\n", 1291)?;
+    let entry: u16 = enum_result.module.functions[0].entry;
+    let saved: mir::MirTerminator = enum_result.module.functions[0].blocks[entry].terminator;
+    assert(saved.op == 177 && saved.c == 2);
+    enum_result.module.functions[0].blocks[entry].terminator.c = 1;
+    let missing: mir_verify::Validation = mir_verify::validate_module(&enum_result.module:Read)?;
+    // rejection_spec: E7035 spec/ir/mir.md#M-5
+    assert(!missing.ok && missing.code.raw == 7035);
+    enum_result.module.functions[0].blocks[entry].terminator = saved;
+    enum_result.module.functions[0].arms[saved.b + 1].variant = 0;
+    let duplicated: mir_verify::Validation = mir_verify::validate_module(&enum_result.module:Read)?;
+    assert(!duplicated.ok && duplicated.code.raw == 7035);
+    enum_result.module.functions[0].arms[saved.b].variant = 1;
+    let unordered: mir_verify::Validation = mir_verify::validate_module(&enum_result.module:Read)?;
+    assert(!unordered.ok && unordered.code.raw == 0);
+
+    var carrier_result: mir::MirResult = runner::accepted("enum Fault { Failed } function g(): u32!Fault { return 1u32; } function f(): u32!Fault { return g()?; }\n", 1292)?;
+    let count: u32 = @len(carrier_result.module.functions[1].blocks) as u32;
+    var i: u32 = 0;
+    while i < count && carrier_result.module.functions[1].blocks[i].terminator.op != 162 { i = i + 1; }
+    assert(i < count);
+    let err_arm: u32 = carrier_result.module.functions[1].blocks[i].terminator.c;
+    assert(carrier_result.module.functions[1].blocks[err_arm].payload != 0);
+    carrier_result.module.functions[1].blocks[err_arm].payload = 0;
+    let carrier: mir_verify::Validation = mir_verify::validate_module(&carrier_result.module:Read)?;
+    assert(!carrier.ok && carrier.code.raw == 7035);
+    return;
+}
+function out_slot_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var mir_result: mir::MirResult = runner::compile("function f(p: &u64:Write): void { *p = 1u64; }\n", 1293, &diags:ReadWrite)?;
+    assert(mir_result.accepted && !diags.has_error && @len(mir_result.module.functions[0].blocks) == 1);
+    let inst_end: u32 = @len(mir_result.module.functions[0].insts) as u32;
+    let write_slot: mir::MirInst = mir_result.module.functions[0].insts[inst_end - 1];
+    assert(write_slot.op == 209);
+    @push(mir_result.module.functions[0].insts, write_slot)?;
+    mir_result.module.functions[0].blocks[0].inst_count = inst_end + 1;
+    let checked: mir_verify::Validation = mir_verify::validate_module(&mir_result.module:Read)?;
+    // rejection_spec: E7036 spec/ir/mir.md#M-6
+    assert(!checked.ok && checked.code.raw == 7036);
+    return;
+}
+function consumed_place_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("function f(x: u32): u32 { let y: u32 = @move(x); return y; }\n", 1294)?;
+    let entry: u16 = result.module.functions[0].entry;
+    assert(result.module.functions[0].blocks[entry].terminator.op == 194);
+    result.module.functions[0].blocks[entry].terminator.a = result.module.functions[0].params[0];
+    let checked: mir_verify::Validation = mir_verify::validate_module(&result.module:Read)?;
+    // rejection_spec: E7031 spec/ir/mir.md#M-1
+    assert(!checked.ok && checked.code.raw == 7031);
+
+    var branch: mir::MirResult = runner::accepted("function f(p: bool, x: u32, y: u32): u32 { if p { @drop(x); } return y; }\n", 1295)?;
+    var i: u32 = 0;
+    while i < @len(branch.module.functions[0].blocks) as u32 && branch.module.functions[0].blocks[i].terminator.op != 194 { i = i + 1; }
+    assert(i < @len(branch.module.functions[0].blocks) as u32);
+    branch.module.functions[0].blocks[i].terminator.a = branch.module.functions[0].params[1];
+    let merged: mir_verify::Validation = mir_verify::validate_module(&branch.module:Read)?;
+    assert(!merged.ok && merged.code.raw == 7031);
+
+    var view_case: mir::MirResult = runner::accepted("function f(n: u32): u32 { var x: u32 = n; let view: &u32 = &x; let v: u32 = *view; @drop(x); return v; }\n", 1296)?;
+    let count: u32 = @len(view_case.module.functions[0].insts) as u32;
+    var read_at: u32 = count;
+    var drop_at: u32 = count;
+    i = 0;
+    while i < count {
+        let op: u8 = view_case.module.functions[0].insts[i].op;
+        if op == 80 { read_at = i; }
+        if op == 115 { drop_at = i; }
+        i = i + 1;
+    }
+    assert(read_at < drop_at && drop_at < count);
+    let drop_inst: mir::MirInst = view_case.module.functions[0].insts[drop_at];
+    i = drop_at;
+    while i > read_at {
+        view_case.module.functions[0].insts[i] = view_case.module.functions[0].insts[i - 1];
+        i = i - 1;
+    }
+    view_case.module.functions[0].insts[read_at] = drop_inst;
+    let via_view: mir_verify::Validation = mir_verify::validate_module(&view_case.module:Read)?;
+    assert(!via_view.ok && via_view.code.raw == 7031);
+
+    let reassigned: mir::MirResult = runner::accepted("function f(): u32 { var x: u32 = 1u32; @drop(x); x = 7u32; return x; }\n", 1296)?;
+    runner::expect0(&reassigned.module:Read, 0, 7)?;
+    return;
+}
+function owning_handoff_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var call: mir::MirResult = runner::compile("function use(arg: u32[]): void { @drop(arg); } function f(a: u32[], keep: u32[]): u64 { use(@move(a)); return @len(keep); }\n", 1297, &diags:ReadWrite)?;
+    assert(call.accepted && !diags.has_error);
+    var i: u32 = 0;
+    while i < @len(call.module.functions[1].insts) as u32 && call.module.functions[1].insts[i].op != 150 { i = i + 1; }
+    assert(i < @len(call.module.functions[1].insts) as u32);
+    let handoff: mir::MirInst = call.module.functions[1].insts[i];
+    assert(handoff.args_count == 1 && handoff.trap != 0);
+    let drop_index: u32 = call.module.functions[1].blocks[handoff.trap - 1].inst_start;
+    assert(call.module.functions[1].blocks[handoff.trap - 1].inst_count > 0 && call.module.functions[1].insts[drop_index].op == 115);
+    let saved: u32 = call.module.functions[1].insts[drop_index].b;
+    call.module.functions[1].insts[drop_index].b = call.module.functions[1].args[handoff.args_start];
+    let wrong_cleanup: mir_verify::Validation = mir_verify::validate_module(&call.module:Read)?;
+    assert(!wrong_cleanup.ok && wrong_cleanup.code.raw == 7031);
+    call.module.functions[1].insts[drop_index].b = saved;
+    assert(mir_verify::verify_module(&call.module:Read)?);
+
+    var aggregate: mir::MirResult = runner::compile("struct Wrap { items: u32[] } function pack(value: u32[]): void { let boxed: Wrap = Wrap { items: @move(value) }; @drop(boxed); }\n", 1298, &diags:ReadWrite)?;
+    assert(aggregate.accepted && !diags.has_error);
+    var element: u32 = 0;
+    i = 0;
+    while i < @len(aggregate.module.functions[0].insts) as u32 {
+        let ins: mir::MirInst = aggregate.module.functions[0].insts[i];
+        if ins.op == 96 {
+            assert(ins.args_count == 1);
+            element = aggregate.module.functions[0].args[ins.args_start];
+        }
+        if ins.op == 115 { break; }
+        i = i + 1;
+    }
+    assert(element != 0 && i < @len(aggregate.module.functions[0].insts) as u32);
+    aggregate.module.functions[0].insts[i].b = element;
+    let wrong_drop: mir_verify::Validation = mir_verify::validate_module(&aggregate.module:Read)?;
+    assert(!wrong_drop.ok && wrong_drop.code.raw == 7031);
+
+    let copy_case: mir::MirResult = runner::compile("struct Pair { a: u32, b: u32 } function peek(p: Pair): u32 { return p.a; } function f(p: Pair): u32 { let x: u32 = peek(p); return x + p.b; }\n", 1299, &diags:ReadWrite)?;
+    assert(copy_case.accepted && !diags.has_error);
+    return;
+}
+function exclusive_borrow_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var branched: mir::MirResult = runner::compile("function f(flag: bool): u32 { var x: u32 = 1u32; var other: u32 = 2u32; let r: &u32:ReadWrite = &x:ReadWrite; if flag { other = 3u32; } return @wrap_add(*r, other); }\n", 1300, &diags:ReadWrite)?;
+    assert(branched.accepted && !diags.has_error);
+    let count: u32 = @len(branched.module.functions[0].insts) as u32;
+    var i: u32 = 0;
+    while i < count && branched.module.functions[0].insts[i].op != 129 { i = i + 1; }
+    assert(i < count);
+    let borrowed: u32 = branched.module.functions[0].insts[i].b;
+    i = i + 1;
+    while i < count && branched.module.functions[0].insts[i].op != 81 { i = i + 1; }
+    assert(i < count && branched.module.functions[0].insts[i].b != borrowed);
+    branched.module.functions[0].insts[i].b = borrowed;
+    let checked: mir_verify::Validation = mir_verify::validate_module(&branched.module:Read)?;
+    // rejection_spec: E7032 spec/ir/mir.md#M-2
+    assert(!checked.ok && checked.code.raw == 7032);
+
+    var scoped: mir::MirResult = runner::compile("function f(): u32 { var x: u32 = 1u32; var other: u32 = 2u32; let r: &u32:ReadWrite = &x:ReadWrite; var saved: u32 = 0u32; if true { let child: &u32 = &*r; other = 3u32; saved = *child; } *r = 4u32; return @wrap_add(@wrap_add(saved, *r), other); }\n", 1301, &diags:ReadWrite)?;
+    assert(scoped.accepted && !diags.has_error);
+    let scoped_count: u32 = @len(scoped.module.functions[0].insts) as u32;
+    i = 0;
+    while i < scoped_count && scoped.module.functions[0].insts[i].op != 128 { i = i + 1; }
+    assert(i < scoped_count);
+    let parent: u32 = scoped.module.functions[0].insts[i].b;
+    i = i + 1;
+    while i < scoped_count && scoped.module.functions[0].insts[i].op != 81 { i = i + 1; }
+    assert(i < scoped_count && scoped.module.functions[0].insts[i].b != parent);
+    scoped.module.functions[0].insts[i].b = parent;
+    let overlapping: mir_verify::Validation = mir_verify::validate_module(&scoped.module:Read)?;
+    assert(!overlapping.ok && overlapping.code.raw == 7032);
+
+    var parameter: mir::MirResult = runner::compile("function f(r: &u32:ReadWrite): u32 { var other: u32 = 1u32; let child: &u32 = &*r; other = 3u32; return @wrap_add(*child, other); }\n", 1302, &diags:ReadWrite)?;
+    assert(parameter.accepted && !diags.has_error);
+    let limit: u32 = @len(parameter.module.functions[0].insts) as u32;
+    i = 0;
+    while i < limit && parameter.module.functions[0].insts[i].op != 128 { i = i + 1; }
+    assert(i < limit);
+    i = i + 1;
+    while i < limit && parameter.module.functions[0].insts[i].op != 81 { i = i + 1; }
+    assert(i < limit);
+    parameter.module.functions[0].insts[i].b = parameter.module.functions[0].params[0];
+    let parameter_overlap: mir_verify::Validation = mir_verify::validate_module(&parameter.module:Read)?;
+    assert(!parameter_overlap.ok && parameter_overlap.code.raw == 7032);
+    return;
+}
+// 以标志常量定位两个同型的真实 store，仅改待测写入的目的槽。
+function redirect_borrow_write(func: &mir::MirFunction:ReadWrite, root_value: u64): void {
+    var root: u32 = 0;
+    var conflict: u32 = 0;
+    var host: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(func.insts) as u32 {
+        let ins: mir::MirInst = func.insts[i];
+        if ins.op == 1 && ins.value == root_value { root = ins.a; }
+        if ins.op == 1 && ins.value == 31 { conflict = ins.a; }
+        if ins.op == 81 && root != 0 && ins.c == root { host = ins.b; }
+        if ins.op == 81 && conflict != 0 && ins.c == conflict {
+            assert(host != 0 && ins.b != host);
+            func.insts[i].b = host;
+            return;
+        }
+        i = i + 1;
+    }
+    assert(false);
+    return;
+}
+
+function mutable_view_join_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var joined: mir::MirResult = runner::compile("function f(flag: bool): u32 { var x: u32 = 1; var y: u32 = 2; var z: u32 = 3; var r: &u32:ReadWrite = &y:ReadWrite; if flag { r = &x:ReadWrite; } z = 31u32; return @wrap_add(*r, z); }\n", 1305, &diags:ReadWrite)?;
+    assert(joined.accepted && !diags.has_error);
+    redirect_borrow_write(&joined.module.functions[0]:ReadWrite, 1);
+    let overlap: mir_verify::Validation = mir_verify::validate_module(&joined.module:Read)?;
+    assert(!overlap.ok && overlap.code.raw == 7032);
+
+    // 合流后复制视图并经两个绑定读取时，两条来路都允许访问其所选位置。
+    let rebound: mir::MirResult = runner::compile("function f(flag: bool): u32 { var x: u32 = 1; var y: u32 = 2; var r: &u32:ReadWrite = &x:ReadWrite; let alt: &u32:ReadWrite = &y:ReadWrite; if flag { r = @copy(alt); } let copied: &u32:ReadWrite = @copy(r); return @wrap_add(*copied, *r); }\n", 1306, &diags:ReadWrite)?;
+    assert(rebound.accepted && !diags.has_error);
+
+    // 重新写槽不会结束先前已经复制到另一 SSA 绑定的视图。
+    var copied: mir::MirResult = runner::compile("function f(flag: bool): u32 { var x: u32 = 1; var y: u32 = 2; var z: u32 = 3; var r: &u32:ReadWrite = &x:ReadWrite; let alias: &u32:ReadWrite = @copy(r); if flag { r = &y:ReadWrite; z = 31u32; } return @wrap_add(*alias, @wrap_add(*r, z)); }\n", 1307, &diags:ReadWrite)?;
+    assert(copied.accepted && !diags.has_error);
+    redirect_borrow_write(&copied.module.functions[0]:ReadWrite, 1);
+    let still_borrowed: mir_verify::Validation = mir_verify::validate_module(&copied.module:Read)?;
+    assert(!still_borrowed.ok && still_borrowed.code.raw == 7032);
+
+    var looped: mir::MirResult = runner::compile("function f(flag: bool): u32 { var x: u32 = 1; var y: u32 = 2; var z: u32 = 3; var r: &u32:ReadWrite = &x:ReadWrite; var test: bool = flag; while test { r = &y:ReadWrite; test = false; } z = 31u32; return @wrap_add(*r, z); }\n", 1308, &diags:ReadWrite)?;
+    assert(looped.accepted && !diags.has_error);
+    redirect_borrow_write(&looped.module.functions[0]:ReadWrite, 2);
+    let back_edge: mir_verify::Validation = mir_verify::validate_module(&looped.module:Read)?;
+    assert(!back_edge.ok && back_edge.code.raw == 7032);
+    return;
+}
+
+function redirect_expression_read(func: &mir::MirFunction:ReadWrite): void {
+    var borrowed: u32 = 0;
+    var tagged: u32 = 0;
+    var other: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(func.insts) as u32 {
+        let ins: mir::MirInst = func.insts[i];
+        if ins.op == 129 { borrowed = ins.b; }
+        if ins.op == 1 && ins.value == 31 { tagged = ins.a; }
+        if ins.op == 81 && tagged != 0 && ins.c == tagged { other = ins.b; }
+        if ins.op == 80 && other != 0 && ins.b == other {
+            assert(borrowed != 0 && other != borrowed);
+            func.insts[i].b = borrowed;
+            return;
+        }
+        i = i + 1;
+    }
+    assert(false);
+    return;
+}
+
+function lexical_view_end_validation(): void!AllocError {
+    var inside: mir::MirResult = runner::accepted("function f(flag: bool): u32 { var x: u32 = 1; var other: u32 = 2; var saved: u32 = 0; if flag { let r: &u32:ReadWrite = &x:ReadWrite; saved = *r; other = 31u32; } return saved; }\n", 1309)?;
+    redirect_borrow_write(&inside.module.functions[0]:ReadWrite, 1);
+    let bound: mir_verify::Validation = mir_verify::validate_module(&inside.module:Read)?;
+    assert(!bound.ok && bound.code.raw == 7032);
+
+    var outside: mir::MirResult = runner::accepted("function f(flag: bool): u32 { var x: u32 = 1; var other: u32 = 2; var saved: u32 = 0; if flag { let r: &u32:ReadWrite = &x:ReadWrite; saved = *r; } other = 31u32; return saved; }\n", 1310)?;
+    redirect_borrow_write(&outside.module.functions[0]:ReadWrite, 1);
+    assert(mir_verify::verify_module(&outside.module:Read)?);
+
+    var same: mir::MirResult = runner::accepted("function f(): u32 { var x: u32 = 1; var other: u32 = 31; return @wrap_add(*(&x:ReadWrite), other); }\n", 1311)?;
+    redirect_expression_read(&same.module.functions[0]:ReadWrite);
+    let temporary: mir_verify::Validation = mir_verify::validate_module(&same.module:Read)?;
+    assert(!temporary.ok && temporary.code.raw == 7032);
+
+    var next: mir::MirResult = runner::accepted("function f(): u32 { var x: u32 = 1; var other: u32 = 31; let saved: u32 = *(&x:ReadWrite); return @wrap_add(saved, other); }\n", 1312)?;
+    redirect_expression_read(&next.module.functions[0]:ReadWrite);
+    assert(mir_verify::verify_module(&next.module:Read)?);
+
+    // 可变绑定重绑后，旧视图的区域仍以绑定块为限；控制流离块才结束借用。
+    var reassigned: mir::MirResult = runner::accepted("function f(flag: bool): u32 { var x: u32 = 1; var y: u32 = 2; var other: u32 = 3; var saved: u32 = 0; if flag { var r: &u32:ReadWrite = &x:ReadWrite; r = &y:ReadWrite; other = 31u32; saved = *r; } return saved; }\n", 1313)?;
+    redirect_borrow_write(&reassigned.module.functions[0]:ReadWrite, 1);
+    let retained: mir_verify::Validation = mir_verify::validate_module(&reassigned.module:Read)?;
+    assert(!retained.ok && retained.code.raw == 7032);
+
+    var looped: mir::MirResult = runner::accepted("function f(flag: bool): u32 { var x: u32 = 1; var other: u32 = 2; var test: bool = flag; while test { if flag { let r: &u32:ReadWrite = &x:ReadWrite; other = *r; other = 31u32; break; } test = false; } return other; }\n", 1314)?;
+    redirect_borrow_write(&looped.module.functions[0]:ReadWrite, 1);
+    let jumped: mir_verify::Validation = mir_verify::validate_module(&looped.module:Read)?;
+    assert(!jumped.ok && jumped.code.raw == 7032);
+
+    // 在循环条件的短路右支产生的临时重借用不能沿回边进入下一次迭代。
+    let short_condition: mir::MirResult = runner::accepted("function allowed(r: &u32): bool { return *r == 1u32; } function f(r: &u32:ReadWrite, count: u32): void { var i: u32 = count; while i != 0u32 && allowed(&*r) { *r = 2u32; i = 0u32; } }\n", 1315)?;
+    assert(short_condition.accepted);
+    return;
+}
+
+function pending_name_validation(): void!AllocError {
+    let loaded: runner::Loaded = runner::load("function f(x: u32): u32 { return x; }\n", 1303)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    let good: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(good.accepted && !diags.has_error && refs.refs.pending_names == 0);
+    var at: u32 = 0;
+    while at < @len(refs.refs.items) as u32 {
+        let candidate: resolve_refs::ResolvedRef = refs.refs.items[at];
+        if candidate.kind == 0 && candidate.node_kind == 0 { break; }
+        at = at + 1;
+    }
+    assert(at < @len(refs.refs.items) as u32);
+    let expected_offset: u32 = refs.refs.items[at].span.offset;
+    let local_def: u32 = refs.refs.items[at].x;
+    refs.refs.items[at].x = refs.result.tables.defs[local_def - 1].name;
+    refs.refs.items[at].kind = resolve_refs::pending_value_name();
+    let rejected: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    // rejection_spec: E7018 spec/lang/symbol.md#S-18
+    assert(!rejected.accepted && @len(rejected.module.functions) == 0 && diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == 7018);
+    assert(diags.diags[0].span.offset == expected_offset);
+    return;
+}
+function lowered_field_ids(): void!AllocError {
+    var loaded: runner::Loaded = runner::load("struct Pair { first: u32, second: u32 } function f(): u32 { let p: Pair = Pair { second: 9u32, first: 4u32 }; return p.second; }\n", 1304)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    var tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(tc.expr_types.members) == 1 && @len(tc.expr_types.ctors) == 1);
+    assert(tc.expr_types.members[0] == 2 && tc.expr_types.ctors[0].fields[0] == 2 && tc.expr_types.ctors[0].fields[1] == 1);
+    loaded.parsed.pool.members[0].name = 0;
+    loaded.parsed.pool.ctors[0].fields[0].name = 0;
+    loaded.parsed.pool.ctors[0].fields[1].name = 0;
+    let emitted: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(emitted.accepted && !diags.has_error);
+    runner::expect0(&emitted.module:Read, 0, 9)?;
+    tc.expr_types.members[0] = 0;
+    let missing_projection: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(!missing_projection.accepted && @len(missing_projection.module.functions) == 0 && diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == 7018);
+    tc.expr_types.members[0] = 2;
+    tc.expr_types.ctors[0].fields[1] = 2;
+    diags = diag::diagbuf_new();
+    let duplicate_field: mir::MirResult = mir_lower::build_mir(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &refs:Read, &tc:Read, &diags:ReadWrite)?;
+    assert(!duplicate_field.accepted && @len(duplicate_field.module.functions) == 0 && diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == 7018);
+    return;
+}
+function field_identifier_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("struct Pair { first: u32, second: u32 } function f(p: Pair): u32 { return p.second; }\n", 1294)?;
+    assert(@len(result.module.fields.items) == 2);
+    assert(result.module.fields.items[0].name == 0 && result.module.fields.items[1].name == 0);
+    result.module.fields.items[1].name = 3;
+    let checked: mir_verify::Validation = mir_verify::validate_module(&result.module:Read)?;
+    // rejection_spec: E7033 spec/ir/mir.md#M-3
+    assert(!checked.ok && checked.code.raw == 7033);
+    return;
+}
+function main(): void {
+    consumed_place_validation()?;
+    owning_handoff_validation()?;
+    exclusive_borrow_validation()?;
+    mutable_view_join_validation()?;
+    lexical_view_end_validation()?;
+    pending_name_validation()?;
+    lowered_field_ids()?;
+    field_identifier_validation()?;
+    unreachable_block_validation()?; dispatch_validation()?; out_slot_validation()?;
+    reference_projection_validation()?;
+    use_before_definition_validation()?;
+    non_dominating_branch_validation()?;
+    imported_params()?; imported_arrays()?; imported_identity()?; imported_no_alloc()?; no_alloc_cause_order()?;
+    scalar_arithmetic()?; arithmetic_type_validation()?; scalar_casts()?; cast_validation()?; char_constant_validation()?; bool_comparison_validation()?; slice_comparison_validation()?; array_comparison_validation()?; struct_comparison_validation()?; reference_comparison_validation()?; scalar_comparisons()?;
+    scalar_branches()?; scalar_loops()?; scalar_short_circuit()?;
+    scalar_calls()?; scalar_recursion()?; scalar_wrap()?;
+    missing_signature()?; rejection_cases()?; void_type_cache()?; binding_decl_identity()?;
+    return;
+}

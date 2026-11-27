@@ -1,0 +1,4 @@
+// expected_trap: private member
+// module: helper=fixtures/helper.yak
+import helper;
+function main(): void { helper::secret(); }

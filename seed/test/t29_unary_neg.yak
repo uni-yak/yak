@@ -1,0 +1,12 @@
+// t29: 零值与一元负 + assert
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let zero: u32 = 0;
+    let neg: i32 = -1;
+    let pos: i32 = -neg;
+    assert(zero == 0);
+    assert(neg == -1);
+    assert(pos == 1);
+    return;
+}

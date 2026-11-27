@@ -1,0 +1,21 @@
+foreign assert(cond: bool): void;
+struct Leaf { value: u32, data: u32[] }
+struct Item { leaf: Leaf, len: u32 }
+function read(data: &u32[]): u32 { return (*data)[0u32]; }
+function sum(left: &u32, right: &u32): u32 { return *left + *right; }
+function bump(value: &u32:ReadWrite): void { *value = *value + 1u32; }
+function main(): void {
+    var items: Item[] = [Item { leaf: Leaf { value: 4u32, data: [9u32] }, len: 6u32 }];
+    let indirect: &function(&u32[]): u32 = &read;
+    assert(indirect(items[0u32].leaf.data) == 9u32);
+    assert(sum(items[0u32].leaf.value, items[0u32].len) == 10u32);
+    bump(items[0u32].len);
+    bump(items[0u32].leaf.data[0u32]);
+    assert(sum(items[0u32].leaf.data[0u32], items[0u32].len) == 17u32);
+    var fixed: [u32; 1] = [10u32];
+    bump(fixed[0u32]);
+    assert(fixed[0u32] == 11u32);
+    let view: &[Item]:ReadWrite = &items[0u32..1u32]:ReadWrite;
+    bump(view[0u32].leaf.value);
+    assert(sum(view[0u32].leaf.value, view[0u32].len) == 12u32);
+}

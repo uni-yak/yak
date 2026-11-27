@@ -1,0 +1,42 @@
+.yak-code {
+    --yak-text: #24292f;
+    --yak-background: #f6f8fa;
+    --yak-comment: #57606a;
+    --yak-keyword: #8c2355;
+    --yak-type: #075c63;
+    --yak-function: #5e3291;
+    --yak-string: #116329;
+    --yak-number: #0349a2;
+    --yak-mark: #824c00;
+    --yak-invalid: #a01220;
+    color: var(--yak-text);
+    background-color: var(--yak-background);
+}
+
+@media (prefers-color-scheme: dark) {
+    .yak-code {
+        --yak-text: #dbe2eb;
+        --yak-background: #161b22;
+        --yak-comment: #a1aab6;
+        --yak-keyword: #ff9db7;
+        --yak-type: #7ce1e6;
+        --yak-function: #d4b1ff;
+        --yak-string: #8cdb9a;
+        --yak-number: #8ac1ff;
+        --yak-mark: #ffd38c;
+        --yak-invalid: #ff9a96;
+    }
+}
+
+.yak-code .yak-comment { color: var(--yak-comment); }
+.yak-code :is(.yak-keyword, .yak-reserved) { color: var(--yak-keyword); }
+.yak-code .yak-reserved { font-style: italic; }
+.yak-code :is(.yak-type, .yak-capability, .yak-namespace) { color: var(--yak-type); }
+.yak-code :is(.yak-function, .yak-primitive) { color: var(--yak-function); }
+.yak-code .yak-string { color: var(--yak-string); }
+.yak-code :is(.yak-literal, .yak-number) { color: var(--yak-number); }
+.yak-code :is(.yak-annotation, .yak-escape, .yak-interpolation, .yak-operator) { color: var(--yak-mark); }
+.yak-code .yak-invalid {
+    color: var(--yak-invalid);
+    text-decoration: underline wavy;
+}

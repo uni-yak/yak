@@ -1,0 +1,9 @@
+// expected_code: E4001
+// expected_diagnostics: E4009 E4001 E4009
+// spec: spec/lang/name.md N-1
+// 触发：同一作用域内重复声明同名绑定。
+function main(): void {
+    let x: u32 = 1u32;
+    let x: u32 = 2u32;
+    return;
+}

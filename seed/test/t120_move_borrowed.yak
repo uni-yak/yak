@@ -1,0 +1,2 @@
+// expected_trap: active Read borrows
+function main(): void { let a: u8[] = [1]; let r: &u8[] = &a; let b: u8[] = @move(a); }

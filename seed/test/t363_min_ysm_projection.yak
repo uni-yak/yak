@@ -1,0 +1,117 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: ysm=../../compiler/min/src/ysm/ysm.yak
+// module: ysm_validate=../../compiler/min/src/ysm/ysm_validate.yak
+// module: ysm_write=../../compiler/min/src/ysm/ysm_write.yak
+// module: ysm_write_sig=../../compiler/min/src/ysm/ysm_write_sig.yak
+// module: runner=mir_runner.yak
+import diag;
+import iface;
+import mir;
+import ysm;
+import ysm_write;
+import runner;
+foreign assert(cond: bool): void;
+
+// 两级取址均保留访问能力，向内的写入还需回传到外层投影。
+function check(): void!AllocError {
+    let result: mir::MirResult = runner::accepted("const C: [[u32; 2]; 2] = [[1u32, 2u32], [3u32, 4u32]]; function read(): u32 { let a: [[u32; 2]; 2] = C; return a[0u64][1u64]; } function set(): void { var a: [[u32; 2]; 2] = C; a[0u64][1u64] = 7u32; return; }\n", 1286)?;
+    let facts: ysm::YsmFacts = ysm::YsmFacts { target_profile: 7, statics: [], dependencies: [], candidate_digests: [], exports: iface::ExportMap { defs: [], exports: [] } };
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    let data: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &diagnostics:ReadWrite)?;
+    assert(data.accepted && diagnostics.count == 0);
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&data.data[0..@len(data.data) as u32]:Read, &diagnostics:ReadWrite)?;
+    assert(loaded.accepted && diagnostics.count == 0);
+    var function_id: u32 = 0;
+    while function_id < 2 {
+        let f: &mir::MirFunction:Read = &result.module.functions[function_id]:Read;
+        let start: u32 = loaded.file.functions[function_id].local_start;
+        var i: u32 = 0;
+        var seen: u32 = 0;
+        while i < @len(f.insts) as u32 {
+            let inst: mir::MirInst = f.insts[i];
+            if inst.op == 83 {
+                let sig: u32 = loaded.file.locals[start + inst.a - 1].type_sig_off;
+                assert(loaded.file.type_sigs[sig] == 7);
+                assert(loaded.file.type_sigs[sig + 1] == function_id as u8);
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        assert(seen == 2);
+        function_id = function_id + 1;
+    }
+    return;
+}
+// 两个函数共享同一字段布局；篡改第二个偏移不能绕过缓存校验。
+function check_field(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("struct Pair { tag: u8, value: u32 } function first(p: Pair): u32 { return p.value; } function second(p: Pair): u32 { return p.value; }\n", 1287)?;
+    var defs: u32[] = [];
+    var exports: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(result.module.types.entries) as u32 {
+        if result.module.types.entries[i].kind == 2 {
+            @push(defs, result.module.types.entries[i].def)?;
+            @push(exports, 1)?;
+        }
+        i = i + 1;
+    }
+    assert(@len(defs) == 1);
+    let facts: ysm::YsmFacts = ysm::YsmFacts { target_profile: 7, statics: [], dependencies: [], candidate_digests: [], exports: iface::ExportMap { defs: @move(defs), exports: @move(exports) } };
+    var ok: diag::DiagBuffer = diag::diagbuf_new();
+    let written: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &ok:ReadWrite)?;
+    assert(written.accepted && ok.count == 0);
+    i = 0;
+    while i < @len(result.module.functions[1].insts) as u32 && result.module.functions[1].insts[i].op != 82 { i = i + 1; }
+    assert(i < @len(result.module.functions[1].insts) as u32);
+    assert(result.module.functions[1].insts[i].c == 4);
+    result.module.functions[1].insts[i].c = 1;
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &bad:ReadWrite)?;
+    assert(!rejected.accepted && rejected.code.raw == 7026 && @len(rejected.data) == 0 && bad.count == 1);
+    return;
+}
+function main(): void { check()?; check_field()?; }

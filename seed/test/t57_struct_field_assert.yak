@@ -1,0 +1,14 @@
+// t57: 结构体字段值assert（真实assert）
+foreign assert(cond: bool): void;
+
+struct Point {
+    x: u32,
+    y: u32,
+}
+
+function main(): void {
+    let p: Point = Point { x: 42, y: 99 };
+    assert(p.x == 42);
+    assert(p.y == 99);
+    return;
+}

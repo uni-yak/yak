@@ -1,0 +1,2 @@
+// expected_trap: unary minus requires integer
+function main(): void { let value: i64 = -true; }

@@ -1,0 +1,4 @@
+// t22: 空函数体
+function main(): void {
+    return;
+}

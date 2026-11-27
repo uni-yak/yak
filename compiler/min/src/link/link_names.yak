@@ -1,0 +1,168 @@
+// 链接符号与 LinkTable 构造：把 MirModule 的函数与已认证的 foreign 服务映射成 COFF 符号。
+// 依据：spec/target/abi-win.md 5.1、spec/lang/foreign.md 3.1/3.2/3.4、spec/target/pe.md 3.3。
+// 本层构造普通导出名与固定入口别名，非导出函数使用本对象的静态符号。
+import types;
+import iface;
+import mir;
+import coff_symbols;
+import coff_state;
+import resolve_refs;
+
+// 未登记或被目标运行时排除的 external 服务调用（E80-01）。
+const EM_UNKNOWN_SERVICE: u16 = 8001;
+const IMPORT_ID_WIDTH: u16 = 7009;
+const IMPORT_IDENTITY: u16 = 7006;
+
+export struct LinkBuild { ok: bool, table: coff_state::LinkTable, code: types::ErrorCode }
+
+function copy_text(text: &[u8]): u8[]!AllocError {
+    var result: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(text) as u32 { @push(result, text[i])?; i = i + 1; }
+    return result;
+}
+// `yak$<module>$<marker><编号>`：marker 为 f（导出函数）或 l（本对象内部函数）。
+// 导出符号首次构造时才会执行本路径；字节统一追加到本地数组，与 copy_text 保持同一写入形态。
+function decorated(module_name: &[u8], marker: u8, id: u32): u8[]!AllocError {
+    var name: u8[] = copy_text("yak$")?;
+    var i: u32 = 0;
+    while i < @len(module_name) as u32 { @push(name, module_name[i])?; i = i + 1; }
+    @push(name, 36)?;
+    @push(name, marker)?;
+    var digits: u8[] = [];
+    var rest: u32 = id;
+    if rest == 0 { @push(name, 48)?; }
+    if rest > 0 {
+        while rest > 0 { @push(digits, (48 + rest % 10) as u8)?; rest = rest / 10; }
+        var j: u32 = @len(digits) as u32;
+        while j > 0 { j = j - 1; @push(name, digits[j])?; }
+    }
+    return name;
+}
+// 标准 foreign 服务到运行时导出符号的固定映射（foreign.md 3.1、3.4、6.2）。
+function service_symbol(kind: u8, checked: bool, sysv: bool): u8[]!AllocError {
+    if checked && sysv {
+        if kind == 2 { return copy_text("yak_rt_checked_assert")?; }
+        if kind == 3 { return copy_text("yak_rt_checked_read")?; }
+        if kind == 4 { return copy_text("yak_rt_checked_write")?; }
+    }
+    if checked {
+        if kind == 2 { return copy_text("yak_rt_try_assert")?; }
+        if kind == 3 { return copy_text("yak_rt_try_read")?; }
+        if kind == 4 { return copy_text("yak_rt_try_write")?; }
+    }
+    if kind == 1 { return copy_text("yak_rt_exit")?; }
+    if kind == 2 { return copy_text("yak_rt_assert")?; }
+    if kind == 3 { return copy_text("yak_rt_read")?; }
+    if kind == 4 { return copy_text("yak_rt_write")?; }
+    return [];
+}
+function service_known(kind: u8): bool {
+    return kind == 1 || kind == 2 || kind == 3 || kind == 4;
+}
+// 只有被调用指令实际引用的服务才需要外部符号；
+// 声明但未调用的 foreign 不产出未定义符号，避免链接器为死声明报错。
+function foreign_op(module: &mir::MirModule:Read, def: u32): u8 {
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &module.functions[i]:Read;
+        var k: u32 = 0;
+        while k < @len(f.insts) as u32 {
+            let op: u8 = f.insts[k].op;
+            if mir::is_foreign_call(op) && f.insts[k].b == def { return op; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 构造 LinkTable。root_entry_def 为根模块 main 的 DefId（0 表示本单元不提供入口别名）。
+// 导出函数按 ExportId 命名；非导出函数使用 STATIC 内部名，不进入对外 ABI。
+// deps 按 DependencyId-1 索引，携带本次编译加载的直接依赖模块名。
+export function build(module: &mir::MirModule:Read, exports: &iface::ExportMap:Read, module_name: &[u8], root_entry_def: u32, services: &[resolve_refs::ForeignService]:Read, deps: &[resolve_refs::Iface]:Read): LinkBuild!AllocError {
+    return build_target(module, exports, module_name, root_entry_def, services, deps, false)?;
+}
+
+export function build_target(module: &mir::MirModule:Read, exports: &iface::ExportMap:Read, module_name: &[u8], root_entry_def: u32, services: &[resolve_refs::ForeignService]:Read, deps: &[resolve_refs::Iface]:Read, sysv: bool): LinkBuild!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    let bad_name: u16 = coff_symbols::decorated_name_error(sysv);
+    if !iface::valid_module_name(module_name) {
+        return LinkBuild { ok: false, table: coff_state::LinkTable { symbols: [] }, code: types::error_code(bad_name) };
+    }
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        let def: u32 = module.functions[i].def;
+        var kind: u8 = 0;
+        var name: u8[] = [];
+        if def == root_entry_def {
+            // 根模块 main 的唯一外部别名（abi-win.md 5.1）。
+            name = copy_text("yak$entry")?;
+            kind = 3;
+        } else {
+            let export_id: u32 = iface::export_id_of(exports, def);
+            if export_id != 0 {
+                name = decorated(module_name, 102u8, export_id)?;
+                kind = 3;
+            } else {
+                // 规格只冻结对外可见的修饰名；内部函数以 STATIC 符号存在，名称仅需确定性。
+                name = decorated(module_name, 108u8, def)?;
+                kind = 0;
+            }
+        }
+        @push(table.symbols, coff_state::LinkSymbol { def: def as u64, kind: kind, name: name })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(services) as u32 {
+        let def: u32 = services[i].def;
+        let op: u8 = foreign_op(module, def);
+        if op != 0 {
+            if !service_known(services[i].kind) {
+                return LinkBuild { ok: false, table: coff_state::LinkTable { symbols: [] }, code: types::error_code(EM_UNKNOWN_SERVICE) };
+            }
+            let service_name: u8[] = service_symbol(services[i].kind, op == 149, sysv)?;
+            @push(table.symbols, coff_state::LinkSymbol { def: def as u64, kind: 1, name: service_name })?;
+        }
+        i = i + 1;
+    }
+    // 跨单元调用与函数取址把 ImportRef 降级为 COFF 外部符号：合成键与发射端共用同一纯函数，
+    // 修饰名由依赖模块名与 ExportId 冻结生成，kind1 使 build_symbols 走未定义外部符号路径。
+    // 合成键的高位非零，不会和前面登记的本地或外部服务 DefId 重叠。
+    var imported_keys: coff_symbols::SymbolKeys = coff_symbols::symbol_keys_new();
+    i = 0;
+    while i < @len(module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &module.functions[i]:Read;
+        var k: u32 = 0;
+        while k < @len(f.insts) as u32 {
+            let ins: mir::MirInst = f.insts[k];
+            if mir::is_far_call(ins.op) || (ins.op == 5 && ins.c != 0) {
+                let dep: u32 = ins.c;
+                let export_id: u32 = ins.b;
+                if dep > 65535 {
+                    return LinkBuild { ok: false, table: coff_state::LinkTable { symbols: [] }, code: types::error_code(IMPORT_ID_WIDTH) };
+                }
+                if dep > @len(deps) as u32 {
+                    return LinkBuild { ok: false, table: coff_state::LinkTable { symbols: [] }, code: types::error_code(coff_symbols::e_em1()) };
+                }
+                let synthetic: u64 = coff_state::import_symbol_def(dep, export_id);
+                if synthetic == 0 || resolve_refs::iface_export_kind(&deps[dep - 1]:Read, export_id) != 1 {
+                    return LinkBuild { ok: false, table: coff_state::LinkTable { symbols: [] }, code: types::error_code(IMPORT_IDENTITY) };
+                }
+                let dep_name: &[u8] = &deps[dep - 1].module[0..@len(deps[dep - 1].module)]:Read;
+                if !iface::valid_module_name(dep_name) {
+                    return LinkBuild { ok: false, table: coff_state::LinkTable { symbols: [] }, code: types::error_code(bad_name) };
+                }
+                if coff_symbols::symbol_key_add(&imported_keys:ReadWrite, synthetic)? {
+                    let external_name: u8[] = decorated(dep_name, 102u8, export_id)?;
+                    @push(table.symbols, coff_state::LinkSymbol { def: synthetic, kind: 1, name: external_name })?;
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    let bad: u16 = coff_symbols::validate_target_links(&table:Read, sysv)?;
+    if bad != 0 { return LinkBuild { ok: false, table: table, code: types::error_code(bad) }; }
+    return LinkBuild { ok: true, table: table, code: types::error_code(0) };
+}

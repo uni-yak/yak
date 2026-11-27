@@ -1,0 +1,4 @@
+// 多单元链接的依赖单元：导出函数经 .iface 供根单元按 ImportRef 调用。
+export function add1(x: u32): u32 {
+    return x + 1u32;
+}

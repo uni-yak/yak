@@ -1,0 +1,24 @@
+// expected_exit: 0
+// spec: spec/lang/name.md 5.2、5.5
+// 更深的块允许遮蔽；离块后恢复载荷绑定，不同臂可独立使用同名。
+foreign assert(cond: bool): void;
+
+enum E { Left(u32), Right(u32) }
+
+function check(e: E, want: u32): void {
+    match e {
+        Left(value) => {
+            if value == 41u32 {
+                let value: u32 = 7u32;
+                assert(value == 7u32);
+            }
+            assert(value == want);
+        },
+        Right(value) => { assert(value == want); }
+    }
+}
+
+function main(): void {
+    check(E::Left(41u32), 41u32);
+    check(E::Right(42u32), 42u32);
+}

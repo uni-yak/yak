@@ -1,0 +1,8 @@
+// expected_code: E4006
+// expected_diagnostics: E4009 E4006
+// dependency: import_name_dep.yak
+// spec: spec/lang/name.md#N-6、spec/lang/module.md#N-6
+// 触发：根模块的函数和导入绑定共享同一个名字。
+import import_name_dep;
+function import_name_dep(): u8 { return 0u8; }
+function main(): void { return; }

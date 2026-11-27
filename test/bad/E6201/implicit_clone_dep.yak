@@ -1,0 +1,2 @@
+// 导出的聚合含动态数组，跨接口仍不是 Copy 值。
+export struct Leaf { first: u32[], second: u32[] }

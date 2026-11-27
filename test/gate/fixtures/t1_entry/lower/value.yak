@@ -1,0 +1,4 @@
+// 传递依赖链最底层：导出叶子值 3，供 mid 单元跨模块调用。
+export function leaf_value(): u32 {
+    return 3u32;
+}

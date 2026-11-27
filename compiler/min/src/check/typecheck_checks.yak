@@ -1,0 +1,484 @@
+// 常量求值快照构造、载体类型核验以及整数字面量/转换/越界的静态诊断。
+import typecheck;
+import type_import;
+import consteval;
+import ast;
+import resolve;
+import resolve_refs;
+import diag;
+import types;
+
+const BUILTIN_U8: u16 = 4097;
+const BUILTIN_U16: u16 = 4098;
+const BUILTIN_U32: u16 = 4099;
+const BUILTIN_U64: u16 = 4100;
+const BUILTIN_I8: u16 = 4101;
+const BUILTIN_I16: u16 = 4102;
+const BUILTIN_I32: u16 = 4103;
+const BUILTIN_I64: u16 = 4104;
+const BUILTIN_CHAR: u16 = 4106;
+const TK_BUILTIN: u8 = 1;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+
+export struct SnapshotBudget { limited: bool, remaining: u64, exhausted: bool }
+export struct ScanBudget { limited: bool, remaining: u32, exhausted: bool }
+
+function charge_snapshot(work: &SnapshotBudget:ReadWrite, count: u64): bool {
+    if work.exhausted { return false; }
+    if count > work.remaining { work.exhausted = true; return false; }
+    work.remaining = work.remaining - count;
+    return true;
+}
+
+// 先按表长扣费再分配；枚举行数先扣，余额不足时不再读取后续载荷表长。
+function reserve_const_snapshot(tt: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, defs: &typecheck::DefTypeTable:Read, work: &SnapshotBudget:ReadWrite): bool {
+    if !charge_snapshot(work, @len(tt.entries)) || !charge_snapshot(work, @len(defs.items)) || !charge_snapshot(work, @len(enums.items)) { return false; }
+    var i: u64 = 0;
+    while i < @len(enums.items) {
+        if !charge_snapshot(work, @len(enums.items[i].payloads)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 把已规范化的类型表与枚举表折叠成求值器只读快照；求值器不接触解析池之外的可变状态。
+export function build_const_input(tt: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, defs: &typecheck::DefTypeTable:Read, needed: bool, work: &SnapshotBudget:ReadWrite): consteval::ConstInput!AllocError {
+    if !needed || (work.limited && !reserve_const_snapshot(tt, enums, defs, work)) {
+        return consteval::ConstInput { types: [], enums: [], def_types: [] };
+    }
+    var types: consteval::ConstType[] = [];
+    var i: u32 = 0;
+    while i < @len(tt.entries) as u32 {
+        let entry: typecheck::TypeEntry = tt.entries[i];
+        @push(types, consteval::ConstType { kind: entry.kind, builtin: entry.builtin, def: entry.def, elem: entry.elem, cap: entry.cap, length: entry.length })?;
+        i = i + 1;
+    }
+    var snapshot: consteval::ConstEnum[] = [];
+    i = 0;
+    while i < @len(enums.items) as u32 {
+        var payloads: u32[] = [];
+        var p: u32 = 0;
+        while p < @len(enums.items[i].payloads) as u32 {
+            @push(payloads, enums.items[i].payloads[p])?;
+            p = p + 1;
+        }
+        @push(snapshot, consteval::ConstEnum { def: enums.items[i].def, payloads: @move(payloads) })?;
+        i = i + 1;
+    }
+    var def_types: u32[] = [];
+    i = 0;
+    while i < @len(defs.items) as u32 {
+        @push(def_types, defs.items[i])?;
+        i = i + 1;
+    }
+    return consteval::ConstInput { types: @move(types), enums: @move(snapshot), def_types: @move(def_types) };
+}
+
+// 转换链只用于诊断试算，缓存仅在当前类型检查内有效。
+struct IntegerProbe { done: bool, known: bool, bits: u64 }
+struct IntegerCache { items: IntegerProbe[] }
+
+function probe_integer(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:Read, expr_types: &typecheck::ExprTypeTable:Read, refs: &resolve_refs::RefTable:Read, input: &consteval::ConstInput:Read, consts: &consteval::ConstTable:ReadWrite, cache: &IntegerCache:ReadWrite, expr: u32, work: &consteval::FoldBudget:ReadWrite): IntegerProbe!AllocError {
+    var chain: u32[] = [];
+    var current: u32 = expr;
+    while current < @len(cache.items) as u32 && (!work.limited || consteval::charge_fold(work)) && !cache.items[current].done && pool.exprs[current].kind == 28 {
+        @push(chain, current)?;
+        current = pool.casts[pool.exprs[current].data as u32].operand;
+    }
+    if work.exhausted { return IntegerProbe { done: false, known: false, bits: 0 }; }
+    var probe: IntegerProbe = IntegerProbe { done: true, known: false, bits: 0 };
+    if current < @len(cache.items) as u32 {
+        if cache.items[current].done { probe = cache.items[current]; }
+        elseif current < @len(expr_types.items) as u32 {
+            let initial: u32 = expr_types.items[current];
+            if initial != 0 && initial <= @len(tt.entries) as u32 && tt.entries[initial - 1].kind == TK_BUILTIN {
+                let first: u16 = tt.entries[initial - 1].builtin;
+                if first >= BUILTIN_U8 && first <= BUILTIN_I64 {
+                    var value: u32 = 0;
+                    if work.limited {
+                        value = consteval::try_integer_limited(consts, input, pool, refs, current, initial, work)?;
+                        if work.exhausted { return IntegerProbe { done: false, known: false, bits: 0 }; }
+                    } else {
+                        value = consteval::try_integer(consts, input, pool, refs, current, initial)?;
+                    }
+                    if value != 0 { probe = IntegerProbe { done: true, known: true, bits: consts.values[value - 1].bits }; }
+                }
+            }
+            cache.items[current] = probe;
+        }
+    }
+    var i: u32 = @len(chain) as u32;
+    while i > 0 {
+        i = i - 1;
+        if work.limited && !consteval::charge_fold(work) { return IntegerProbe { done: false, known: false, bits: 0 }; }
+        let node: u32 = chain[i];
+        let operand: u32 = pool.casts[pool.exprs[node].data as u32].operand;
+        if probe.known && node < @len(expr_types.items) as u32 && operand < @len(expr_types.items) as u32 {
+            let source: u32 = expr_types.items[operand];
+            let target: u32 = expr_types.items[node];
+            if source != 0 && source <= @len(tt.entries) as u32 && target != 0 && target <= @len(tt.entries) as u32 && tt.entries[source - 1].kind == TK_BUILTIN && tt.entries[target - 1].kind == TK_BUILTIN {
+                let from: u16 = tt.entries[source - 1].builtin;
+                let to: u16 = tt.entries[target - 1].builtin;
+                if from >= BUILTIN_U8 && from <= BUILTIN_I64 && to >= BUILTIN_U8 && to <= BUILTIN_I64 {
+                    var sw: u64 = 64;
+                    if from == BUILTIN_U8 || from == BUILTIN_I8 { sw = 8; } elseif from == BUILTIN_U16 || from == BUILTIN_I16 { sw = 16; } elseif from == BUILTIN_U32 || from == BUILTIN_I32 { sw = 32; }
+                    var bits: u64 = probe.bits;
+                    if from >= BUILTIN_I8 && sw < 64 && (bits & (1u64 << (sw - 1))) != 0 { bits = bits | (18446744073709551615u64 << sw); }
+                    var tw: u64 = 64;
+                    if to == BUILTIN_U8 || to == BUILTIN_I8 { tw = 8; } elseif to == BUILTIN_U16 || to == BUILTIN_I16 { tw = 16; } elseif to == BUILTIN_U32 || to == BUILTIN_I32 { tw = 32; }
+                    probe.bits = bits & (18446744073709551615u64 >> (64u64 - tw));
+                } else { probe.known = false; }
+            } else { probe.known = false; }
+        } else { probe.known = false; }
+        cache.items[node] = probe;
+    }
+    return probe;
+}
+
+function integer_scan_charge(scan: &ScanBudget:ReadWrite, rows: u32): bool {
+    if scan.exhausted { return false; }
+    if rows > scan.remaining { scan.exhausted = true; return false; }
+    scan.remaining = scan.remaining - rows;
+    return true;
+}
+
+// 检查可证的非法字符标量和非负整数截断。
+function check_cast_constants(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:Read, expr_types: &typecheck::ExprTypeTable:Read, refs: &resolve_refs::RefTable:Read, input: &consteval::ConstInput:Read, consts: &consteval::ConstTable:ReadWrite, cache: &IntegerCache:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, work: &consteval::FoldBudget:ReadWrite, scan: &ScanBudget:ReadWrite): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(pool.exprs) as u32 && i < @len(expr_types.items) as u32 {
+        if scan.limited && !integer_scan_charge(scan, 1u32) { return; }
+        if pool.exprs[i].kind == 28 {
+            let cast: ast::CastExpr = pool.casts[pool.exprs[i].data as u32];
+            let target: u32 = expr_types.items[i];
+            if cast.operand < @len(expr_types.items) as u32 && target != 0 && target <= @len(tt.entries) as u32 {
+                let source: u32 = expr_types.items[cast.operand];
+                if source != 0 && source <= @len(tt.entries) as u32 && tt.entries[source - 1].kind == TK_BUILTIN && tt.entries[target - 1].kind == TK_BUILTIN {
+                    let from: u16 = tt.entries[source - 1].builtin;
+                    let to: u16 = tt.entries[target - 1].builtin;
+                    // 仅拒绝可证明不是 Unicode 标量的值；动态值与试算失败保持未知。
+                    if from == BUILTIN_U32 && to == BUILTIN_CHAR {
+                        let scalar: IntegerProbe = probe_integer(pool, tt, expr_types, refs, input, consts, cache, cast.operand, work)?;
+                        if work.exhausted { return; }
+                        if scalar.known && ((scalar.bits >= 55296u64 && scalar.bits <= 57343u64) || scalar.bits > 1114111u64) { typecheck::emit(diags, types::error_code(5001), pool.exprs[i].span)?; }
+                    }
+                    var source_width: u16 = from;
+                    var target_width: u16 = to;
+                    if from >= BUILTIN_I8 && from <= BUILTIN_I64 { source_width = from - 4; }
+                    if to >= BUILTIN_I8 && to <= BUILTIN_I64 { target_width = to - 4; }
+                    if source_width >= BUILTIN_U8 && source_width <= BUILTIN_U64 && target_width >= BUILTIN_U8 && target_width < source_width {
+                        let probe: IntegerProbe = probe_integer(pool, tt, expr_types, refs, input, consts, cache, cast.operand, work)?;
+                        if work.exhausted { return; }
+                        if probe.known {
+                            let bits: u64 = probe.bits;
+                            var width: u64 = 32;
+                            if target_width == BUILTIN_U8 { width = 8; } elseif target_width == BUILTIN_U16 { width = 16; }
+                            var source_bits: u64 = 64;
+                            if source_width == BUILTIN_U16 { source_bits = 16; } elseif source_width == BUILTIN_U32 { source_bits = 32; }
+                            if (from < BUILTIN_I8 || (bits >> (source_bits - 1)) == 0) && (bits >> width) != 0 { typecheck::emit(diags, types::error_code(5004), pool.exprs[i].span)?; }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+function positive_integer_max(builtin: u16): u64 {
+    if builtin == BUILTIN_U8 { return 255; }
+    if builtin == BUILTIN_U16 { return 65535; }
+    if builtin == BUILTIN_U32 { return 4294967295; }
+    if builtin == BUILTIN_I8 { return 127; }
+    if builtin == BUILTIN_I16 { return 32767; }
+    if builtin == BUILTIN_I32 { return 2147483647; }
+    if builtin == BUILTIN_I64 { return 9223372036854775807u64; }
+    return 18446744073709551615u64;
+}
+
+// 仅诊断可证越界：动态容器长度未知时只检查负下标。
+function negative_integer(tt: &typecheck::TypeTable:Read, value_type_id: u32, bits: u64): bool {
+    if !typecheck::is_integer_type(tt, value_type_id) { return false; }
+    let b: u16 = tt.entries[value_type_id - 1].builtin;
+    if b < BUILTIN_I8 { return false; }
+    var width: u64 = 64;
+    if b == BUILTIN_I8 { width = 8; } elseif b == BUILTIN_I16 { width = 16; } elseif b == BUILTIN_I32 { width = 32; }
+    return (bits & (1u64 << (width - 1))) != 0;
+}
+
+function check_index_bounds(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:Read, expr_types: &typecheck::ExprTypeTable:Read, refs: &resolve_refs::RefTable:Read, input: &consteval::ConstInput:Read, consts: &consteval::ConstTable:ReadWrite, cache: &IntegerCache:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, work: &consteval::FoldBudget:ReadWrite, scan: &ScanBudget:ReadWrite): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(pool.exprs) as u32 && i < @len(expr_types.items) as u32 {
+        if scan.limited && !integer_scan_charge(scan, 1u32) { return; }
+        if pool.exprs[i].kind == 24 {
+            let data: u32 = pool.exprs[i].data as u32;
+            let object: u32 = pool.indices[data].object;
+            let index: u32 = pool.indices[data].index;
+            if object < @len(expr_types.items) as u32 && index < @len(expr_types.items) as u32 {
+                var host: u32 = expr_types.items[object];
+                let value_type_id: u32 = expr_types.items[index];
+                if host != 0 && host <= @len(tt.entries) as u32 && tt.entries[host - 1].kind == TK_REF { host = tt.entries[host - 1].elem; }
+                if host != 0 && host <= @len(tt.entries) as u32 && (tt.entries[host - 1].kind == TK_FIXED_ARRAY || tt.entries[host - 1].kind == TK_DYN_ARRAY || tt.entries[host - 1].kind == TK_SLICE) {
+                    let fixed: bool = tt.entries[host - 1].kind == TK_FIXED_ARRAY;
+                    var outside: bool = false;
+                    if value_type_id == 0 && pool.exprs[index].kind == 2 && pool.exprs[index].integer_suffix == 0 {
+                        outside = fixed && pool.exprs[index].data >= tt.entries[host - 1].length;
+                    } elseif value_type_id == 0 && pool.exprs[index].kind == 21 {
+                        let unary: ast::UnaryExpr = pool.unaries[pool.exprs[index].data as u32];
+                        if unary.op == 12 && pool.exprs[unary.operand].kind == 2 && pool.exprs[unary.operand].integer_suffix == 0 { outside = pool.exprs[unary.operand].data != 0; }
+                    } elseif value_type_id != 0 && value_type_id <= @len(tt.entries) as u32 && tt.entries[value_type_id - 1].kind == TK_BUILTIN {
+                        let b: u16 = tt.entries[value_type_id - 1].builtin;
+                        if b >= BUILTIN_U8 && b <= BUILTIN_I64 {
+                            let probe: IntegerProbe = probe_integer(pool, tt, expr_types, refs, input, consts, cache, index, work)?;
+                            if work.exhausted { return; }
+                            if probe.known {
+                                let bits: u64 = probe.bits;
+                                var width: u64 = 64;
+                                if b == BUILTIN_I8 { width = 8; } elseif b == BUILTIN_I16 { width = 16; } elseif b == BUILTIN_I32 { width = 32; }
+                                outside = (b >= BUILTIN_I8 && (bits & (1u64 << (width - 1))) != 0) || (fixed && bits >= tt.entries[host - 1].length);
+                            }
+                        }
+                    }
+                    if outside { typecheck::emit(diags, types::error_code(6002), pool.exprs[index].span)?; }
+                }
+            }
+        } elseif pool.exprs[i].kind == 27 {
+            let range: ast::SliceExpr = pool.slices[pool.exprs[i].data as u32];
+            var host: u32 = expr_types.items[range.object];
+            if host != 0 && tt.entries[host - 1].kind == TK_REF { host = tt.entries[host - 1].elem; }
+            let low: IntegerProbe = probe_integer(pool, tt, expr_types, refs, input, consts, cache, range.low, work)?;
+            if work.exhausted { return; }
+            var high: IntegerProbe = IntegerProbe { done: true, known: false, bits: 0 };
+            if range.inclusive_upper == 4294967295u32 {
+                high = probe_integer(pool, tt, expr_types, refs, input, consts, cache, range.high, work)?;
+            } else {
+                let bound_type: u32 = expr_types.items[range.inclusive_upper];
+                if typecheck::is_integer_type(tt, bound_type) {
+                    let upper: IntegerProbe = probe_integer(pool, tt, expr_types, refs, input, consts, cache, range.inclusive_upper, work)?;
+                    if upper.known {
+                        let builtin: u16 = tt.entries[bound_type - 1].builtin;
+                        let max: u64 = positive_integer_max(builtin);
+                        if upper.bits == max {
+                            // 只报告区间上界加一才产生的溢出，位置为原闭区间分隔符。
+                            typecheck::emit(diags, types::error_code(3005), pool.exprs[range.high].span)?;
+                            i = i + 1;
+                            continue;
+                        }
+                        var mask: u64 = max;
+                        if builtin >= BUILTIN_I8 { mask = max * 2 + 1; }
+                        high.bits = @wrap_add(upper.bits, 1u64) & mask;
+                        high.known = true;
+                    }
+                }
+            }
+            if work.exhausted { return; }
+            let fixed: bool = host != 0 && tt.entries[host - 1].kind == TK_FIXED_ARRAY;
+            var length: u64 = 0;
+            if fixed { length = tt.entries[host - 1].length; }
+            let low_bad: bool = low.known && (negative_integer(tt, expr_types.items[range.low], low.bits) || (fixed && low.bits > length));
+            let high_bad: bool = high.known && (negative_integer(tt, expr_types.items[range.high], high.bits) || (fixed && high.bits > length));
+            if low_bad { typecheck::emit(diags, types::error_code(6002), pool.exprs[range.low].span)?; }
+            elseif high_bad { typecheck::emit(diags, types::error_code(6002), pool.exprs[range.high].span)?; }
+            elseif low.known && high.known && low.bits > high.bits { typecheck::emit(diags, types::error_code(6002), range.span)?; }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// 推断结束后统一检查，避免反向推断时重复报告同一字面量。
+function check_integer_ranges(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:Read, expr_types: &typecheck::ExprTypeTable:Read, diags: &diag::DiagBuffer:ReadWrite, scan: &ScanBudget:ReadWrite): void!AllocError {
+    if scan.limited && !integer_scan_charge(scan, @len(pool.exprs) as u32) { return; }
+    var negative: bool[] = [];
+    var i: u32 = 0;
+    while i < @len(pool.exprs) as u32 { @push(negative, false)?; i = i + 1; }
+    i = 0;
+    while i < @len(pool.unaries) as u32 {
+        if scan.limited && !integer_scan_charge(scan, 1u32) { return; }
+        let unary: ast::UnaryExpr = pool.unaries[i];
+        if unary.op == 12 && unary.operand < @len(pool.exprs) as u32 && pool.exprs[unary.operand].kind == 2 { negative[unary.operand] = true; }
+        i = i + 1;
+    }
+    // 表达式只扫描一次，去重只需比对扫描之前已有的诊断。
+    let existing: u32 = @len(diags.diags) as u32;
+    i = 0;
+    while i < @len(expr_types.items) as u32 && i < @len(pool.exprs) as u32 {
+        if scan.limited && !integer_scan_charge(scan, 1u32) { return; }
+        let value_type_id: u32 = expr_types.items[i];
+        if pool.exprs[i].kind == 2 && value_type_id != 0 && value_type_id <= @len(tt.entries) as u32 && tt.entries[value_type_id - 1].kind == TK_BUILTIN {
+            let b: u16 = tt.entries[value_type_id - 1].builtin;
+            var limit: u64 = positive_integer_max(b);
+            if b >= BUILTIN_I8 && b <= BUILTIN_I64 && negative[i] { limit = limit + 1; }
+            if pool.exprs[i].data > limit {
+                let span: types::Span = pool.exprs[i].span;
+                var reported: bool = false;
+                var d: u32 = 0;
+                while d < existing {
+                    if scan.limited && !integer_scan_charge(scan, 1u32) { return; }
+                    let prior: types::ErrorCode = diags.diags[d].code;
+                    if prior.raw == 1004 && diags.diags[d].span.file == span.file && diags.diags[d].span.offset == span.offset { reported = true; }
+                    d = d + 1;
+                }
+                if !reported { typecheck::emit(diags, types::error_code(1004), span)?; }
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// 统一执行整数范围、显式转换常量与数组/切片边界检查。
+export function run_integer_checks(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:Read, expr_types: &typecheck::ExprTypeTable:Read, refs: &resolve_refs::RefTable:Read, snapshot: &consteval::ConstInput:Read, consts: &consteval::ConstTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, probe_work: &consteval::FoldBudget:ReadWrite, scan: &ScanBudget:ReadWrite, document: bool): void!AllocError {
+    check_integer_ranges(pool, tt, expr_types, diags, scan)?;
+    if scan.exhausted { return; }
+    // 文档没有试算入口时，保留范围扫描但不分配缓存或遍历空消费者。
+    if !document || @len(pool.casts) != 0 || @len(pool.indices) != 0 || @len(pool.slices) != 0 {
+        if scan.limited && !integer_scan_charge(scan, @len(pool.exprs) as u32) { return; }
+        var probes: IntegerCache = IntegerCache { items: [] };
+        var i: u32 = 0;
+        while i < @len(pool.exprs) as u32 { @push(probes.items, IntegerProbe { done: false, known: false, bits: 0 })?; i = i + 1; }
+        check_cast_constants(pool, tt, expr_types, refs, snapshot, consts, &probes:ReadWrite, diags, probe_work, scan)?;
+        if probe_work.exhausted || scan.exhausted { return; }
+        check_index_bounds(pool, tt, expr_types, refs, snapshot, consts, &probes:ReadWrite, diags, probe_work, scan)?;
+    }
+    return;
+}
+
+export function check_carrier_types(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, tt: &typecheck::TypeTable:ReadWrite, work: &typecheck::InternBudget:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    var i: u32 = 0;
+    var accepted: bool = true;
+    while i < @len(pool.types) as u32 {
+        let node: ast::Type = pool.types[i];
+        if node.kind == 8 {
+            let inner: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, node.data, work)?;
+            if work.exhausted { return false; }
+            if inner != 0 && !typecheck::nullable_payload_allowed(tt, inner) {
+                typecheck::emit(diags, types::error_code(5813), node.span)?;
+                accepted = false;
+            }
+        } elseif node.kind == 9 {
+            let value: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, i, work)?;
+            if work.exhausted { return false; }
+            if value == 0 {
+                // 成员池按后序写入；内层联合已先检查，保留最接近问题的诊断。
+                typecheck::emit(diags, types::error_code(5817), node.span)?;
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return accepted;
+}
+
+function add_func(table: &typecheck::FuncTable:ReadWrite, def: u32, params: u32[], ret: u32): void!AllocError {
+    @push(table.items, typecheck::FuncSig { def: def, params: params, ret: ret, service: 0 })?;
+    return;
+}
+
+// 收集顶层函数、枚举、结构体、常量与外部函数声明的类型签名。
+export function collect_declarations(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, tables: &resolve::ResolveTables:Read, refs: &resolve_refs::RefTable:Read, tt: &typecheck::TypeTable:ReadWrite, funcs: &typecheck::FuncTable:ReadWrite, defs: &typecheck::DefTypeTable:ReadWrite, fields: &typecheck::FieldTable:ReadWrite, enums: &typecheck::EnumTable:ReadWrite, work: &typecheck::InternBudget:ReadWrite, document: bool): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        let item: ast::AstItem = file.items[i];
+        let def: u32 = resolution.result.file.items[i].def_id;
+        if item.kind == 0 {
+            let data: u32 = item.data;
+            var params: u32[] = [];
+            var p: u32 = 0;
+            while p < @len(pool.functions[data].params) as u32 {
+                let param: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, pool.functions[data].params[p].type_ref, work)?;
+                if work.exhausted { break; }
+                @push(params, param)?;
+                p = p + 1;
+            }
+            if work.exhausted { break; }
+            let ret: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, pool.functions[data].ret_type, work)?;
+            if work.exhausted { break; }
+            add_func(funcs, def, @move(params), ret)?;
+            let scope: u32 = typecheck::function_scope(tables, pool.functions[data].body, def);
+            p = 0;
+            while p < @len(pool.functions[data].params) as u32 {
+                let name: u32 = pool.functions[data].params[p].name;
+                var param_def: u32 = 0;
+                if document { param_def = resolve::function_param_def(tables, def, scope, p, name); }
+                else { param_def = typecheck::lookup_binding(tables, scope, name); }
+                if param_def != 0 { typecheck::set_def_type(defs, param_def, funcs.items[@len(funcs.items) as u32 - 1].params[p]); }
+                p = p + 1;
+            }
+        } elseif item.kind == 1 {
+            let enum_type: u32 = typecheck::intern_local_limited(tt, def, work)?;
+            if work.exhausted { break; }
+            typecheck::set_def_type(defs, def, enum_type);
+            var payloads: u32[] = [];
+            var v: u32 = 0;
+            while v < @len(pool.enums[item.data].variants) as u32 {
+                let payload: u32 = pool.enums[item.data].variants[v].payload_type;
+                if payload == 4294967295u32 { @push(payloads, 0)?; }
+                else {
+                    let payload_type: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, payload, work)?;
+                    if work.exhausted { break; }
+                    @push(payloads, payload_type)?;
+                }
+                v = v + 1;
+            }
+            if work.exhausted { break; }
+            @push(enums.items, typecheck::EnumType { def: def, payloads: @move(payloads) })?;
+        } elseif item.kind == 2 {
+            let struct_type: u32 = typecheck::intern_local_limited(tt, def, work)?;
+            if work.exhausted { break; }
+            typecheck::set_def_type(defs, def, struct_type);
+            var f: u32 = 0;
+            while f < @len(pool.structs[item.data].fields) as u32 {
+                let field_name: u32 = pool.structs[item.data].fields[f].name;
+                let field_type_id: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, pool.structs[item.data].fields[f].type_ref, work)?;
+                if work.exhausted { break; }
+                typecheck::add_field(fields, def, field_name, field_type_id)?;
+                f = f + 1;
+            }
+        } elseif item.kind == 3 {
+            let const_type: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, pool.consts[item.data].type_ref, work)?;
+            if work.exhausted { break; }
+            typecheck::set_def_type(defs, def, const_type);
+        } elseif item.kind == 4 {
+            let data: u32 = item.data;
+            var params: u32[] = [];
+            var p: u32 = 0;
+            while p < @len(pool.foreigns[data].params) as u32 {
+                let param: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, pool.foreigns[data].params[p].type_ref, work)?;
+                if work.exhausted { break; }
+                @push(params, param)?;
+                p = p + 1;
+            }
+            if work.exhausted { break; }
+            let ret: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, pool.foreigns[data].ret_type, work)?;
+            if work.exhausted { break; }
+            add_func(funcs, def, @move(params), ret)?;
+        }
+        if work.exhausted { break; }
+        i = i + 1;
+    }
+    return;
+}
+
+// 收齐未调用导入签名的类型槽，确保所有错误集载体使用统一标签序。
+export function intern_import_slots(refs: &resolve_refs::RefTable:Read, tt: &typecheck::TypeTable:ReadWrite): void!AllocError {
+    let total: u32 = @len(refs.imports) as u32;
+    if total == 0 { return; }
+    var cache: type_import::SlotCache = type_import::new_slot_cache()?;
+    var i: u32 = 0;
+    while i < total {
+        let dep: u16 = refs.imports[i].dep;
+        let slots: &[resolve_refs::ImportType] = &refs.imports[i].types[0..@len(refs.imports[i].types)];
+        type_import::import_slot_type_cached(tt, &cache:ReadWrite, slots, refs.imports[i].ret_slot, dep)?;
+        var p: u32 = 0;
+        while p < refs.imports[i].param_count as u32 {
+            type_import::import_slot_type_cached(tt, &cache:ReadWrite, slots, refs.imports[i].param_start + p, dep)?;
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    return;
+}

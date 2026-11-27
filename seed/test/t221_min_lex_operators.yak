@@ -1,0 +1,26 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+import lex;
+foreign assert(cond: bool): void;
+function main(): void {
+    let r: lex::LexResult = lex::lex_scan("/* outer /* inner */ still */ :: == != <= >= && || << >> => .. + - * / % < > ! & | ^ = . : ? ( ) { } [ ] , ;\r\n", 3)?;
+    assert(@len(r.diagnostics) == 0 && @len(r.tokens) == 35);
+    var i: u32 = 0;
+    while i < 34 {
+        assert(r.tokens[i].kind == 7 && r.tokens[i].payload == i as u64);
+        assert(r.tokens[i].integer_suffix == 0);
+        i = i + 1;
+    }
+    assert(r.tokens[0].span.offset == 30 && r.tokens[0].span.length == 2);
+    assert(r.tokens[34].kind == 9);
+    let fallback: lex::LexResult = lex::lex_scan("r#name\n", 0)?;
+    assert(@len(fallback.diagnostics) == 0 && @len(fallback.tokens) == 3);
+    assert(fallback.tokens[0].kind == 0 && fallback.tokens[1].kind == 1);
+    let ordinary: lex::LexResult = lex::lex_scan("r'a' b 'b'\n", 0)?;
+    assert(@len(ordinary.diagnostics) == 0 && @len(ordinary.tokens) == 5);
+    assert(ordinary.tokens[0].kind == 0 && ordinary.tokens[1].kind == 4);
+}

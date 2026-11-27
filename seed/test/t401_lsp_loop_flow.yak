@@ -1,0 +1,71 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+import lex;
+import parse;
+import ast;
+import owner_flow;
+foreign assert(ok: bool): void;
+
+// 旧的两次独立遍历仅作为对照。
+// 只有不含控制转移的直线块才能直接使用末态作为下一轮入口。
+function block_is_linear(pool: &ast::AstPool:Read, block: u32, label: u32): bool {
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block].stmts[i]];
+        let kind: u8 = stmt.kind;
+        if kind == 12 { return stmt.data == 0 || stmt.data == label; }
+        if kind != 1 && kind != 13 && kind != 17 && kind != 18 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 仅接受直线执行到当前循环 break 的情况，避免混淆标签和嵌套循环。
+function block_breaks_loop(pool: &ast::AstPool:Read, block: u32, label: u32): bool {
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block].stmts[i]];
+        if stmt.kind == 11 { return stmt.data == 0 || stmt.data == label; }
+        if stmt.kind != 1 && stmt.kind != 13 && stmt.kind != 17 && stmt.kind != 18 { return false; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 逐个块对照直线落尾、当前与外层标签、不可达后缀及复合前缀。
+function main(): void {
+    let source: &[u8] = "function f(flag: bool): void { outer: while true { empty: while true {} same: while true { @drop(flag); continue same; break outer; } outward: while true { continue outer; } escaped: while true { break outer; } local: while true { break local; } bare: while true { break; } step: while true { continue; } compound: while true { if flag {} break compound; } } }\n";
+    let lexed: lex::LexResult = lex::lex_scan(source, 211u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 211u16)?;
+    assert(@len(parsed.diagnostics) == 0u64);
+    let pool: &ast::AstPool:Read = &parsed.pool:Read;
+    assert(@len(pool.whiles) == 9u64);
+    var i: u32 = 0u32;
+    while i < @len(pool.whiles) as u32 {
+        let body: u32 = pool.whiles[i].body;
+        var label_no: u32 = 0u32;
+        while label_no < @len(pool.whiles) as u32 {
+            let label: u32 = pool.whiles[label_no].label;
+            let linear: bool = block_is_linear(pool, body, label);
+            let breaks: bool = block_breaks_loop(pool, body, label);
+            let prefix: u8 = owner_flow::loop_prefix(pool, body, label);
+            assert((prefix == 1u8) == linear);
+            assert((prefix == 2u8) == breaks);
+            label_no = label_no + 1u32;
+        }
+        i = i + 1u32;
+    }
+    return;
+}

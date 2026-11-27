@@ -1,0 +1,12 @@
+// expected_trap: index out of bounds
+struct Item { data: u32[] }
+function clear(items: &Item[]:ReadWrite): u32 {
+    *items = [];
+    return 0u32;
+}
+function main(): void {
+    var items: Item[] = [Item { data: [42u32] }];
+    let ref: &Item[]:ReadWrite = &items:ReadWrite;
+    let value: u32 = @copy(ref)[0u32].data[clear(ref)];
+    @drop(value);
+}

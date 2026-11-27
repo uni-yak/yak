@@ -1,0 +1,106 @@
+// 验证按失败位置生成私有清理块，并拒绝篡改后的边和析构项。
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import owner;
+import mir;
+import mir_lower;
+import mir_verify;
+import layout;
+foreign assert(cond: bool): void;
+
+function check(): void!AllocError {
+    let src: &[u8] = "function f(z: u32): u32 { let a: u32[] = [1u32]; let b: u32[] = [2u32]; let q: u32 = 10u32 / z; return q + (@len(a) + @len(b)) as u32; }\n";
+    let lexed: lex::LexResult = lex::lex_scan(src, 9010)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 9010)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let owners: owner::OwnerResult = owner::check_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    let flat: u32[] = owner::encode_drop_plans(&owners.drop_plans:Read)?;
+    let layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    let enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    var m: mir::MirResult = mir_lower::build_mir_with_drops(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &checked:Read, &flat:Read, &layouts:Read, &fields:Read, &enums:Read, &diags:ReadWrite)?;
+    assert(m.accepted && mir_verify::verify_module(&m.module:Read)?);
+    var site: u32 = 0;
+    while site < @len(m.module.functions[0].insts) as u32 && m.module.functions[0].insts[site].op != 19 { site = site + 1; }
+    assert(site < @len(m.module.functions[0].insts) as u32);
+    let edge: u32 = m.module.functions[0].insts[site].trap;
+    assert(edge != 0 && m.module.functions[0].blocks[edge - 1].inst_count == 2);
+    let drop_start: u32 = m.module.functions[0].blocks[edge - 1].inst_start;
+    let first: u32 = m.module.functions[0].insts[drop_start].b;
+    let second: u32 = m.module.functions[0].insts[drop_start + 1].b;
+    assert(first > second);
+    m.module.functions[0].insts[site].trap = (m.module.functions[0].entry as u32) + 1;
+    assert(!mir_verify::verify_module(&m.module:Read)?);
+    m.module.functions[0].insts[site].trap = (m.module.functions[0].trap_target as u32) + 1;
+    assert(!mir_verify::verify_module(&m.module:Read)?);
+    m.module.functions[0].insts[site].trap = edge;
+    m.module.functions[0].insts[drop_start].b = m.module.functions[0].insts[site].a;
+    assert(!mir_verify::verify_module(&m.module:Read)?);
+    m.module.functions[0].insts[drop_start].b = second;
+    assert(!mir_verify::verify_module(&m.module:Read)?);
+    m.module.functions[0].insts[drop_start].b = first;
+    assert(mir_verify::verify_module(&m.module:Read)?);
+    return;
+}
+
+function main(): void { check()?; return; }

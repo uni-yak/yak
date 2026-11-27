@@ -1,0 +1,19 @@
+// t59: match 通配符 _
+// expected_stdout: other
+foreign write(data: &[u8]): void;
+
+enum Status {
+    Ok,
+    Err,
+    Timeout,
+}
+
+function main(): void {
+    let s: Status = Status::Timeout;
+    match s {
+        Ok => { write("ok\n"); },
+        Err => { write("err\n"); },
+        _ => { write("other\n"); },
+    }
+    return;
+}

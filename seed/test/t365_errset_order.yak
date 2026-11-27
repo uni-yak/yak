@@ -1,0 +1,14 @@
+// 定向回归：ErrorSet 成员书写顺序不影响类型身份（result.md 归一化）。
+// expected_stdout: ok
+foreign write(data: &[u8]): void;
+
+enum E1 { A }
+enum E2 { B }
+
+function f(): void!(E1 | E2) { return; }
+
+function main(): void {
+    let g: &function(): void!(E2 | E1) = &f;
+    write("ok");
+    return;
+}

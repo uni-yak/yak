@@ -1,0 +1,6 @@
+// expected_code: E5509
+// spec: spec/lang/layout.md#LY-9
+// 触发：结构体按值包含自身，布局依赖图存在环。
+struct Node { child: Node }
+
+function main(): void { return; }

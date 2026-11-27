@@ -1,0 +1,20 @@
+// expected_code: E6005
+// spec: spec/lang/base.md R-6；spec/lang/owner.md OW-3；spec/lang/type/ref.md OW-3
+// 触发：把内层动态数组切片的副本保存到外层绑定，越过宿主所在块。
+foreign assert(cond: bool): void;
+
+function check(copy_slice: bool): void {
+    var outside: &[u8] = "";
+    if copy_slice {
+        let values: u8[] = [];
+        let inside: &[u8] = values[0..0];
+        outside = @copy(inside);
+    }
+    assert(@len(outside) == 0u64);
+    return;
+}
+
+function main(): void {
+    check(true);
+    return;
+}

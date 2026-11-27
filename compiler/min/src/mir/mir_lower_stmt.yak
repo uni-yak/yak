@@ -1,0 +1,431 @@
+// 将函数形参与语句递归控制流降低到 MIR。
+import resolve_refs;
+import resolve;
+import mir;
+import mir_builder;
+import ast;
+import typecheck;
+import diag;
+import mir_lower_expr;
+import types;
+
+const NONE: u32 = 4294967295u32;
+
+// 按作用域、名称和声明位置查找绑定。
+function binding_def(resolution: &resolve_refs::Resolution:Read, scope: u32, name: u32, offset: u32): u32 {
+    let tables: &resolve::ResolveTables:Read = &resolution.result.tables:Read;
+    let id: u32 = resolve::binding_in_scope(tables, scope, name);
+    if id == 0 || id > @len(tables.defs) as u32 { return 0; }
+    let def: resolve::DefEntry = tables.defs[id - 1];
+    if def.scope == scope && def.name == name && def.decl_offset == offset { return id; }
+    return 0;
+}
+
+// 模式绑定以 arm 作用域的 DefId 登记（resolve DefEntry.kind 12）：
+// 从臂体块的作用域链按名称取回 DefId，供 MIR 映射到隐式载荷局部。
+function arm_binding_def(resolution: &resolve_refs::Resolution:Read, arm_body: u32, name: u32): u32 {
+    let tables: &resolve::ResolveTables = &resolution.result.tables:Read;
+    if arm_body >= @len(tables.block_scope) as u32 { return 0; }
+    return resolve::lookup_binding(tables, tables.block_scope[arm_body], name);
+}
+
+function copy_u32_values(src: &u32[]:Read): u32[]!AllocError {
+    var dst: u32[] = [];
+    var i: u32 = 0;
+    while i < @len((*src)) as u32 { @push(dst, (*src)[i])?; i = i + 1; }
+    return dst;
+}
+
+// 降低条件分支和可选的 else 块。
+function lower_if(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, data: u32): void!AllocError {
+    let join: u16 = mir_builder::new_block(ctx, build)?;
+    var branch: u32 = 0;
+    while branch < @len(pool.ifs[data].branches) as u32 {
+        let first: u32 = build.temporary_depth;
+        let condition: u32 = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, pool.ifs[data].branches[branch].condition)?;
+        mir_builder::end_expression(ctx, build, first)?;
+        let body: u16 = mir_builder::new_block(ctx, build)?;
+        var next: u16 = join;
+        if branch + 1 < @len(pool.ifs[data].branches) as u32 || pool.ifs[data].else_body != NONE { next = mir_builder::new_block(ctx, build)?; }
+        mir_builder::term(ctx, build, 193, condition, body as u32, next as u32);
+        build.current = body;
+        lower_block(ctx, build, pool, tc, resolution, diags, pool.ifs[data].branches[branch].body)?;
+        mir_builder::term(ctx, build, 192, 0, join as u32, 0);
+        build.current = next;
+        branch = branch + 1;
+    }
+    if pool.ifs[data].else_body != NONE {
+        lower_block(ctx, build, pool, tc, resolution, diags, pool.ifs[data].else_body)?;
+        mir_builder::term(ctx, build, 192, 0, join as u32, 0);
+    }
+    build.current = join;
+    return;
+}
+
+function lower_while(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, data: u32): void!AllocError {
+    let head: u16 = mir_builder::new_block(ctx, build)?;
+    let body: u16 = mir_builder::new_block(ctx, build)?;
+    let exit: u16 = mir_builder::new_block(ctx, build)?;
+    mir_builder::term(ctx, build, 192, 0, head as u32, 0);
+    build.current = head;
+    let first: u32 = build.temporary_depth;
+    let condition: u32 = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, pool.whiles[data].condition)?;
+    mir_builder::end_expression(ctx, build, first)?;
+    mir_builder::term(ctx, build, 193, condition, body as u32, exit as u32);
+    let target: mir_builder::LoopTarget = mir_builder::LoopTarget { label: pool.whiles[data].label, head: head, exit: exit, bound_views: build.view_depth };
+    if build.loop_depth < @len(build.loops) as u32 { build.loops[build.loop_depth] = target; }
+    else { @push(build.loops, target)?; }
+    build.loop_depth = build.loop_depth + 1;
+    build.current = body;
+    lower_block(ctx, build, pool, tc, resolution, diags, pool.whiles[data].body)?;
+    mir_builder::term(ctx, build, 192, 0, head as u32, 0);
+    build.loop_depth = build.loop_depth - 1;
+    build.current = exit;
+    return;
+}
+
+// 取模式对应的 VariantId；身份不匹配或未解析形态返回 NONE。
+function pattern_variant(pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, identity: &mir::EnumIdentity:Read, pattern_id: u32): u32 {
+    let refs: &resolve_refs::RefTable = &resolution.refs:Read;
+    var i: u32 = 0;
+    while i < @len(refs.items) as u32 {
+        let r: resolve_refs::ResolvedRef = refs.items[i];
+        if r.node_kind == 2 && r.node == pattern_id {
+            // 3 = 本地变体，4 = 导入变体，5 / 6 = 内置变体（AllocError）。
+            if r.kind == 3 {
+                if identity.kind == 1 && r.x == identity.def { return r.y; }
+                return NONE;
+            }
+            if r.kind == 4 {
+                if identity.kind == 3 && r.x == identity.dep as u32 && r.y == identity.export_id { return r.z; }
+                return NONE;
+            }
+            if r.kind == 5 || r.kind == 6 { return r.y; }
+            return NONE;
+        }
+        i = i + 1;
+    }
+    // 裸标签没有解析引用时回退到成员名表；逐字段读取，避免部分移动。
+    if pattern_id >= @len(pool.patterns) as u32 { return NONE; }
+    if pool.patterns[pattern_id].kind != 0 || @len(pool.patterns[pattern_id].path) != 1 { return NONE; }
+    let label: u32 = pool.patterns[pattern_id].path[0];
+    // 导入枚举：按 (dep, export_id, 成员名) 在已载入变体表里查声明序编号。
+    if identity.kind == 3 {
+        var v: u32 = 0;
+        while v < @len(refs.variants) as u32 {
+            let variant: &resolve_refs::ImportVariant:Read = &refs.variants[v]:Read;
+            if variant.dep == identity.dep && variant.export_id == identity.export_id && variant.name == label { return variant.variant; }
+            v = v + 1;
+        }
+        return NONE;
+    }
+    if identity.kind != 1 { return NONE; }
+    let tables: &resolve::ResolveTables = &resolution.result.tables:Read;
+    var m: u32 = 0;
+    while m < @len(tables.enum_members) as u32 {
+        let binding: resolve::EnumMemberBinding = tables.enum_members[m];
+        if binding.host == identity.def && binding.name == label { return binding.variant; }
+        m = m + 1;
+    }
+    return NONE;
+}
+
+// match 降级为 enum_dispatch：建立每臂块与合流块，臂表按 VariantId 升序覆盖全部变体，
+// 通配臂展开为剩余变体；未绑定的拥有型载荷先走独立清理臂。
+function lower_match(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, match_id: u32): void!AllocError {
+    if match_id >= @len(pool.matches) as u32 { mir_builder::reject(build, 7, build.span); return; }
+    // 逐字段读取：MatchStmt 含臂数组，整体绑定会构成部分移动（owner.md 2.5）。
+    let match_span: types::Span = pool.matches[match_id].span;
+    let arm_count: u32 = @len(pool.matches[match_id].arms) as u32;
+    // match 所在的块承载 scrutinee 求值与 177 终结指令，必须显式记住。
+    let first: u32 = build.temporary_depth;
+    let value: u32 = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, pool.matches[match_id].scrutinee)?;
+    mir_builder::end_expression(ctx, build, first)?;
+    if build.rejection.kind != 0 { return; }
+    let entry: u16 = build.current;
+    let value_type_id: u32 = mir::local_type(ctx, value);
+    let identity: mir::EnumIdentity = mir::enum_identity_of(&tc.types:Read, value_type_id);
+    let total: u32 = mir::enum_count_of(&tc.types:Read, &tc.enums:Read, &tc.imported_enums:Read, value_type_id);
+    if identity.kind == 0 || total == 0 { mir_builder::reject(build, 3, match_span); return; }
+    var arm_blocks: u16[] = [];
+    var i: u32 = 0;
+    while i < total { @push(arm_blocks, 0)?; i = i + 1; }
+    var wildcard_block: u16 = 0;
+    let join: u16 = mir_builder::new_block(ctx, build)?;
+    i = 0;
+    while i < arm_count {
+        let pattern_id: u32 = pool.matches[match_id].arms[i].pattern;
+        let arm_span: types::Span = pool.matches[match_id].arms[i].span;
+        let arm_body: u32 = pool.matches[match_id].arms[i].body;
+        if pattern_id >= @len(pool.patterns) as u32 { mir_builder::reject(build, 7, arm_span); return; }
+        let pattern_kind: u8 = pool.patterns[pattern_id].kind;
+        let pattern_binding: u32 = pool.patterns[pattern_id].binding;
+        let pattern_span: types::Span = pool.patterns[pattern_id].span;
+        let block: u16 = mir_builder::new_block(ctx, build)?;
+        if pattern_kind == 1 {
+            // 通配臂不携带变体，不能绑定载荷。
+            if pattern_binding != 0 { mir_builder::reject(build, 3, pattern_span); return; }
+            wildcard_block = block;
+        } else {
+            let variant: u32 = pattern_variant(pool, resolution, &identity:Read, pattern_id);
+            if variant == NONE || variant >= total { mir_builder::reject(build, 3, pattern_span); return; }
+            if arm_blocks[variant] != 0 { mir_builder::reject(build, 3, pattern_span); return; }
+            arm_blocks[variant] = block;
+            if pattern_binding != 0 {
+                // 载荷绑定：臂块带一个隐式定义的载荷局部，绑定 DefId 直接映射到它。
+                var payload_type: u32 = 0;
+                if identity.kind == 1 {
+                    let ei: u32 = mir::enum_index(tc, value_type_id);
+                    if ei == 0 || variant >= @len(tc.enums.items[ei - 1].payloads) as u32 { mir_builder::reject(build, 3, pattern_span); return; }
+                    payload_type = tc.enums.items[ei - 1].payloads[variant];
+                } elseif identity.kind == 3 {
+                    payload_type = mir::imported_payload_of(&tc.imported_enums:Read, identity.dep, identity.export_id, variant);
+                    if payload_type == NONE { mir_builder::reject(build, 3, pattern_span); return; }
+                } else { mir_builder::reject(build, 3, pattern_span); return; }
+                if payload_type == 0 { mir_builder::reject(build, 3, pattern_span); return; }
+                let bound_def: u32 = arm_binding_def(resolution, arm_body, pattern_binding);
+                if bound_def == 0 || bound_def > @len(build.def_map) as u32 { mir_builder::reject(build, 7, pattern_span); return; }
+                let payload_local: u32 = mir_builder::new_local(ctx, build, payload_type, 0)?;
+                if payload_local == 0 { return; }
+                ctx.blocks[block].payload = payload_local;
+                @push(build.bound_defs, bound_def - 1)?;
+                build.def_map[bound_def - 1] = payload_local;
+            }
+        }
+        build.current = block;
+        lower_block(ctx, build, pool, tc, resolution, diags, arm_body)?;
+        mir_builder::term(ctx, build, 192, 0, join as u32, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < total {
+        if arm_blocks[i] == 0 {
+            if wildcard_block == 0 { mir_builder::reject(build, 3, match_span); return; }
+            arm_blocks[i] = wildcard_block;
+        }
+        let destination: u16 = arm_blocks[i];
+        if ctx.blocks[destination].payload == 0 {
+            let payload_type: u32 = mir::variant_payload(&tc.enums:Read, &tc.imported_enums:Read, identity, i);
+            if payload_type == NONE { mir_builder::reject(build, 3, match_span); return; }
+            if payload_type != 0 && !mir_builder::mir_copy_type(tc, payload_type, build.copy_order) {
+                let cleanup: u16 = mir_builder::new_block(ctx, build)?;
+                let payload: u32 = mir_builder::new_local(ctx, build, payload_type, 0)?;
+                if build.rejection.kind != 0 { return; }
+                ctx.blocks[cleanup].payload = payload;
+                build.current = cleanup;
+                mir_builder::inst(ctx, build, 115, 0, payload, 0, 0, 0, 0, 0)?;
+                mir_builder::term(ctx, build, 192, 0, destination as u32, 0);
+                arm_blocks[i] = cleanup;
+            }
+        }
+        i = i + 1;
+    }
+    let start: u32 = @len(ctx.arms) as u32;
+    i = 0;
+    while i < total {
+        @push(ctx.arms, mir::MirArm { variant: i as u16, block: arm_blocks[i] })?;
+        i = i + 1;
+    }
+    // 177 属于 match 所在块；臂块此时都已用 br 关闭，必须先切回 entry。
+    build.current = entry;
+    mir_builder::term(ctx, build, 177, value, start, total);
+    build.current = join;
+    return;
+}
+
+function lower_block(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, block: u32): void!AllocError {
+    if block >= @len(pool.blocks) as u32 || block >= @len(resolution.result.tables.block_scope) as u32 { mir_builder::reject(build, 7, build.span); return; }
+    let scope_views: u32 = build.view_depth;
+    var i: u32 = 0;
+    while i < @len(pool.blocks[block].stmts) as u32 && mir_builder::block_open(ctx, build) {
+        let stmt_id: u32 = pool.blocks[block].stmts[i];
+        let stmt: ast::Stmt = pool.stmts[stmt_id];
+        build.span = stmt.span;
+        let first_view: u32 = build.temporary_depth;
+        if stmt.kind == 1 {
+            let local: ast::LocalDecl = pool.locals[stmt.data];
+            let def: u32 = binding_def(resolution, resolution.result.tables.block_scope[block], local.name, local.span.offset);
+            if def == 0 || def > @len(tc.def_types.items) as u32 { mir_builder::reject(build, 7, stmt.span); return; }
+            let value_type_id: u32 = tc.def_types.items[def - 1];
+            if value_type_id == 0 { mir_builder::reject(build, 4, stmt.span); return; }
+            if !mir_builder::supported_cached(build, tc, value_type_id, false) { mir_builder::reject(build, 3, stmt.span); return; }
+            if local.is_out {
+                if !mir::out_payload_supported(&tc.types:Read, value_type_id) { mir_builder::reject(build, 3, stmt.span); return; }
+                let slot: u32 = mir_builder::new_local(ctx, build, value_type_id, 3)?;
+                mir_builder::inst(ctx, build, 208, slot, 0, 0, value_type_id, 0, 0, 0)?;
+                @push(build.bound_defs, def - 1)?;
+                build.def_map[def - 1] = slot;
+                i = i + 1;
+                continue;
+            }
+            if local.init == NONE { mir_builder::reject(build, 7, stmt.span); return; }
+            var kind: u8 = 0;
+            if local.is_var { kind = 2; }
+            let id: u32 = mir_builder::new_local(ctx, build, value_type_id, kind)?;
+            let initial: u32 = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, local.init)?;
+            var value: u32 = initial;
+            if mir::local_type(ctx, initial) != value_type_id { value = mir_lower_expr::inject(ctx, build, tc, value_type_id, initial)?; }
+            if local.is_var {
+                mir_builder::store(ctx, build, id, value)?;
+                let local_kind: u8 = tc.types.entries[value_type_id - 1].kind;
+                if (local_kind == 4 || local_kind == 5) && build.rejection.kind == 0 {
+                    let site: u32 = build.last_inst[build.current];
+                    ctx.insts[site - 1].opens_view_slot = true;
+                }
+            }
+            else {
+                var op: u8 = 112;
+                if mir_builder::mir_copy_type(tc, value_type_id, build.copy_order) { op = 113; }
+                mir_builder::inst(ctx, build, op, id, value, 0, value_type_id, 0, 0, 0)?;
+            }
+            if build.rejection.kind != 0 { return; }
+            @push(build.bound_defs, def - 1)?;
+            build.def_map[def - 1] = id;
+            mir_builder::bind_view(build, &tc.types:Read, id, value_type_id)?;
+        } elseif stmt.kind == 10 {
+            var value: u32 = 0;
+            if stmt.data != NONE { value = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, stmt.data)?; }
+            if tc.types.entries[build.ret - 1].kind == 9 { value = mir_lower_expr::inject(ctx, build, tc, build.ret, value)?; }
+            elseif (!mir::is_void(&tc.types:Read, build.ret) && mir::local_type(ctx, value) != build.ret) || (mir::is_void(&tc.types:Read, build.ret) && value != 0) { mir_builder::reject(build, 7, stmt.span); }
+            mir_builder::end_expression(ctx, build, first_view)?;
+            mir_builder::end_bound_views(ctx, &*build:Read, 0)?;
+            // 返回前按声明逆序析构本作用域仍 live 的 owning 局部（owner.md 6.1/6.2）。
+            mir_builder::emit_drops(ctx, build, build.current, 0, stmt_id)?;
+            mir_builder::term(ctx, build, 194, value, 0, 0);
+        } elseif stmt.kind == 17 {
+            let target_expr: u32 = pool.assigns[stmt.data].target;
+            // Write 通道只允许对形参直接解引用并整值填充。
+            if pool.exprs[target_expr].kind == 21 {
+                let unary: ast::UnaryExpr = pool.unaries[pool.exprs[target_expr].data as u32];
+                if unary.op == 13 {
+                    let slot: u32 = mir_builder::bound_local_of(build, ctx, pool, resolution, unary.operand);
+                    if slot != 0 && ctx.locals[slot - 1].kind == 3 && ctx.locals[slot - 1].state == 11 {
+                        let value: u32 = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, pool.assigns[stmt.data].value)?;
+                        if mir::local_type(ctx, value) != mir::local_type(ctx, slot) { mir_builder::reject(build, 7, stmt.span); return; }
+                        mir_builder::inst(ctx, build, 209, 0, slot, value, mir::local_type(ctx, slot), 0, 0, 0)?;
+                        mir_builder::end_expression(ctx, build, first_view)?;
+                        i = i + 1;
+                        continue;
+                    }
+                }
+            }
+            let projected: bool = mir_lower_expr::is_projection(pool, target_expr);
+            let first: u32 = @len(ctx.insts) as u32;
+            var place: u32 = mir_lower_expr::lower_write_place(ctx, build, pool, tc, resolution, diags, target_expr)?;
+            if place == 0 || build.rejection.kind != 0 { return; }
+            let before: u32 = @len(ctx.insts) as u32;
+            var target: u32 = mir::local_type(ctx, place);
+            if projected { target = mir_builder::checked_type(build, tc, pool, target_expr); }
+            if target == 0 || build.rejection.kind != 0 { return; }
+            let rhs: u32 = pool.assigns[stmt.data].value;
+            var source: u32 = 0;
+            if projected && !mir_builder::mir_copy_type(tc, target, build.copy_order) { source = mir_builder::bound_local_of(build, ctx, pool, resolution, rhs); }
+            var initial: u32 = 0;
+            if source != 0 && ctx.locals[source - 1].kind != 3 { initial = mir_builder::result_inst(ctx, build, 112, mir::local_type(ctx, source), source, 0, 0)?; }
+            else { initial = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, rhs)?; }
+            if build.rejection.kind != 0 { return; }
+            var value: u32 = initial;
+            if mir::local_type(ctx, value) != target { value = mir_lower_expr::inject(ctx, build, tc, target, initial)?; }
+            if projected {
+                if value == 0 || mir::local_type(ctx, value) != target { mir_builder::reject(build, 6, stmt.span); return; }
+                if build.dyn_views[value - 1] { mir_builder::reject(build, 3, stmt.span); return; }
+                place = mir_lower_expr::refresh_write_addr(ctx, build, tc, place, first, before)?;
+                // 右侧成功后才析构旧投影值。宿主保持 live，仍拥有新值。
+                if !mir_builder::mir_copy_type(tc, target, build.copy_order) {
+                    let old: u32 = mir_builder::result_inst(ctx, build, 80, target, place, 0, 0)?;
+                    mir_builder::inst(ctx, build, 115, 0, old, 0, 0, 0, 0, 0)?;
+                }
+                mir_builder::inst(ctx, build, 81, 0, place, value, target, 0, 0, 0)?;
+            } else {
+                // 先求完右值；定稿时按左值此刻的状态选择是否析构旧值。
+                if !mir_builder::mir_copy_type(tc, target, build.copy_order) { mir_builder::inst(ctx, build, 115, 0, place, 0, 0, 1, 0, 0)?; }
+                mir_builder::store(ctx, build, place, value)?;
+            }
+        } elseif stmt.kind == 14 { lower_if(ctx, build, pool, tc, resolution, diags, stmt.data)?; }
+        elseif stmt.kind == 15 { lower_while(ctx, build, pool, tc, resolution, diags, stmt.data)?; }
+        elseif stmt.kind == 11 || stmt.kind == 12 {
+            var depth: u32 = build.loop_depth;
+            var found: bool = false;
+            while depth > 0 && !found {
+                depth = depth - 1;
+                if stmt.data == 0 || stmt.data == NONE || build.loops[depth].label == stmt.data {
+                    var target: u16 = build.loops[depth].exit;
+                    var edge_kind: u32 = 2;
+                    if stmt.kind == 12 { target = build.loops[depth].head; edge_kind = 3; }
+                    let first_bound: u32 = build.loops[depth].bound_views;
+                    mir_builder::end_bound_views(ctx, &*build:Read, first_bound)?;
+                    // break/continue 离循环体前按声明逆序析构越过作用域内仍 live 的 owning 局部。
+                    mir_builder::emit_drops(ctx, build, build.current, edge_kind, stmt_id)?;
+                    mir_builder::term(ctx, build, 192, 0, target as u32, 0);
+                    found = true;
+                }
+            }
+            if !found { mir_builder::reject(build, 7, stmt.span); }
+        } elseif stmt.kind == 16 {
+            lower_match(ctx, build, pool, tc, resolution, diags, stmt.data)?;
+        } elseif stmt.kind == 18 {
+            // @drop 语句的 data 是目标而非调用；0x73 直接消费原绑定。
+            let local: u32 = mir_builder::bound_local_of(build, ctx, pool, resolution, stmt.data);
+            if local == 0 { mir_builder::reject(build, 2, stmt.span); return; }
+            mir_builder::inst(ctx, build, 115, 0, local, 0, 0, 0, 0, 0)?;
+        } elseif stmt.kind == 13 {
+            let value: u32 = mir_lower_expr::lower_expr(ctx, build, pool, tc, resolution, diags, stmt.data)?;
+            if build.rejection.kind != 0 { return; }
+            if value != 0 && mir_builder::block_open(ctx, build) &&
+                !mir_builder::mir_copy_type(tc, mir::local_type(ctx, value), build.copy_order) &&
+                !mir_lower_expr::is_projection(pool, stmt.data) &&
+                mir_builder::bound_local_of(build, ctx, pool, resolution, stmt.data) == 0 {
+                // 表达式结果若未被接收，其唯一析构责任在完整表达式结束时消费。
+                mir_builder::inst(ctx, build, 115, 0, value, 0, 0, 0, 0, 0)?;
+            }
+        } else { mir_builder::reject(build, 2, stmt.span); }
+        mir_builder::end_expression(ctx, build, first_view)?;
+        i = i + 1;
+    }
+    // 非函数体子块正常落尾时按声明逆序析构本块内仍 live 的 owning 局部；终结块由 emit_drops 自动跳过。
+    mir_builder::end_bound_views(ctx, &*build:Read, scope_views)?;
+    build.view_depth = scope_views;
+    if block != build.body && mir_builder::block_open(ctx, build) {
+        mir_builder::emit_drops(ctx, build, build.current, 4, block)?;
+    }
+    return;
+}
+
+export function lower_function(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, file: &ast::AstFile:Read, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, drop_defs: &u32[]:Read, item: u32): void!AllocError {
+    build.drop_defs = copy_u32_values(drop_defs)?;
+    let data: u32 = file.items[item].data;
+    let sig: u32 = ctx.signature;
+    if sig == 0 || data >= @len(pool.functions) as u32 { mir_builder::reject(build, 7, build.span); return; }
+    build.ret = tc.funcs.items[sig - 1].ret;
+    let ret_type: u32 = build.ret;
+    if ret_type == 0 { mir_builder::reject(build, 4, build.span); return; }
+    if !mir_builder::supported_cached(build, tc, ret_type, true) { mir_builder::reject(build, 3, build.span); return; }
+    let body: u32 = pool.functions[data].body;
+    build.body = body;
+    if body >= @len(resolution.result.tables.block_scope) as u32 { mir_builder::reject(build, 7, build.span); return; }
+    var p: u32 = 0;
+    while p < @len(pool.functions[data].params) as u32 {
+        if p >= @len(tc.funcs.items[sig - 1].params) as u32 { mir_builder::reject(build, 7, build.span); return; }
+        var value_type_id: u32 = tc.funcs.items[sig - 1].params[p];
+        if value_type_id == 0 { mir_builder::reject(build, 4, build.span); return; }
+        let payload: u32 = typecheck::write_ref_target(&tc.types:Read, value_type_id);
+        var kind: u8 = 0;
+        if payload != 0 {
+            if !mir::out_payload_supported(&tc.types:Read, payload) || !mir::out_return_supported(&tc.types:Read, build.ret) { mir_builder::reject(build, 3, pool.functions[data].params[p].span); return; }
+            kind = 3;
+            value_type_id = payload;
+        } elseif !mir_builder::supported_cached(build, tc, value_type_id, false) { mir_builder::reject(build, 3, pool.functions[data].params[p].span); return; }
+        let def: u32 = binding_def(resolution, resolution.result.tables.block_scope[body], pool.functions[data].params[p].name, pool.functions[data].params[p].span.offset);
+        if def == 0 { mir_builder::reject(build, 7, build.span); return; }
+        let id: u32 = mir_builder::new_local(ctx, build, value_type_id, kind)?;
+        if kind == 3 { ctx.locals[id - 1].state = 11; }
+        @push(ctx.params, id)?;
+        @push(build.bound_defs, def - 1)?;
+        build.def_map[def - 1] = id;
+        p = p + 1;
+    }
+    ctx.entry = mir_builder::new_block(ctx, build)?;
+    build.current = ctx.entry;
+    lower_block(ctx, build, pool, tc, resolution, diags, body)?;
+    return;
+}

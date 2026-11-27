@@ -1,0 +1,7 @@
+// expected_trap: partial move forbidden
+struct Wrap { data: u32[], count: u32 }
+function main(): void {
+    let item: Wrap = Wrap { data: [1u32, 2u32], count: 2u32 };
+    let data: u32[] = item.data;
+    @drop(data);
+}

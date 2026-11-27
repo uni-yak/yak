@@ -1,0 +1,1 @@
+export function fold(value: u32): u32 { return value; }

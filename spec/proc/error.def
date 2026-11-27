@@ -1,0 +1,331 @@
+# error.def — 错误码配置源（UTF-8、LF、确定性字节序）
+# 本文件是 ErrorCode 大段、子领域、码位、关联拒绝编号与描述的唯一真源。
+# 格式：E<千位><百位><两位序号> = u16
+#   千位 = 大阶段（0-9，编译管线顺序）
+#   百位 = 子领域（0-9，阶段内语义细分）
+#   两位序号 = 01-99
+# 编译器不在用户构建热路径解析本文件；生成器只在本文件变更时生成静态表。
+# 大段顺序 = 编译管线顺序，禁止重排。
+
+format 2
+
+# ── 大段声明（按编译管线顺序） ──
+segment E0 name "通用"
+segment E1 name "词法"
+segment E2 name "解析"
+segment E3 name "脱糖"
+segment E4 name "名字/作用域"
+segment E5 name "类型"
+segment E6 name "所有权/能力"
+segment E7 name "MIR/发射"
+segment E8 name "链接"
+segment E9 name "运行时/库"
+
+# ── 子领域声明 ──
+segment E00 name "通用/内部"            parent E0
+segment E10 name "词法"                 parent E1
+segment E20 name "解析"                 parent E2
+segment E30 name "脱糖"                 parent E3
+segment E40 name "名字/作用域"           parent E4
+segment E50 name "隐式转换/as/字面量/const" parent E5
+segment E51 name "泛型/单态化"           parent E5
+segment E52 name "interface/impl"       parent E5
+segment E53 name "类型推断"              parent E5
+segment E54 name "方法/字段查找"         parent E5
+segment E55 name "布局/对齐/大小"        parent E5
+segment E56 name "关联类型/存在式"       parent E5
+segment E57 name "数值转换白名单"        parent E5
+segment E58 name "enum/struct/carrier声明" parent E5
+segment E59 name "预留"                 parent E5
+segment E60 name "借用/能力型变"         parent E6
+segment E61 name "槽位状态机/out"       parent E6
+segment E62 name "析构/Drop"            parent E6
+segment E63 name "生命周期/借用区域"     parent E6
+segment E64 name "Send/Sync/线程安全"   parent E6
+segment E65 name "interface对象所有权"  parent E6
+segment E66 name "闭包捕获"             parent E6
+segment E67 name "异步状态机"           parent E6
+segment E68 name "预留"                 parent E6
+segment E69 name "预留"                 parent E6
+segment E70 name "MIR构建"             parent E7
+segment E71 name "发射"                parent E7
+segment E72 name "优化pass"            parent E7
+segment E80 name "链接"                parent E8
+segment E90 name "运行时"              parent E9
+segment E91 name "标准库"              parent E9
+segment E92 name "foreign服务"         parent E9
+
+# ── E00 通用/内部（当前无分配） ──
+reserve E00 from 01 to 99
+
+# ── E10 词法（ref lex.md L-编号） ──
+entry E10 code 01 ref lex.md:L-1  desc "非UTF-8字节序列BOM代理对"
+entry E10 code 02 ref lex.md:L-2  desc "base期出现文档注释"
+entry E10 code 03 ref lex.md:L-3  desc "@被写作用户标识符的组成部分"
+entry E10 code 04 ref lex.md:L-4  desc "整数字面量溢出目标类型范围"
+entry E10 code 05 ref lex.md:L-5  desc "字符串字面量含裸换行"
+entry E10 code 06 ref lex.md:L-6  desc "字面量含非法转义序列"
+entry E10 code 07 ref lex.md:L-7  desc "base期出现浮点字面量"
+entry E10 code 08 ref lex.md:L-8  desc "base期出现null"
+entry E10 code 09 ref lex.md:L-9  desc "base期类型位出现T?"
+entry E10 code 10 ref lex.md:L-10 desc "..出现在非索引位"
+entry E10 code 11 ref lex.md:L-11 desc "@单独出现后随非标识符或未登记原语注解名"
+entry E10 code 12 ref lex.md:L-12 desc "字节字面量为空多字节或使用Unicode转义"
+entry E10 code 13 ref lex.md:L-13 desc "原始字符串未闭合或井号界定不匹配"
+entry E10 code 14 ref lex.md:L-14 desc "模板字符串未闭合"
+entry E10 code 15 ref lex.md:L-15 desc "模板插值洞未闭合"
+entry E10 code 16 ref lex.md:L-16 desc "#未形成合法HashName或出现未登记源字符"
+entry E10 code 17 ref lex.md:L-17 desc "单独CR行结束"
+entry E10 code 18 ref lex.md:L-18 desc "文件末尾换行不符合约定"
+entry E10 code 19 ref lex.md:L-19 desc "块注释未闭合"
+entry E10 code 20 ref lex.md:L-20 desc "token长度超过Span范围"
+entry E10 code 21 ref lex.md:L-21 desc "整数进制数字或后缀形态非法"
+entry E10 code 22 ref lex.md:L-22 desc "字符标量数非法或字面量未闭合"
+reserve E10 from 23 to 99
+
+# ── E20 解析（ref parse.md P-编号） ──
+entry E20 code 01 ref parse.md:P-1  desc "产生式不匹配语法错误"
+entry E20 code 02 ref parse.md:P-2  desc "match不穷尽"
+entry E20 code 03 ref parse.md:P-3  desc "match标签payload形态与绑定写法不匹配"
+entry E20 code 04 ref parse.md:P-4  desc "if条件非bool"
+entry E20 code 05 ref parse.md:P-5  desc "return表达式类型与函数返回不匹配"
+entry E20 code 06 ref parse.md:P-6  desc "赋值目标非可写左值"
+entry E20 code 07 ref parse.md:P-7  desc "out声明带初始化器"
+entry E20 code 08 ref parse.md:P-8  desc "let-var-const缺初始化器"
+entry E20 code 09 ref parse.md:P-9  desc "视图类型出现在非法位置"
+entry E20 code 10 ref parse.md:P-10 desc "T?出现在base期类型位"
+entry E20 code 11 ref parse.md:P-11 desc "多级自动解引用"
+entry E20 code 12 ref parse.md:P-12 desc "match作用于T!E-T?-ErrorSet或普通联合"
+entry E20 code 13 ref parse.md:P-13 desc "match标签不属于scrutinee的enum类型"
+entry E20 code 14 ref parse.md:P-14 desc "match标签重复通配臂重复或通配臂后仍有arm"
+entry E20 code 15 ref parse.md:P-15 desc "HashName出现在非callable声明位"
+reserve E20 from 16 to 99
+
+# ── E30 脱糖（ref sugar.md SU-编号 / base.md R-编号） ──
+entry E30 code 01 ref sugar.md:SU-1 desc "未登记的高阶语法出现"
+entry E30 code 02 ref sugar.md:SU-2 desc "脱糖后仍含非base形态"
+entry E30 code 03 ref sugar.md:SU-3 desc "脱糖引入新的MIR opcode或BuiltinId"
+entry E30 code 04 ref sugar.md:SU-4 desc "if-let作用于T!E"
+entry E30 code 05 ref sugar.md:SU-5 desc "..=溢出"
+entry E30 code 06 ref sugar.md:SU-6 desc "顶层let-var循环依赖"
+entry E30 code 07 ref sugar.md:SU-7 desc "泛型单态化失败"
+entry E30 code 08 ref base.md:R-24  desc "使用保留占位字或未启用形态"
+reserve E30 from 09 to 99
+
+# ── E40 名字/作用域（ref name.md N-编号） ──
+entry E40 code 01 ref name.md:N-1  desc "同一作用域内重复声明"
+entry E40 code 02 ref name.md:N-2  desc "名字解析失败"
+entry E40 code 03 ref name.md:N-3  desc "名字解析歧义"
+entry E40 code 04 ref name.md:N-4  desc "前向引用"
+entry E40 code 05 ref name.md:N-5  desc "循环模块依赖"
+entry E40 code 06 ref name.md:N-6  desc "import引入名被重新声明"
+entry E40 code 07 ref name.md:N-7  desc "模块自导入"
+entry E40 code 08 ref name.md:N-8  desc "未导出项被外部引用"
+entry E40 code 09 ref name.md:N-9  desc "未使用绑定"
+entry E40 code 10 ref name.md:N-10 desc "match臂绑定遮蔽同臂已有绑定"
+entry E40 code 11 ref name.md:N-11 desc "参数遮蔽同函数域其他参数"
+reserve E40 from 12 to 99
+
+# ── E50 隐式转换/as/字面量/const（ref base.md、const.md） ──
+entry E50 code 01 ref base.md:R-1  desc "隐式类型转换"
+entry E50 code 02 ref base.md:R-9  desc "浮点字面量或浮点类型"
+entry E50 code 03 ref base.md:6.6  desc "整数算术溢出"
+entry E50 code 04 ref base.md:6.6  desc "as窄化截断编译期可证诊断"
+entry E50 code 05 ref base.md:4.7  desc "整数字面量无法唯一定型且无后缀"
+entry E50 code 06 ref ../lang/const.md:C-1 desc "base const初始器含不允许表达式或不可物化类型"
+entry E50 code 07 ref ../lang/const.md:C-2 desc "const enum payload或定长数组元素非法"
+entry E50 code 08 ref ../lang/const.md:C-5 desc "const整数运算溢出除零或移位越界"
+reserve E50 from 09 to 99
+
+# ── E51 泛型/单态化 ──
+entry E51 code 01 ref base.md:R-17 desc "用户定义参数化类型或泛型函数"
+reserve E51 from 02 to 99
+
+# ── E52-E54 预留（full 层 interface/推断/方法） ──
+reserve E52 from 01 to 99
+reserve E53 from 01 to 99
+reserve E54 from 01 to 99
+
+# ── E55 布局/对齐/大小（ref layout.md LY-编号） ──
+entry E55 code 01 ref layout.md:LY-1 desc "布局计算的大小偏移步长或乘积溢出u64"
+entry E55 code 02 ref layout.md:LY-2 desc "构造零大小可存储对象"
+entry E55 code 03 ref layout.md:LY-3 desc "enum变体或ErrorSet成员数超过65536"
+entry E55 code 04 ref layout.md:LY-4 desc "void用作对象存储字段数组元素或泛型实参"
+entry E55 code 05 ref layout.md:LY-5 desc "未实例化类型参数进入MIR-YSM-布局或ABI"
+entry E55 code 06 ref layout.md:LY-6 desc "读取比较哈希或语义复制padding或inactive payload"
+entry E55 code 07 ref layout.md:LY-7 desc "未冻结动态interface对象进入稳定ABI或foreign边界"
+entry E55 code 08 ref layout.md:LY-8 desc "未登记layout profile的类型进入ABI"
+entry E55 code 09 ref layout.md:LY-9 desc "按值布局依赖环"
+entry E55 code 10 ref layout.md:LY-10 desc "struct字段数超过65536"
+entry E55 code 11 ref layout.md:LY-11 desc "align注解对象值或对齐方向非法"
+reserve E55 from 12 to 99
+
+# ── E56-E57 预留（full 层关联类型/数值转换） ──
+reserve E56 from 01 to 99
+reserve E57 from 01 to 99
+
+# ── E58 enum/struct声明 ──
+entry E58 code 01 ref ../lang/type/result.md:RE-2 desc "错误集联合E1-E2成员可重叠"
+entry E58 code 02 ref ../lang/type/result.md:RE-3 desc "构造T!E时T与E可重叠"
+entry E58 code 03 ref ../lang/type/enum.md:EN-1 desc "同一enum内标签名重复"
+entry E58 code 04 ref ../lang/type/enum.md:EN-2 desc "标签构造payload形态与声明不匹配"
+entry E58 code 05 ref ../lang/type/enum.md:EN-3 desc "标签构造payload类型不可赋给声明类型"
+entry E58 code 06 ref ../lang/type/enum.md:EN-4 desc "普通表达式位置使用无前缀标签构造"
+entry E58 code 07 ref ../lang/type/result.md:RE-1 desc "ErrorSet操作数不是enum类型"
+entry E58 code 08 ref ../lang/type/enum.md:EN-5 desc "读取写入或转换enum原始tag"
+entry E58 code 09 ref ../lang/type/enum.md:EN-6 desc "enum payload不可比较却使用相等比较"
+entry E58 code 10 ref ../lang/type/enum.md:EN-7 desc "单独的下划线不可作enum标签名"
+entry E58 code 11 ref ../lang/type/result.md:RE-8 desc "T!E出现在非返回或局部carrier绑定位置"
+entry E58 code 12 ref ../lang/type/result.md:RE-9 desc "裸组合carrier后缀或把carrier伪装为普通联合"
+entry E58 code 13 ref ../lang/type/option.md:OP-1 desc "null没有唯一预期可空类型或可空内部类型非法"
+entry E58 code 14 ref ../lang/type/option.md:OP-2 desc "非可空接收者使用可空操作"
+entry E58 code 15 ref ../lang/type/option.md:OP-3 desc "可空载体使用错误传播恢复或普通联合分流"
+entry E58 code 16 ref ../lang/type/option.md:OP-4 desc "裸组合后缀或伪造可空状态"
+entry E58 code 17 ref ../lang/type/union.md:UN-1 desc "普通联合成员非法或规范化后重叠"
+entry E58 code 18 ref ../lang/type/union.md:UN-2 desc "构造读取或转换普通联合内部tag"
+entry E58 code 19 ref ../lang/type/union.md:UN-3 desc "普通联合使用carrier专用操作或is目标非法"
+entry E58 code 20 ref ../lang/type/union.md:UN-4 desc "未冻结的普通联合分流形态"
+entry E58 code 21 ref ../lang/type/result.md:RE-10 desc "catch-handler-table成员不属于E的members"
+entry E58 code 22 ref ../lang/type/result.md:RE-11 desc "catch-handler-table成员重复"
+entry E58 code 23 ref ../lang/type/result.md:RE-12 desc "unwrap接收者非T!E或T?"
+reserve E58 from 24 to 99
+
+# ── E59 预留 ──
+reserve E59 from 01 to 99
+
+# ── E60 借用/能力型变（ref base.md R-编号） ──
+entry E60 code 01 ref base.md:R-2  desc "match scrutinee不是owning enum值"
+entry E60 code 02 ref base.md:R-3  desc "越界编译期可证"
+entry E60 code 03 ref base.md:R-4  desc "移动或析构后继续使用源"
+entry E60 code 04 ref base.md:R-5  desc "ReadWrite活跃期间访问原变量名或其他引用"
+entry E60 code 05 ref base.md:R-6  desc "引用逃逸宿主区域或返回局部借用"
+entry E60 code 06 ref base.md:R-7  desc "以引用或切片表达环自引用"
+entry E60 code 07 ref ../lang/type/result.md:RE-4 desc "普通值使用问号或T!E传播的返回类型错误集不兼容"
+entry E60 code 08 ref base.md:R-14 desc "能力升级"
+entry E60 code 09 ref base.md:R-15 desc "对let绑定请求ReadWrite"
+entry E60 code 10 ref base.md:R-16 desc "依赖多层隐式解引用"
+entry E60 code 11 ref base.md:R-18 desc "视图作为字段enum payload元素泛型实参或返回类型"
+reserve E60 from 12 to 99
+
+# ── E61 槽位状态机/out ──
+entry E61 code 01 ref base.md:R-13 desc "用户书写Write或在非out通道建立Write"
+entry E61 code 02 ref base.md:R-22 desc "对out槽位读取部分写入重复填充借用或转发"
+entry E61 code 03 ref base.md:R-23 desc "控制流合流点对同一槽位状态不一致"
+entry E61 code 04 ref base.md:R-25 desc "out的T为视图函数静态引用void普通联合T?或T!E，或含out调用返回未登记carrier"
+entry E61 code 05 ref ../lang/type/result.md:RE-6 desc "含out的T!E调用保存到绑定后判定"
+reserve E61 from 06 to 99
+
+# ── E62 析构/Drop ──
+entry E62 code 01 ref base.md:R-19 desc "隐式clone-move-drop或copy收窄为clone"
+entry E62 code 02 ref base.md:R-20 desc "对非Copy类型使用copy-Copy类型拥有需析构资源"
+entry E62 code 03 ref base.md:R-21 desc "clone未登记克隆契约或作用于Copy类型视图或T!E"
+entry E62 code 04 ref base.md:R-26 desc "move-drop作用于非owning"
+entry E62 code 05 ref ../lang/owner.md:OW-10 desc "对struct字段或数组元素的投影部分移动"
+entry E62 code 06 ref ../lang/owner.md:OW-11 desc "drop作用于投影而非整place"
+reserve E62 from 07 to 99
+
+# ── E63-E69 预留（full 层 生命周期/Send/Sync/interface对象/闭包/异步） ──
+reserve E63 from 01 to 99
+reserve E64 from 01 to 99
+reserve E65 from 01 to 99
+reserve E66 from 01 to 99
+reserve E67 from 01 to 99
+reserve E68 from 01 to 99
+reserve E69 from 01 to 99
+
+# ── E70 MIR构建 / 审计镜像（ref symbol.md / ir/*.md） ──
+entry E70 code 01 ref symbol.md:S-1  desc "混用任意两套id系统"
+entry E70 code 02 ref symbol.md:S-2  desc "随机化哈希种子"
+entry E70 code 03 ref symbol.md:S-3  desc "固有符号分区越界"
+entry E70 code 04 ref symbol.md:S-4  desc "用户名字进入BuiltinId分区"
+entry E70 code 05 ref symbol.md:S-5  desc "保留字重复进入symbol.def"
+entry E70 code 06 ref symbol.md:S-6  desc "NameId-ScopeId-DefId跨单元传播"
+entry E70 code 07 ref symbol.md:S-7  desc "程序运行期加载sym或iface作为依赖"
+entry E70 code 08 ref symbol.md:S-8  desc "错误路径运行期查符号表"
+entry E70 code 09 ref symbol.md:S-9  desc "统一id位宽"
+entry E70 code 10 ref symbol.md:S-10 desc "symbol.def生成表与产物摘要不一致"
+entry E70 code 11 ref symbol.md:S-11 desc "以视图作字段或返回"
+entry E70 code 12 ref symbol.md:S-12 desc "接口容器签名摘要或目标profile非法或不匹配"
+entry E70 code 13 ref symbol.md:S-13 desc "拷贝接口字节进本地arena"
+entry E70 code 14 ref symbol.md:S-14 desc "在2.1声明分区字段之外做位域打包或抽取"
+entry E70 code 15 ref symbol.md:S-15 desc "默认快速构建生成或解析JSON"
+entry E70 code 16 ref symbol.md:S-16 desc "普通标准库函数重复登记为BuiltinId"
+entry E70 code 17 ref symbol.md:S-17 desc "配置源含执行代码或未登记派生项"
+entry E70 code 18 ref symbol.md:S-18 desc "名字解析完成后仍以名称或作用域id表示语义引用"
+entry E70 code 19 ref symbol.md:S-19 desc "名称intern或接口bridge后仍重复hash或扫描名称字节"
+entry E70 code 20 ref ../ir/mir.md:M-7 desc "#函数可达调用图含增操作或非no_alloc导入目标"
+entry E70 code 21 ref ../ir/mir.md:M-8 desc "#函数含不可验证的间接函数调用"
+entry E70 code 22 ref ../ir/mir.md:M-9 desc "#泛型函数当前profile未激活"
+entry E70 code 23 ref ../ir/ysm.md:Y-1 desc "YSM含NameId或ScopeId"
+entry E70 code 24 ref ../ir/ysm.md:Y-2 desc "YSM节目录非法"
+entry E70 code 25 ref ../ir/ysm.md:Y-3 desc "YSM保留字段或禁止flags非零"
+entry E70 code 26 ref ../ir/ysm.md:Y-4 desc "YSM指令操作数与MIR不符"
+entry E70 code 27 ref ../ir/ysm.md:Y-5 desc "YSM排序违规"
+entry E70 code 28 ref ../ir/ysm.md:Y-6 desc "YSM函数no_alloc flags非法"
+entry E70 code 29 ref ../ir/ysm.md:Y-7 desc "YSM依赖接口摘要非法或不匹配"
+entry E70 code 30 ref ../ir/ysm.md:Y-8 desc "YSM target_profile不一致或不匹配"
+entry E70 code 31 ref ../ir/mir.md:M-1 desc "MIR使用moved或dropped的place"
+entry E70 code 32 ref ../ir/mir.md:M-2 desc "borrow_rw活跃期访问重叠place"
+entry E70 code 33 ref ../ir/mir.md:M-3 desc "MIR保留NameId或ScopeId"
+entry E70 code 34 ref ../ir/mir.md:M-4 desc "MIR含不可达块未删除"
+entry E70 code 35 ref ../ir/mir.md:M-5 desc "enum_dispatch或carrier_dispatch非穷尽"
+entry E70 code 36 ref ../ir/mir.md:M-6 desc "out槽位状态转移非法"
+reserve E70 from 37 to 99
+
+# ── E71 发射（ref target/x86.md X-编号） ──
+entry E71 code 01 ref ../target/x86.md:X-1 desc "使用允许子集外指令"
+entry E71 code 02 ref ../target/x86.md:X-2 desc "编码歧义同一opcode操作数产生多字节序列"
+entry E71 code 03 ref ../target/x86.md:X-3 desc "多余前缀或非最短编码"
+reserve E71 from 04 to 99
+
+# ── E72 优化pass（预留，full 层） ──
+reserve E72 from 01 to 99
+
+# ── E80 链接 / ABI / 对象格式 ──
+entry E80 code 01 ref base.md:R-11                desc "未登记的外部服务调用"
+entry E80 code 02 ref ../target/emitter.md:EM-1  desc "链接符号未定义"
+entry E80 code 03 ref ../target/emitter.md:EM-2  desc "链接符号重复定义"
+entry E80 code 04 ref ../target/emitter.md:EM-3  desc "重定位失败"
+entry E80 code 05 ref ../target/emitter.md:EM-4  desc "目标格式不支持"
+entry E80 code 06 ref ../target/abi-win.md:AW-1  desc "Win栈未16字节对齐"
+entry E80 code 07 ref ../target/abi-win.md:AW-2  desc "Win shadow space不足32字节"
+entry E80 code 08 ref ../target/abi-win.md:AW-3  desc "Win被调方保存寄存器未恢复"
+entry E80 code 09 ref ../target/abi-win.md:AW-4  desc "Win修饰名非法字符或非确定digest"
+entry E80 code 10 ref ../target/pe.md:PE-1       desc "PE TimeDateStamp非零"
+entry E80 code 11 ref ../target/pe.md:PE-2       desc "PE未知节或节属性"
+entry E80 code 12 ref ../target/pe.md:PE-3       desc "PE重定位类型宽度加数非法"
+entry E80 code 13 ref ../target/pe.md:PE-4       desc "PE符号表未按LinkId升序"
+entry E80 code 14 ref ../target/abi-linux.md:AL-1 desc "Linux栈未16字节对齐"
+entry E80 code 15 ref ../target/abi-linux.md:AL-2 desc "Linux被调方保存寄存器未恢复"
+entry E80 code 16 ref ../target/abi-linux.md:AL-3 desc "syscall clobber寄存器泄漏到ABI边界"
+entry E80 code 17 ref ../target/abi-linux.md:AL-4 desc "Linux修饰名非法字符或非确定digest"
+entry E80 code 18 ref ../target/elf.md:EL-1      desc "ELF header字段非法"
+entry E80 code 19 ref ../target/elf.md:EL-2      desc "ELF未知节或节属性"
+entry E80 code 20 ref ../target/elf.md:EL-3      desc "ELF重定位类型宽度加数非法"
+entry E80 code 21 ref ../target/elf.md:EL-4      desc "ELF符号表未按LinkId升序"
+entry E80 code 22 ref ../target/emitter.md:EM-5  desc "条件跳转符号性不匹配或wrap运算误发溢出跳转"
+entry E80 code 23 ref ../target/emitter.md:EM-6  desc "ABI 值形态不被当前 profile 支持"
+reserve E80 from 24 to 99
+
+# ── E90 运行时 ──
+entry E90 code 01 ref base.md:R-12  desc "资源上限超出"
+entry E90 code 02 ref base.md:7.15  desc "运行期越界索引切片"
+entry E90 code 03 ref base.md:10.3  desc "运行期不正常完成路径触发"
+entry E90 code 04 ref base.md:T-12  desc "AllocError堆分配失败"
+entry E90 code 05 ref base.md:5.7   desc "栈溢出递归深度超限"
+reserve E90 from 06 to 99
+
+# ── E91 标准库（预留） ──
+reserve E91 from 01 to 99
+
+# ── E92 foreign服务 ──
+entry E92 code 01 ref ../lang/foreign.md:F-2 desc "foreign参数或返回类型非法(owning/Write/carrier/函数引用)"
+entry E92 code 02 ref ../lang/foreign.md:F-3 desc "向foreign边界传递Write"
+entry E92 code 03 ref ../lang/foreign.md:F-4 desc "foreign服务失败未映射为陷阱"
+entry E92 code 04 ref ../lang/foreign.md:F-5 desc "foreign声明使用export前缀"
+entry E92 code 05 ref ../lang/foreign.md:3.5 desc "断言服务条件为假未映射为陷阱"
+entry E92 code 06 ref host.md:HS-1 desc "种子宿主登记或选项非法"
+entry E92 code 07 ref host.md:HS-2 desc "参数索引或接收缓冲非法"
+entry E92 code 08 ref host.md:HS-3 desc "访问未登记的输入或输出名称"
+entry E92 code 09 ref host.md:HS-4 desc "受限文件服务执行失败"
+reserve E92 from 10 to 99

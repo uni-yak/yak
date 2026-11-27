@@ -1,0 +1,2 @@
+// expected_trap: write through Read reference
+function main(): void { var x: i64 = 1; let r: &i64 = &x; *r = 2; }

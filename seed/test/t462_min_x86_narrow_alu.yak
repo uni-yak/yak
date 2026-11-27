@@ -1,0 +1,133 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function logical_identity(): void!AllocError {
+    // 同值写回与 TEST 的寄存器和已定义标志一致；32 位写回另会清空高半部。
+    var code: pe::Code = pe::code_new();
+    pe::and_rr(&code:ReadWrite, pe::rax(), pe::rax())?;
+    pe::or_rr(&code:ReadWrite, pe::r8(), pe::r8())?;
+    assert(code.used == 6 && code.bytes[1] == 0x85 && code.bytes[4] == 0x85);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    let rr: [u8; 16] = [0x48, 0x21, 0xc0, 0x4d, 0x09, 0xc0, 0x66, 0x09, 0xc0,
+        0x40, 0x20, 0xe4, 0x21, 0xc0, 0x09, 0xc0];
+    encoding(&rr[0..3]:Read, 7102)?;
+    encoding(&rr[3..6]:Read, 7102)?;
+    encoding(&rr[6..9]:Read, 7102)?;
+    encoding(&rr[9..12]:Read, 7102)?;
+    encoding(&rr[12..16]:Read, 0)?;
+
+    // 与位宽相同的全一掩码和 OR 零保留原值；内存形态仍写回。
+    let imm: [u8; 32] = [0x0c, 0, 0x24, 0xff, 0x48, 0x83, 0xc8, 0, 0x49, 0x83, 0xe0, 0xff,
+        0x66, 0x25, 0xff, 0xff, 0x80, 0xcf, 0, 0x48, 0x83, 0x08, 0,
+        0x83, 0xcb, 0, 0x83, 0xe3, 0xff, 0x48, 0x83, 0xc8];
+    encoding(&imm[0..2]:Read, 7102)?;
+    encoding(&imm[2..4]:Read, 7102)?;
+    encoding(&imm[4..8]:Read, 7103)?;
+    encoding(&imm[8..12]:Read, 7103)?;
+    encoding(&imm[12..16]:Read, 7103)?;
+    encoding(&imm[16..19]:Read, 7103)?;
+    encoding(&imm[19..29]:Read, 0)?;
+    encoding(&imm[29..32]:Read, 7101)?;
+    // XOR 零只更新逻辑标志；32 位写回和内存访问仍保留。
+    let xor_zero: [u8; 31] = [0x34, 0, 0x80, 0xf4, 0, 0x40, 0x80, 0xf4, 0,
+        0x66, 0x83, 0xf0, 0, 0x49, 0x83, 0xf0, 0, 0x83, 0xf0, 0, 0x48, 0x83, 0x30, 0,
+        0x49, 0x83, 0xf0, 1, 0x4d, 0x85, 0xc0];
+    encoding(&xor_zero[0..2]:Read, 7102)?;
+    encoding(&xor_zero[2..5]:Read, 7103)?;
+    encoding(&xor_zero[5..9]:Read, 7103)?;
+    encoding(&xor_zero[9..13]:Read, 7103)?;
+    encoding(&xor_zero[13..17]:Read, 7103)?;
+    encoding(&xor_zero[13..16]:Read, 7101)?;
+    encoding(&xor_zero[17..31]:Read, 0)?;
+    // 寄存器 AND 零与同宽清零等价，内存 AND 零仍读写完整操作数。
+    let zero: [u8; 28] = [0x24, 0, 0x80, 0xe4, 0, 0x40, 0x80, 0xe4, 0,
+        0x66, 0x83, 0xe0, 0, 0x83, 0xe0, 0, 0x49, 0x83, 0xe0, 0,
+        0x48, 0x83, 0x21, 0, 0x66, 0x83, 0x21, 0];
+    encoding(&zero[0..2]:Read, 7102)?;
+    encoding(&zero[2..5]:Read, 7103)?;
+    encoding(&zero[5..9]:Read, 7103)?;
+    encoding(&zero[9..13]:Read, 7103)?;
+    encoding(&zero[13..16]:Read, 7103)?;
+    encoding(&zero[16..20]:Read, 7103)?;
+    encoding(&zero[20..28]:Read, 0)?;
+    encoding(&zero[16..19]:Read, 7101)?;
+    return;
+}
+
+function verify(): void!AllocError {
+    logical_identity()?;
+    // 相同寄存器清零时，32 位目的也会清空高半部。
+    let wide_self: [u8; 12] = [0x48, 0x31, 0xd2, 0x4d, 0x31, 0xc0, 0x48, 0x29, 0xc0, 0x4d, 0x29, 0xc9];
+    encoding(&wide_self[0..3]:Read, 7103)?;
+    encoding(&wide_self[3..6]:Read, 7102)?;
+    encoding(&wide_self[6..9]:Read, 7103)?;
+    encoding(&wide_self[9..12]:Read, 7102)?;
+    let other: [u8; 9] = [0x4c, 0x31, 0xc0, 0x48, 0x29, 0xc8, 0x48, 0x31, 0x00];
+    encoding(&other[0..9]:Read, 0)?;
+
+    var code: pe::Code = pe::code_new();
+    pe::xor_rr(&code:ReadWrite, 2, 2)?;
+    pe::xor_rr(&code:ReadWrite, 8, 8)?;
+    pe::sub_rr(&code:ReadWrite, 0, 0)?;
+    pe::sub_rr(&code:ReadWrite, 9, 9)?;
+    let expected: [u8; 10] = [0x31, 0xd2, 0x45, 0x31, 0xc0, 0x29, 0xc0, 0x45, 0x29, 0xc9];
+    assert(pe::code_len(&code:Read) == 10);
+    var i: u32 = 0;
+    while i < 10 { assert(code.bytes[i] == expected[i]); i = i + 1; }
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+
+    // 非负符号扩展掩码压窄寄存器结果，内存和负掩码保留原宽度。
+    let masks: [u8; 44] = [0x48, 0x83, 0xe0, 0x7f, 0x49, 0x83, 0xe0, 1,
+        0x48, 0x25, 0xff, 0xff, 0xff, 0x7f, 0x49, 0x81, 0xe1, 0x80, 0, 0, 0,
+        0x48, 0x83, 0xe0, 0x80, 0x48, 0x25, 0, 0, 0, 0x80, 0x48, 0x83, 0x20, 0x7f,
+        0x49, 0x83, 0xe0, 0xfe, 0x41, 0x83, 0xe0, 1, 0xc3];
+    encoding(&masks[0..4]:Read, 7103)?;
+    encoding(&masks[4..8]:Read, 7102)?;
+    encoding(&masks[8..14]:Read, 7103)?;
+    encoding(&masks[14..21]:Read, 7102)?;
+    encoding(&masks[21..44]:Read, 0)?;
+    encoding(&masks[8..13]:Read, 7101)?;
+
+    // TEST 只更新标志，仍须保留负掩码和内存读取宽度。
+    let tests: [u8; 30] = [0x48, 0xa9, 0xff, 0xff, 0xff, 0x7f, 0x49, 0xf7, 0xc0, 0x80, 0, 0, 0,
+        0x48, 0xa9, 0, 0, 0, 0x80, 0x48, 0xf7, 0x00, 1, 0, 0, 0, 0x41, 0xf6, 0xc0, 1];
+    encoding(&tests[0..6]:Read, 7103)?;
+    encoding(&tests[6..13]:Read, 7103)?;
+    encoding(&tests[13..30]:Read, 0)?;
+    let small_tests: [u8; 16] = [0x66, 0xa9, 0x7f, 0, 0x41, 0xf7, 0xc0, 1, 0, 0, 0,
+        0xa9, 0x7f, 0, 0, 0];
+    encoding(&small_tests[0..4]:Read, 7103)?;
+    encoding(&small_tests[4..11]:Read, 7103)?;
+    encoding(&small_tests[11..16]:Read, 7103)?;
+    let short_tests: [u8; 10] = [0xa8, 0x7f, 0x40, 0xf6, 0xc4, 0x7f, 0x66, 0xa9, 0x80, 0];
+    encoding(&short_tests[0..10]:Read, 0)?;
+    // 低 15 位可用 16 位 TEST；掩码第 15 位为一时缩窄会改变 SF。
+    let word_boundary: [u8; 42] = [0xa9, 0x80, 0, 0, 0, 0x41, 0xf7, 0xc1, 0xff, 0x7f, 0, 0,
+        0xa9, 0, 0x80, 0, 0, 0x41, 0xf7, 0xc1, 0, 0x80, 0, 0,
+        0x66, 0x41, 0xf7, 0xc1, 0xff, 0x7f, 0x48, 0xf7, 0x01, 0xff, 0x7f, 0, 0,
+        0x66, 0xf7, 0xc1, 0, 0x80];
+    encoding(&word_boundary[0..5]:Read, 7103)?;
+    encoding(&word_boundary[5..12]:Read, 7103)?;
+    encoding(&word_boundary[12..42]:Read, 0)?;
+    encoding(&word_boundary[5..11]:Read, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

@@ -1,0 +1,22 @@
+// 定向回归：@len 直接消费临时 owning 数组后按完整表达式析构，循环重复执行不耗尽预算。
+// mem_limit: 1048576
+// expected_stdout: ok
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+function make(): u8[] {
+    return [1u8, 2u8, 3u8, 4u8];
+}
+
+function main(): void {
+    var i: u32 = 0;
+    var total: u64 = 0u64;
+    while i < 20000 {
+        total = total + @len([1u8, 2u8, 3u8, 4u8]);
+        total = total + @len(make());
+        i = i + 1u32;
+    }
+    assert(total == 160000u64);
+    write("ok");
+    return;
+}

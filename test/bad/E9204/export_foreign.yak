@@ -1,0 +1,6 @@
+// expected_code: E9204
+// spec: spec/lang/foreign.md#F-5
+// 触发：给已登记的 foreign 声明添加 export 前缀。
+export foreign write(data: &[u8]): void;
+
+function main(): void { return; }

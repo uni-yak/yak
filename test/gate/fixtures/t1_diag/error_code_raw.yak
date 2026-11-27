@@ -1,0 +1,13 @@
+// 真实驱动的错误码接口不接受同编码的裸整数。
+import driver_diag;
+
+function check(): void!AllocError {
+    let raw: u16 = 4002u16;
+    driver_diag::report_code("检查", raw)?;
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = check();
+    @drop(result);
+}

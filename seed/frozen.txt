@@ -1,0 +1,30 @@
+# frozen.txt —— yak-seed 冻结哈希登记
+# 格式：sha256  编译器对  产物名
+# 冻结后不得重编；升级视为重基线事件（../spec/proc/seed.md T0）
+#
+# 语义：可复现性基线 —— 同一编译器连续构建两次，产物必须字节一致，
+#       该哈希即为冻结值（gcc 构建，产物哈希）。不记录构建日期：
+#       日期会破坏确定性比对。
+# 交叉验证：clang 行为等价（两套二进制跑全部回归测试，输出与退出码
+#       逐一致）。gcc 与 clang 代码生成不同，产物字节比对不可行。
+e2e1a862ade9af73e74158b5d1546ef780fef82eb0bc5afa7c4b23fa88d19dc3  gcc16.2.0  yak-seed.exe
+ed4fd086e2b66113b211cf4f196379ea3df9d0d599b8c3152c60e612b0a243d6  gcc16.2.0+clang23.1.3  yak-seed.exe
+36c7fc3f4de2bd05d7b11029e229ef86a9082de68057da7117787977aba853b8  gcc16.2.0+clang23.1.3  yak-seed.exe
+420b04cb26342ea1072732993d1fae558ecbcb03e8c546009b63ca5d55cc75bf  gcc16.2.0+clang23.1.3  yak-seed.exe
+c6c58c63875b7cf52b4dc67cce03cc8eeb53a34df7be832618e12c92f177f6bc  gcc16.2.0+clang23.1.3  yak-seed.exe
+139b89071203429ff21ca74ac0b3afec06cf416fb176cba3758a6ca734936c45  gcc16.2.0+clang23.1.3  yak-seed.exe
+58c71e733455dc102f5dfaec3ab7090777fceb28c3467492c4b79339835973ec  gcc16.2.0+clang23.1.3  yak-seed.exe
+a109bc84ba65df0574c5fa74e3e83c8372bd8a7656d753a635171fff516ff3f9  gcc16.2.0+clang23.1.3  yak-seed.exe
+d8ddee710e37976583fc95d248d590703dad7e8157d292352589ca97c95c59c6  gcc16.2.0+clang23.1.3  yak-seed.exe
+1ff6f83cfed657cf23b16ccd28bea6e779caf01aa71ebd1d7092d46caea6a07e  gcc16.2.0+clang23.1.3  yak-seed.exe
+eca55713ee7c0b80e015f317df3c6e67455c2c1c8cec1226ec94ce3f0dadc077  gcc16.2.0+clang23.1.3  yak-seed.exe
+2a40cfc8e9b931213253369ac08e6c427d93454a3035cda1ea7d7babb3714cb3  gcc16.2.0+clang23.1.3  yak-seed.exe
+b30f31055e6e3a0c72545775d7281715aef18a74a7e6a1508b51c2fabdfa4d48  gcc16.2.0+clang23.1.3  yak-seed.exe
+c55c8f8333ba13cb7100412da6a5ea6879d45909a45c97096f00a18f71d6b0e2  gcc16.2.0+clang23.1.3  yak-seed.exe
+0528a2ea77fd45526571a792b7e6eda144b679ab197290e07f25f64e4ca2e465  gcc16.2.0+clang23.1.3  yak-seed.exe
+1b51abe2fe6e2b6587ff2b59eaffb26b03eef3f12f9743be637a309c7114ad0d  gcc16.2.0+clang23.1.3  yak-seed.exe
+f7427e904828d7a6305cd04a9bf197623fe969fa377c524a857bb76f6de5630c  gcc16.2.0+clang23.1.3  yak-seed.exe
+1020368c7abb0bc022f48e79583bf3d8adaf8807186a79add8ae76df9142e20c  gcc16.2.0+clang23.1.3  yak-seed.exe
+96a3a6760c9f4b2d7341a313d01cba04982db9f541ce22d9c223dc97b0c07e3f  gcc16.2.0+clang23.1.3  yak-seed.exe
+bd88e16c28e80a3100684393702691692c05862c2879a988974ea46410d96aa0  gcc16.2.0+clang23.1.3  yak-seed.exe
+9abd162e2713748ffb62d471e39c5703abb733b607bb6431dccef1e7b9fe30ec  gcc16.2.0+clang23.1.3  yak-seed.exe

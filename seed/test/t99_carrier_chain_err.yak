@@ -1,0 +1,15 @@
+// t99: ? 传播链错误路径 → 顶层未捕获 trap（RE-4）
+// expected_trap: uncaught error propagation
+enum E { Bad }
+function f(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function g(x: u32): u32!E {
+    let v: u32 = f(x)?;
+    return v + 1;
+}
+function main(): void {
+    let v: u32 = g(0)?;
+    return;
+}

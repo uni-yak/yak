@@ -1,0 +1,329 @@
+// 定向验证函数出口析构计划与 MIR 的 drop 指令插入。
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import owner;
+import owner_state;
+import mir;
+import mir_lower;
+import mir_verify;
+import layout;
+foreign assert(cond: bool): void;
+
+// 前端结果容器，避免重复解析。
+struct Unit { parsed: parse::ParseResult, lexed: lex::LexResult, resolution: resolve_refs::Resolution, checked: typecheck::TypeCheckResult }
+
+function load(src: &[u8], file: u16): Unit!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let lexed: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    return Unit { parsed: parsed, lexed: lexed, resolution: resolution, checked: checked };
+}
+
+// 对源码执行所有权检查并返回完整结果；调用方只读访问计划表。
+function result_of(src: &[u8], file: u16): owner::OwnerResult!AllocError {
+    let u: Unit = load(src, file)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: owner::OwnerResult = owner::check_unit(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    return result;
+}
+
+// 情形一：出口仍 live 的 owning 局部必须进入析构计划；空函数体产出空序列。
+function local_enters_plan(): void!AllocError {
+    let r: owner::OwnerResult = result_of("function main(): void { let a: u32[] = [1u32]; let n: u64 = @len(a); @drop(n); }\nfunction empty(): void { }\n", 9001)?;
+    if @len(r.drop_plans.items) != 2 { write("x1\n"); return; }
+    if r.drop_plans.items[0].func_def == 0 { write("x2\n"); return; }
+    if @len(r.drop_plans.items[0].defs) != 1 { write("x3\n"); return; }
+    if @len(r.drop_plans.items[1].defs) != 0 { write("x4\n"); return; }
+    return;
+}
+
+// 情形二：按值 owning 形参随函数出口析构，与局部一起按声明逆序排列（owner.md 2.3 / 6.1 / 6.2）。
+function parameter_enters_plan(): void!AllocError {
+    let r: owner::OwnerResult = result_of("function main(): void { }\nfunction f(x: u32[]): void { let b: u32[] = [2u32]; let n: u64 = @len(x) + @len(b); @drop(n); }\n", 9002)?;
+    assert(@len(r.drop_plans.items) == 2);
+    assert(@len(r.drop_plans.items[1].defs) == 2);
+    assert(r.drop_plans.items[1].defs[0] > r.drop_plans.items[1].defs[1]);
+    return;
+}
+
+// 情形三：显式 @drop 或已移动的局部不再计入出口析构。
+function moved_excluded(): void!AllocError {
+    let r: owner::OwnerResult = result_of("function take(x: u32[]): void { @drop(x); }\nfunction main(): void { let a: u32[] = [1u32]; @drop(a); let b: u32[] = [2u32]; let n: u64 = @len(b); @drop(n); }\nfunction g(): void { let c: u32[] = [3u32]; take(@move(c)); }\n", 9003)?;
+    assert(@len(r.drop_plans.items) == 3);
+    assert(@len(r.drop_plans.items[0].defs) == 0);
+    assert(@len(r.drop_plans.items[1].defs) == 1);
+    assert(@len(r.drop_plans.items[2].defs) == 0);
+    return;
+}
+
+// 情形四：同一作用域按声明逆序排列，后声明者的 DefId 更大且排在前面（owner.md 6.2）。
+function reverse_order(): void!AllocError {
+    let r: owner::OwnerResult = result_of("function main(): void { let a: u32[] = [1u32]; let b: u32[] = [2u32]; let n: u64 = @len(a) + @len(b); @drop(n); }\n", 9004)?;
+    assert(@len(r.drop_plans.items[0].defs) == 2);
+    assert(r.drop_plans.items[0].defs[0] > r.drop_plans.items[0].defs[1]);
+    return;
+}
+
+function count_drops(m: &mir::MirModule:Read, fn: u32): u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(m.functions[fn].insts) as u32 {
+        if m.functions[fn].insts[i].op == 115 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 情形五：MIR 在函数出口真正插入 0x73 drop；空计划不产生 drop。
+// 用定长数组做机械验证：checker 的 owning 过滤由前四例覆盖，本例只验证插入通道。
+function mir_emits_drop(): void!AllocError {
+    let src: &[u8] = "const C: [u32; 2] = [1u32, 2u32]; function mir_case(): u32 { let a: [u32; 2] = C; return a[1u32]; }\n";
+    let u: Unit = load(src, 9005)?;
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let result: owner::OwnerResult = owner::check_unit(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &d1:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&d1:Read));
+    assert(@len(result.places.items) == 1);
+    let local_def: u32 = result.places.items[0].def;
+    assert(local_def != 0);
+    var flat: u32[] = [];
+    assert(@len(result.drop_plans.items[0].returns.items) == 1);
+    @push(flat, 1u32)?;
+    @push(flat, 0u32)?;
+    @push(flat, result.drop_plans.items[0].returns.items[0].site)?;
+    @push(flat, 1u32)?;
+    @push(flat, local_def)?;
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let no_layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let no_fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    let no_enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    let plan_mir: mir::MirResult = mir_lower::build_mir_with_drops(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &flat:Read, &no_layouts:Read, &no_fields:Read, &no_enums:Read, &d2:ReadWrite)?;
+    assert(plan_mir.accepted);
+    assert(diag::diagbuf_count(&d2:Read) == 0);
+    assert(mir_verify::verify_module(&plan_mir.module:Read)?);
+    assert(count_drops(&plan_mir.module:Read, 0) == 1);
+    let empty: u32[] = [];
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let plain: mir::MirResult = mir_lower::build_mir_with_drops(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &empty:Read, &no_layouts:Read, &no_fields:Read, &no_enums:Read, &d3:ReadWrite)?;
+    assert(plain.accepted);
+    assert(count_drops(&plain.module:Read, 0) == 0);
+    return;
+}
+
+// 两个返回点必须有不同清单，转移到调用方的局部值不在任一清单中。
+function return_edges(): void!AllocError {
+    let r: owner::OwnerResult = result_of("function f(flag: bool): u32[] { let a: u32[] = [1u32]; let b: u32[] = [2u32]; if flag { return @move(b); } @drop(b); return @move(a); }\n", 9006)?;
+    assert(@len(r.drop_plans.items) == 1);
+    assert(@len(r.drop_plans.items[0].defs) == 0);
+    assert(@len(r.drop_plans.items[0].returns.items) == 2);
+    assert(r.drop_plans.items[0].returns.items[0].site != r.drop_plans.items[0].returns.items[1].site);
+    assert(!r.drop_plans.items[0].returns.items[0].on_error && !r.drop_plans.items[0].returns.items[1].on_error);
+    assert(@len(r.drop_plans.items[0].returns.items[0].defs) == 1);
+    assert(@len(r.drop_plans.items[0].returns.items[1].defs) == 0);
+    let flat: u32[] = owner::encode_drop_plans(&r.drop_plans:Read)?;
+    assert(@len(flat) == 11 && flat[0] == 3 && flat[1] == 0 && flat[2] == 4294967295u32 && flat[3] == 0);
+    assert(flat[4] == 0 && flat[5] == r.drop_plans.items[0].returns.items[0].site && flat[6] == 1 && flat[7] == r.drop_plans.items[0].returns.items[0].defs[0]);
+    assert(flat[8] == 0 && flat[9] == r.drop_plans.items[0].returns.items[1].site && flat[10] == 0);
+    return;
+}
+
+// 平常 void 末尾只使用隐式计划，生成对原局部的 drop。
+function implicit_edge(): void!AllocError {
+    let u: Unit = load("function f(): void { var a: u32[] = []; let n: u64 = @len(a); @drop(n); }\n", 9007)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let r: owner::OwnerResult = owner::check_unit(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    assert(@len(r.drop_plans.items[0].defs) == 1 && @len(r.drop_plans.items[0].returns.items) == 0);
+    let flat: u32[] = owner::encode_drop_plans(&r.drop_plans:Read)?;
+    let layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    let enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    let m: mir::MirResult = mir_lower::build_mir_with_drops(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &flat:Read, &layouts:Read, &fields:Read, &enums:Read, &diags:ReadWrite)?;
+    assert(m.accepted && mir_verify::verify_module(&m.module:Read)?);
+    // 标量的显式消费和数组的隐式清理分别保留一条指令。
+    assert(count_drops(&m.module:Read, 0) == 2);
+    return;
+}
+
+// 直接传播对照显式返回：借出的槽只能在成功边成为已初始化的 owning 值。
+function propagation_slots(): void!AllocError {
+    let r: owner::OwnerResult = result_of("struct S { a: u32[] } function fill(x: &S:Write): void!AllocError { *x = S { a: [1u32] }; return; } function f(): void!AllocError { let kept: u32[] = [2u32]; let n: u64 = @len(kept); @drop(n); out filled: S; fill(out filled)?; return; }\n", 9008)?;
+    assert(@len(r.drop_plans.items[1].returns.items) == 2);
+    assert(r.drop_plans.items[1].returns.items[0].on_error);
+    assert(!r.drop_plans.items[1].returns.items[1].on_error);
+    assert(@len(r.drop_plans.items[1].returns.items[0].defs) == 1);
+    assert(@len(r.drop_plans.items[1].returns.items[1].defs) == 2);
+    assert(r.drop_plans.items[1].returns.items[0].defs[0] == r.drop_plans.items[1].returns.items[1].defs[1]);
+    return;
+}
+
+// 块级正常落尾、continue 与带标签 break 按退出作用域边界逆序记录析构计划，且不与外层重复。
+function scope_exit_and_loop_jumps(): void!AllocError {
+    let src: &[u8] = "function f(flag: bool): void!AllocError { var outer_v: u32[] = []; @push(outer_v, 1u32)?; var i: u32 = 0; outer: while i < 2 { var loop_a: u32[] = []; @push(loop_a, 2u32)?; if i == 0 { var cont_v: u32[] = []; @push(cont_v, 3u32)?; i = 1; continue outer; } inner: while flag { var inner_b: u32[] = []; @push(inner_b, 4u32)?; break outer; } } if flag { var if_v: u32[] = []; @push(if_v, 5u32)?; } return; }\n";
+    let u: Unit = load(src, 9009)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let r: owner::OwnerResult = owner::check_unit(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    assert(@len(r.drop_plans.items) == 1);
+    // 作用域退出记录包含：continue(边3: cont_v, loop_a)、break outer(边2: inner_b, loop_a)、
+    // outer 循环体正常落尾(边4: loop_a)、if 块正常落尾(边4: if_v)。
+    let scopes: &owner_state::ScopeDropPlan[]:Read = &r.drop_plans.items[0].returns.scopes:Read;
+    var has_continue: bool = false;
+    var has_break: bool = false;
+    var block_exits: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(*scopes) as u32 {
+        let sc: &owner_state::ScopeDropPlan:Read = &(*scopes)[i]:Read;
+        if sc.edge == 3 { assert(@len(sc.defs) == 2 && sc.defs[0] > sc.defs[1]); has_continue = true; }
+        elseif sc.edge == 2 { assert(@len(sc.defs) == 2 && sc.defs[0] > sc.defs[1]); has_break = true; }
+        elseif sc.edge == 4 { assert(@len(sc.defs) == 1); block_exits = block_exits + 1; }
+        i = i + 1;
+    }
+    assert(has_continue && has_break && block_exits == 2);
+    // 函数显式返回只析构 outer_v，不含任何已离块的子作用域局部。
+    let ret_count: u32 = @len(r.drop_plans.items[0].returns.items) as u32;
+    assert(ret_count > 0);
+    assert(!r.drop_plans.items[0].returns.items[ret_count - 1].on_error);
+    assert(@len(r.drop_plans.items[0].returns.items[ret_count - 1].defs) == 1);
+    let flat: u32[] = owner::encode_drop_plans(&r.drop_plans:Read)?;
+    let layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    let enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    let m: mir::MirResult = mir_lower::build_mir_with_drops(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &flat:Read, &layouts:Read, &fields:Read, &enums:Read, &diags:ReadWrite)?;
+    assert(m.accepted && mir_verify::verify_module(&m.module:Read)?);
+    return;
+}
+
+// 合流后的条件所有者：只有一支析构时仍保留在出口计划中，两支都析构时不重复计入，
+// 合流后读取或再次移动则拒绝（owner.md 4.4 / 6.1，OW-1）。
+function conditional_owner_exit(): void!AllocError {
+    let maybe_src: &[u8] = "function m(v: u32[]): void { let n: u64 = @len(v); if n == 999u64 { @drop(v); } return; }\nfunction main(): void { }\n";
+    let u: Unit = load(maybe_src, 9010)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let r: owner::OwnerResult = owner::check_unit(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    // 形参只在条件分支上被析构，返回边仍须保留它。
+    let last: u32 = @len(r.drop_plans.items[0].returns.items) as u32;
+    assert(last == 1);
+    assert(@len(r.drop_plans.items[0].returns.items[0].defs) == 1);
+    let flat: u32[] = owner::encode_drop_plans(&r.drop_plans:Read)?;
+    let layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    let enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    var lowered: mir::MirResult = mir_lower::build_mir_with_drops(&u.parsed.file:Read, &u.parsed.pool:Read, &u.resolution:Read, &u.checked:Read, &flat:Read, &layouts:Read, &fields:Read, &enums:Read, &diags:ReadWrite)?;
+    assert(lowered.accepted && !diags.has_error);
+    let count: u32 = @len(lowered.module.functions[0].insts) as u32;
+    var i: u32 = 0;
+    var flag: u32 = 0;
+    var lit_true: u32 = 0;
+    while i < count {
+        let ins: mir::MirInst = lowered.module.functions[0].insts[i];
+        if ins.op == 2 && ins.value == 1 { lit_true = ins.a; }
+        if ins.op == 115 && ins.c != 0 { flag = ins.c; }
+        i = i + 1;
+    }
+    assert(flag != 0 && lit_true != 0);
+    i = 0;
+    while i + 1 < count {
+        let dropped: mir::MirInst = lowered.module.functions[0].insts[i];
+        let save_flag: mir::MirInst = lowered.module.functions[0].insts[i + 1];
+        if dropped.op == 115 && dropped.c == 0 && save_flag.op == 81 && save_flag.b == flag { break; }
+        i = i + 1;
+    }
+    assert(i + 1 < count && lowered.module.functions[0].insts[i + 1].c != lit_true);
+    lowered.module.functions[0].insts[i + 1].c = lit_true;
+    let wrong_guard: mir_verify::Validation = mir_verify::validate_module(&lowered.module:Read)?;
+    assert(!wrong_guard.ok && wrong_guard.code.raw == 7031);
+    let dead_src: &[u8] = "function m(v: u32[]): void { let n: u64 = @len(v); if n == 999u64 { @drop(v); } else { @drop(v); } return; }\nfunction main(): void { }\n";
+    let u2: Unit = load(dead_src, 9011)?;
+    var diags2: diag::DiagBuffer = diag::diagbuf_new();
+    let r2: owner::OwnerResult = owner::check_unit(&u2.parsed.file:Read, &u2.parsed.pool:Read, &u2.resolution:Read, &u2.checked:Read, &diags2:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags2:Read));
+    // 两支都已析构，出口不得再次计入，否则运行期双释放。
+    assert(@len(r2.drop_plans.items[0].returns.items) == 1);
+    assert(@len(r2.drop_plans.items[0].returns.items[0].defs) == 0);
+    // 合流后读取同一 place 属移动或析构后继续使用（OW-1）。
+    let read_src: &[u8] = "function m(v: u32[]): void { let n: u64 = @len(v); if n == 999u64 { @drop(v); } let k: u64 = @len(v); @drop(k); return; }\nfunction main(): void { }\n";
+    let u3: Unit = load(read_src, 9012)?;
+    var diags3: diag::DiagBuffer = diag::diagbuf_new();
+    owner::check_unit(&u3.parsed.file:Read, &u3.parsed.pool:Read, &u3.resolution:Read, &u3.checked:Read, &diags3:ReadWrite)?;
+    assert(diag::diagbuf_has_error(&diags3:Read));
+    return;
+}
+
+function main(): void {
+    conditional_owner_exit()?;
+    scope_exit_and_loop_jumps()?;
+    propagation_slots()?;
+    implicit_edge()?;
+    return_edges()?;
+    local_enters_plan()?;
+    parameter_enters_plan()?;
+    moved_excluded()?;
+    reverse_order()?;
+    mir_emits_drop()?;
+    return;
+}

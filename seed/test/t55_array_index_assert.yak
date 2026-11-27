@@ -1,0 +1,11 @@
+// t55: 数组索引值assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let arr: u32[] = [10, 20, 30];
+    assert(arr[0] == 10);
+    assert(arr[1] == 20);
+    assert(arr[2] == 30);
+    assert(arr[0] + arr[2] == 40);
+    return;
+}

@@ -1,0 +1,9 @@
+// expected_code: E6202
+// spec: spec/lang/base.md R-20
+// 触发：尝试复制拥有堆存储的动态数组。
+function reject(value: u32[]): void {
+    let copied: u32[] = @copy(value);
+    @drop(copied);
+    @drop(value);
+}
+function main(): void { return; }

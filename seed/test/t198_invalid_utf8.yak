@@ -1,0 +1,3 @@
+// expected_trap: invalid UTF-8
+// ÿ
+function main(): void {}

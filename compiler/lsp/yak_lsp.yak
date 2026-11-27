@@ -1,0 +1,6 @@
+// 独立的 stdio 诊断候选入口，不接入批处理命令。
+import diagnostic_service;
+
+function main(): void {
+    diagnostic_service::run(true);
+}

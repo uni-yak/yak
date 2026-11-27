@@ -1,0 +1,482 @@
+// PE/COFF 对象发射入口与文件容器装配。
+// 依据 spec/target/pe.md 二～四节与 spec/target/abi-win.md 五节。
+
+import mir;
+import types;
+import coff_code;
+import coff_state;
+import coff_symbols;
+import coff_layout;
+
+// ── 拒绝码（spec/proc/error.def E80「链接 / ABI / 对象格式」段）──
+// 编码规则：E<千位><百位><两位序号>，E80 段即 8000 + code，与 iface.yak 的 7012 写法一致。
+// 8002=EM-1 链接符号未定义；8003=EM-2 重复定义；8004=EM-3 重定位失败；
+// 8005=EM-4 目标格式不支持；8022=EM-5 条件跳转符号性不匹配或回绕运算误发溢出跳转；
+// 8023=EM-6 ABI 值形态不被当前 profile 支持（切片按值返回、>8 字节聚合按值返回/实参）。
+export function e_em3(): u16 { return 8004; }
+export function e_em4(): u16 { return 8005; }
+export function e_em5(): u16 { return 8022; }
+export function e_em6(): u16 { return 8023; }
+// 目标 profile 编号：1 = abi-win + pe（首发唯一登记值）。
+const PROFILE_WIN64_PE: u16 = 1;
+// ── 对象总装配 ──
+// 拒绝位置：kind 对应 emit 拒绝形态编号，span 为源位置（本模块只透传）。
+export struct Rejection { kind: u8, span: types::Span }
+// 发射结果：成功给出字节，失败给出 error.def 的错误码（8002..8005 / 8022 / 8023）。
+export struct EmitResult { ok: bool, code: types::ErrorCode, bytes: coff_code::Bytes, rejection: Rejection }
+
+// 重定位记录：节内偏移、符号表索引、类型。
+export struct RelocRecord { address: u32, symbol: u32, kind: u16 }
+// 对象内一个节：名字、属性、内容与挂在其上的重定位。
+export struct OutSection {
+    name: u8[], characteristics: u32,
+    data: u8[], relocs: RelocRecord[],
+}
+export function rel_rel32(): u16 { return 4; }
+export function rel_addr32nb(): u16 { return 3; }
+export function rel_addr64(): u16 { return 1; }
+
+// 重定位的位宽必须与类型相符（emitter.md 2.4）：宽度不符即 EM-3，
+// 绝不把 8 字节目标塞进 4 字节字段，也不做静默截断。
+export function reloc_width(kind: u16): u8 {
+    if kind == rel_addr64() { return 8; }
+    if kind == rel_rel32() { return 4; }
+    if kind == rel_addr32nb() { return 4; }
+    return 0;
+}
+export function reloc_width_legal(width: u8, kind: u16): bool {
+    let need: u8 = reloc_width(kind);
+    if need == 0 { return false; }
+    return width == need;
+}
+// 重定位站点必须完整落在节内：越界或宽度不符都是无法施加的重定位（EM-3）。
+export function reloc_site_legal(site: u32, section_size: u32, kind: u16): bool {
+    let need: u8 = reloc_width(kind);
+    if need == 0 { return false; }
+    if site > section_size { return false; }
+    return section_size - site >= need as u32;
+}
+export function machine_amd64(): u16 { return 34404; }
+// 节名：COFF 节表里 8 字节定长，短名左侧填充字节由写出方补 0。
+export function section_name_text(): u8[]!AllocError { return text_copy(".text")?; }
+export function section_name_rdata(): u8[]!AllocError { return text_copy(".rdata")?; }
+export function section_name_data(): u8[]!AllocError { return text_copy(".data")?; }
+export function scn_text(): u32 { return 1610612768; }
+export function scn_rdata(): u32 { return 1073741888; }
+export function scn_data(): u32 { return 3221225536; }
+export function profile_win64_pe(): u16 { return PROFILE_WIN64_PE; }
+
+// ── 对象总装配 ──
+// 把已发射的函数机器码合并进 .text，并整体输出 COFF 对象。
+// profile 未知 → EM-4；链接输入非法 → EM-1/EM-2；重定位宽度非法 → EM-3。
+function text_copy(s: &[u8]:Read): u8[]!AllocError {
+    var d: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(s) as u32 { @push(d, s[i])?; i = i + 1; }
+    return d;
+}
+export function augment_runtime_symbols(module: &mir::MirModule:Read, table: &coff_state::LinkTable:Read, planned: &coff_state::ObjectLayout:Read): coff_state::LinkTable!AllocError {
+    return coff_layout::augment_runtime_symbols(module, table, planned)?;
+}
+function reject_emit(code: u16, kind: u8): EmitResult {
+    return EmitResult { ok: false, code: types::error_code(code), bytes: coff_code::bytes_new(),
+        rejection: Rejection { kind: kind, span: types::Span { file: 0, offset: 0, length: 0 } } };
+}
+export function emit_object(module: &mir::MirModule:Read, table: &coff_state::LinkTable:Read, profile: u16): EmitResult!AllocError {
+    // 目标 profile 校验：只登记 abi-win + pe（emitter.md 2.1、PE-2）。
+    if profile != profile_win64_pe() { return reject_emit(e_em4(), 4); }
+    let bad: u16 = coff_symbols::validate_indexed_links(table)?;
+    if bad != 0 { return reject_emit(bad, 1); }
+    // 内建运行时入口：178（@push）与动态数组析构需要固定外部符号。
+    // 只在模块确实使用时追加，既有对象的符号表保持不变。
+    var bytes: coff_code::Bytes = coff_code::bytes_new();
+    let layout: coff_state::ObjectLayout = coff_layout::build_layout_mode(module, false, false, &bytes:ReadWrite)?;
+    // 发射期拒绝：未识别 opcode、比较符号性不匹配或 ABI 值形态非法。都必须拒绝，不得带着 int3 成功返回。
+    // 未识别 opcode 归 EM-4（当前 profile 不支持该对象内容）；符号性不匹配归 EM-5；
+    // 切片按值返回、>8 字节聚合按值返回/按值实参归 EM-6（8023，依据 abi-win 2.1/2.4）。
+    if layout.rejected != 0 {
+        var code: u16 = e_em4();
+        var kind: u8 = 4;
+        if layout.reject_kind == 5 { code = e_em5(); kind = 5; }
+        if layout.reject_kind == 6 { code = e_em6(); kind = 6; }
+        let abi_code: u16 = coff_state::win64_reject_code(layout.reject_kind);
+        if abi_code != 0 { code = abi_code; kind = layout.reject_kind; }
+        return reject_emit(code, kind);
+    }
+    // 重定位目标必须在链接表中登记：未登记属于未定义链接符号（EM-1）。
+    let links: coff_state::LinkTable = coff_layout::augment_runtime_symbols(module, table, &layout:Read)?;
+    let missing: u16 = validate_known_call_targets(&layout:Read, &links:Read)?;
+    if missing != 0 { return reject_emit(missing, 1); }
+    // 重定位位宽与站点范围在装配前统一校验：非法即 EM-3，不进入写出阶段。
+    let bad_site: u16 = validate_reloc_sites_mode(&layout:Read, true);
+    if bad_site != 0 { return reject_emit(bad_site, 3); }
+    // 符号可装配性：已定义符号的 DefId 必须能在本对象布局里找到，否则即 EM-1。
+    // 长名由字符串表承载，不再构成拒绝理由。
+    let bad_sym: u16 = coff_symbols::validate_symbols(table, &layout:Read)?;
+    if bad_sym != 0 { return reject_emit(bad_sym, 4); }
+    let assembled: bool = assemble_into(&layout:Read, &links:Read, &bytes:ReadWrite, true)?;
+    // 装配失败即重定位不可施加：按 EM-3 拒绝，不交付缓冲中的部分字节。
+    if !assembled { return reject_emit(e_em3(), 3); }
+    return EmitResult { ok: true, code: types::error_code(0), bytes: bytes,
+        rejection: Rejection { kind: 0, span: types::Span { file: 0, offset: 0, length: 0 } } };
+}
+// 逐函数发射并按顺序拼接 .text；函数入口偏移记入布局，供重定位与符号值使用。
+export function build_layout(module: &mir::MirModule:Read): coff_state::ObjectLayout!AllocError {
+    return coff_layout::build_layout(module)?;
+}
+export function build_sysv_layout(module: &mir::MirModule:Read): coff_state::ObjectLayout!AllocError {
+    return coff_layout::build_sysv_layout(module)?;
+}
+// COFF 对象装配（按 pe.md 二～四节的物理顺序）：
+// 文件头 → 节表 → 各节内容 → 重定位表 → 符号表 → 字符串表。
+// 文件头里的指针字段必须回填真实偏移，不能留 0（否则链接器读到错误位置）。
+// 装配失败（重定位不可施加）时返回空字节：合法的 COFF 头部至少 20 字节，
+// 因此空字节唯一表示失败，调用方据此拒绝，绝不产生半成品对象。
+export function assemble(layout: &coff_state::ObjectLayout:Read, table: &coff_state::LinkTable:Read): coff_code::Bytes!AllocError {
+    var bytes: coff_code::Bytes = coff_code::bytes_new();
+    if !assemble_into(layout, table, &bytes:ReadWrite, false)? { return coff_code::bytes_new(); }
+    return bytes;
+}
+function build_coff_headers(text_off: u32, text_size: u32, rdata_off: u32, rdata_size: u32, reloc_off: u32, reloc_count: u16, symtab_off: u32, sym_count: u32): coff_code::Bytes!AllocError {
+    var headers: coff_code::Bytes = coff_code::bytes_new();
+    let head: coff_code::FileHeader = coff_code::FileHeader { machine: machine_amd64(), sections: 3u16,
+        timestamp: 0u32, symtab: symtab_off, symbols: sym_count,
+        opt_size: 0u16, characteristics: 0u16 };
+    coff_code::emit_file_header(&headers:ReadWrite, head)?;
+    let n_text: u8[] = section_name_text()?;
+    let n_text_head: coff_code::SectionHeader = coff_code::SectionHeader { name: @move(n_text),
+        virtual_size: 0u32, virtual_address: 0u32, raw_size: text_size,
+        raw_ptr: text_off, reloc_ptr: reloc_off, line_ptr: 0u32,
+        relocs: reloc_count, lines: 0u16, characteristics: scn_text() };
+    coff_code::emit_section_header(&headers:ReadWrite, &n_text_head:Read)?;
+    let n_rdata: u8[] = section_name_rdata()?;
+    let n_rdata_head: coff_code::SectionHeader = coff_code::SectionHeader { name: @move(n_rdata),
+        virtual_size: 0u32, virtual_address: 0u32, raw_size: rdata_size,
+        raw_ptr: rdata_off, reloc_ptr: 0u32, line_ptr: 0u32,
+        relocs: 0u16, lines: 0u16, characteristics: scn_rdata() };
+    coff_code::emit_section_header(&headers:ReadWrite, &n_rdata_head:Read)?;
+    let n_data: u8[] = section_name_data()?;
+    let n_data_head: coff_code::SectionHeader = coff_code::SectionHeader { name: @move(n_data),
+        virtual_size: 0u32, virtual_address: 0u32, raw_size: 0u32,
+        raw_ptr: 0u32, reloc_ptr: 0u32, line_ptr: 0u32,
+        relocs: 0u16, lines: 0u16, characteristics: scn_data() };
+    coff_code::emit_section_header(&headers:ReadWrite, &n_data_head:Read)?;
+    return headers;
+}
+function assemble_into(layout: &coff_state::ObjectLayout:Read, table: &coff_state::LinkTable:Read, buf: &coff_code::Bytes:ReadWrite, stream_text: bool): bool!AllocError {
+    let built: coff_symbols::OutSymbol[] = coff_symbols::build_symbols(table, layout)?;
+    let symbols: coff_symbols::OutSymbol[] = coff_symbols::sorted_symbols(&built[0..@len(built)]:Read, table)?;
+    // 各节的相对偏移先算出来：文件头 20 + 节表 3×40，随后依次是 .text、.rdata。
+    let text_off: u32 = coff_layout::object_text_offset();
+    let functions: &[coff_state::FunctionLayout]:Read = &layout.functions[0..@len(layout.functions)]:Read;
+    var text_size: u32 = @len(layout.text) as u32;
+    if stream_text {
+        if @len(buf.data) < text_off as u64 { return false; }
+        text_size = @len(buf.data) as u32 - text_off;
+    }
+    let rdata_off: u32 = text_off + text_size;
+    let rdata_size: u32 = @len(layout.rdata) as u32;
+    let reloc_off: u32 = rdata_off + rdata_size;
+    let reloc_count: u32 = count_relocs(functions);
+    // COFF 节头的 relocs 是 u16；截断会谎报节内容，超过容量必须整体拒绝。
+    if reloc_count > 65535u32 { return false; }
+    let reloc_size: u32 = reloc_count * 10;
+    let symtab_off: u32 = reloc_off + reloc_size;
+    let headers: coff_code::Bytes = build_coff_headers(text_off, text_size, rdata_off, rdata_size, reloc_off, reloc_count as u16, symtab_off, @len(symbols) as u32)?;
+    // 内部缓冲的 .text 已就位，只回填固定长度的头；公开布局仍按实际字节装配。
+    if @len(headers.data) != text_off as u64 { return false; }
+    if stream_text {
+        var h: u32 = 0;
+        while h < text_off { buf.data[h] = headers.data[h]; h = h + 1; }
+    } else {
+        coff_code::bytes_raw(buf, &headers.data[0..@len(headers.data)]:Read)?;
+        coff_code::bytes_raw(buf, &layout.text[0..text_size]:Read)?;
+    }
+    // .rdata 紧随 .text：只承载静态字节池，逐字节原样写出（无节内填充）。
+    coff_code::bytes_raw(buf, &layout.rdata[0..rdata_size]:Read)?;
+    // 数据符号按次序排在链接表符号之后，故首个数据符号的符号表下标即链接表符号条数。
+    let data_base: u32 = @len(table.symbols) as u32;
+    let entries: &[coff_symbols::OutSymbol]:Read = &symbols[0..@len(symbols)]:Read;
+    var reloc_bad: u16 = 0;
+    if relocs_are_ordered(functions, stream_text) {
+        reloc_bad = emit_ordered_relocs(buf, functions, entries, data_base, stream_text)?;
+    } else {
+        reloc_bad = emit_relocs_mode(buf, functions, entries, data_base, stream_text)?;
+    }
+    // 重定位无法施加时整体作废：返回空字节，由调用方转成失败结果，绝不返回半成品对象。
+    if reloc_bad != 0 { return false; }
+    let str_size: u64 = coff_symbols::string_table_size(entries);
+    if str_size > 4294967295u64 { return false; }
+    emit_symbols_and_strings(buf, entries, str_size as u32)?;
+    return true;
+}
+function emit_symbols_and_strings(buf: &coff_code::Bytes:ReadWrite, symbols: &[coff_symbols::OutSymbol]:Read, str_size: u32): void!AllocError {
+    let inline_limit: u32 = coff_code::name_inline_limit();
+    let count: u32 = @len(symbols) as u32;
+    var name_at: u32 = 4;
+    var s: u32 = 0;
+    while s < count {
+        let sym: &coff_symbols::OutSymbol:Read = &symbols[s]:Read;
+        let name: &[u8]:Read = &sym.name[0..@len(sym.name)]:Read;
+        var name_offset: u32 = 0;
+        if @len(name) as u32 > inline_limit {
+            name_offset = name_at;
+            name_at = name_at + @len(name) as u32 + 1;
+        }
+        coff_code::emit_symbol_at(buf, name, sym.value, sym.section, sym.kind, sym.storage, name_offset)?;
+        s = s + 1;
+    }
+    // 先写含长度字段的总长，再把长名逐个直接追加到最终对象。
+    coff_code::bytes_u32(buf, str_size)?;
+    s = 0;
+    while s < count {
+        let name: &[u8]:Read = &symbols[s].name[0..@len(symbols[s].name)]:Read;
+        if @len(name) as u32 > inline_limit {
+            coff_code::bytes_raw(buf, name)?;
+            coff_code::bytes_u8(buf, 0)?;
+        }
+        s = s + 1;
+    }
+    return;
+}
+// 统计全部函数体内的重定位条数（每条为 10 字节）。
+export function count_relocs(functions: &[coff_state::FunctionLayout]:Read): u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(functions) as u32 {
+        n = n + @len(functions[i].calls) as u32;
+        n = n + @len(functions[i].data_refs) as u32;
+        i = i + 1;
+    }
+    return n;
+}
+// 正常发射的链接表已通过非零键校验；仅在此路径使用索引。
+function validate_known_call_targets(layout: &coff_state::ObjectLayout:Read, table: &coff_state::LinkTable:Read): u16!AllocError {
+    var keys: coff_symbols::SymbolKeys = coff_symbols::symbol_keys_new();
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        coff_symbols::symbol_key_add(&keys:ReadWrite, table.symbols[i].def)?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(layout.functions) as u32 {
+        let f: &coff_state::FunctionLayout:Read = &layout.functions[i]:Read;
+        var k: u32 = 0;
+        while k < @len(f.calls) as u32 {
+            if !coff_symbols::symbol_key_present(&keys:Read, f.calls[k].symbol) { return coff_symbols::e_em1(); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 校验全部调用点目标都已登记；返回 0 表示通过，否则为 EM-1。
+export function validate_call_targets(layout: &coff_state::ObjectLayout:Read, table: &coff_state::LinkTable:Read): u16 {
+    var i: u32 = 0;
+    while i < @len(layout.functions) as u32 {
+        let f: &coff_state::FunctionLayout:Read = &layout.functions[i]:Read;
+        var k: u32 = 0;
+        while k < @len(f.calls) as u32 {
+            if coff_symbols::def_index(table, f.calls[k].symbol) == 0 { return coff_symbols::e_em1(); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 校验全部重定位站点：位宽与 REL32 相符且完整落在函数机器码内，否则 EM-3。
+function function_code_size(f: &coff_state::FunctionLayout:Read, stream_text: bool): u32 {
+    if stream_text { return f.code_size; }
+    return @len(f.code) as u32;
+}
+export function validate_reloc_sites(layout: &coff_state::ObjectLayout:Read): u16 {
+    return validate_reloc_sites_mode(layout, false);
+}
+// 连续发射不保留函数字节副本；站点仍必须完整位于相应函数内。
+export function validate_stream_reloc_sites(layout: &coff_state::ObjectLayout:Read): u16 {
+    return validate_reloc_sites_mode(layout, true);
+}
+function validate_reloc_sites_mode(layout: &coff_state::ObjectLayout:Read, stream_text: bool): u16 {
+    var i: u32 = 0;
+    while i < @len(layout.functions) as u32 {
+        let f: &coff_state::FunctionLayout:Read = &layout.functions[i]:Read;
+        var k: u32 = 0;
+        while k < @len(f.calls) as u32 {
+            let site: u32 = f.calls[k].at;
+            if !reloc_site_legal(site, function_code_size(f, stream_text), rel_rel32()) { return e_em3(); }
+            k = k + 1;
+        }
+        // 数据引用同样落在 .text 的 4 字节 lea 位移字段上，位宽与站点范围规则一致。
+        var d: u32 = 0;
+        while d < @len(f.data_refs) as u32 {
+            let site: u32 = f.data_refs[d].at;
+            if !reloc_site_legal(site, function_code_size(f, stream_text), rel_rel32()) { return e_em3(); }
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 输出重定位表；调用点指向其他函数的给 REL32，未登记符号即 EM-1。
+// 重定位按实际发射的符号表顺序解析，而不是把内部键写入对象。
+// COFF 重定位的 SymbolTableIndex 是零基序号（PE/COFF 对象格式），
+// 找不到目标时返回 4294967295 供调用方转成 EM-1，不能用 0 兼作哨兵。
+function ordered_symbol_index(symbols: &[coff_symbols::OutSymbol]:Read, count: u32, key: u64): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = count;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2;
+        let value: u64 = symbols[mid].def;
+        if value == key { return mid; }
+        if value < key { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return 4294967295u32;
+}
+// 函数按节内顺序发射；调用与数据两列各自随机器码追加。先验证这一前提，
+// 手工构造的无序布局仍走稳定排序，不改变对象格式或诊断。
+function relocs_are_ordered(functions: &[coff_state::FunctionLayout]:Read, stream_text: bool): bool {
+    var i: u32 = 0;
+    var end: u64 = 0;
+    while i < @len(functions) as u32 {
+        let f: &coff_state::FunctionLayout:Read = &functions[i]:Read;
+        let start: u64 = f.text_offset as u64;
+        if start < end { return false; }
+        end = start + function_code_size(f, stream_text) as u64;
+        if end > 4294967295u64 { return false; }
+        var k: u32 = 1;
+        while k < @len(f.calls) as u32 {
+            if f.calls[k].at < f.calls[k - 1].at { return false; }
+            k = k + 1;
+        }
+        k = 1;
+        while k < @len(f.data_refs) as u32 {
+            if f.data_refs[k].at < f.data_refs[k - 1].at { return false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+function emit_ordered_relocs(buf: &coff_code::Bytes:ReadWrite, functions: &[coff_state::FunctionLayout]:Read, symbols: &[coff_symbols::OutSymbol]:Read, data_base: u32, stream_text: bool): u16!AllocError {
+    // 已登记符号通常也按键排序。重名及手工布局不能假定如此。
+    var ordered: bool = data_base <= @len(symbols) as u32;
+    var i: u32 = 0;
+    var prev: u64 = 0;
+    while ordered && i < data_base {
+        let key: u64 = symbols[i].def;
+        if key <= prev { ordered = false; }
+        prev = key;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(functions) as u32 {
+        let f: &coff_state::FunctionLayout:Read = &functions[i]:Read;
+        let n_calls: u32 = @len(f.calls) as u32;
+        let n_data: u32 = @len(f.data_refs) as u32;
+        let code_size: u32 = function_code_size(f, stream_text);
+        let kind: u16 = rel_rel32();
+        var k: u32 = 0;
+        var d: u32 = 0;
+        while k < n_calls || d < n_data {
+            // 同址先写调用，保持原先按调用、数据依次采集的稳定次序。
+            if k < n_calls && (d == n_data || f.calls[k].at <= f.data_refs[d].at) {
+                let site: &coff_state::CallSite:Read = &f.calls[k]:Read;
+                if !reloc_site_legal(site.at, code_size, kind) { return e_em3(); }
+                var index: u32 = 4294967295u32;
+                if ordered && site.symbol != 0 { index = ordered_symbol_index(symbols, data_base, site.symbol); }
+                else { index = coff_symbols::symbol_index(symbols, site.symbol); }
+                if index == 4294967295u32 { return coff_symbols::e_em1(); }
+                coff_code::emit_reloc(buf, f.text_offset + site.at, index, kind)?;
+                k = k + 1;
+            } else {
+                let site: &coff_state::DataRef:Read = &f.data_refs[d]:Read;
+                if !reloc_site_legal(site.at, code_size, kind) { return e_em3(); }
+                let index: u32 = data_base + site.index;
+                if index >= @len(symbols) as u32 { return coff_symbols::e_em1(); }
+                coff_code::emit_reloc(buf, f.text_offset + site.at, index, kind)?;
+                d = d + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+export function emit_relocs(buf: &coff_code::Bytes:ReadWrite, functions: &[coff_state::FunctionLayout]:Read, symbols: &[coff_symbols::OutSymbol]:Read, data_base: u32): u16!AllocError {
+    return emit_relocs_mode(buf, functions, symbols, data_base, false)?;
+}
+function emit_relocs_mode(buf: &coff_code::Bytes:ReadWrite, functions: &[coff_state::FunctionLayout]:Read, symbols: &[coff_symbols::OutSymbol]:Read, data_base: u32, stream_text: bool): u16!AllocError {
+    // COFF 要求节内重定位按 RVA 升序；先收集全部站点，再按地址稳定排序后统一写出。
+    let kind: u16 = rel_rel32();
+    var ats: u32[] = [];
+    var syms: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(functions) as u32 {
+        let f: &coff_state::FunctionLayout:Read = &functions[i]:Read;
+        let code_size: u32 = function_code_size(f, stream_text);
+        var k: u32 = 0;
+        while k < @len(f.calls) as u32 {
+            let site: &coff_state::CallSite:Read = &f.calls[k]:Read;
+            if !reloc_site_legal(site.at, code_size, kind) { return e_em3(); }
+            let sym_index: u32 = coff_symbols::symbol_index(symbols, site.symbol);
+            if sym_index == 4294967295u32 { return coff_symbols::e_em1(); }
+            @push(ats, f.text_offset + site.at)?;
+            @push(syms, sym_index)?;
+            k = k + 1;
+        }
+        var d: u32 = 0;
+        while d < @len(f.data_refs) as u32 {
+            let ref: &coff_state::DataRef:Read = &f.data_refs[d]:Read;
+            if !reloc_site_legal(ref.at, code_size, kind) { return e_em3(); }
+            let sym_index: u32 = data_base + ref.index;
+            if sym_index >= @len(symbols) as u32 { return coff_symbols::e_em1(); }
+            @push(ats, f.text_offset + ref.at)?;
+            @push(syms, sym_index)?;
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    let heap: u64[] = sort_reloc_keys(&ats[0..@len(ats)]:Read)?;
+    var p: u32 = 0;
+    while p < @len(heap) as u32 {
+        let index: u32 = (heap[p] & 4294967295u64) as u32;
+        coff_code::emit_reloc(buf, ats[index], syms[index], kind)?;
+        p = p + 1;
+    }
+    return 0;
+}
+// 高位为地址，低位为收集次序；堆排序保留同址次序且避免二次扫描。
+function sort_reloc_keys(ats: &[u32]): u64[]!AllocError {
+    var heap: u64[] = [];
+    var p: u32 = 0;
+    while p < @len(ats) as u32 {
+        let key: u64 = ((ats[p] as u64) << 32u64) | (p as u64);
+        @push(heap, key)?;
+        var child: u32 = p;
+        while child > 0 {
+            let parent: u32 = (child - 1) / 2;
+            if heap[parent] >= key { break; }
+            heap[child] = heap[parent];
+            child = parent;
+        }
+        heap[child] = key;
+        p = p + 1;
+    }
+    var end: u32 = @len(heap) as u32;
+    while end > 1 {
+        let largest: u64 = heap[0];
+        end = end - 1;
+        let key: u64 = heap[end];
+        heap[end] = largest;
+        var parent: u32 = 0;
+        while parent < end / 2 {
+            var child: u32 = parent * 2 + 1;
+            if child + 1 < end && heap[child + 1] > heap[child] { child = child + 1; }
+            if heap[child] <= key { break; }
+            heap[parent] = heap[child];
+            parent = child;
+        }
+        heap[parent] = key;
+    }
+    return heap;
+}

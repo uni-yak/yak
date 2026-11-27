@@ -1,0 +1,25 @@
+// expected_stdout: ok
+// mem_limit: 330000
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+enum Mixed { Empty, Bytes(u8[]) }
+
+function one(): void {
+    let value: Mixed = Mixed::Bytes([5u8, 6u8]);
+    match value {
+        Mixed::Empty => { assert(false); },
+        Mixed::Bytes(bytes) => { assert(bytes.len == 2u64 && bytes[1u64] == 6u8); }
+    }
+    let ignored: Mixed = Mixed::Bytes([8u8]);
+    match ignored {
+        Empty => { assert(false); },
+        _ => { return; }
+    }
+}
+
+function main(): void {
+    var i: u64 = 0u64;
+    while i < 500u64 { one(); i = i + 1u64; }
+    write("ok");
+}

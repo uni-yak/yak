@@ -1,0 +1,8 @@
+// t74: ReadWrite 活跃时访问原 place → OW-2 trap
+// expected_trap: exclusively borrowed
+function main(): void {
+    var x: u32 = 0;
+    let r: &u32 = &x:ReadWrite;
+    let y: u32 = x;
+    return;
+}

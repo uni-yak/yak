@@ -1,0 +1,2 @@
+// expected_trap: logical not requires bool
+function main(): void { let value: bool = !1; }

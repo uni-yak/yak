@@ -1,0 +1,3 @@
+export struct Item { data: u32[] }
+export function make(value: u32): Item { return Item { data: [value] }; }
+export function read(value: &Item): u32 { return (*value).data[0u32]; }

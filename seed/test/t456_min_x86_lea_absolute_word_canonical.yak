@@ -1,0 +1,63 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产 RIP 引用保留完整位移字段，不按绝对寻址处理。
+    var code: pe::Code = pe::code_new();
+    let at: u32 = pe::lea_rip(&code:ReadWrite, pe::rax())?;
+    assert(at == 3 && pe::code_len(&code:Read) == 7 && code.bytes[0] == 0x48);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    let memory: [u8; 8] = [0x66, 0x8b, 0x0c, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&memory[0..8]:Read, 0)?;
+    let dword: [u8; 7] = [0x8d, 0x04, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&dword[0..7]:Read, 7103)?;
+    let r8d: [u8; 8] = [0x44, 0x8d, 0x04, 0x25, 0x00, 0x00, 0x00, 0x80];
+    encoding(&r8d[0..7]:Read, 7101)?;
+    encoding(&r8d[0..8]:Read, 7103)?;
+    let qword: [u8; 8] = [0x48, 0x8d, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00];
+    encoding(&qword[0..8]:Read, 0)?;
+    let rip: [u8; 7] = [0x66, 0x8d, 0x05, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&rip[0..7]:Read, 0)?;
+    let rip_alias: [u8; 7] = [0x66, 0x8d, 0x05, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&rip_alias[0..7]:Read, 7102)?;
+    let true_r12_index: [u8; 9] = [0x66, 0x42, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&true_r12_index[0..9]:Read, 7103)?;
+    let ignored_scale: [u8; 8] = [0x66, 0x8d, 0x04, 0x65, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&ignored_scale[0..8]:Read, 7103)?;
+    let unused_rex_b: [u8; 9] = [0x66, 0x41, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&unused_rex_b[0..9]:Read, 7103)?;
+    // 窄绝对取址与同宽立即数传送等价，不受位移高半字影响。
+    let ax: [u8; 8] = [0x66, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&ax[0..8]:Read, 7103)?;
+    let ax_alias: [u8; 8] = [0x66, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&ax_alias[0..7]:Read, 7101)?;
+    encoding(&ax_alias[0..8]:Read, 7103)?;
+    let r8w: [u8; 9] = [0x66, 0x44, 0x8d, 0x04, 0x25, 0x00, 0x80, 0xff, 0xff];
+    encoding(&r8w[0..9]:Read, 7103)?;
+    let r8w_alias: [u8; 9] = [0x66, 0x44, 0x8d, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00];
+    encoding(&r8w_alias[0..8]:Read, 7101)?;
+    encoding(&r8w_alias[0..9]:Read, 7103)?;
+    let literals: [u8; 20] = [0x66, 0xb8, 0x7f, 0x00, 0x66, 0x41, 0xb8, 0x00, 0x80,
+        0xb8, 0x00, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x00, 0x00, 0x00, 0x80];
+    encoding(&literals[0..20]:Read, 0)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

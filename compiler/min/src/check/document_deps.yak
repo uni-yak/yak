@@ -1,0 +1,223 @@
+// 从宿主已授权的内存材料准备文档依赖；模块名、摘要和直接索引均来自外部登记。
+import diag;
+import iface;
+import iface_load;
+import iface_layout;
+import layout;
+import pipeline;
+import resolve_refs;
+import types;
+
+export struct Material { module: u8[], digest: u8[], bytes: u8[] }
+// 来自宿主授权登记的打开模块身份，不接受 URI 或路径推断。
+export struct OpenModule { module: u8[] }
+export struct Prepared { status: u8, direct_count: u32, assembly: iface_load::DependencyAssembly, layouts: layout::ImportedLayoutTable, roots: u8[] }
+
+// 0 成功，1 超过材料配额，2 登记、文件或布局无效，3 缺失，4 过时，5 依赖环，6 被打开缓冲遮蔽。
+function rejected(status: u8): Prepared {
+    return Prepared { status: status, direct_count: 0, assembly: iface_load::DependencyAssembly { valid: false, targets: [], deps: resolve_refs::DependencySet { ifaces: [] } }, layouts: layout::ImportedLayoutTable { items: [] }, roots: [] };
+}
+
+function module_index(candidates: &[iface::LoadedInterface]:Read, name: &[u8]): u32 {
+    var i: u32 = 0;
+    while i < @len(candidates) as u32 {
+        let candidate: &iface::LoadedInterface:Read = &candidates[i]:Read;
+        if iface::bytes_order(&candidate.module_name[0..@len(candidate.module_name)]:Read, name) == 0 { return i; }
+        i = i + 1u32;
+    }
+    return i;
+}
+
+function is_open(open_modules: &[OpenModule]:Read, name: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(open_modules) as u32 {
+        let current: &OpenModule:Read = &open_modules[i]:Read;
+        if iface::bytes_order(&current.module[0..@len(current.module)]:Read, name) == 0 { return true; }
+        i = i + 1u32;
+    }
+    return false;
+}
+
+// 只沿登记为直接依赖的接口出发；所有可达记录都须匹配模块身份和内容摘要。
+function closure(candidates: &[iface::LoadedInterface]:Read, direct: &[u32]:Read, module_name: &[u8], open_modules: &[OpenModule]:Read): u8!AllocError {
+    let count: u32 = @len(candidates) as u32;
+    var graph: u64[] = [];
+    var queue: u32[] = [];
+    var queued: u64 = 0;
+    var i: u32 = 0;
+    while i < count { @push(graph, 0u64)?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(direct) as u32 {
+        let root: u32 = direct[i];
+        if root >= count { return 2u8; }
+        let bit: u64 = 1u64 << (root as u64);
+        if (queued & bit) != 0u64 { return 2u8; }
+        queued = queued | bit;
+        @push(queue, root)?;
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(queue) as u32 {
+        let index: u32 = queue[i];
+        let current: &iface::LoadedInterface:Read = &candidates[index]:Read;
+        let current_name: &[u8] = &current.module_name[0..@len(current.module_name)]:Read;
+        if iface::bytes_order(current_name, module_name) == 0 { return 5u8; }
+        if is_open(open_modules, current_name) { return 6u8; }
+        var j: u32 = 0;
+        while j < @len(current.dependencies) as u32 {
+            let dep: &iface::LoadedDependency:Read = &current.dependencies[j]:Read;
+            let name: &[u8] = &current.name_bytes[dep.name_off..dep.name_off + dep.name_len as u32]:Read;
+            if iface::bytes_order(name, module_name) == 0 { return 5u8; }
+            if is_open(open_modules, name) { return 6u8; }
+            let target: u32 = module_index(candidates, name);
+            if target == count { return 3u8; }
+            if iface::bytes_order(&candidates[target].digest[0..32]:Read, &dep.digest[0..32]:Read) != 0 { return 4u8; }
+            let bit: u64 = 1u64 << (target as u64);
+            graph[index] = graph[index] | bit;
+            if (queued & bit) == 0u64 {
+                queued = queued | bit;
+                @push(queue, target)?;
+            }
+            j = j + 1u32;
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < count {
+        let bit: u64 = 1u64 << (i as u64);
+        let reach: u64 = graph[i];
+        var j: u32 = 0;
+        while j < count {
+            if (graph[j] & bit) != 0u64 { graph[j] = graph[j] | reach; }
+            j = j + 1u32;
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < count {
+        if (graph[i] & (1u64 << (i as u64))) != 0u64 { return 5u8; }
+        i = i + 1u32;
+    }
+    return 0u8;
+}
+
+// 先限制整个登记的材料，再解码；任何失败都不交付部分依赖或布局。
+export function prepare_context(materials: &[Material]:Read, direct: &[u32]:Read, module_name: &[u8], open_modules: &[OpenModule]:Read): Prepared!AllocError {
+    let count: u32 = @len(materials) as u32;
+    if @len(materials) > 32 || @len(direct) > 32 || @len(open_modules) > 32 || @len(module_name) > 1024 { return rejected(1u8); }
+    if !iface::valid_module_name(module_name) { return rejected(2u8); }
+    var total: u64 = 0;
+    var i: u32 = 0;
+    while i < @len(open_modules) as u32 {
+        let opened: &OpenModule:Read = &open_modules[i]:Read;
+        if @len(opened.module) > 1024 { return rejected(1u8); }
+        if !iface::valid_module_name(&opened.module[0..@len(opened.module)]:Read) { return rejected(2u8); }
+        total = total + @len(opened.module) as u64;
+        if total > 32768u64 { return rejected(1u8); }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < count {
+        let m: &Material:Read = &materials[i]:Read;
+        if @len(m.bytes) > 32768 || @len(m.module) > 1024 { return rejected(1u8); }
+        if @len(m.digest) != 32 { return rejected(2u8); }
+        total = total + @len(m.bytes) as u64 + @len(m.module) as u64 + 32u64;
+        if total > 32768u64 { return rejected(1u8); }
+        i = i + 1u32;
+    }
+    var errors: diag::DiagBuffer = diag::diagbuf_limited(1u32);
+    var candidates: iface::LoadedInterface[] = [];
+    i = 0u32;
+    while i < count {
+        let m: &Material:Read = &materials[i]:Read;
+        let name: &[u8] = &m.module[0..@len(m.module)]:Read;
+        if module_index(&candidates[0..i]:Read, name) != i { return rejected(2u8); }
+        let lib: iface::LoadedInterface = iface_load::load_expected_interface(&m.bytes[0..@len(m.bytes)]:Read, name, &m.digest[0..32]:Read, &errors:ReadWrite)?;
+        if errors.has_error { return rejected(2u8); }
+        @push(candidates, @move(lib))?;
+        i = i + 1u32;
+    }
+    let status: u8 = closure(&candidates[0..count]:Read, direct, module_name, open_modules)?;
+    if status != 0u8 { return rejected(status); }
+    var order: u32[] = [];
+    i = 0u32;
+    let n: u32 = @len(direct) as u32;
+    while i < n { @push(order, direct[i])?; i = i + 1u32; }
+    let assembly: iface_load::DependencyAssembly = iface_load::assemble_dependencies(&candidates[0..count]:Read, &order:ReadWrite, n, &errors:ReadWrite)?;
+    if !assembly.valid { return rejected(2u8); }
+    let layouts: layout::ImportedLayoutTable = iface_layout::imported_layouts(&candidates[0..count]:Read, &order[0..n]:Read, &assembly.targets[0..@len(assembly.targets)]:Read)?;
+    // 每个已校验的根摘要也绑定其依赖记录；闭包校验保证记录与实际材料一一对应。
+    var roots: u8[] = [];
+    i = 0u32;
+    while i < n {
+        let index: u32 = order[i];
+        var j: u32 = 0;
+        while j < 32u32 { @push(roots, candidates[index].digest[j])?; j = j + 1u32; }
+        i = i + 1u32;
+    }
+    return Prepared { status: 0, direct_count: n, assembly: @move(assembly), layouts: @move(layouts), roots: @move(roots) };
+}
+
+export function prepare(materials: &[Material]:Read, direct: &[u32]:Read, module_name: &[u8]): Prepared!AllocError {
+    let closed: OpenModule[] = [];
+    return prepare_context(materials, direct, module_name, &closed[0..0]:Read)?;
+}
+
+// 继续保存精确的字段边界：版本本身不含路径、mtime 或瞬时候选序号。
+export struct Identity { valid: bool, bytes: u8[] }
+
+export function snapshot_identity(prepared: &Prepared:Read, module_name: &[u8], profile: &[u8], frontend: u64): Identity!AllocError {
+    if @len(module_name) > 1024 || @len(profile) > 256 || @len(prepared.roots) > 1024 {
+        return Identity { valid: false, bytes: [] };
+    }
+    let module_size: u32 = @len(module_name) as u32;
+    let profile_size: u32 = @len(profile) as u32;
+    var key: u8[] = [];
+    @push(key, 1u8)?;
+    @push(key, prepared.status)?;
+    var i: u32 = 0;
+    while i < 8u32 {
+        @push(key, ((frontend >> ((i as u64) * 8u64)) & 255u64) as u8)?;
+        i = i + 1u32;
+    }
+    @push(key, (module_size & 255u32) as u8)?;
+    @push(key, (module_size >> 8u32) as u8)?;
+    i = 0u32;
+    while i < module_size { @push(key, module_name[i])?; i = i + 1u32; }
+    @push(key, (profile_size & 255u32) as u8)?;
+    @push(key, (profile_size >> 8u32) as u8)?;
+    i = 0u32;
+    while i < profile_size { @push(key, profile[i])?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(prepared.roots) as u32 { @push(key, prepared.roots[i])?; i = i + 1u32; }
+    return Identity { valid: true, bytes: @move(key) };
+}
+
+export struct Analysis { material_status: u8, document: pipeline::DocumentWithDefinitions }
+
+// 同一调用绑定模块身份、材料与当前缓冲；失败时保留前端本版的无依赖结果。
+export function analyze(source: &[u8], file: u16, module_name: &[u8], materials: &[Material]:Read, direct: &[u32]:Read): Analysis!AllocError {
+    let closed: OpenModule[] = [];
+    return analyze_with_open_modules(source, file, module_name, materials, direct, &closed[0..0]:Read)?;
+}
+
+// 在支持当前源码生成接口之前，打开的依赖只阻止旧接口参与分析。
+export function analyze_with_open_modules(source: &[u8], file: u16, module_name: &[u8], materials: &[Material]:Read, direct: &[u32]:Read, open_modules: &[OpenModule]:Read): Analysis!AllocError {
+    let prepared: Prepared = prepare_context(materials, direct, module_name, open_modules)?;
+    return analyze_prepared(source, file, module_name, &prepared:Read)?;
+}
+
+// 同一个准备结果用于选择快照身份和分析，避免重复解码。
+export function analyze_prepared(source: &[u8], file: u16, module_name: &[u8], prepared: &Prepared:Read): Analysis!AllocError {
+    var definitions: types::DocumentDefinitions = types::empty_definitions();
+    let analysis: pipeline::DocumentAnalysis = analyze_prepared_indexed(source, file, module_name, prepared, &definitions:ReadWrite)?;
+    let current: pipeline::DocumentWithDefinitions = pipeline::DocumentWithDefinitions { analysis: analysis, definitions: definitions };
+    return Analysis { material_status: prepared.status, document: @move(current) };
+}
+
+export function analyze_prepared_indexed(source: &[u8], file: u16, module_name: &[u8], prepared: &Prepared:Read,
+    definitions: &types::DocumentDefinitions:ReadWrite): pipeline::DocumentAnalysis!AllocError {
+    if prepared.status != 0u8 { return pipeline::run_document_indexed(source, file, true, definitions)?; }
+    return pipeline::run_document_dependency_indexed(source, file, module_name, &prepared.assembly.deps:Read,
+        prepared.direct_count, &prepared.layouts:Read, definitions)?;
+}

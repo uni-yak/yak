@@ -1,0 +1,268 @@
+// Win64 函数序言、基本块发射与跳转回填。
+
+import pe;
+import x86_validate;
+import mir;
+import coff_state;
+import coff_call;
+import coff_place;
+import coff_inst;
+
+// ── 函数发射 ──
+// 序言 push rbp / mov rbp,rsp / sub rsp,frame；帧大小 16 字节对齐，含 32 字节 shadow space
+// 与存放第 5 个及以后实参的出站实参区；调用点不移动 rsp，故对齐恒定成立（abi-win 2.5）。
+// 每块顺序发射指令与终结指令；跳转先写占位位移，块偏移齐全后统一回填。
+export function emit_function(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read, module: &mir::MirModule:Read, drop_depths: &[u32]:Read, retain_slots: bool): coff_state::FunctionLayout!AllocError {
+    return emit_function_mode(em, func, module, drop_depths, retain_slots, false)?;
+}
+
+function rejected_function(def_id: u32, kind: u8): coff_state::FunctionLayout {
+    return coff_state::FunctionLayout { def: def_id, symbol: 0, text_offset: 0, code_size: 0,
+        frame_size: 0, slots: [], widths: [], code: [], calls: [], data_refs: [], rejected: 255, reject_kind: kind };
+}
+
+// 调用和数据引用各自按发射顺序排列，用定稿后的偏移归并后与指令边界核对。
+function validate_relocations(code: &pe::Code:Read, start: u32, calls: &[coff_state::CallSite], data_refs: &[coff_state::DataRef]): u16!AllocError {
+    var sites: x86_validate::Rel32Site[] = [];
+    var ci: u32 = 0;
+    var di: u32 = 0;
+    let cn: u32 = @len(calls) as u32;
+    let dn: u32 = @len(data_refs) as u32;
+    while ci < cn || di < dn {
+        if ci < cn && (di == dn || calls[ci].at <= data_refs[di].at) {
+            let call: coff_state::CallSite = calls[ci];
+            @push(sites, x86_validate::Rel32Site { offset: start + call.at, address: call.kind == 5 })?;
+            ci = ci + 1;
+        } else {
+            @push(sites, x86_validate::Rel32Site { offset: start + data_refs[di].at, address: true })?;
+            di = di + 1;
+        }
+    }
+    return x86_validate::validate_relocated(code, start, &sites[0..@len(sites)]:Read)?;
+}
+
+// 连续模式的所有函数共用同一机器码缓冲，不保留单独的函数字节。
+export function emit_function_mode(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read, module: &mir::MirModule:Read, drop_depths: &[u32]:Read, retain_slots: bool, append_text: bool): coff_state::FunctionLayout!AllocError {
+    let def_id: u32 = func.def;
+    let sysv: bool = em.code.sysv;
+    let plan: coff_state::SlotPlan = coff_state::plan_target_slots(func, module, &em.layouts:Read, sysv)?;
+    // 槽位数等于局部数；按指针返回时额外有一个隐藏返回指针槽。
+    var expected_slots: u32 = @len(func.locals) as u32;
+    if plan.sret != 0 { expected_slots = expected_slots + 1; }
+    // 栈槽规划溢出或栈帧无法编码时不得继续发射，避免槽位缺失或错误调整栈指针。
+    // 按 EM-4 形态拒绝；rejected 取 255 作为
+    // 无对应 opcode 的合成标记，仅用于触发 emit_object 的拒绝映射。
+    // 出站实参区：本函数所有调用点里第 5 个及以后展开实参的最大宽度，帧内一次预留。
+    var out_slots: u32 = 0;
+    if sysv { out_slots = coff_state::plan_sysv_out_slots(func, module, &em.layouts:Read); }
+    else { out_slots = coff_state::plan_out_slots(func, module, &plan:Read); }
+    let drop_depth: u32 = coff_place::plan_drop_depth(func, drop_depths);
+    var last_slot: u32 = 0;
+    if @len(plan.slots) > 0 { last_slot = plan.slots[@len(plan.slots) - 1]; }
+    let drop_bytes: u64 = (drop_depth as u64) * 16u64;
+    // 清理块可调用运行时析构；传入的失败状态需保存在调用约定保护的栈槽。
+    var trap_bytes: u64 = 0;
+    var scan: u32 = 0;
+    while scan < @len(func.blocks) as u32 {
+        if func.blocks[scan].terminator.op == 195 && func.blocks[scan].terminator.a == 2 { trap_bytes = 8; break; }
+        scan = scan + 1;
+    }
+    let used_frame: u64 = (last_slot as u64) + drop_bytes + trap_bytes;
+    var total_frame: u64 = used_frame + (out_slots as u64) * 8u64;
+    if !sysv { total_frame = total_frame + 32u64; }
+    let aligned_frame: u64 = ((total_frame + 15u64) / 16u64) * 16u64;
+    if @len(plan.slots) as u32 != expected_slots ||
+        used_frame > 2147483647u64 ||
+        aligned_frame > 2147483647u64 {
+        return rejected_function(def_id, 4);
+    }
+    var drop_scratch: u32 = 0;
+    if drop_depth > 0 { drop_scratch = last_slot + (drop_bytes as u32); }
+    let frame_size: u32 = aligned_frame as u32;
+    let ltypes: u32[] = coff_state::local_types(func)?;
+    var slice_flags: bool[] = [];
+    var agg_sizes: u32[] = [];
+    var sf: u32 = 0;
+    while sf < @len(func.locals) as u32 {
+        @push(slice_flags, coff_state::is_slice_type(&module.types:Read, func.locals[sf].value_type_id))?;
+        @push(agg_sizes, coff_state::table_object_size(&em.layouts:Read, &module.types:Read, func.locals[sf].value_type_id) as u32)?;
+        sf = sf + 1;
+    }
+    em.slots = @clone(plan.slots)?;
+    em.widths = @clone(plan.widths)?;
+    if !append_text { em.code = pe::code_new(); }
+    let code_start: u32 = pe::code_len(&em.code:Read);
+    pe::begin_layout(&em.code:ReadWrite);
+    var slots_copy: u32[] = [];
+    var widths_copy: u8[] = [];
+    // 公开布局保留槽位元数据；普通对象装配只读取机器码与重定位。
+    if retain_slots {
+        slots_copy = @clone(plan.slots)?;
+        widths_copy = @clone(plan.widths)?;
+    }
+    em.locals = @move(ltypes);
+    em.slice_flags = @move(slice_flags);
+    em.agg_sizes = @move(agg_sizes);
+    em.by_ptr = @clone(plan.by_ptr)?;
+    em.sret = plan.sret;
+    em.trap_status = 0;
+    if trap_bytes != 0 { em.trap_status = used_frame as u32; }
+    em.resume_jumps = [];
+    em.drop_scratch = drop_scratch;
+    em.drop_depth = drop_depth;
+    em.frame_size = frame_size;
+    em.out_slots = out_slots;
+    em.block_offsets = [];
+    em.fixups = [];
+    em.arm_fixups = [];
+    em.calls = [];
+    em.data_refs = [];
+    em.rejected = 0;
+    em.reject_kind = 0;
+    if sysv { pe::sysv_enter(&em.code:ReadWrite, frame_size, used_frame, out_slots)?; }
+    else { pe::win64_enter(&em.code:ReadWrite, frame_size, used_frame, out_slots)?; }
+    let entry_status: u16 = pe::win64_status(&em.code:Read);
+    if entry_status != 0 { return rejected_function(def_id, coff_state::win64_reject_kind(entry_status)); }
+    coff_call::spill_params(em, func)?;
+    var block: u32 = 0;
+    var prev_cleanup: bool = false;
+    var prev_offset: u32 = 0;
+    let block_count: u32 = @len(func.blocks) as u32;
+    while block < block_count {
+        let bref: &mir::MirBlock:Read = &func.blocks[block]:Read;
+        let cleanup: bool = bref.terminator.op == 195 && bref.payload == 0 && bref.inst_count != 0;
+        var reuse: bool = false;
+        if cleanup && prev_cleanup { reuse = same_cleanup(func, block - 1, bref); }
+        if reuse {
+            @push(em.block_offsets, prev_offset)?;
+        } else {
+            prev_offset = pe::code_len(&em.code:Read) - code_start;
+            @push(em.block_offsets, prev_offset)?;
+            // 分支块本身不是析构陷阱块，下一块不会与它复用机器码。
+            emit_block(em, func, bref, block + 1)?;
+        }
+        prev_cleanup = cleanup;
+        block = block + 1;
+    }
+    // 无待清理值的失败边共享尾声，原样把被调方状态交给上层。
+    if @len(em.resume_jumps) != 0 {
+        let resume: u32 = pe::code_len(&em.code:Read);
+        var j: u32 = 0;
+        while j < @len(em.resume_jumps) as u32 {
+            let site: u32 = em.resume_jumps[j];
+            pe::patch_rel32(&em.code:ReadWrite, site, resume);
+            j = j + 1;
+        }
+        coff_inst::leave_frame(em)?;
+    }
+    let abi_status: u16 = pe::win64_status(&em.code:Read);
+    if em.rejected == 0 {
+        if abi_status != 0 { return rejected_function(def_id, coff_state::win64_reject_kind(abi_status)); }
+        resolve_fixups(em, code_start)?;
+        if !pe::finish_layout(&em.code:ReadWrite, code_start) { return rejected_function(def_id, 4); }
+    }
+    let size: u32 = pe::code_len(&em.code:Read) - code_start;
+    let frame: u32 = em.frame_size;
+    var calls: coff_state::CallSite[] = [];
+    var ci: u32 = 0;
+    while ci < @len(em.calls) as u32 {
+        let site: coff_state::CallSite = em.calls[ci];
+        let at: u32 = pe::layout_position(&em.code:Read, site.at);
+        if at < code_start { return rejected_function(def_id, 3); }
+        @push(calls, coff_state::CallSite { at: at - code_start, symbol: site.symbol, kind: site.kind })?;
+        ci = ci + 1;
+    }
+    var data_refs: coff_state::DataRef[] = [];
+    var di: u32 = 0;
+    while di < @len(em.data_refs) as u32 {
+        let site: coff_state::DataRef = em.data_refs[di];
+        let at: u32 = pe::layout_position(&em.code:Read, site.at);
+        if at < code_start { return rejected_function(def_id, 3); }
+        @push(data_refs, coff_state::DataRef { at: at - code_start, index: site.index })?;
+        di = di + 1;
+    }
+    if em.rejected == 0 {
+        let x86_status: u16 = validate_relocations(&em.code:Read, code_start, &calls[0..@len(calls)]:Read, &data_refs[0..@len(data_refs)]:Read)?;
+        if x86_status != 0 { return rejected_function(def_id, coff_state::win64_reject_kind(x86_status)); }
+    }
+    var code: u8[] = [];
+    if !append_text { code = coff_state::copy_code(&em.code:Read)?; }
+    return coff_state::FunctionLayout { def: def_id, symbol: 0, text_offset: 0, code_size: size,
+        frame_size: frame, slots: slots_copy, widths: widths_copy,
+        code: code, calls: calls, data_refs: data_refs,
+        rejected: em.rejected, reject_kind: em.reject_kind };
+}
+// 仅复用相邻的纯析构陷阱块机器码；位点、守卫和块编号仍完整保留在 MIR 与 YSM。
+function same_cleanup(func: &mir::MirFunction:Read, prev: u32, block: &mir::MirBlock:Read): bool {
+    let count: u32 = block.inst_count;
+    if func.blocks[prev].inst_count != count || func.blocks[prev].terminator.a != block.terminator.a { return false; }
+    let p: u32 = func.blocks[prev].inst_start;
+    let q: u32 = block.inst_start;
+    if p + count > @len(func.insts) as u32 || q + count > @len(func.insts) as u32 { return false; }
+    var i: u32 = 0;
+    while i < count {
+        let a: &mir::MirInst:Read = &func.insts[p + i]:Read;
+        let b: &mir::MirInst:Read = &func.insts[q + i]:Read;
+        if a.op != 115 || b.op != 115 || a.a != b.a || a.b != b.b || a.c != b.c { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 发射一个块：先按 inst_start/inst_count 取指令区间，再发射终结指令。
+function emit_block(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read, block: &mir::MirBlock:Read, next_block: u32): void!AllocError {
+    if block.terminator.op == 195 && block.terminator.a == 2 {
+        let status: u32 = em.trap_status;
+        pe::store_slot(&em.code:ReadWrite, pe::r11(), status, 8)?;
+    }
+    var i: u32 = 0;
+    while i < block.inst_count {
+        let index: u32 = block.inst_start + i;
+        if index < @len(func.insts) as u32 {
+            let iref: &mir::MirInst:Read = &func.insts[index]:Read;
+            em.trap = func.trap_target;
+            if iref.trap != 0 { em.trap = (iref.trap - 1) as u16; }
+            let ok: bool = coff_inst::lower_inst(em, iref, func)?;
+            // 比较指令返回 false 表示条件码非法（符号性不匹配），属 EM-5；
+            // 其余 false 为未识别 opcode。两者都必须留痕并拒绝，不得静默产出 int3 后成功。
+            if !ok {
+                if coff_state::is_compare(iref.op) { reject_signedness(em, iref)?; }
+                else { coff_state::unsupported_op(em, iref.op)?; }
+            }
+        }
+        i = i + 1;
+    }
+    let tref: &mir::MirTerminator:Read = &block.terminator:Read;
+    let ok_term: bool = coff_inst::lower_term(em, func, tref, next_block)?;
+    if !ok_term {
+        // 未知终结指令同样必须记录拒绝，不能把 int3 当作成功结果。
+        coff_state::unsupported_op(em, tref.op)?;
+    }
+    return;
+}
+// EM-5：比较指令的条件码不合法（符号性与指令形态不匹配）。
+// 与 unsupported_op 一样只在首个拒绝时记录类别，避免后续拒绝覆盖首个拒绝的类别。
+function reject_signedness(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): void!AllocError {
+    if em.rejected == 0 { em.rejected = inst.op; em.reject_kind = 5; }
+    pe::int3(&em.code:ReadWrite)?;
+    return;
+}
+// 回填所有普通分支和陷阱边到各自的块起始偏移。
+function resolve_fixups(em: &coff_state::Emitter:ReadWrite, code_start: u32): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(em.fixups) as u32 {
+        let fix: coff_state::BlockFixup = em.fixups[i];
+        let target: u32 = code_start + coff_state::block_offset(&em.block_offsets[0..@len(em.block_offsets)]:Read, fix.target);
+        pe::patch_rel32(&em.code:ReadWrite, fix.at, target);
+        i = i + 1;
+    }
+    // enum_dispatch 表项：写「目标块偏移 - 表基址偏移」的 i32 二补码。
+    var k: u32 = 0;
+    while k < @len(em.arm_fixups) as u32 {
+        let arm_fix: coff_state::ArmFixup = em.arm_fixups[k];
+        let arm_target: u32 = code_start + coff_state::block_offset(&em.block_offsets[0..@len(em.block_offsets)]:Read, arm_fix.target);
+        pe::patch_relative(&em.code:ReadWrite, arm_fix.at, arm_fix.table, arm_target)?;
+        k = k + 1;
+    }
+    return;
+}

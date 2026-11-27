@@ -1,0 +1,7 @@
+// 单根用例：无依赖，向标准输出写固定字节，期望退出码 0。
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    write("single\n");
+    return;
+}

@@ -1,0 +1,303 @@
+// 解码 YKIF 文件并验证段目录、内容摘要、成员描述符和布局。
+import iface;
+import diag;
+import iface_layout_check;
+import resolve_refs;
+import hash;
+import iface_read_members;
+import types;
+
+function empty_interface(): iface::LoadedInterface {
+    return iface::LoadedInterface { module_name: [], name_bytes: [], dependencies: [], sig_bytes: [], exports: [], digest: [], summaries: [], enum_descriptors: [], enum_members: [], enum_name_index: [], struct_descriptors: [], struct_fields: [], struct_field_name_index: [], privates: [] };
+}
+function reject_interface(diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    iface::emit_unsupported(diags)?;
+    return empty_interface();
+}
+
+// 仅识别 JSON 容器前缀，让二进制入口直接拒绝文本接口。
+function json_container_prefix(bytes: &[u8]): bool {
+    let length: u64 = @len(bytes);
+    var i: u64 = 0;
+    if length >= 3 && bytes[0] == 239 && bytes[1] == 187 && bytes[2] == 191 { i = 3; }
+    while i < length {
+        let b: u8 = bytes[i];
+        if b != 9 && b != 10 && b != 13 && b != 32 { return b == 123 || b == 91; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 读取任何节内容之前验证目录及固定记录尺寸，避免错误诊断后继续越界。
+function valid_interface_directory(bytes: &[u8], size: u32, profile: u32): bool {
+    if size < 296 { return false; }
+    // header flags 必须为 1（含私有名节）；flags=0 的旧接口无法区分未导出与不存在，失败关闭。
+    if bytes[0] != 89 || bytes[1] != 75 || bytes[2] != 73 || bytes[3] != 70 || iface_read_members::read_u16_at(bytes, 4) != 2 || iface_read_members::read_u16_at(bytes, 6) != 1 || iface_read_members::read_u32_at(bytes, 8) != profile || iface_read_members::read_u16_at(bytes, 12) != 15 || iface_read_members::read_u16_at(bytes, 14) != 0 || iface_read_members::read_u32_at(bytes, 16) != 56 || iface_read_members::read_u32_at(bytes, 20) != size { return false; }
+    var index: u32 = 0;
+    while index < 15 {
+        let entry: u32 = 56 + index * 16;
+        let offset: u32 = iface_read_members::read_u32_at(bytes, entry + 4);
+        let length: u32 = iface_read_members::read_u32_at(bytes, entry + 8);
+        let count: u32 = iface_read_members::read_u32_at(bytes, entry + 12);
+        if iface_read_members::read_u16_at(bytes, entry) as u32 != index + 1 || iface_read_members::read_u16_at(bytes, entry + 2) != 0 || offset > size || length > size - offset { return false; }
+        if length > 0 && offset < 296 { return false; }
+        var width: u32 = 1;
+        if index == 1 { if length != 8 || count != 1 { return false; } width = 0; }
+        if index == 2 { if count > 65535 { return false; } width = 40; }
+        if index == 3 || index == 7 || index == 12 { width = 32; }
+        if index == 5 || index == 6 || index == 9 || index == 11 || index == 14 { width = 16; }
+        if index == 8 || index == 13 { width = 8; }
+        if width != 0 && (length % width != 0 || count != length / width) { return false; }
+        var other: u32 = 0;
+        while other < index {
+            let prior: u32 = 56 + other * 16;
+            let start: u32 = iface_read_members::read_u32_at(bytes, prior + 4);
+            let span: u32 = iface_read_members::read_u32_at(bytes, prior + 8);
+            if length > 0 && span > 0 && offset < start + span && start < offset + length { return false; }
+            other = other + 1;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+function copy_bytes_range(bytes: &[u8], start: u32, length: u32): u8[]!AllocError {
+    var copied: u8[] = [];
+    var i: u32 = 0;
+    while i < length {
+        @push(copied, bytes[start + i])?;
+        i = i + 1;
+    }
+    return copied;
+}
+
+// 校验并装载依赖节，失败返回 false，由外层统一发出不支持接口诊断。
+function read_dependencies(bytes: &[u8], name_bytes: &[u8], module_name: &[u8], dependency_offset: u32, dependency_count: u32, dependencies: &iface::LoadedDependency[]:ReadWrite): bool!AllocError {
+    let name_length: u32 = @len(name_bytes) as u32;
+    var prev_off: u32 = 0;
+    var prev_len: u32 = 0;
+    var i: u32 = 0;
+    while i < dependency_count {
+        let record: u32 = dependency_offset + i * 40;
+        let off: u32 = iface_read_members::read_u32_at(bytes, record);
+        let len: u32 = iface_read_members::read_u16_at(bytes, record + 4) as u32;
+        if off > name_length || len > name_length - off || iface_read_members::read_u16_at(bytes, record + 6) != 0 { return false; }
+        let name: &[u8] = &name_bytes[off..off + len]:Read;
+        let digest_bytes: &[u8] = &bytes[record + 8..record + 40]:Read;
+        if !iface::valid_module_name(name) || iface::bytes_order(name, module_name) == 0 { return false; }
+        if i > 0 && !iface::dependency_less(&bytes[record - 32..record]:Read, &name_bytes[prev_off..prev_off + prev_len]:Read, digest_bytes, name) { return false; }
+        var digest: u8[] = copy_bytes_range(bytes, record + 8, 32)?;
+        @push(*dependencies, iface::LoadedDependency { name_off: off, name_len: len as u16, digest: @move(digest) })?;
+        prev_off = off;
+        prev_len = len;
+        i = i + 1;
+    }
+    return true;
+}
+
+// 校验并装载导出节，保证导出编号连续且按规范键严格升序。
+function read_exports(bytes: &[u8], name_bytes: &[u8], sig_offset: u32, sig_length: u32, export_offset: u32, export_count: u32, exports: &iface::LoadedExport[]:ReadWrite): bool!AllocError {
+    let name_length: u32 = @len(name_bytes) as u32;
+    var i: u32 = 0;
+    while i < export_count {
+        let record: u32 = export_offset + i * 32;
+        let export_name_off: u32 = iface_read_members::read_u32_at(bytes, record);
+        let export_name_len: u16 = iface_read_members::read_u16_at(bytes, record + 4);
+        let export_kind: u8 = bytes[record + 6];
+        let flags: u8 = bytes[record + 7];
+        if export_kind < 1 || export_kind > 3 || (export_kind == 1 && flags > 1) || (export_kind != 1 && flags != 0) { return false; }
+        let export_id: u32 = iface_read_members::read_u32_at(bytes, record + 16);
+        let sig_off: u32 = iface_read_members::read_u32_at(bytes, record + 20);
+        let sig_len: u32 = iface_read_members::read_u32_at(bytes, record + 24);
+        let aux_off: u32 = iface_read_members::read_u32_at(bytes, record + 28);
+        if export_name_off > name_length || export_name_len as u32 > name_length - export_name_off { return false; }
+        let name_hash: u64 = iface_read_members::read_u64_at(bytes, record + 8);
+        let name: &[u8]:Read = &name_bytes[export_name_off..export_name_off + export_name_len as u32]:Read;
+        if !iface::valid_identifier(name) || hash::fnv1a(name) != name_hash { return false; }
+        if i > 0 {
+            let previous: iface::LoadedExport = (*exports)[i - 1];
+            let prior: &[u8]:Read = &name_bytes[previous.name_off..previous.name_off + previous.name_len as u32]:Read;
+            if !iface::export_key_less(previous.name_hash, prior, previous.kind, name_hash, name, export_kind) { return false; }
+        }
+        if sig_off > sig_length || sig_len > sig_length - sig_off { return false; }
+        if export_id != i + 1 { return false; }
+        if export_kind == 1 {
+            if sig_len < 4 || aux_off != 0 { return false; }
+            if iface_read_members::read_u16_at(bytes, sig_offset + sig_off) != 0 && flags != 0 { return false; }
+        } else {
+            if sig_off != 0 || sig_len != 0 { return false; }
+        }
+        @push(*exports, iface::LoadedExport { name_off: export_name_off, name_len: export_name_len, kind: export_kind, flags: flags, export_id: export_id, sig_off: sig_off, sig_len: sig_len, aux_off: aux_off, name_hash: name_hash })?;
+        i = i + 1;
+    }
+    return true;
+}
+
+// 校验并装载私有名节，保证按规范键严格升序。
+function read_privates(bytes: &[u8], name_bytes: &[u8], private_offset: u32, private_count: u32, privates: &iface::LoadedPrivate[]:ReadWrite): bool!AllocError {
+    let name_length: u32 = @len(name_bytes) as u32;
+    var i: u32 = 0;
+    while i < private_count {
+        let private_record: u32 = private_offset + i * 16;
+        let private_name_off: u32 = iface_read_members::read_u32_at(bytes, private_record);
+        let private_name_len: u16 = iface_read_members::read_u16_at(bytes, private_record + 4);
+        let private_kind: u8 = bytes[private_record + 6];
+        if private_kind < 1 || private_kind > 5 || bytes[private_record + 7] != 0 { return false; }
+        if private_name_off > name_length || private_name_len as u32 > name_length - private_name_off { return false; }
+        let private_name_hash: u64 = iface_read_members::read_u64_at(bytes, private_record + 8);
+        let private_bytes: &[u8]:Read = &name_bytes[private_name_off..private_name_off + private_name_len as u32]:Read;
+        if !iface::valid_identifier(private_bytes) || hash::fnv1a(private_bytes) != private_name_hash { return false; }
+        if i > 0 {
+            let prior_private: iface::LoadedPrivate = (*privates)[i - 1];
+            let prior_private_bytes: &[u8]:Read = &name_bytes[prior_private.name_off..prior_private.name_off + prior_private.name_len as u32]:Read;
+            if !iface::export_key_less(prior_private.name_hash, prior_private_bytes, prior_private.kind, private_name_hash, private_bytes, private_kind) { return false; }
+        }
+        @push(*privates, iface::LoadedPrivate { name_off: private_name_off, name_len: private_name_len, kind: private_kind, name_hash: private_name_hash })?;
+        i = i + 1;
+    }
+    return true;
+}
+
+// 归并校验导出表与私有名表无重名冲突，且泛型函数体索引完整匹配。
+function check_exports_and_bodies(bytes: &[u8], name_bytes: &[u8], exports: &[iface::LoadedExport], privates: &[iface::LoadedPrivate], sig_offset: u32, export_offset: u32): bool {
+    let export_count: u32 = @len(exports) as u32;
+    let private_count: u32 = @len(privates) as u32;
+    var private_index: u32 = 0;
+    var i: u32 = 0;
+    while i < export_count && private_index < private_count {
+        let export_item: iface::LoadedExport = exports[i];
+        let private_item: iface::LoadedPrivate = privates[private_index];
+        if export_item.name_hash < private_item.name_hash { i = i + 1; continue; }
+        if export_item.name_hash > private_item.name_hash { private_index = private_index + 1; continue; }
+        let merge_export_bytes: &[u8]:Read = &name_bytes[export_item.name_off..export_item.name_off + export_item.name_len as u32]:Read;
+        let merge_private_bytes: &[u8]:Read = &name_bytes[private_item.name_off..private_item.name_off + private_item.name_len as u32]:Read;
+        let private_cmp: i32 = iface::bytes_order(merge_export_bytes, merge_private_bytes);
+        if private_cmp == 0 { return false; }
+        if private_cmp < 0 { i = i + 1; } else { private_index = private_index + 1; }
+    }
+    let index_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 9 * 16 + 4);
+    let index_count: u32 = iface_read_members::read_u32_at(bytes, 56 + 9 * 16 + 12);
+    let body_length: u32 = iface_read_members::read_u32_at(bytes, 56 + 10 * 16 + 8);
+    var index: u32 = 0;
+    i = 0;
+    while i < export_count {
+        let record: u32 = export_offset + i * 32;
+        let id: u32 = i + 1;
+        var generic: bool = false;
+        if bytes[record + 6] == 1 {
+            generic = iface_read_members::read_u16_at(bytes, sig_offset + iface_read_members::read_u32_at(bytes, record + 20)) != 0;
+        }
+        if index < index_count {
+            let entry: u32 = index_offset + index * 16;
+            let entry_id: u32 = iface_read_members::read_u32_at(bytes, entry);
+            if entry_id < id { return false; }
+            if entry_id == id {
+                let body_off: u32 = iface_read_members::read_u32_at(bytes, entry + 4);
+                let body_len: u32 = iface_read_members::read_u32_at(bytes, entry + 8);
+                if !generic || iface_read_members::read_u32_at(bytes, entry + 12) != 0 || body_off > body_length || body_len > body_length - body_off { return false; }
+                index = index + 1;
+                generic = false;
+            }
+        }
+        if generic { return false; }
+        i = i + 1;
+    }
+    return index == index_count;
+}
+
+// 校验全部导出函数签名与结构体/枚举布局描述符。
+function validate_signatures_and_layouts(loaded: &iface::LoadedInterface:Read, dependency_count: u32, diags: &diag::DiagBuffer:ReadWrite): u8!AllocError {
+    var sig_exports: resolve_refs::IfaceExport[] = [];
+    var i: u32 = 0;
+    while i < @len(loaded.exports) as u32 {
+        let item: iface::LoadedExport = loaded.exports[i];
+        @push(sig_exports, resolve_refs::IfaceExport { name_hash: item.name_hash, name_off: item.name_off, name_len: item.name_len, kind: item.kind, flags: item.flags, export_id: item.export_id, sig_off: item.sig_off, sig_len: item.sig_len })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(loaded.exports) as u32 {
+        let item: iface::LoadedExport = loaded.exports[i];
+        if item.kind == 1 {
+            if !resolve_refs::valid_interface_function_signature(&loaded.sig_bytes[item.sig_off..item.sig_off + item.sig_len]:Read, &sig_exports[0..@len(sig_exports)]:Read, &loaded.name_bytes[0..@len(loaded.name_bytes)]:Read, diags, dependency_count)? { return 1; }
+        }
+        i = i + 1;
+    }
+    let binding: iface_layout_check::LayoutBinding = iface_layout_check::LayoutBinding { bound: false, targets: [] };
+    let candidates: iface::LoadedInterface[] = [];
+    let before_layout: u32 = diag::diagbuf_count(diags);
+    if !iface_layout_check::checked_layouts(loaded, &sig_exports[0..@len(sig_exports)]:Read, &binding:Read, &candidates[0..0]:Read, diags)? {
+        if diag::diagbuf_count(diags) != before_layout { return 1; }
+        return 2;
+    }
+    return 0;
+}
+
+export function load_interface(bytes: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    return load_target_interface(bytes, 65537, diags)?;
+}
+
+export function load_target_interface(bytes: &[u8], profile: u32, diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    if profile != 65537 && profile != 65538 { return reject_interface(diags)?; }
+    if @len(bytes) > 4294967295u64 { return reject_interface(diags)?; }
+    let size: u32 = @len(bytes) as u32;
+    if !valid_interface_directory(bytes, size, profile) {
+        if json_container_prefix(bytes) {
+            iface::emit(diags, types::error_code(7015))?;
+            return empty_interface();
+        }
+        return reject_interface(diags)?;
+    }
+    // 摘要字段在计算时视为零，目录验证已保证首块完整。
+    let recomputed: u8[] = iface::sha256_zero_header_digest(bytes, 24)?;
+    var i: u32 = 0;
+    while i < 32 {
+        if bytes[24 + i] != recomputed[i] { return reject_interface(diags)?; }
+        i = i + 1;
+    }
+    let name_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 0 * 16 + 4);
+    let name_length: u32 = iface_read_members::read_u32_at(bytes, 56 + 0 * 16 + 8);
+    let module_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 1 * 16 + 4);
+    let module_name_off: u32 = iface_read_members::read_u32_at(bytes, module_offset + 0);
+    let module_name_len: u16 = iface_read_members::read_u16_at(bytes, module_offset + 4);
+    if iface_read_members::read_u16_at(bytes, module_offset + 6) != 0 { return reject_interface(diags)?; }
+    if module_name_len == 0 || module_name_off > name_length || module_name_len as u32 > name_length - module_name_off { return reject_interface(diags)?; }
+    var name_bytes: u8[] = copy_bytes_range(bytes, name_offset, name_length)?;
+    var module_name: u8[] = copy_bytes_range(&name_bytes[0..name_length]:Read, module_name_off, module_name_len as u32)?;
+    if !iface::valid_module_name(&module_name[0..@len(module_name)]:Read) { return reject_interface(diags)?; }
+    // 类型签名节原样保留，供导入方按导出记录的偏移解码。
+    let sig_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 4 * 16 + 4);
+    let sig_length: u32 = iface_read_members::read_u32_at(bytes, 56 + 4 * 16 + 8);
+    var sig_bytes: u8[] = copy_bytes_range(bytes, sig_offset, sig_length)?;
+    let dependency_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 2 * 16 + 4);
+    let dependency_count: u32 = iface_read_members::read_u32_at(bytes, 56 + 2 * 16 + 12);
+    let export_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 3 * 16 + 4);
+    let export_count: u32 = iface_read_members::read_u32_at(bytes, 56 + 3 * 16 + 12);
+    let private_offset: u32 = iface_read_members::read_u32_at(bytes, 56 + 14 * 16 + 4);
+    let private_count: u32 = iface_read_members::read_u32_at(bytes, 56 + 14 * 16 + 12);
+    var dependencies: iface::LoadedDependency[] = [];
+    if !read_dependencies(bytes, &name_bytes[0..name_length]:Read, &module_name[0..@len(module_name)]:Read, dependency_offset, dependency_count, &dependencies:ReadWrite)? { return reject_interface(diags)?; }
+    var exports: iface::LoadedExport[] = [];
+    if !read_exports(bytes, &name_bytes[0..name_length]:Read, sig_offset, sig_length, export_offset, export_count, &exports:ReadWrite)? { return reject_interface(diags)?; }
+    var privates: iface::LoadedPrivate[] = [];
+    if !read_privates(bytes, &name_bytes[0..name_length]:Read, private_offset, private_count, &privates:ReadWrite)? { return reject_interface(diags)?; }
+    if !check_exports_and_bodies(bytes, &name_bytes[0..name_length]:Read, &exports[0..@len(exports)]:Read, &privates[0..@len(privates)]:Read, sig_offset, export_offset) { return reject_interface(diags)?; }
+    var digest: u8[] = copy_bytes_range(bytes, 24, 32)?;
+    var loaded: iface::LoadedInterface = iface::LoadedInterface { module_name: @move(module_name), name_bytes: @move(name_bytes), dependencies: @move(dependencies), sig_bytes: @move(sig_bytes), exports: @move(exports), digest: @move(digest), summaries: [], enum_descriptors: [], enum_members: [], enum_name_index: [], struct_descriptors: [], struct_fields: [], struct_field_name_index: [], privates: @move(privates) };
+    if !iface_read_members::decode_members(bytes, &loaded:ReadWrite)? { return reject_interface(diags)?; }
+    let status: u8 = validate_signatures_and_layouts(&loaded:Read, dependency_count, diags)?;
+    if status == 1 { return empty_interface(); }
+    if status == 2 { return reject_interface(diags)?; }
+    return loaded;
+}
+
+// 预期身份来自调用方已授权的材料登记，不能用接口自述身份替代。
+export function load_expected_interface(bytes: &[u8], module_name: &[u8], digest: &[u8], diags: &diag::DiagBuffer:ReadWrite): iface::LoadedInterface!AllocError {
+    if diag::diagbuf_has_error(diags) { return empty_interface(); }
+    if @len(digest) != 32 || !iface::valid_module_name(module_name) { return reject_interface(diags)?; }
+    let loaded: iface::LoadedInterface = load_interface(bytes, diags)?;
+    if diag::diagbuf_has_error(diags) { return empty_interface(); }
+    if @len(loaded.digest) != 32 || iface::bytes_order(&loaded.module_name[0..@len(loaded.module_name)]:Read, module_name) != 0 || iface::bytes_order(&loaded.digest[0..32]:Read, digest) != 0 {
+        return reject_interface(diags)?;
+    }
+    return loaded;
+}

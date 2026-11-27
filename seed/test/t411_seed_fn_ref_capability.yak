@@ -1,0 +1,5 @@
+// expected_trap: borrow: function address has no capability
+function get(): void { return; }
+function main(): void {
+    let callback: &function(): void = &get:Read;
+}

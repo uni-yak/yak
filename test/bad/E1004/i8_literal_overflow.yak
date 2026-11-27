@@ -1,0 +1,7 @@
+// expected_code: E1004
+// spec: spec/lang/type/i8.md L-4
+// 触发：带类型后缀的数值 129 超出 i8 的正值上界。
+function main(): void {
+    @drop(129i8);
+    return;
+}

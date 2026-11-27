@@ -1,0 +1,11 @@
+// 多单元链接的根单元：跨单元调用经 0x91 call_far 降级为 COFF 外部符号。
+// 依赖单元导出 add1(x: u32): u32，41 加 1 得退出码 42；标准输出为空。
+foreign exit(code: u8): void;
+
+import multi_dep;
+
+function main(): void {
+    let v: u32 = multi_dep::add1(41u32);
+    exit(v as u8);
+    return;
+}

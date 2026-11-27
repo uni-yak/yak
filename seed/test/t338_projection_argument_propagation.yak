@@ -1,0 +1,21 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Pair { data: u32[] }
+enum Failure { Bad }
+function index(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 0u32; }
+function read(left: &u32, right: &u32): u32 { return *left + *right; }
+function run(pair: &Pair:ReadWrite, ok: bool): u32!Failure {
+    return read((*pair).data[0u32], (*pair).data[index(ok)?]);
+}
+function recover(e: &Failure): u32 { return 999u32; }
+function main(): void {
+    var pair: Pair = Pair { data: [1u32] };
+    let parent: &Pair:ReadWrite = &pair:ReadWrite;
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(run(parent, false).catch(&recover) == 999u32);
+        (*parent).data[0u32] = i;
+        assert(run(parent, true).catch(&recover) == i + i);
+        i = i + 1u32;
+    }
+}

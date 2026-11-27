@@ -1,0 +1,47 @@
+// demo_sugars.yak —— .then/.catch/.or 恢复糖审计演示（result.md full / S-9）
+// 覆盖每个糖的 Ok 与 Err 两条路径；assert 验证数值，write 标记块到达。
+foreign write(data: &[u8]): void;
+foreign assert(cond: bool): void;
+
+enum E { Bad, }
+
+function maybe(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+
+function double(v: &u32): u32 {
+    return *v * 2;
+}
+
+function recover(e: &E): u32 {
+    return 42;
+}
+
+function main(): void {
+    // ── .or：Ok→解包 T；Err→惰性求值 fallback ──
+    let o1: u32 = maybe(5).or(99);   // Ok(5) → 5（fallback 不求值）
+    let o2: u32 = maybe(0).or(99);   // Err   → 99（fallback 惰性求值）
+    assert(o1 == 5);
+    assert(o2 == 99);
+    write("or ok\n");
+
+    // ── .then：Ok→h(&T) 映射为 U；Err→穿透（载体原样透传，h 不调用）──
+    let t1: u32 = maybe(4).then(&double)?;                 // Ok(4)→double(&4)=8→Ok(8)→?→8
+    assert(t1 == 8);
+    // Err 穿透验证：maybe(0).then(&double) 不调用 double，直接透传 Err(E::Bad)；
+    //   用 .catch 接住以观测"穿透"语义
+    let t2: u32 = maybe(0).then(&double).catch(&recover);  // Err 穿透 → catch 恢复 → 42
+    assert(t2 == 42);
+    write("then ok\n");
+
+    // ── .catch：Ok→解包 T；Err→h(&E) 恢复为 T ──
+    let c1: u32 = maybe(9).catch(&recover);   // Ok(9) → 9（h 不调用）
+    let c2: u32 = maybe(0).catch(&recover);   // Err   → recover(&E::Bad)=42
+    assert(c1 == 9);
+    assert(c2 == 42);
+    write("catch ok\n");
+
+    write("all ok\n");
+    return;
+}

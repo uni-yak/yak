@@ -1,0 +1,6 @@
+// expected_trap: eval: enum payload does not support equality (EN-6)
+enum Variant { Empty, Bytes(u8[]) }
+
+function main(): void {
+    Variant::Empty == Variant::Empty;
+}

@@ -1,0 +1,26 @@
+// @push 拥有元素后当前帧算术陷阱：元素已由目标复合数组接管；
+// 陷阱清理只能析构目标数组一次，不得再次析构已移动的源元素。
+foreign write(data: &[u8]): void;
+
+struct Payload { data: u32[] }
+
+function trigger(mode: u32): void!AllocError {
+    write("before-push\n");
+    var inner: u32[] = [];
+    @push(inner, 91u32)?;
+    var p: Payload = Payload { data: @move(inner) };
+    var items: Payload[] = [];
+    @push(items, @move(p))?;
+    write("after-push\n");
+    let zero: u32 = mode - mode;
+    let q: u32 = 100u32 / zero;
+    if q == 0u32 { return; }
+    return;
+}
+
+function outer(): void!AllocError {
+    trigger(0u32)?;
+    return;
+}
+
+function main(): void { outer(); return; }

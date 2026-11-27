@@ -1,0 +1,117 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+import buf;
+import lex;
+import parse;
+import diag;
+import pipeline;
+foreign assert(cond: bool): void;
+
+// 对每个不足的配额验证早停；恰好够时与不设限解析的 AST 及诊断对应。
+function check_steps(src: &[u8], steps: u32, errors: u32, statements: u32, depth: u32): void!AllocError {
+    let scanned: lex::LexResult = lex::lex_scan(src, 115u16)?;
+    assert(@len(scanned.diagnostics) == 0);
+    let batch: parse::ParseResult = parse::parse_lexed(&scanned:Read, 115u16)?;
+    assert(!batch.depth_exceeded && !batch.match_path_exceeded && !batch.diagnostics_truncated);
+    assert(@len(batch.diagnostics) as u32 == errors && @len(batch.pool.matches) as u32 == statements);
+    var budget: u32 = 1u32;
+    while budget <= steps {
+        let doc: parse::ParseResult = parse::parse_lexed_limited(&scanned:Read, 115u16, 64u32, depth, budget, 0u32)?;
+        assert(!doc.depth_exceeded && !doc.diagnostics_truncated);
+        assert(doc.match_path_exceeded == (budget < steps));
+        if budget < steps {
+            assert(@len(doc.diagnostics) == 0);
+            assert(@len(doc.file.items) < @len(batch.file.items));
+            assert(@len(doc.pool.statics) == 0 && @len(doc.pool.static_bytes) == 0);
+        } else {
+            assert(@len(doc.file.items) == @len(batch.file.items));
+            assert(@len(doc.pool.patterns) == @len(batch.pool.patterns));
+            assert(@len(doc.pool.matches) == @len(batch.pool.matches));
+            assert(@len(doc.pool.static_bytes) == @len(batch.pool.static_bytes));
+            assert(@len(doc.diagnostics) == @len(batch.diagnostics));
+            if errors != 0u32 {
+                assert(doc.diagnostics[0].code.raw == 2014u16 && batch.diagnostics[0].code.raw == 2014u16);
+                assert(doc.diagnostics[0].span.offset == batch.diagnostics[0].span.offset);
+            }
+        }
+        budget = budget + 1u32;
+    }
+    return;
+}
+
+function boundary(over: bool, bad: bool): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    if bad { buf::buf_push_bytes(&text:ReadWrite, "function broken(e: E): void { match e { _ => {}, _ => {} } }\n")?; }
+    buf::buf_push_bytes(&text:ReadWrite, "enum E { A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19 }\nfunction f20(e: E): void { match e { E::A0 => {}, E::A1 => {}, E::A2 => {}, E::A3 => {}, E::A4 => {}, E::A5 => {}, E::A6 => {}, E::A7 => {}, E::A8 => {}, E::A9 => {}, E::A10 => {}, E::A11 => {}, E::A12 => {}, E::A13 => {}, E::A14 => {}, E::A15 => {}, E::A16 => {}, E::A17 => {}, E::A18 => {}, E::A19 => {}, _ => {} } }\nfunction f17(e: E): void { match e { E::A0 => {}, E::A1 => {}, E::A2 => {}, E::A3 => {}, E::A4 => {}, E::A5 => {}, E::A6 => {}, E::A7 => {}, E::A8 => {}, E::A9 => {}, E::A10 => {}, E::A11 => {}, E::A12 => {}, E::A13 => {}, E::A14 => {}, E::A15 => {}, E::A16 => {}, _ => {} } }\nfunction f6(e: E): void { match e { E::A0 => {}, E::A1 => {}, E::A2 => {}, E::A3 => {}, E::A4 => {}, E::A5 => {}, _ => {} } }\nfunction f1(e: E): void { match e { A0 => {}, E::A1 => {}, _ => {} } }\n")?;
+    if over { buf::buf_push_bytes(&text:ReadWrite, "function f2(e: E): void { match e { A0 => {}, E::A1 => {}, _ => {} } }\n")?; }
+    let input: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(input, 115u16)?;
+    if over {
+        assert(pipeline::analysis_match_path_exceeded(doc.status));
+        assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    } elseif bad {
+        assert(pipeline::analysis_rejected(doc.status));
+        assert(doc.diagnostics.count == 1u32 && doc.diagnostics.diags[0].code.raw == 2014u16);
+    } else {
+        assert(pipeline::analysis_checked(doc.status) && doc.diagnostics.count == 0u32);
+    }
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let accepted: bool = pipeline::run_frontend(input, 115u16, &batch:ReadWrite)?;
+    assert(accepted == !bad);
+    if bad { assert(batch.count == 1u32 && batch.diags[0].code.raw == 2014u16); }
+    else { assert(batch.count == 0u32); }
+    return;
+}
+
+function main(): void {
+    // 首个候选分段即不同，只收候选行和首段；同前缀则继续比较下一段。
+    check_steps("function f(e: E): void { match e { F::A => {}, E::B => {} } }\n", 2u32, 0u32, 1u32, 64u32)?;
+    check_steps("function f(e: E): void { match e { E::A => {}, E::B => {} } }\n", 3u32, 0u32, 1u32, 64u32)?;
+    // 首次命中即停：前两臂花三步，第三臂仅与第一条比较三步。
+    check_steps("function f(e: E): void { match e { E::A => {}, E::B => {}, E::A => {} } }\n", 6u32, 1u32, 1u32, 64u32)?;
+    // 嵌套和跨函数共享配额；不同长度仅扣行；此前的真实通配重复诊断也丢弃。
+    check_steps("function f(e: E): void { match e { _ => {}, _ => {} } match e { A => { match e { E::A => {}, E::B => {} } }, E::B => {} } } function g(e: E): void { match e { A => {}, E::B => {} } }\n", 5u32, 1u32, 4u32, 0u32)?;
+    boundary(false, false)?;
+    boundary(false, true)?;
+    boundary(true, true)?;
+    boundary(true, false)?;
+    return;
+}

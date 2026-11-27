@@ -1,0 +1,231 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: json_string=../../compiler/lsp/json_string.yak
+// module: json=../../compiler/lsp/json.yak
+// module: positions=../../compiler/lsp/positions.yak
+// module: workspace_index=../../compiler/lsp/workspace_index.yak
+// module: lsp_format=../../compiler/lsp/lsp_format.yak
+// module: lsp_edit=../../compiler/lsp/lsp_edit.yak
+// module: lsp_complete=../../compiler/lsp/lsp_complete.yak
+// module: documents=../../compiler/lsp/documents.yak
+
+// P4 语言服务定向回归：总工作量预算、编码协商、Span u32、格式化、重命名、Code Action、成员与跨文件补全。
+import lex;
+import parse;
+import pipeline;
+import positions;
+import types;
+import workspace_index;
+import lsp_format;
+import lsp_edit;
+import lsp_complete;
+import documents;
+import json;
+foreign assert(cond: bool): void;
+
+function bytes_eq(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function test_encodings(): void!AllocError {
+    // "A中😀\n"：A(1B/1u16/1u32) + 中(3B/1u16/1u32) + 😀(4B/2u16/1u32)
+    let src: &[u8] = "A中😀\n";
+    let i16: positions::Index = positions::build_encoded(src, positions::enc_utf16())?;
+    let i8: positions::Index = positions::build_encoded(src, positions::enc_utf8())?;
+    let i32: positions::Index = positions::build_encoded(src, positions::enc_utf32())?;
+    assert(i16.status == 0u8 && i8.status == 0u8 && i32.status == 0u8);
+    let p16: positions::PositionResult = positions::to_position(&i16:Read, src, 8u32);
+    let p8: positions::PositionResult = positions::to_position(&i8:Read, src, 8u32);
+    let p32: positions::PositionResult = positions::to_position(&i32:Read, src, 8u32);
+    assert(p16.valid && p16.position.line == 0u32 && p16.position.character == 4u32);
+    assert(p8.valid && p8.position.line == 0u32 && p8.position.character == 8u32);
+    assert(p32.valid && p32.position.line == 0u32 && p32.position.character == 3u32);
+    assert(positions::to_offset(&i16:Read, src, 0u32, 4u32).offset == 8u32);
+    assert(positions::to_offset(&i8:Read, src, 0u32, 8u32).offset == 8u32);
+    assert(positions::to_offset(&i32:Read, src, 0u32, 3u32).offset == 8u32);
+    // UTF-8 落入多字节字符中间必须拒绝。
+    assert(!positions::to_offset(&i8:Read, src, 0u32, 2u32).valid);
+    return;
+}
+
+function test_work_budget(): void!AllocError {
+    let src: &[u8] = "function add(a: u32, b: u32): u32 { return a + b; }\n";
+    let tight: pipeline::DocumentAnalysis = pipeline::run_document_budgeted(src, 1u16, 10u64)?;
+    assert(pipeline::analysis_total_work_exceeded(tight.status));
+    assert(tight.diagnostics.count == 0u32);
+    let ok: pipeline::DocumentAnalysis = pipeline::run_document_budgeted(src, 1u16, 8192u64)?;
+    assert(pipeline::analysis_checked(ok.status));
+    return;
+}
+
+function test_long_span_u32(): void!AllocError {
+    // 构造超过 65535 字节的函数体块，验证 Span.length 不再截断为 65535。
+    var src: u8[] = [];
+    let head: &[u8] = "function big(): void {\n";
+    var i: u32 = 0;
+    while i < @len(head) as u32 { @push(src, head[i])?; i = i + 1u32; }
+    // 写入 70000 字节行注释
+    var line: u32 = 0;
+    while line < 700u32 {
+        @push(src, 47u8)?;
+        @push(src, 47u8)?;
+        var k: u32 = 0;
+        while k < 97u32 { @push(src, 97u8)?; k = k + 1u32; }
+        @push(src, 10u8)?;
+        line = line + 1u32;
+    }
+    let tail: &[u8] = "    return;\n}\n";
+    i = 0u32;
+    while i < @len(tail) as u32 { @push(src, tail[i])?; i = i + 1u32; }
+    let slice: &[u8] = &src[0..@len(src)]:Read;
+    let lexed: lex::LexResult = lex::lex_scan(slice, 1u16)?;
+    assert(@len(lexed.diagnostics) == 0u64);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 1u16)?;
+    assert(@len(parsed.diagnostics) == 0u64 && @len(parsed.file.items) == 1u64);
+    assert(parsed.file.items[0].span.length > 70000u32);
+    return;
+}
+
+function test_format(): void!AllocError {
+    let messy: &[u8] = "function f(): u32 {\r\nlet x: u32 = 1;   \r\n\r\n\r\nif x > 0 {\r\nreturn x;\r\n}\r\nreturn 0;\r\n}";
+    let idx: positions::Index = positions::build(messy)?;
+    let fmt: lsp_format::FormatResult = lsp_format::format_document(messy, &idx:Read, 4u32, true)?;
+    assert(fmt.status == 2u8 && fmt.changed);
+    let expected: &[u8] = "function f(): u32 {\n    let x: u32 = 1;\n\n    if x > 0 {\n        return x;\n    }\n    return 0;\n}\n";
+    assert(bytes_eq(&fmt.new_text[0..@len(fmt.new_text)]:Read, expected));
+    // 幂等性校验：再次格式化应无变更。
+    let idx2: positions::Index = positions::build(expected)?;
+    let fmt2: lsp_format::FormatResult = lsp_format::format_document(expected, &idx2:Read, 4u32, true)?;
+    assert(fmt2.status == 2u8 && !fmt2.changed);
+    return;
+}
+
+function test_rename_and_members(): void!AllocError {
+    let src: &[u8] = "struct Point { x: u32, y: u32 }\nenum Color { Red, Blue }\nfunction sum(pt: Point): u32 {\n    let total: u32 = pt.x + pt.y;\n    return total;\n}\n";
+    let doc: pipeline::DocumentWithDefinitions = pipeline::run_document_with_definitions(src, 1u16)?;
+    assert(pipeline::analysis_checked(doc.analysis.status));
+    let idx: positions::Index = positions::build(src)?;
+    // prepareRename / rename 局部变量 total（声明处 offset=96，使用处 offset=133）
+    let prep: lsp_edit::PrepareRenameResult = lsp_edit::prepare_rename(&doc.definitions:Read, &idx:Read, src, 1u16, 133u32);
+    assert(prep.status == 2u8 && prep.length == 5u32);
+    let ren: lsp_edit::RenameResult = lsp_edit::compute_rename(&doc.definitions:Read, &idx:Read, src, 1u16, 133u32, "acc")?;
+    assert(ren.status == 2u8 && @len(ren.ranges) == 2u64);
+    // 拒绝关键字与同作用域冲突（pt）
+    let bad_kw: lsp_edit::RenameResult = lsp_edit::compute_rename(&doc.definitions:Read, &idx:Read, src, 1u16, 133u32, "return")?;
+    assert(bad_kw.status == 0u8);
+    let bad_col: lsp_edit::RenameResult = lsp_edit::compute_rename(&doc.definitions:Read, &idx:Read, src, 1u16, 133u32, "pt")?;
+    assert(bad_col.status == 0u8);
+    // 成员补全：`.` 结构体字段与 `::` 枚举变体 + 工作区模块导出
+    var ws: workspace_index::Index = workspace_index::create();
+    workspace_index::upsert_file(&ws:ReadWrite, "file:///C:/ws/math.yak", "math", "export function triple(v: u32): u32 { return v * 3; }\n")?;
+    let dot_src: &[u8] = "struct Point { x: u32, y: u32 }\nfunction f(pt: Point): u32 { return pt.; }\n";
+    let dot_idx: positions::Index = positions::build(dot_src)?;
+    let empty_defs: types::DocumentDefinitions = types::empty_definitions();
+    let dot_res: lsp_complete::ExtCompletion = lsp_complete::member_completion(dot_src, &dot_idx:Read, &empty_defs:Read, &ws:Read, 1u16, 71u32)?;
+    assert(dot_res.status == 2u8 && @len(dot_res.items) == 2u64);
+    assert(bytes_eq(&dot_res.items[0].label[0..@len(dot_res.items[0].label)]:Read, "x"));
+    assert(bytes_eq(&dot_res.items[1].label[0..@len(dot_res.items[1].label)]:Read, "y"));
+    let mod_src: &[u8] = "import math;\nfunction f(): u32 { return math::; }\n";
+    let mod_idx: positions::Index = positions::build(mod_src)?;
+    let mod_res: lsp_complete::ExtCompletion = lsp_complete::member_completion(mod_src, &mod_idx:Read, &empty_defs:Read, &ws:Read, 1u16, 46u32)?;
+    assert(mod_res.status == 2u8 && @len(mod_res.items) == 1u64);
+    assert(bytes_eq(&mod_res.items[0].label[0..@len(mod_res.items[0].label)]:Read, "triple"));
+    // Code Action：E1018 与 E4002 自动导入
+    let no_nl: &[u8] = "function f(): u32 { return triple(2); }";
+    let nl_idx: positions::Index = positions::build(no_nl)?;
+    var dlist: types::DocumentDiag[] = [];
+    @push(dlist, types::DocumentDiag { code: 1018u16, span: types::Span { file: 1u16, offset: 39u32, length: 0u32 } })?;
+    @push(dlist, types::DocumentDiag { code: 4002u16, span: types::Span { file: 1u16, offset: 27u32, length: 6u32 } })?;
+    let all_range: positions::Range = positions::Range {
+        start: positions::Position { line: 0, character: 0 },
+        end: positions::Position { line: 0, character: 39 },
+    };
+    let ca: lsp_edit::CodeActionResult = lsp_edit::compute_code_actions("file:///C:/ws/main.yak", no_nl, 1u16, &nl_idx:Read, &dlist[0..2]:Read, &ws:Read, all_range)?;
+    assert(ca.status == 2u8 && @len(ca.items) == 2u64);
+    assert(@len(ca.items[1].edits) == 2u64);
+    return;
+}
+
+function test_incremental_sync(): void!AllocError {
+    var store: documents::Store = documents::create(65536u32);
+    let open_src: &[u8] = "{\"textDocument\":{\"uri\":\"file:///C:/t.yak\",\"languageId\":\"yak\",\"version\":1,\"text\":\"//中😀\"}}";
+    let open_doc: json::Document = json::parse(open_src)?;
+    let ev1: documents::Event = documents::apply(&store:ReadWrite, &open_doc:Read, open_src, 0u32, 1u8)?;
+    assert(ev1.status == 1u8);
+    // 模拟 VS Code 携带 range + rangeLength 的增量替换（增量模式允许，全量模式拒绝）。
+    let chg_src: &[u8] = "{\"textDocument\":{\"uri\":\"file:///C:/t.yak\",\"version\":2},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":5}},\"rangeLength\":5,\"text\":\"function f(): void {}\\n\"}]}";
+    let chg_doc: json::Document = json::parse(chg_src)?;
+    let ev_full_reject: documents::Event = documents::apply(&store:ReadWrite, &chg_doc:Read, chg_src, 0u32, 2u8)?;
+    assert(ev_full_reject.status == 3u8);
+    let ev2: documents::Event = documents::apply_with_sync_mode(&store:ReadWrite, &chg_doc:Read, chg_src, 0u32, 2u8, true)?;
+    assert(ev2.status == 1u8);
+    assert(bytes_eq(&store.slots[0].snapshot.text.data[0..@len(store.slots[0].snapshot.text.data)]:Read, "function f(): void {}\n"));
+    // 多条顺序增量补丁（先插首行注释，再删除首行）。
+    let batch_src: &[u8] = "{\"textDocument\":{\"uri\":\"file:///C:/t.yak\",\"version\":3},\"contentChanges\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"text\":\"// top\\n\"},{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":1,\"character\":0}},\"text\":\"\"}]}";
+    let batch_doc: json::Document = json::parse(batch_src)?;
+    let ev3: documents::Event = documents::apply_with_sync_mode(&store:ReadWrite, &batch_doc:Read, batch_src, 0u32, 2u8, true)?;
+    assert(ev3.status == 1u8);
+    assert(bytes_eq(&store.slots[0].snapshot.text.data[0..@len(store.slots[0].snapshot.text.data)]:Read, "function f(): void {}\n"));
+    // 拒绝非对象 range（如 range: null）。
+    let bad_src: &[u8] = "{\"textDocument\":{\"uri\":\"file:///C:/t.yak\",\"version\":4},\"contentChanges\":[{\"range\":null,\"text\":\"bad\"}]}";
+    let bad_doc: json::Document = json::parse(bad_src)?;
+    let ev4: documents::Event = documents::apply_with_sync_mode(&store:ReadWrite, &bad_doc:Read, bad_src, 0u32, 2u8, true)?;
+    assert(ev4.status == 3u8);
+    return;
+}
+
+function main(): void {
+    let r1: void!AllocError = test_encodings();
+    let r2: void!AllocError = test_work_budget();
+    let r3: void!AllocError = test_long_span_u32();
+    let r4: void!AllocError = test_format();
+    let r5: void!AllocError = test_rename_and_members();
+    let r6: void!AllocError = test_incremental_sync();
+    @drop(r1); @drop(r2); @drop(r3); @drop(r4); @drop(r5); @drop(r6);
+    return;
+}

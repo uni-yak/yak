@@ -1,0 +1,64 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(low: u32, high: u32, size: u32, expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    var i: u32 = 0;
+    while i < size {
+        var word: u32 = low;
+        if i >= 4 { word = high; }
+        pe::code_u8(&code:ReadWrite, (word >> ((i % 4u32) * 8u32)) as u8)?;
+        i = i + 1;
+    }
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 必须保留 SIB 的 RSP、R12 和无基址绝对寻址。
+    encoding(0x24048b48u32, 0x0u32, 4, 0)?;
+    encoding(0x64048b48u32, 0x0u32, 4, 7102)?;
+    encoding(0xa4048b48u32, 0x0u32, 4, 7102)?;
+    encoding(0xe4048b48u32, 0x0u32, 4, 7102)?;
+    encoding(0x24448b49u32, 0x08u32, 5, 0)?;
+    encoding(0xe4448b49u32, 0x08u32, 5, 7102)?;
+    // 非累加器的绝对寻址不能换作累加器专用 MOV。
+    encoding(0x250c8b48u32, 0x12345678u32, 8, 0)?;
+    encoding(0xa50c8b48u32, 0x12345678u32, 8, 7102)?;
+    // REX.X 选中的 R12 是真实索引，而不是无索引标记。
+    encoding(0x24048b4au32, 0x0u32, 4, 0)?;
+    encoding(0xe4048b4au32, 0x0u32, 4, 0)?;
+    encoding(0x44048b48u32, 0x0u32, 4, 0)?;
+    // 可去掉的 SIB 或位移属于非最短形态；截断仍属于无效指令。
+    encoding(0x20048b48u32, 0x0u32, 4, 7103)?;
+    encoding(0xe0048b48u32, 0x0u32, 4, 7103)?;
+    encoding(0xe4448b48u32, 0x00u32, 5, 7103)?;
+    encoding(0xe5048b48u32, 0x78u32, 5, 7101)?;
+    // 有符号单字节位移的两端可以缩短；区间外必须保留完整位移。
+    encoding(0x7f418b48u32, 0x0u32, 4, 0)?;
+    encoding(0x80418b48u32, 0x0u32, 4, 0)?;
+    encoding(0x7f818b48u32, 0x0u32, 7, 7103)?;
+    encoding(0x80818b48u32, 0xffffffu32, 7, 7103)?;
+    encoding(0x80818b48u32, 0x0u32, 7, 0)?;
+    encoding(0x7f818b48u32, 0xffffffu32, 7, 0)?;
+    encoding(0x80818b48u32, 0xffffu32, 6, 7101)?;
+    // R12 的 SIB 不能省，但零位移能省；RBP 和 R13 仍须编码零位移。
+    encoding(0x24448949u32, 0x0u32, 5, 7103)?;
+    encoding(0x24048949u32, 0x0u32, 4, 0)?;
+    encoding(0x458b48u32, 0x0u32, 4, 0)?;
+    encoding(0x458b49u32, 0x0u32, 4, 0)?;
+    encoding(0x24448949u32, 0x0u32, 4, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

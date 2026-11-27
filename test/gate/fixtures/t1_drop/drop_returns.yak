@@ -1,0 +1,18 @@
+function exercise(early: bool, id: u32): void!AllocError {
+    var first: u32[] = [];
+    @push(first, id)?;
+    var second: u32[] = [];
+    @push(second, id + 1u32)?;
+    if early { return; }
+    @drop(second);
+    @drop(first);
+    return;
+}
+
+function entry(): void!AllocError {
+    exercise(true, 1u32)?;
+    exercise(false, 3u32)?;
+    return;
+}
+
+function main(): void { entry(); return; }

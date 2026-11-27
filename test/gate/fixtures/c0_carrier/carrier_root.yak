@@ -1,0 +1,18 @@
+import carrier_leaf;
+
+foreign assert(cond: bool): void;
+
+export function checksum(ok: bool): u32!AllocError {
+    let values: u32[] = carrier_leaf::make(ok)?;
+    assert(@len(values) == 2);
+    return values[0u64] + values[1u64];
+}
+
+// 两条路径只允许释放活跃的拥有载荷。
+export function discard(ok: bool): void {
+    let value: u32[]!(AllocError | carrier_leaf::Rejected) = carrier_leaf::make_guarded(ok);
+    @drop(value);
+    return;
+}
+
+function main(): void { return; }

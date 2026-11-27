@@ -1,0 +1,13 @@
+// expected_trap: overlapping call arguments with exclusive access (OW-2)
+foreign assert(condition: bool): void;
+
+function write_pair(first: &[u8]:ReadWrite, second: &[u8]): void {
+    assert(false);
+    first[0] = second[1];
+}
+
+function main(): void {
+    var values: [u8; 2] = [7u8, 8u8];
+    let view: &[u8]:ReadWrite = &values[0..2]:ReadWrite;
+    write_pair(view, view);
+}

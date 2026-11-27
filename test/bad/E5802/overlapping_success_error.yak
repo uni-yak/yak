@@ -1,0 +1,6 @@
+// expected_code: E5802
+// spec: spec/lang/base.md#R-27、spec/lang/type/result.md#RE-3
+// 触发：可错返回的成功载荷与错误枚举具有相同运行期成员。
+enum E { X }
+
+function main(): E!E { return E::X; }

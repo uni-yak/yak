@@ -1,0 +1,70 @@
+// module: error_codes=../../compiler/min/src/diag/error_codes.yak
+import error_codes;
+foreign assert(cond: bool): void;
+
+// 逐项核对生成表的码位、分段、规格引用、描述和独立引用域。
+function main(): void {
+    assert(error_codes::error_count() == 197u32);
+    var i: u32 = 0u32;
+    var previous: u16 = 0u16;
+    while i < error_codes::error_count() {
+        let entry: error_codes::ErrorEntry = error_codes::error_entry_at(i);
+        assert(entry.code > previous);
+        assert(error_codes::error_index(entry.code) == i);
+        assert(error_codes::error_exists(entry.code));
+        let by_code: error_codes::ErrorEntry = error_codes::error_entry(entry.code);
+        assert(by_code.code == entry.code && by_code.segment == entry.segment);
+        assert(by_code.sub == entry.sub && by_code.seq == entry.seq);
+        assert(entry.segment == (entry.code / 1000u16) as u8);
+        assert(entry.sub == ((entry.code / 100u16) % 10u16) as u8);
+        assert(entry.seq == (entry.code % 100u16) as u8);
+        assert(entry.ref_len > 0u16 && entry.desc_len > 0u16);
+        assert(error_codes::error_ref_len(i) == entry.ref_len);
+        assert(error_codes::error_desc_len(i) == entry.desc_len);
+        var j: u32 = 0u32;
+        while j < entry.ref_len as u32 {
+            assert(error_codes::error_ref_at(i, j) != 0u8);
+            j = j + 1u32;
+        }
+        j = 0u32;
+        while j < entry.desc_len as u32 {
+            assert(error_codes::error_desc_at(i, j) != 0u8);
+            j = j + 1u32;
+        }
+        assert(error_codes::error_ref_at(i, entry.ref_len as u32) == 0u8);
+        assert(error_codes::error_desc_at(i, entry.desc_len as u32) == 0u8);
+        previous = entry.code;
+        i = i + 1u32;
+    }
+    assert(!error_codes::error_exists(0u16));
+    assert(!error_codes::error_exists(65535u16));
+    assert(error_codes::error_index(65535u16) == 4294967295u32);
+    assert(error_codes::error_entry_at(197u32).code == 0u16);
+    assert(error_codes::error_ref_len(197u32) == 0u16);
+    assert(error_codes::error_desc_len(197u32) == 0u16);
+    assert(error_codes::error_ref_eq(0u32, "lex.md:L-1"));
+    assert(!error_codes::error_ref_eq(0u32, "lex.md:L-2"));
+    // 同一错误码的多个配置描述按登记顺序拼接，不能只验证其中一段。
+    assert(error_codes::error_desc_eq(0u32, "非UTF-8字节序列BOM代理对"));
+    assert(!error_codes::error_desc_eq(0u32, "完全不同的描述"));
+    assert(error_codes::error_source_sha256_len() == 64u32);
+    assert(error_codes::error_source_sha256_eq("8a527d4852d0f3f885d9d95b8dd6b2791c3adfaf199febdb6dc7211ce505b219"));
+    assert(!error_codes::error_source_sha256_eq(""));
+    assert(error_codes::error_ref_kind_count() == 6u8);
+    assert(error_codes::error_ref_kind_label_eq(0u8, "DefId"));
+    assert(error_codes::error_ref_kind_label_eq(1u8, "BuiltinId"));
+    assert(error_codes::error_ref_kind_label_eq(2u8, "ImportRef"));
+    assert(error_codes::error_ref_kind_label_eq(3u8, "FieldId"));
+    assert(error_codes::error_ref_kind_label_eq(4u8, "VariantId"));
+    assert(error_codes::error_ref_kind_label_eq(5u8, "LocalId"));
+    var kind: u8 = 0u8;
+    while kind < 6u8 {
+        assert(error_codes::error_ref_kind_valid(kind));
+        assert(error_codes::error_ref_kind_label_len(kind) > 0u8);
+        kind = kind + 1u8;
+    }
+    assert(!error_codes::error_ref_kind_valid(6u8));
+    assert(error_codes::error_ref_kind_label_len(6u8) == 0u8);
+    assert(!error_codes::error_ref_kind_label_eq(6u8, ""));
+    return;
+}

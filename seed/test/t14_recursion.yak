@@ -1,0 +1,17 @@
+// t14: 递归函数 + assert验证结果
+foreign assert(cond: bool): void;
+
+function fact(n: u32): u32 {
+    if n <= 1 {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+function main(): void {
+    let r: u32 = fact(5);
+    assert(r == 120);
+    assert(fact(0) == 1);
+    assert(fact(3) == 6);
+    return;
+}

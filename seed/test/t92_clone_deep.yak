@@ -1,0 +1,10 @@
+// t92: @clone 深拷贝 owning（载体 Ok 经 ? 解包；源保持 live，副本独立）
+foreign assert(cond: bool): void;
+function main(): void {
+    let a: u32[] = [1, 2, 3];
+    var b: u32[] = @clone(a)?;
+    @push(b, 4);
+    assert(@len(a) == 3);
+    assert(@len(b) == 4);
+    return;
+}

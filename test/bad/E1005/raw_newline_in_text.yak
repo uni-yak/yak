@@ -1,0 +1,5 @@
+// expected_code: E1005
+// spec: spec/lang/lex.md L-5
+// 触发：文本字面量内含裸换行。
+function main(): void { let text: &[u8] = "a
+b"; return; }

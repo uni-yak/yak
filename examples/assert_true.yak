@@ -1,0 +1,7 @@
+// 断言成功的可执行程序：条件为真时正常返回，进程退出码为 0。
+// 编译：tools/link.sh examples/assert_true.yak
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(true);
+}

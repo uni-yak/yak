@@ -1,0 +1,4 @@
+// expected_trap: path root shadowed
+// module: helper=fixtures/helper.yak
+import helper;
+function main(): void { let helper: u32 = 1; helper::answer(); }

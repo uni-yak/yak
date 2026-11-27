@@ -1,0 +1,59 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产栈槽取址仍使用 RBP 基址和完整位移。
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 129)?;
+    assert(pe::code_len(&code:Read) == 7 && code.bytes[2] == 0x85);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // R12 与 RCX 访存可交换；RSP 不能作为索引，真实缩放和同寄存器保持原编码。
+    let mem_r12: [u8; 4] = [0x49, 0x8b, 0x04, 0x0c];
+    encoding(&mem_r12[0..4]:Read, 7102)?;
+    let mem_rcx: [u8; 4] = [0x4a, 0x8b, 0x04, 0x21];
+    encoding(&mem_rcx[0..4]:Read, 0)?;
+    let rsp: [u8; 4] = [0x4a, 0x8d, 0x04, 0x24];
+    encoding(&rsp[0..4]:Read, 0)?;
+    let real_scale: [u8; 4] = [0x49, 0x8d, 0x04, 0x4c];
+    encoding(&real_scale[0..4]:Read, 0)?;
+    let same_r12: [u8; 4] = [0x4b, 0x8d, 0x04, 0x24];
+    encoding(&same_r12[0..4]:Read, 0)?;
+    let nonminimal_disp: [u8; 8] = [0x49, 0x8d, 0x84, 0x0c, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&nonminimal_disp[0..8]:Read, 7103)?;
+    // 三种目的宽度与位移长度均只接受编号较小的基址。
+    let quad_canonical: [u8; 4] = [0x4a, 0x8d, 0x04, 0x21];
+    encoding(&quad_canonical[0..4]:Read, 0)?;
+    let quad_alias: [u8; 4] = [0x49, 0x8d, 0x04, 0x0c];
+    encoding(&quad_alias[0..3]:Read, 7101)?;
+    encoding(&quad_alias[0..4]:Read, 7102)?;
+    let dword_canonical: [u8; 5] = [0x42, 0x8d, 0x44, 0x21, 0x80];
+    encoding(&dword_canonical[0..5]:Read, 0)?;
+    let dword_alias: [u8; 5] = [0x41, 0x8d, 0x44, 0x0c, 0x80];
+    encoding(&dword_alias[0..4]:Read, 7101)?;
+    encoding(&dword_alias[0..5]:Read, 7102)?;
+    let word_canonical: [u8; 9] = [0x66, 0x43, 0x8d, 0x84, 0x34, 0x80, 0x00, 0x00, 0x00];
+    encoding(&word_canonical[0..9]:Read, 0)?;
+    let word_alias: [u8; 9] = [0x66, 0x43, 0x8d, 0x84, 0x26, 0x80, 0x00, 0x00, 0x00];
+    encoding(&word_alias[0..8]:Read, 7101)?;
+    encoding(&word_alias[0..9]:Read, 7102)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

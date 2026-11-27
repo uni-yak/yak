@@ -1,0 +1,69 @@
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+export struct Entry { wide: u64, flag: bool, tail: u16 }
+export struct Table { marker: u32, rows: Entry[], count: u64 }
+
+function fill(dst: &Table:ReadWrite): void!AllocError {
+    @push(dst.rows, Entry { wide: 123456u64, flag: true, tail: 17 })?;
+    @push(dst.rows, Entry { wide: 987654u64, flag: false, tail: 19 })?;
+    dst.rows[1u64] = Entry { wide: 2468u64, flag: true, tail: 23 };
+    dst.count = 2;
+    return;
+}
+
+function index(calls: &u32:ReadWrite): u64 {
+    *calls = *calls + 1;
+    return 0;
+}
+
+function grow(dst: &Table:ReadWrite): Entry!AllocError {
+    @push(dst.rows, Entry { wide: 999u64, flag: true, tail: 29 })?;
+    return Entry { wide: 4321u64, flag: false, tail: 31 };
+}
+
+function cover_relocation(dst: &Table:ReadWrite): void!AllocError {
+    @push(dst.rows, Entry { wide: 30u64, flag: false, tail: 25 })?;
+    @push(dst.rows, Entry { wide: 40u64, flag: false, tail: 27 })?;
+    var calls: u32 = 0;
+    // 第五次追加必定迁移缓冲，且左侧索引只应求值一次。
+    dst.rows[index(&calls:ReadWrite)] = grow(dst)?;
+    assert(calls == 1 && @len(dst.rows) == 5);
+    assert(dst.rows[0u64].wide == 4321u64 && dst.rows[0u64].tail == 31);
+    assert(dst.rows[4u64].wide == 999u64 && dst.rows[4u64].tail == 29);
+    return;
+}
+
+function replace(dst: &Table:ReadWrite): void!AllocError {
+    var next: Table = Table { marker: 88, rows: [], count: 1 };
+    @push(next.rows, Entry { wide: 222u64, flag: false, tail: 34 })?;
+    *dst = next;
+    return;
+}
+
+export function owning_replace(): void!AllocError {
+    var table: Table = Table { marker: 77, rows: [], count: 1 };
+    @push(table.rows, Entry { wide: 111u64, flag: true, tail: 17 })?;
+    replace(&table:ReadWrite)?;
+    assert(table.marker == 88 && table.count == 1 && table.rows[0u64].wide == 222u64);
+    return;
+}
+
+function check(src: &Table:Read): void {
+    assert(src.marker == 77 && src.count == 2);
+    assert(src.rows[0u64].wide == 123456u64 && src.rows[0u64].flag && src.rows[0u64].tail == 17);
+    assert(src.rows[1u64].wide == 2468u64 && src.rows[1u64].flag && src.rows[1u64].tail == 23);
+}
+
+function run(): void!AllocError {
+    var table: Table = Table { marker: 77, rows: [], count: 0 };
+    fill(&table:ReadWrite)?;
+    check(&table:Read);
+    cover_relocation(&table:ReadWrite)?;
+    exit(0);
+    return;
+}
+function main(): void {
+    let result: void!AllocError = run();
+    @drop(result);
+    assert(false);
+}

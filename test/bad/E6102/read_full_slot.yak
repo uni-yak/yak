@@ -1,0 +1,13 @@
+// expected_code: E6102
+// spec: spec/lang/base.md R-22；spec/lang/owner.md OW-8
+// 触发：满槽位被直接读取而非移动提取。
+foreign assert(cond: bool): void;
+
+function fill(x: &u32:Write): void { *x = 1u32; }
+
+function main(): void {
+    out r: u32;
+    fill(out r);
+    assert(r == 1u32);
+    return;
+}

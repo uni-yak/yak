@@ -1,0 +1,26 @@
+// t58: enum 变体构造 + match 分派
+// expected_stdout: red
+// expected_stdout: blue
+foreign write(data: &[u8]): void;
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+function main(): void {
+    let c: Color = Color::Red;
+    match c {
+        Red => { write("red\n"); },
+        Green => { write("green\n"); },
+        Blue => { write("blue\n"); },
+    }
+    let c2: Color = Color::Blue;
+    match c2 {
+        Red => { write("red\n"); },
+        Green => { write("green\n"); },
+        Blue => { write("blue\n"); },
+    }
+    return;
+}

@@ -1,0 +1,2 @@
+// expected_trap: read-borrowed place
+function main(): void { var value: i64 = 1; let first: &i64 = &value; { let second: &i64 = &*first; } value = 2; }

@@ -1,0 +1,13 @@
+# STAGE —— yakc-min 阶段元数据
+# 格式：键: 值（UTF-8、LF）
+
+stage: T1
+status: 本地 Win64 C0 点火已验证，T1 整体未验收
+base_spec: ../../spec/lang/base.md
+target_profile: yak64-v1 + abi-win
+products: out/<root>.exe；可选审计目录保留各单元 .ysm、.iface、.obj
+entry: build.sh
+verify: verify.sh
+driver: src/main.yak
+ignition: 由 yak-seed 解释执行（../../seed/）
+next: 关闭 T1 发布门禁后再启动 T2（../../spec/proc/fixpoint.md）

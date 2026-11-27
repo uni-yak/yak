@@ -1,0 +1,9 @@
+// expected_code: E6104
+// spec: spec/lang/base.md R-25；spec/lang/owner.md OW-9
+// 触发：out 槽位载荷为引用视图。
+enum E { Bad }
+
+function main(): void {
+    out r: &u32;
+    return;
+}

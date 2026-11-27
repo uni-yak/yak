@@ -1,0 +1,29 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+function number(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 4u32; }
+function forbidden(): u32 { assert(false); return 1u32; }
+function add_left(ok: bool): u32!Failure { return @wrap_add(number(ok)?, forbidden()); }
+function sub_left(ok: bool): u32!Failure { return @wrap_sub(number(ok)?, forbidden()); }
+function mul_left(ok: bool): u32!Failure { return @wrap_mul(number(ok)?, forbidden()); }
+function add_right(ok: bool): u32!Failure { return @wrap_add(2u32, number(ok)?); }
+function sub_right(ok: bool): u32!Failure { return @wrap_sub(8u32, number(ok)?); }
+function mul_right(ok: bool): u32!Failure { return @wrap_mul(2u32, number(ok)?); }
+function length(ok: bool): u64!Failure {
+    let data: u8[] = [1, 2, 3, 4];
+    return @len(&data[0..number(ok)?]);
+}
+function recover(e: &Failure): u32 { return 99u32; }
+function recover_len(e: &Failure): u64 { return 99u64; }
+function main(): void {
+    assert(add_left(false).catch(&recover) == 99u32);
+    assert(sub_left(false).catch(&recover) == 99u32);
+    assert(mul_left(false).catch(&recover) == 99u32);
+    assert(add_right(false).catch(&recover) == 99u32);
+    assert(sub_right(false).catch(&recover) == 99u32);
+    assert(mul_right(false).catch(&recover) == 99u32);
+    assert(add_right(true).catch(&recover) == 6u32);
+    assert(sub_right(true).catch(&recover) == 4u32);
+    assert(mul_right(true).catch(&recover) == 8u32);
+    assert(length(false).catch(&recover_len) == 99u64);
+    assert(length(true).catch(&recover_len) == 4u64);
+}

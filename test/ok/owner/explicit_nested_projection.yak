@@ -1,0 +1,20 @@
+// expected_exit: 0
+// expected_stdout:
+// spec: spec/lang/base.md 7.14
+// 字段和索引只隐式解引用一层；额外的层级由显式星号承担。
+foreign assert(cond: bool): void;
+struct Record { value: u32 }
+
+function main(): void {
+    let record: Record = Record { value: 7u32 };
+    let array: [u32; 2] = [13u32, 17u32];
+    let scalar: u32 = 23u32;
+    let r: &Record:Read = &record;
+    let a: &([u32; 2]):Read = &array;
+    let s: &u32:Read = &scalar;
+    assert(r.value == 7u32);
+    assert(a[0u32] == 13u32);
+    assert((*(&r)).value == 7u32);
+    assert((*(&a))[1u32] == 17u32);
+    assert(*(*(&s)) == 23u32);
+}

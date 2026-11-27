@@ -1,0 +1,1187 @@
+// x86-64 机器码编码原语：寄存器编号、REX 前缀、ModRM/SIB、位移、立即数与常用指令。
+// 本模块只产出字节，不含目标文件容器结构；容器装配见 coff.yak。
+// 依据 spec/target/x86.md：固定 64 位操作数尺寸、选最短合法形式、禁止冗余前缀。
+// 局部变量一律位于 [rbp - disp]，故内存寻址只需 rbp 相对形式。
+
+// 通用寄存器编号，与 ModRM 的 reg/rm 字段一致。
+export function rax(): u8 { return 0; }
+export function rcx(): u8 { return 1; }
+export function rdx(): u8 { return 2; }
+export function rbx(): u8 { return 3; }
+export function rsp(): u8 { return 4; }
+export function rbp(): u8 { return 5; }
+export function rsi(): u8 { return 6; }
+export function rdi(): u8 { return 7; }
+export function r8(): u8 { return 8; }
+export function r9(): u8 { return 9; }
+export function r10(): u8 { return 10; }
+export function r11(): u8 { return 11; }
+export function r12(): u8 { return 12; }
+export function r13(): u8 { return 13; }
+export function r14(): u8 { return 14; }
+export function r15(): u8 { return 15; }
+export function cc_e(): u8 { return 4; }
+export function cc_ne(): u8 { return 5; }
+export function cc_b(): u8 { return 2; }
+export function cc_ae(): u8 { return 3; }
+export function cc_be(): u8 { return 6; }
+export function cc_a(): u8 { return 7; }
+export function cc_l(): u8 { return 12; }
+export function cc_ge(): u8 { return 13; }
+export function cc_le(): u8 { return 14; }
+export function cc_g(): u8 { return 15; }
+export function cc_o(): u8 { return 0; }
+
+// 分支按占位指令的起点排列。saved 是本轮截至该分支移除的总字节数。
+export struct Branch { start: u32, target: u32, saved: u32, short_op: u8, long_size: u8, size: u8, resolved: bool }
+export struct Relative { at: u32, base: u32, target: u32 }
+export struct TextData { start: u32, end: u32 }
+// 缩短分支后保留物理缓冲的尾部容量，下次发射优先覆写。仅 used 内的字节有效。
+export struct Code {
+    bytes: u8[], used: u32, win64_body: bool, win64_frame: u32, win64_error: u16, sysv: bool,
+    layout_active: bool, branches: Branch[], relatives: Relative[], tables: TextData[],
+}
+
+export function code_new(): Code {
+    return Code { bytes: [], used: 0, win64_body: false, win64_frame: 0, win64_error: 0, sysv: false,
+        layout_active: false, branches: [], relatives: [], tables: [] };
+}
+export function code_len(code: &Code:Read): u32 {
+    return code.used;
+}
+export function code_u8(code: &Code:ReadWrite, value: u8): void!AllocError {
+    let at: u32 = code.used;
+    if (at as u64) == @len(code.bytes) { @push(code.bytes, value)?; }
+    else { code.bytes[at] = value; }
+    code.used = at + 1;
+    return;
+}
+export function code_u32(code: &Code:ReadWrite, value: u32): void!AllocError {
+    code_u8(code, value as u8)?;
+    code_u8(code, (value >> 8) as u8)?;
+    code_u8(code, (value >> 16) as u8)?;
+    code_u8(code, (value >> 24) as u8)?;
+    return;
+}
+export function code_u64(code: &Code:ReadWrite, value: u64): void!AllocError {
+    var i: u32 = 0;
+    while i < 8 {
+        code_u8(code, (value >> ((i as u64) * 8)) as u8)?;
+        i = i + 1;
+    }
+    return;
+}
+export function code_bytes(code: &Code:ReadWrite, src: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(src) as u32 {
+        code_u8(code, src[i])?;
+        i = i + 1;
+    }
+    return;
+}
+// 回填 4 字节小端；越界视为内部错误并按空操作处理，由调用方的长度断言兜底。
+export function code_patch_u32(code: &Code:ReadWrite, offset: u32, value: u32): void {
+    if offset > code.used || code.used - offset < 4 { return; }
+    code.bytes[offset] = (value & 255) as u8;
+    code.bytes[offset + 1] = ((value >> 8) & 255) as u8;
+    code.bytes[offset + 2] = ((value >> 16) & 255) as u8;
+    code.bytes[offset + 3] = ((value >> 24) & 255) as u8;
+    return;
+}
+export function code_get(code: &Code:Read, offset: u32): u8 {
+    if offset >= code.used { return 0; }
+    return code.bytes[offset];
+}
+
+// 固定栈槽模型只把易失寄存器用于中间值；rbp 只由成对序言与尾声写入。
+function check_gpr_write(code: &Code:ReadWrite, reg: u8): void {
+    if reg < 3 || (reg >= 8 && reg <= 11) { return; }
+    if code.sysv && (reg == 6 || reg == 7) { return; }
+    if code.win64_body && code.win64_error == 0 {
+        if code.sysv {
+            if reg == 4 { code.win64_error = 8014; }
+            else { code.win64_error = 8015; }
+        } elseif reg == 4 { code.win64_error = 8006; }
+        else { code.win64_error = 8008; }
+    }
+    return;
+}
+
+export function win64_status(code: &Code:Read): u16 { return code.win64_error; }
+
+export function sysv_arg_reg(index: u32): u8 {
+    if index == 0 { return rdi(); }
+    if index == 1 { return rsi(); }
+    if index == 2 { return rdx(); }
+    if index == 3 { return rcx(); }
+    if index == 4 { return r8(); }
+    return r9();
+}
+
+// ── 前缀与寻址 ──
+export function reg_ext(reg: u8): u8 {
+    if reg >= 8 { return 1; }
+    return 0;
+}
+// REX：仅当需要 64 位尺寸位或扩展寄存器位时发射，避免冗余前缀。
+export function rex(code: &Code:ReadWrite, w: u8, r: u8, x: u8, b: u8): void!AllocError {
+    let value: u8 = 64 | ((w & 1) << 3) | ((r & 1) << 2) | ((x & 1) << 1) | (b & 1);
+    if value == 64 { return; }
+    code_u8(code, value)?;
+    return;
+}
+export function modrm(code: &Code:ReadWrite, mod: u8, reg: u8, rm: u8): void!AllocError {
+    code_u8(code, (((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7)) as u8)?;
+    return;
+}
+// [rbp - disp]：disp 在 1..128 用 disp8，其余用 disp32。
+// 位移按补码取负：disp8 = 256 - disp，disp32 = 2^32 - disp，避免无符号下溢。
+export function neg_disp8(rbp_disp: u32): u8 {
+    if rbp_disp == 0 { return 0; }
+    return (256u32 - rbp_disp) as u8;
+}
+export function neg_disp32(rbp_disp: u32): u32 {
+    return (4294967296u64 - (rbp_disp as u64)) as u32;
+}
+export function modrm_rbp(code: &Code:ReadWrite, reg: u8, rbp_disp: u32): void!AllocError {
+    let field: u8 = (reg & 7) << 3;
+    if rbp_disp <= 128 {
+        code_u8(code, 69u8 | field)?;
+        var disp: u8 = 0;
+        if rbp_disp != 0 { disp = (256u32 - rbp_disp) as u8; }
+        code_u8(code, disp)?;
+    } else {
+        code_u8(code, 133u8 | field)?;
+        code_u32(code, (4294967296u64 - (rbp_disp as u64)) as u32)?;
+    }
+    return;
+}
+// 栈槽相对位移的字节数，供跨函数估算代码长度时使用。
+export function disp_width(rbp_disp: u32): u8 {
+    if rbp_disp <= 128 { return 1; }
+    return 4;
+}
+
+// ── 移动 ──
+// 同一 64 位寄存器的传送用单字节 NOP；其余使用 89 /r。
+export function mov_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    if dst == src { nop(code)?; return; }
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(src), 0, reg_ext(dst))?;
+    code_u8(code, 137)?;
+    modrm(code, 3, src, dst)?;
+    return;
+}
+// mov dst, [rbp-disp]（8B /r）。
+export function mov_rm(code: &Code:ReadWrite, dst: u8, rbp_disp: u32): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, 0)?;
+    code_u8(code, 139)?;
+    modrm_rbp(code, dst, rbp_disp)?;
+    return;
+}
+// mov [rbp-disp], src（89 /r）。
+export function mov_mr(code: &Code:ReadWrite, src: u8, rbp_disp: u32): void!AllocError {
+    rex(code, 1, reg_ext(src), 0, 0)?;
+    code_u8(code, 137)?;
+    modrm_rbp(code, src, rbp_disp)?;
+    return;
+}
+// mov dst, imm64（B8+rd io）。
+export function mov_imm64(code: &Code:ReadWrite, dst: u8, value: u64): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, 0, 0, reg_ext(dst))?;
+    code_u8(code, (184 + (dst & 7)) as u8)?;
+    code_u64(code, value)?;
+    return;
+}
+
+// 清零整个通用寄存器；调用者只在比较标志已用完时使用。
+export function clear_reg(code: &Code:ReadWrite, dst: u8): void!AllocError {
+    check_gpr_write(code, dst);
+    let high: u8 = reg_ext(dst);
+    rex(code, 0, high, 0, high)?;
+    code_u8(code, 49u8)?;
+    modrm(code, 3, dst, dst)?;
+    return;
+}
+
+// MIR 标量常量写入目标宽度的槽。寄存器的其余字节不会被该槽存储读取。
+export function mov_int(code: &Code:ReadWrite, dst: u8, value: u64, width: u8): void!AllocError {
+    if value == 0 { clear_reg(code, dst)?; return; }
+    if width == 8 { mov_imm64(code, dst, value)?; return; }
+    check_gpr_write(code, dst);
+    if width == 2 { code_u8(code, 102)?; }
+    if width == 1 && dst >= 4 && dst <= 7 { code_u8(code, 64)?; }
+    else { rex(code, 0, 0, 0, reg_ext(dst))?; }
+    var opcode: u8 = 184;
+    if width == 1 { opcode = 176; }
+    code_u8(code, opcode + (dst & 7u8))?;
+    if width == 4 { code_u32(code, value as u32)?; }
+    else {
+        code_u8(code, value as u8)?;
+        if width == 2 { code_u8(code, (value >> 8u64) as u8)?; }
+    }
+    return;
+}
+// 按类型宽度读写栈槽：dst 置零扩展后的值（宽度 < 8 时高位清零）。
+export function load_slot(code: &Code:ReadWrite, dst: u8, rbp_disp: u32, width: u8): void!AllocError {
+    check_gpr_write(code, dst);
+    // 栈槽的基址固定为 rbp，因此只需要 W 和寄存器扩展位。
+    var prefix: u8 = 64;
+    if dst >= 8 { prefix = 68; }
+    if width == 8 { prefix = prefix | 8u8; }
+    if prefix != 64 { code_u8(code, prefix)?; }
+    if width == 8 || width == 4 { code_u8(code, 139u8)?; }
+    else {
+        code_u8(code, 15u8)?;
+        if width == 2 { code_u8(code, 183u8)?; }
+        else { code_u8(code, 182u8)?; }
+    }
+    modrm_rbp(code, dst, rbp_disp)?;
+    return;
+}
+// 只写低 width 字节，保留槽内高位不变（窄化赋值）。
+export function store_slot(code: &Code:ReadWrite, src: u8, rbp_disp: u32, width: u8): void!AllocError {
+    if width == 2 { code_u8(code, 102u8)?; }
+    var prefix: u8 = 64;
+    if src >= 8 { prefix = 68; }
+    if width == 8 { prefix = prefix | 8u8; }
+    if prefix != 64 || (width == 1 && src >= 4) { code_u8(code, prefix)?; }
+    if width == 8 || width == 4 || width == 2 { code_u8(code, 137u8)?; }
+    else { code_u8(code, 136u8)?; }
+    modrm_rbp(code, src, rbp_disp)?;
+    return;
+}
+
+// ── 算术与逻辑 ──
+// ALU 运算的 reg 字段为源、rm 字段为目的。
+// SPL、BPL、SIL、DIL 的字节形态需要裸 REX；同寄存器比较用 32 位更短。
+export function cmp_self_byte(reg: u8): bool { return reg < 4 || reg >= 8; }
+
+function alu_rr(code: &Code:ReadWrite, opcode: u8, dst: u8, src: u8): void!AllocError {
+    if dst == src && (opcode == 9 || opcode == 33) {
+        test_rr(code, dst, src)?;
+        return;
+    }
+    if opcode != 57 { check_gpr_write(code, dst); }
+    var wide: u8 = 1;
+    var encoding: u8 = opcode;
+    if dst == src {
+        // 自异或与自减需要 32 位写回以清空高半部。
+        if opcode == 49 || opcode == 41 { wide = 0; }
+        elseif opcode == 57 {
+            // 自比较只设置标志，不改写寄存器；所有宽度都有相同的零差值和标志。
+            wide = 0;
+            if cmp_self_byte(dst) { encoding = 56; }
+        }
+    }
+    rex(code, wide, reg_ext(src), 0, reg_ext(dst))?;
+    code_u8(code, encoding)?;
+    modrm(code, 3, src, dst)?;
+    return;
+}
+// 按整数宽度计算 rax 与 rcx，保留该宽度的进位及溢出标志。
+export function addsub_width(code: &Code:ReadWrite, width: u8, subtract: bool): void!AllocError {
+    if width == 2 { code_u8(code, 102)?; }
+    if width == 8 { rex(code, 1, 0, 0, 0)?; }
+    var opcode: u8 = 1;
+    if subtract { opcode = 41; }
+    if width == 1 { opcode = opcode - 1; }
+    code_u8(code, opcode)?;
+    modrm(code, 3, rcx(), rax())?;
+    return;
+}
+// add dst, src（01 /r）。
+export function add_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    alu_rr(code, 1, dst, src)?;
+    return;
+}
+export function sub_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    alu_rr(code, 41, dst, src)?;
+    return;
+}
+export function and_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    alu_rr(code, 33, dst, src)?;
+    return;
+}
+export function or_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    alu_rr(code, 9, dst, src)?;
+    return;
+}
+export function xor_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    alu_rr(code, 49, dst, src)?;
+    return;
+}
+// cmp a, b：不同寄存器保留 64 位，同寄存器选择最短形态。
+export function cmp_rr(code: &Code:ReadWrite, a: u8, b: u8): void!AllocError {
+    alu_rr(code, 57, a, b)?;
+    return;
+}
+function alu_imm8(code: &Code:ReadWrite, group: u8, reg: u8, value: u8): void!AllocError {
+    if group == 4 && value == 0 {
+        clear_reg(code, reg)?;
+        return;
+    }
+    if (group == 1 && value == 0) || (group == 4 && value == 255) {
+        test_rr(code, reg, reg)?;
+        return;
+    }
+    if group != 7 { check_gpr_write(code, reg); }
+    var wide: u8 = 1;
+    // 非负 AND 掩码把符号位和高半部都清零，低位结果与标志保持相同。
+    if group == 4 && value < 128 { wide = 0; }
+    rex(code, wide, 0, 0, reg_ext(reg))?;
+    code_u8(code, 131)?;
+    modrm(code, 3, group, reg)?;
+    code_u8(code, value)?;
+    return;
+}
+// 有符号零比较用 cmp + jl。
+export function cmp_zero(code: &Code:ReadWrite, reg: u8): void!AllocError {
+    alu_imm8(code, 7, reg, 0)?;
+    return;
+}
+// TEST 的两个寄存器可交换；编号较小的寄存器放在 r/m 位。
+export function test_rr(code: &Code:ReadWrite, a: u8, b: u8): void!AllocError {
+    var low: u8 = a;
+    var high: u8 = b;
+    if b < a { low = b; high = a; }
+    rex(code, 1, reg_ext(high), 0, reg_ext(low))?;
+    code_u8(code, 133)?;
+    modrm(code, 3, high, low)?;
+    return;
+}
+// 单操作数乘法使用 rax 与 rcx，按目标宽度设置溢出标志。
+export function multiply_signed(code: &Code:ReadWrite, width: u8): void!AllocError {
+    if width == 2 { code_u8(code, 102)?; }
+    if width == 8 { rex(code, 1, 0, 0, 0)?; }
+    if width == 1 { code_u8(code, 246)?; }
+    else { code_u8(code, 247)?; }
+    modrm(code, 3, 5, rcx())?;
+    return;
+}
+// imul dst, src（0F AF /r），有符号乘。
+export function imul_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, reg_ext(src))?;
+    code_u8(code, 15)?;
+    code_u8(code, 175)?;
+    modrm(code, 3, dst, src)?;
+    return;
+}
+// 一元运算组：F7 /n，发射 not、neg 和 idiv。
+function unary_rm(code: &Code:ReadWrite, group: u8, rbp_disp: u32): void!AllocError {
+    rex(code, 1, 0, 0, 0)?;
+    code_u8(code, 247)?;
+    modrm_rbp(code, group, rbp_disp)?;
+    return;
+}
+export function not_slot(code: &Code:ReadWrite, rbp_disp: u32): void!AllocError {
+    unary_rm(code, 2, rbp_disp)?;
+    return;
+}
+// 按值类型宽度取负，以便从对应宽度的标志位检测溢出。
+export function neg_slot(code: &Code:ReadWrite, rbp_disp: u32, width: u8): void!AllocError {
+    if width == 2 { code_u8(code, 102)?; }
+    if width == 8 { rex(code, 1, 0, 0, 0)?; }
+    if width == 1 { code_u8(code, 246)?; }
+    else { code_u8(code, 247)?; }
+    modrm_rbp(code, 3, rbp_disp)?;
+    return;
+}
+// 除数放在 rcx，避免读取窄栈槽中未初始化的高位。
+export function divide_signed(code: &Code:ReadWrite): void!AllocError {
+    rex(code, 1, 0, 0, 0)?;
+    code_u8(code, 247)?;
+    modrm(code, 3, 7, rcx())?;
+    return;
+}
+// cdq/cqo：48 99，把 rax 符号扩展到 rdx。
+export function cqo(code: &Code:ReadWrite): void!AllocError {
+    code_u8(code, 72)?;
+    code_u8(code, 153)?;
+    return;
+}
+// 无符号除法前需清零 rdx。
+export function xor_rdx_rdx(code: &Code:ReadWrite): void!AllocError {
+    xor_rr(code, rdx(), rdx())?;
+    return;
+}
+
+// 无符号乘积的高半部是有符号乘积高半部，加上每个负操作数对应的另一个操作数。
+// 输入 rax、rcx，低半部留在 rax；宽度为 64 位时以高半部是否为零报告溢出。
+// 窄操作数加载时已零扩展，低半部就是完整乘积，可直接与目标宽度的最大值比较。
+export function multiply_unsigned(code: &Code:ReadWrite, width: u8): u8!AllocError {
+    if width != 8 {
+        imul_rr(code, rax(), rcx())?;
+        let limit: u64 = (1u64 << ((width as u64) * 8u64)) - 1u64;
+        mov_imm64(code, rdx(), limit)?;
+        cmp_rr(code, rax(), rdx())?;
+        return cc_a();
+    }
+    mov_rr(code, r8(), rax())?;
+    multiply_signed(code, 8)?;
+    cmp_zero(code, r8())?;
+    let positive_left: u32 = jcc_rel32(code, cc_ge())?;
+    add_rr(code, rdx(), rcx())?;
+    let check_right: u32 = code_len(code);
+    patch_rel32(code, positive_left, check_right);
+    cmp_zero(code, rcx())?;
+    let positive_right: u32 = jcc_rel32(code, cc_ge())?;
+    add_rr(code, rdx(), r8())?;
+    let check_high: u32 = code_len(code);
+    patch_rel32(code, positive_right, check_high);
+    test_rr(code, rdx(), rdx())?;
+    return cc_ne();
+}
+
+// 输入为已检查非零除数的 rax、rcx，输出商 rax 和余数 rdx。
+// 最高位为 1 的除数最多整除一次。其余情况先算 (被除数 >> 1) / 除数，
+// 对商余加倍并补回最低位，最后在余数仍不小于除数时修正一次。
+export function divide_unsigned(code: &Code:ReadWrite, width: u8): void!AllocError {
+    if width != 8 {
+        xor_rdx_rdx(code)?;
+        divide_signed(code)?;
+        return;
+    }
+    cmp_zero(code, rcx())?;
+    let large_divisor: u32 = jcc_rel32(code, cc_l())?;
+    mov_rr(code, r8(), rax())?;
+    alu_imm8(code, 4, r8(), 1)?;
+    // shr rax, 1 的专用短编码保留 rcx 中的除数。
+    code_u8(code, 72)?;
+    code_u8(code, 209)?;
+    modrm(code, 3, 5, rax())?;
+    xor_rdx_rdx(code)?;
+    divide_signed(code)?;
+    add_rr(code, rax(), rax())?;
+    add_rr(code, rdx(), rdx())?;
+    add_rr(code, rdx(), r8())?;
+    let adjust: u32 = jmp_rel32(code)?;
+    let large: u32 = code_len(code);
+    patch_rel32(code, large_divisor, large);
+    mov_rr(code, rdx(), rax())?;
+    xor_rr(code, rax(), rax())?;
+    let check: u32 = code_len(code);
+    patch_rel32(code, adjust, check);
+    cmp_rr(code, rdx(), rcx())?;
+    let done: u32 = jcc_rel32(code, cc_b())?;
+    sub_rr(code, rdx(), rcx())?;
+    alu_imm8(code, 0, rax(), 1)?;
+    let end: u32 = code_len(code);
+    patch_rel32(code, done, end);
+    return;
+}
+
+// ── 移位 ──
+// shl/shr/sar 使用 CL 作为移位量：D3 /4, /5, /7。
+function shift_slot(code: &Code:ReadWrite, group: u8, rbp_disp: u32): void!AllocError {
+    rex(code, 1, 0, 0, 0)?;
+    code_u8(code, 211)?;
+    modrm_rbp(code, group, rbp_disp)?;
+    return;
+}
+export function shl_cl(code: &Code:ReadWrite, rbp_disp: u32): void!AllocError {
+    shift_slot(code, 4, rbp_disp)?;
+    return;
+}
+export function shr_cl(code: &Code:ReadWrite, rbp_disp: u32): void!AllocError {
+    shift_slot(code, 5, rbp_disp)?;
+    return;
+}
+export function sar_cl(code: &Code:ReadWrite, rbp_disp: u32): void!AllocError {
+    shift_slot(code, 7, rbp_disp)?;
+    return;
+}
+// mov r64, rcx 的等价：把移位量准备到 cl。
+export function mov_to_rcx(code: &Code:ReadWrite, src: u8): void!AllocError {
+    mov_rr(code, rcx(), src)?;
+    return;
+}
+
+// ── 扩展与截断 ──
+// movzx r32, r/m8 自动清除高 32 位。
+export function movzx8_slot(code: &Code:ReadWrite, dst: u8, rbp_disp: u32): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 0, reg_ext(dst), 0, 0)?;
+    code_u8(code, 15)?;
+    code_u8(code, 182)?;
+    modrm_rbp(code, dst, rbp_disp)?;
+    return;
+}
+// movsx r64, r/m8（0F BE /r）与 r/m16（0F BF /r）。
+export function movsx8_slot(code: &Code:ReadWrite, dst: u8, rbp_disp: u32): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, 0)?;
+    code_u8(code, 15)?;
+    code_u8(code, 190)?;
+    modrm_rbp(code, dst, rbp_disp)?;
+    return;
+}
+export function movsx16_slot(code: &Code:ReadWrite, dst: u8, rbp_disp: u32): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, 0)?;
+    code_u8(code, 15)?;
+    code_u8(code, 191)?;
+    modrm_rbp(code, dst, rbp_disp)?;
+    return;
+}
+// movsxd r64, r/m32（63 /r）。
+export function movsx32_rr(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, reg_ext(src))?;
+    code_u8(code, 99)?;
+    modrm(code, 3, dst, src)?;
+    return;
+}
+
+// ── 比较结果 ──
+// mov eax, 1 保留 cmp 标志。条件成立则跳过两字节的 xor，否则将结果清零。
+// 写 eax 同时清零 rax 高位，结果可按任一宽度保存。
+export function compare_bool(code: &Code:ReadWrite, cc: u8): void!AllocError {
+    code_u8(code, 184)?;
+    code_u32(code, 1)?;
+    code_u8(code, 112u8 + (cc & 15u8))?;
+    code_u8(code, 2)?;
+    code_u8(code, 49)?;
+    modrm(code, 3, rax(), rax())?;
+    return;
+}
+
+// ── 控制流 ──
+export function begin_layout(code: &Code:ReadWrite): void {
+    code.branches = [];
+    code.relatives = [];
+    code.tables = [];
+    code.layout_active = true;
+    return;
+}
+
+// 仅枚举分派在 .text 内写入表数据；记录实际写入的边界，随分支一并重算。
+export function mark_jump_table(code: &Code:ReadWrite, start: u32): void!AllocError {
+    let end: u32 = code.used;
+    @push(code.tables, TextData { start: start, end: end })?;
+    return;
+}
+
+function branch_site(code: &Code:ReadWrite, short_op: u8, long_size: u8): void!AllocError {
+    if code.layout_active {
+        @push(code.branches, Branch { start: code.used, target: 0, saved: 0,
+            short_op: short_op, long_size: long_size, size: 2, resolved: false })?;
+    }
+    return;
+}
+
+// jcc rel32（0F 80+cc cd）：返回 4 字节位移的偏移，供回填。
+export function jcc_rel32(code: &Code:ReadWrite, cc: u8): u32!AllocError {
+    branch_site(code, 112u8 + (cc & 15u8), 6)?;
+    code_u8(code, 15)?;
+    code_u8(code, (128 + (cc & 15)) as u8)?;
+    let at: u32 = code_len(code);
+    code_u32(code, 0)?;
+    return at;
+}
+// jmp rel32（E9 cd）。
+export function jmp_rel32(code: &Code:ReadWrite): u32!AllocError {
+    branch_site(code, 235, 5)?;
+    code_u8(code, 233)?;
+    let at: u32 = code_len(code);
+    code_u32(code, 0)?;
+    return at;
+}
+// call rel32（E8 cd）。
+export function call_rel32(code: &Code:ReadWrite): u32!AllocError {
+    code_u8(code, 232)?;
+    let at: u32 = code_len(code);
+    code_u32(code, 0)?;
+    return at;
+}
+// 回填相对位移：目标绝对偏移 - (位移字段偏移 + 4)。
+// 后向分支的位移为负，必须用回绕算术写成 u32 二补码，普通减法会触发溢出陷阱。
+export function patch_rel32(code: &Code:ReadWrite, at: u32, target: u32): void {
+    if code.layout_active {
+        var lo: u32 = 0;
+        var hi: u32 = @len(code.branches) as u32;
+        while lo < hi {
+            let mid: u32 = lo + (hi - lo) / 2u32;
+            let origin: u32 = code.branches[mid].start + (code.branches[mid].long_size as u32) - 4u32;
+            if origin < at { lo = mid + 1; }
+            elseif origin > at { hi = mid; }
+            else {
+                code.branches[mid].target = target;
+                code.branches[mid].resolved = true;
+                return;
+            }
+        }
+    }
+    code_patch_u32(code, at, @wrap_sub(target, @wrap_add(at, 4u32)));
+    return;
+}
+
+// 跳转表与 RIP 相对引用保留各自的起算位置，与普通分支一起重算。
+export function patch_relative(code: &Code:ReadWrite, at: u32, base: u32, target: u32): void!AllocError {
+    if code.layout_active { @push(code.relatives, Relative { at: at, base: base, target: target })?; }
+    code_patch_u32(code, at, @wrap_sub(target, base));
+    return;
+}
+
+// 返回位置之前的分支数；恰好在分支开头的位置不计入该分支。
+function branches_before(branches: &[Branch], at: u32): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = @len(branches) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        if branches[mid].start < at { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return lo;
+}
+
+function branch_position(branches: &[Branch], at: u32): u32 {
+    let before: u32 = branches_before(branches, at);
+    if before == 0 { return at; }
+    return at - branches[before - 1].saved;
+}
+
+export function layout_position(code: &Code:Read, at: u32): u32 {
+    return branch_position(&code.branches[0..@len(code.branches)]:Read, at);
+}
+
+// 调整布局前确认目标不落在任何待处理分支的操作码或位移中间。
+export function branch_targets_clear(branches: &[Branch]): bool {
+    var i: u32 = 0;
+    while i < @len(branches) as u32 {
+        let target: u32 = branches[i].target;
+        let before: u32 = branches_before(branches, target);
+        if before != 0 {
+            let previous: Branch = branches[before - 1];
+            if target - previous.start < previous.long_size as u32 { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+function fits_rel8(delta: i64): bool { return delta >= -128i64 && delta <= 127i64; }
+function rel8(delta: i64): u8 { return ((256i64 + delta) as u32 & 255u32) as u8; }
+
+// 倒序追踪紧邻、已可删除的分支。只有目标与顺行之间没有其它指令时才省略分支。
+function omit_fallthrough_branches(branches: &Branch[]:ReadWrite): void {
+    var i: u32 = @len(*branches) as u32;
+    var next_start: u32 = 0;
+    var fallthrough_end: u32 = 0;
+    while i != 0 {
+        i = i - 1;
+        let item: Branch = (*branches)[i];
+        let after: u32 = item.start + item.long_size as u32;
+        if after != next_start { fallthrough_end = after; }
+        if item.target >= after && item.target <= fallthrough_end { (*branches)[i].size = 0; }
+        else { fallthrough_end = item.start; }
+        next_start = item.start;
+    }
+    return;
+}
+
+// 先让保留的分支采用短形，再扩展超界项。扩展只会增加跨越它的距离，
+// 因此能同时缩短互相跨越、单独缩短时无法满足距离限制的分支。
+// 发射器和最终字节扫描共用尺寸计算；候选分支按指令起点排序。
+export function plan_branch_widths(branches: &Branch[]:ReadWrite): void {
+    let count: u32 = @len(*branches) as u32;
+    var changed: bool = true;
+    while changed {
+        var saved: u32 = 0;
+        var i: u32 = 0;
+        while i < count {
+            saved = saved + (((*branches)[i].long_size - (*branches)[i].size) as u32);
+            (*branches)[i].saved = saved;
+            i = i + 1;
+        }
+        saved = 0;
+        changed = false;
+        i = 0;
+        // 本轮查表只读取固定的累计偏移，扩展后的宽度由下一轮使用。
+        while i < count {
+            let item: Branch = (*branches)[i];
+            if item.size == 2 {
+                let origin: u32 = item.start - saved + 2;
+                let target: u32 = branch_position(&(*branches)[0..count]:Read, item.target);
+                if !fits_rel8((target as i64) - (origin as i64)) {
+                    (*branches)[i].size = item.long_size;
+                    changed = true;
+                }
+            }
+            saved = item.saved;
+            i = i + 1;
+        }
+    }
+    return;
+}
+
+export function finish_layout(code: &Code:ReadWrite, start: u32): bool {
+    let count: u32 = @len(code.branches) as u32;
+    let end: u32 = code.used;
+    var i: u32 = 0;
+    while i < count {
+        let item: Branch = code.branches[i];
+        if !item.resolved || item.target < start || item.target > end { return false; }
+        i = i + 1;
+    }
+    if !branch_targets_clear(&code.branches[0..count]:Read) { return false; }
+    omit_fallthrough_branches(&code.branches:ReadWrite);
+    plan_branch_widths(&code.branches:ReadWrite);
+    var read: u32 = start;
+    var write: u32 = start;
+    i = 0;
+    while i < count {
+        let item: Branch = code.branches[i];
+        if read == write { read = item.start; write = item.start; }
+        while read < item.start {
+            code.bytes[write] = code.bytes[read];
+            read = read + 1;
+            write = write + 1;
+        }
+        let after: u32 = write + item.size as u32;
+        if item.size != 0 {
+            let target: u32 = layout_position(code, item.target);
+            let delta: i64 = (target as i64) - (after as i64);
+            if item.size == 2 {
+                code.bytes[write] = item.short_op;
+                code.bytes[write + 1] = rel8(delta);
+            } else {
+                if delta < -2147483648i64 || delta > 2147483647i64 { return false; }
+                if item.long_size == 6 { code.bytes[write] = 15; code.bytes[write + 1] = item.short_op + 16; }
+                else { code.bytes[write] = 233; }
+                code_patch_u32(code, after - 4, @wrap_sub(target, after));
+            }
+        }
+        read = item.start + item.long_size as u32;
+        write = after;
+        i = i + 1;
+    }
+    if read == write { write = end; read = end; }
+    while read < end {
+        code.bytes[write] = code.bytes[read];
+        read = read + 1;
+        write = write + 1;
+    }
+    code.used = write;
+    i = 0;
+    while i < @len(code.relatives) as u32 {
+        let item: Relative = code.relatives[i];
+        let at: u32 = layout_position(code, item.at);
+        let base: u32 = layout_position(code, item.base);
+        let target: u32 = layout_position(code, item.target);
+        let delta: i64 = (target as i64) - (base as i64);
+        if delta < -2147483648i64 || delta > 2147483647i64 { return false; }
+        code_patch_u32(code, at, @wrap_sub(target, base));
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(code.tables) as u32 {
+        let table: TextData = code.tables[i];
+        let first: u32 = layout_position(code, table.start);
+        let last: u32 = layout_position(code, table.end);
+        code.tables[i] = TextData { start: first, end: last };
+        i = i + 1;
+    }
+    code.layout_active = false;
+    return true;
+}
+
+// 独立编码的已知目标可直接选 rel8；函数定稿时仍要随其它分支重新定位。
+export function jump_to(code: &Code:ReadWrite, target: u32): void!AllocError {
+    let delta: i64 = (target as i64) - (code_len(code) as i64) - 2i64;
+    if !code.layout_active && fits_rel8(delta) {
+        code_u8(code, 235)?;
+        code_u8(code, rel8(delta))?;
+    } else {
+        let at: u32 = jmp_rel32(code)?;
+        patch_rel32(code, at, target);
+    }
+    return;
+}
+export function ret(code: &Code:ReadWrite): void!AllocError {
+    check_gpr_write(code, rbp());
+    code_u8(code, 195)?;
+    return;
+}
+export function int3(code: &Code:ReadWrite): void!AllocError {
+    code_u8(code, 204)?;
+    return;
+}
+export function nop(code: &Code:ReadWrite): void!AllocError {
+    code_u8(code, 144)?;
+    return;
+}
+
+// ── 栈与帧 ──
+export function push_rbp(code: &Code:ReadWrite): void!AllocError {
+    check_gpr_write(code, rsp());
+    code_u8(code, 85)?;
+    return;
+}
+export function pop_rbp(code: &Code:ReadWrite): void!AllocError {
+    check_gpr_write(code, rbp());
+    code_u8(code, 93)?;
+    return;
+}
+export function mov_rbp_rsp(code: &Code:ReadWrite): void!AllocError {
+    mov_rr(code, rbp(), rsp())?;
+    return;
+}
+// 栈调整立即数选择能表示同一正值的最短宽度。
+function rsp_imm(code: &Code:ReadWrite, amount: u32, field: u8): void!AllocError {
+    if amount == 0 { return; }
+    check_gpr_write(code, rsp());
+    code_u8(code, 72)?;
+    if amount <= 127 { code_u8(code, 131)?; code_u8(code, field)?; code_u8(code, amount as u8)?; }
+    else { code_u8(code, 129)?; code_u8(code, field)?; code_u32(code, amount)?; }
+    return;
+}
+
+export function sub_rsp_imm(code: &Code:ReadWrite, amount: u32): void!AllocError {
+    rsp_imm(code, amount, 236)?;
+    return;
+}
+// Win64 栈向低地址逐页增长。只读触碰每页和帧尾，随后仍一次调整 rsp。
+// r10、r11 是易失寄存器，不承载入站参数；回填和槽位仍以 rbp 为准。
+export function alloc_stack_frame(code: &Code:ReadWrite, amount: u32): void!AllocError {
+    if amount >= 4096u32 {
+        mov_rr(code, r10(), rsp())?;
+        // mov r11d, 完整页数。
+        code_u8(code, 65)?; code_u8(code, 187)?;
+        code_u32(code, amount / 4096u32)?;
+        // sub r10, 4096；test byte [r10], 255。
+        code_u8(code, 73)?; code_u8(code, 129)?; code_u8(code, 234)?;
+        code_u32(code, 4096u32)?;
+        code_u8(code, 65)?; code_u8(code, 246)?; code_u8(code, 2)?; code_u8(code, 255)?;
+        // dec r11d；jne 回到 sub（相对下一条指令 -16 字节）。
+        code_u8(code, 65)?; code_u8(code, 255)?; code_u8(code, 203)?;
+        code_u8(code, 117)?; code_u8(code, 240)?;
+        let tail: u32 = amount % 4096u32;
+        if tail != 0 {
+            // 触碰最终 rsp 所在页；负位移可编码为 disp8 时选短编码。
+            code_u8(code, 65)?; code_u8(code, 246)?;
+            if tail <= 128u32 {
+                code_u8(code, 66)?; code_u8(code, neg_disp8(tail))?;
+            } else {
+                code_u8(code, 130)?; code_u32(code, neg_disp32(tail))?;
+            }
+            code_u8(code, 255)?;
+        }
+    }
+    sub_rsp_imm(code, amount)?;
+    return;
+}
+export function add_rsp_imm(code: &Code:ReadWrite, amount: u32): void!AllocError {
+    rsp_imm(code, amount, 196)?;
+    return;
+}
+function frame_u32(code: &Code:Read, at: u32): u32 {
+    return (code.bytes[at] as u32) | ((code.bytes[at + 1] as u32) << 8u32)
+        | ((code.bytes[at + 2] as u32) << 16u32) | ((code.bytes[at + 3] as u32) << 24u32);
+}
+
+// 探栈循环只使用 r10 与 r11；尾部访问随负位移宽度多占五或八字节。
+function probe_code_size(frame: u32): u32 {
+    if frame < 4096u32 { return 0; }
+    let tail: u32 = frame % 4096u32;
+    if tail == 0 { return 25; }
+    if tail <= 128 { return 30; }
+    return 33;
+}
+
+struct StackAdjust { valid: bool, amount: u32, long: bool, redundant: bool }
+
+function read_stack_adjust(code: &Code:Read, at: u32, end: u32, field: u8): StackAdjust {
+    var op: u32 = at;
+    var prefix: u8 = 0;
+    while op < end && code.bytes[op] >= 64 && code.bytes[op] <= 79 {
+        prefix = code.bytes[op];
+        op = op + 1;
+    }
+    // REX.R/X 对组号和寄存器直寻址无意义；REX.B 会改变被调整的寄存器。
+    if end - op >= 3 && (prefix & 9u8) == 8u8 && code.bytes[op + 1] == field {
+        let redundant: bool = prefix != 72 || op - at != 1;
+        if code.bytes[op] == 131 && end - op == 3 && code.bytes[op + 2] < 128 {
+            return StackAdjust { valid: true, amount: code.bytes[op + 2] as u32, long: false, redundant: redundant };
+        }
+        if code.bytes[op] == 129 && end - op == 6 {
+            return StackAdjust { valid: true, amount: frame_u32(code, op + 2), long: true, redundant: redundant };
+        }
+    }
+    return StackAdjust { valid: false, amount: 0, long: false, redundant: false };
+}
+
+// 入口返回地址占八字节，保存 rbp 后 rsp 恢复到 16 字节边界。
+// 栈调整位于探栈指令之后；读取编码中的真实立即数，核对局部区、栈传参与影子空间各自的预算。
+export function validate_win64_entry(code: &Code:Read, start: u32, end: u32, planned: u32,
+    occupied: u64, outgoing: u32): u16 {
+    if end > code_len(code) || start > end || end - start < 4 { return 8008; }
+    if code.bytes[start] != 85 || code.bytes[start + 1] != 72 { return 8008; }
+    // 48 8B EC 与 48 89 E5 读取和写入同一组寄存器，长度相同；寄存器直传统一使用 89 /r。
+    if code.bytes[start + 2] == 139 && code.bytes[start + 3] == 236 { return 7102; }
+    if code.bytes[start + 2] != 137 || code.bytes[start + 3] != 229 { return 8008; }
+    if end - start == 4 { return 8007; }
+    let prologue: u32 = 4u32 + probe_code_size(planned);
+    if end - start < prologue { return 8006; }
+    let sub: u32 = start + prologue;
+    let adjust: StackAdjust = read_stack_adjust(code, sub, end, 236);
+    if !adjust.valid { return 8006; }
+    let frame: u32 = adjust.amount;
+    if frame > 2147483647u32 || frame % 16 != 0 { return 8006; }
+    let call_bytes: u64 = 32u64 + (outgoing as u64) * 8u64;
+    if (frame as u64) < call_bytes || occupied > (frame as u64) - call_bytes { return 8007; }
+    if frame != planned { return 8006; }
+    if adjust.redundant || (adjust.long && frame <= 127) { return 7103; }
+    return 0;
+}
+
+export function win64_enter(code: &Code:ReadWrite, amount: u32, occupied: u64, outgoing: u32): void!AllocError {
+    code.sysv = false;
+    code.win64_body = false;
+    let start: u32 = code_len(code);
+    push_rbp(code)?;
+    mov_rbp_rsp(code)?;
+    alloc_stack_frame(code, amount)?;
+    code.win64_frame = amount;
+    let end: u32 = code_len(code);
+    code.win64_error = validate_win64_entry(code, start, end, amount, occupied, outgoing);
+    code.win64_body = true;
+    return;
+}
+
+// 每条正常、失败或共享尾声都使用同一恢复序列，栈中保存的 rbp 必须原样弹回。
+export function validate_win64_exit(code: &Code:Read, start: u32, end: u32, frame: u32): u16 {
+    if end > code_len(code) || start > end || end - start < 6 { return 8008; }
+    let add: StackAdjust = read_stack_adjust(code, start, end - 2, 196);
+    if !add.valid || add.amount != frame || code.bytes[end - 2] != 93 || code.bytes[end - 1] != 195 { return 8008; }
+    if add.redundant || (add.long && frame <= 127) { return 7103; }
+    return 0;
+}
+
+export function win64_leave(code: &Code:ReadWrite): void!AllocError {
+    let start: u32 = code_len(code);
+    code.win64_body = false;
+    let frame: u32 = code.win64_frame;
+    add_rsp_imm(code, frame)?;
+    pop_rbp(code)?;
+    ret(code)?;
+    if code.win64_error == 0 {
+        let end: u32 = code_len(code);
+        code.win64_error = validate_win64_exit(code, start, end, frame);
+    }
+    code.win64_body = true;
+    return;
+}
+
+// System V 使用同一栈槽模型，无影子区；空帧只需成对保存和恢复 rbp。
+export function validate_sysv_entry(code: &Code:Read, start: u32, end: u32, planned: u32,
+    occupied: u64, outgoing: u32): u16 {
+    if end > code_len(code) || start > end || end - start < 4 { return 8015; }
+    if code.bytes[start] != 85 || code.bytes[start + 1] != 72 { return 8015; }
+    if code.bytes[start + 2] == 139 && code.bytes[start + 3] == 236 { return 7102; }
+    if code.bytes[start + 2] != 137 || code.bytes[start + 3] != 229 { return 8015; }
+    if planned == 0 && occupied == 0 && outgoing == 0 && end - start == 4 { return 0; }
+    let prologue: u32 = 4u32 + probe_code_size(planned);
+    if end - start < prologue { return 8014; }
+    let adjust: StackAdjust = read_stack_adjust(code, start + prologue, end, 236);
+    if !adjust.valid || adjust.amount != planned || planned > 2147483647u32 || planned % 16 != 0 { return 8014; }
+    let stack_bytes: u64 = (outgoing as u64) * 8u64;
+    if stack_bytes > planned as u64 || occupied > (planned as u64) - stack_bytes { return 8014; }
+    if adjust.redundant || (adjust.long && planned <= 127) { return 7103; }
+    return 0;
+}
+
+export function validate_sysv_exit(code: &Code:Read, start: u32, end: u32, frame: u32): u16 {
+    if end > code_len(code) || start > end || end - start < 2 { return 8015; }
+    if code.bytes[end - 2] != 93 || code.bytes[end - 1] != 195 { return 8015; }
+    if frame == 0 && end - start == 2 { return 0; }
+    let adjust: StackAdjust = read_stack_adjust(code, start, end - 2, 196);
+    if !adjust.valid || adjust.amount != frame { return 8014; }
+    if adjust.redundant || (adjust.long && frame <= 127) { return 7103; }
+    return 0;
+}
+
+export function sysv_enter(code: &Code:ReadWrite, amount: u32, occupied: u64, outgoing: u32): void!AllocError {
+    code.sysv = true;
+    code.win64_body = false;
+    let start: u32 = code_len(code);
+    push_rbp(code)?;
+    mov_rbp_rsp(code)?;
+    alloc_stack_frame(code, amount)?;
+    code.win64_frame = amount;
+    let end: u32 = code_len(code);
+    code.win64_error = validate_sysv_entry(code, start, end, amount, occupied, outgoing);
+    code.win64_body = true;
+    return;
+}
+
+export function sysv_leave(code: &Code:ReadWrite): void!AllocError {
+    let start: u32 = code_len(code);
+    let frame: u32 = code.win64_frame;
+    code.win64_body = false;
+    add_rsp_imm(code, frame)?;
+    pop_rbp(code)?;
+    ret(code)?;
+    if code.win64_error == 0 {
+        let end: u32 = code_len(code);
+        code.win64_error = validate_sysv_exit(code, start, end, frame);
+    }
+    code.win64_body = true;
+    return;
+}
+
+// lea r64, [rip + disp32]：48 8D /r，位移字段由重定位或回填提供。
+export function lea_rip(code: &Code:ReadWrite, dst: u8): u32!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, 0)?;
+    code_u8(code, 141)?;
+    modrm(code, 0, dst, 5)?;
+    let at: u32 = code_len(code);
+    code_u32(code, 0)?;
+    return at;
+}
+// movsxd r64, dword [rax]（REX.W 63 /r，mod=00 基址 rax）：
+// 跳转表项是有符号相对偏移，必须符号扩展后再与表基址相加。
+export function movsxd_rax(code: &Code:ReadWrite, dst: u8): void!AllocError {
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, 0)?;
+    code_u8(code, 99)?;
+    modrm(code, 0, dst, 0)?;
+    return;
+}
+// jmp r64（FF /4）：寄存器间接跳转，用于 enum_dispatch 的跳转表。
+export function jmp_rm64(code: &Code:ReadWrite, reg: u8): void!AllocError {
+    rex(code, 0, 0, 0, reg_ext(reg))?;
+    code_u8(code, 255)?;
+    modrm(code, 3, 4, reg)?;
+    return;
+}
+// call r64（FF /2）：调用签名已验证的静态函数引用。
+export function call_rm64(code: &Code:ReadWrite, reg: u8): void!AllocError {
+    rex(code, 0, 0, 0, reg_ext(reg))?;
+    code_u8(code, 255)?;
+    modrm(code, 3, 2, reg)?;
+    return;
+}
+// 取局部地址，零位移用更短的寄存器传送。
+export function lea_rbp(code: &Code:ReadWrite, dst: u8, rbp_disp: u32): void!AllocError {
+    if rbp_disp == 0 { mov_rr(code, dst, rbp())?; return; }
+    check_gpr_write(code, dst);
+    rex(code, 1, reg_ext(dst), 0, 0)?;
+    code_u8(code, 141)?;
+    modrm_rbp(code, dst, rbp_disp)?;
+    return;
+}
+
+// ── 基址寄存器 + 偏移寻址 ──
+// 普通基址零位移可省略；rbp/r13 的零位移须保留 disp8，rsp/r12 必须带 SIB。
+function base_operand(code: &Code:ReadWrite, reg: u8, base: u8, disp: u32): void!AllocError {
+    let rm: u8 = base & 7;
+    var mode: u8 = 2;
+    if disp == 0 && rm != 5 { mode = 0; }
+    elseif disp <= 127 || disp >= 4294967168u32 { mode = 1; }
+    modrm(code, mode, reg, rm)?;
+    if rm == 4 { code_u8(code, 36)?; }
+    if mode == 1 { code_u8(code, (disp & 255) as u8)?; }
+    elseif mode == 2 { code_u32(code, disp)?; }
+    return;
+}
+// 交换数据段寄存器的 ×1 基址和索引。R13 优先作索引，以便零位移时不写位移字节。
+export function swap_unit_index(base: u8, index: u8): bool {
+    if base == 4 || base == 5 || index == 4 || index == 5 { return false; }
+    if base == 13 { return index != 13; }
+    return index != 13 && index < base;
+}
+
+// [base + index*1]：mod=00，rm=100 走 SIB，scale=0（×1）。
+// base 低 3 位为 5 时 mod=00 表示「无基址 + disp32」，故此时改发 mod=01 + disp8=0。
+export function modrm_base_index(code: &Code:ReadWrite, reg: u8, base: u8, index: u8): void!AllocError {
+    var chosen_base: u8 = base;
+    var chosen_index: u8 = index;
+    if swap_unit_index(base, index) { chosen_base = index; chosen_index = base; }
+    rex(code, 1, reg_ext(reg), reg_ext(chosen_index), reg_ext(chosen_base))?;
+    if (chosen_base & 7) == 5 {
+        modrm(code, 1, reg, 4)?;
+        code_u8(code, (((chosen_index & 7) << 3) | (chosen_base & 7)) as u8)?;
+        code_u8(code, 0)?;
+        return;
+    }
+    modrm(code, 0, reg, 4)?;
+    code_u8(code, (((chosen_index & 7) << 3) | (chosen_base & 7)) as u8)?;
+    return;
+}
+// 1、2 字节加载用 movzx 写入 r32，4 字节 mov 也会自动清除高位。
+export function load_base(code: &Code:ReadWrite, dst: u8, base: u8, disp: u32, width: u8): void!AllocError {
+    check_gpr_write(code, dst);
+    var wide: u8 = 0;
+    if width == 8 { wide = 1; }
+    rex(code, wide, reg_ext(dst), 0, reg_ext(base))?;
+    if width == 8 || width == 4 { code_u8(code, 139)?; }
+    else {
+        code_u8(code, 15)?;
+        if width == 2 { code_u8(code, 183)?; }
+        else { code_u8(code, 182)?; }
+    }
+    base_operand(code, dst, base, disp)?;
+    return;
+}
+// 保存低 width 字节。编号 4 至 7 的低字节寄存器必须有 REX。
+export function store_base(code: &Code:ReadWrite, src: u8, base: u8, disp: u32, width: u8): void!AllocError {
+    if width == 2 { code_u8(code, 102)?; }
+    var wide: u8 = 0;
+    if width == 8 { wide = 1; }
+    if width == 1 && src >= 4 && src <= 7 && base < 8 { code_u8(code, 64)?; }
+    else { rex(code, wide, reg_ext(src), 0, reg_ext(base))?; }
+    if width == 1 { code_u8(code, 136)?; }
+    else { code_u8(code, 137)?; }
+    base_operand(code, src, base, disp)?;
+    return;
+}
+// add base, index：48 01 /r，dst 为 r/m，src 为 reg 字段。
+export function add_rr_base(code: &Code:ReadWrite, dst: u8, src: u8): void!AllocError {
+    add_rr(code, dst, src)?;
+    return;
+}
+// 固定字段偏移使用可表示该值的最短立即数；累加器的 imm32 形式省去 ModRM。
+export function add_imm32(code: &Code:ReadWrite, dst: u8, amount: u32): void!AllocError {
+    if amount == 0 { return; }
+    check_gpr_write(code, dst);
+    if amount <= 127 {
+        rex(code, 1, 0, 0, reg_ext(dst))?;
+        code_u8(code, 131)?;
+        modrm(code, 3, 0, dst)?;
+        code_u8(code, amount as u8)?;
+        return;
+    }
+    rex(code, 1, 0, 0, reg_ext(dst))?;
+    if dst == rax() { code_u8(code, 5)?; }
+    else { code_u8(code, 129)?; modrm(code, 3, 0, dst)?; }
+    code_u32(code, amount)?;
+    return;
+}
+
+// 栈槽相对读取：[rbp - slot + off]。
+// slot 是内部正数槽位移，off 是聚合内正字节偏移，故实际位移为 -(slot - off)。
+export function load_slot_off(code: &Code:ReadWrite, dst: u8, slot: u32, off: u32, width: u8): void!AllocError {
+    let disp: u32 = neg_disp32(slot - off);
+    if width == 8 { load_base(code, dst, rbp(), disp, 8)?; return; }
+    if width == 4 { load_base(code, dst, rbp(), disp, 4)?; return; }
+    if width == 2 { load_base(code, dst, rbp(), disp, 2)?; return; }
+    load_base(code, dst, rbp(), disp, 1)?;
+    return;
+}
+// 栈槽相对写入：[rbp - slot + off]，位移换算同上。
+export function store_slot_off(code: &Code:ReadWrite, src: u8, slot: u32, off: u32, width: u8): void!AllocError {
+    let disp: u32 = neg_disp32(slot - off);
+    if width == 8 { store_base(code, src, rbp(), disp, 8)?; return; }
+    if width == 4 { store_base(code, src, rbp(), disp, 4)?; return; }
+    if width == 2 { store_base(code, src, rbp(), disp, 2)?; return; }
+    store_base(code, src, rbp(), disp, 1)?;
+    return;
+}
+
+// 有符号小于条件码（0x0C），供比较指令按符号性选择；与 cc_l 同为 12。
+export function cc_lt_signed(): u8 { return 12; }

@@ -1,0 +1,232 @@
+// 宿主先授权模块及材料，再刷新一份打开文档；此处不读取文件或发协议帧。
+import diag;
+import document_deps;
+import documents;
+import iface;
+import json_string;
+import pipeline;
+import types;
+
+// 0 复用，1 新提交，2 票据已过期，3 超过预算。只有状态 1 交付新分析。
+export struct Refresh { status: u8, ticket: documents::Ticket, material_status: u8, analysis: pipeline::DocumentAnalysis }
+
+function skipped(status: u8, ticket: documents::Ticket, material_status: u8): Refresh {
+    return Refresh { status: status, ticket: ticket, material_status: material_status,
+        analysis: pipeline::DocumentAnalysis { status: 0u8, diagnostics: diag::diagbuf_new() } };
+}
+
+function analysis_allowed(store: &documents::Store:Read, slot: u32): bool {
+    let text: &json_string::Decoded:Read = &store.slots[slot].snapshot.text:Read;
+    return documents::analysis_size_allowed(@len(text.data));
+}
+
+function analyze(store: &documents::Store:Read, ticket: documents::Ticket, module_name: &[u8], prepared: &document_deps::Prepared:Read,
+    definitions: &types::DocumentDefinitions:ReadWrite): pipeline::DocumentAnalysis!AllocError {
+    let text: &json_string::Decoded:Read = &store.slots[ticket.slot].snapshot.text:Read;
+    return document_deps::analyze_prepared_indexed(&text.data[0..@len(text.data)]:Read,
+        (ticket.slot + 1u32) as u16, module_name, prepared, definitions)?;
+}
+
+export function refresh(store: &documents::Store:ReadWrite, ticket: documents::Ticket, module_name: &[u8], profile: &[u8], frontend: u64,
+    materials: &[document_deps::Material]:Read, direct: &[u32]:Read, open_modules: &[document_deps::OpenModule]:Read): Refresh!AllocError {
+    if !documents::is_current(&*store:Read, ticket) { return skipped(2u8, ticket, 0u8); }
+    let prepared: document_deps::Prepared = document_deps::prepare_context(materials, direct, module_name, open_modules)?;
+    let identity: document_deps::Identity = document_deps::snapshot_identity(&prepared:Read, module_name, profile, frontend)?;
+    var current: documents::Ticket = ticket;
+    if !identity.valid {
+        // 无法编码的上下文不能继续提供上一次的索引。单字节标记不与合法身份相交。
+        let refused: documents::Event = documents::set_analysis_context(store, ticket, "!")?;
+        if refused.status == 1u8 { current = refused.ticket; }
+        return skipped(3u8, current, prepared.status);
+    }
+    let changed: documents::Event = documents::set_analysis_context(store, ticket, &identity.bytes[0..@len(identity.bytes)]:Read)?;
+    if changed.status == 1u8 { current = changed.ticket; }
+    elseif changed.status != 0u8 { return skipped(3u8, ticket, prepared.status); }
+    if documents::has_analysis(&*store:Read, current) { return skipped(0u8, current, prepared.status); }
+    if !analysis_allowed(&*store:Read, current.slot) { return skipped(3u8, current, prepared.status); }
+    var definitions: types::DocumentDefinitions = types::empty_definitions();
+    let result: pipeline::DocumentAnalysis = analyze(&*store:Read, current, module_name, &prepared:Read, &definitions:ReadWrite)?;
+    if !documents::commit_definitions(store, current, @move(definitions)) { return skipped(2u8, current, prepared.status); }
+    return Refresh { status: 1u8, ticket: current, material_status: prepared.status, analysis: @move(result) };
+}
+
+// 登记绑定打开代而非正文版本；每个消费者独立持有被授权使用的材料。
+export struct Binding { slot: u32, generation: u64, module: u8[], materials: document_deps::Material[], direct: u32[] }
+// 0 已处理；1 重复或无效登记；2 登记数超限。拒绝不提交更新。
+export struct Batch { status: u8, updates: Refresh[] }
+
+const NO_BINDING: u32 = 32;
+
+function binding_active(store: &documents::Store:Read, binding: &Binding:Read): bool {
+    return binding.generation != 0u64 && documents::current_ticket(store, binding.slot).generation == binding.generation;
+}
+
+function copy_module(source: &[u8]): document_deps::OpenModule!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(source) as u32 { @push(bytes, source[i])?; i = i + 1u32; }
+    return document_deps::OpenModule { module: @move(bytes) };
+}
+
+function uri_less(store: &documents::Store:Read, left: u32, right: u32): bool {
+    let a: &json_string::Decoded:Read = &store.slots[left].uri:Read;
+    let b: &json_string::Decoded:Read = &store.slots[right].uri:Read;
+    return iface::bytes_order(&a.data[0..@len(a.data)]:Read, &b.data[0..@len(b.data)]:Read) < 0;
+}
+
+function target_slots(store: &documents::Store:Read, mapped: &[u32]): u32[]!AllocError {
+    var result: u32[] = [];
+    var slot: u32 = 0;
+    while slot < @len(store.slots) as u32 {
+        if store.slots[slot].generation != 0u64 && (mapped[slot] != NO_BINDING || @len(store.slots[slot].context) != 0u64) {
+            var at: u32 = @len(result) as u32;
+            @push(result, slot)?;
+            while at != 0u32 && uri_less(store, slot, result[at - 1u32]) {
+                result[at] = result[at - 1u32];
+                at = at - 1u32;
+            }
+            result[at] = slot;
+        }
+        slot = slot + 1u32;
+    }
+    return result;
+}
+
+function analyze_plain(store: &documents::Store:Read, ticket: documents::Ticket, definitions: &types::DocumentDefinitions:ReadWrite): pipeline::DocumentAnalysis!AllocError {
+    let text: &json_string::Decoded:Read = &store.slots[ticket.slot].snapshot.text:Read;
+    return pipeline::run_document_indexed(&text.data[0..@len(text.data)]:Read, (ticket.slot + 1u32) as u16, true, definitions)?;
+}
+
+function revoke(store: &documents::Store:ReadWrite, ticket: documents::Ticket): Refresh!AllocError {
+    let changed: documents::Event = documents::set_analysis_context(store, ticket, "")?;
+    if changed.status != 1u8 { return skipped(3u8, ticket, 0u8); }
+    let current: documents::Ticket = changed.ticket;
+    if !analysis_allowed(&*store:Read, current.slot) { return skipped(3u8, current, 0u8); }
+    var definitions: types::DocumentDefinitions = types::empty_definitions();
+    let result: pipeline::DocumentAnalysis = analyze_plain(&*store:Read, current, &definitions:ReadWrite)?;
+    if !documents::commit_definitions(store, current, @move(definitions)) { return skipped(2u8, current, 0u8); }
+    return Refresh { status: 1u8, ticket: current, material_status: 0u8, analysis: @move(result) };
+}
+
+function refresh_binding(store: &documents::Store:ReadWrite, ticket: documents::Ticket, binding: &Binding:Read, profile: &[u8], frontend: u64,
+    opened: &[document_deps::OpenModule]:Read): Refresh!AllocError {
+    return refresh(store, ticket, &binding.module[0..@len(binding.module)]:Read, profile, frontend,
+        &binding.materials[0..@len(binding.materials)]:Read, &binding.direct[0..@len(binding.direct)]:Read, opened)?;
+}
+
+// 宿主提交完整登记后分发；退出的打开代不遮蔽接口，撤销登记的文档回到无材料分析。
+export function refresh_workspace(store: &documents::Store:ReadWrite, bindings: &[Binding]:Read, profile: &[u8], frontend: u64): Batch!AllocError {
+    if @len(bindings) > 32u64 { return Batch { status: 2u8, updates: [] }; }
+    var mapped: u32[] = [];
+    var slot: u32 = 0;
+    while slot < 32u32 { @push(mapped, NO_BINDING)?; slot = slot + 1u32; }
+    var opened: document_deps::OpenModule[] = [];
+    var i: u32 = 0;
+    while i < @len(bindings) as u32 {
+        let binding: &Binding:Read = &bindings[i]:Read;
+        if binding_active(&*store:Read, binding) {
+            slot = binding.slot;
+            let name: &[u8] = &binding.module[0..@len(binding.module)]:Read;
+            if mapped[slot] != NO_BINDING || @len(name) > 1024u64 || !iface::valid_module_name(name) {
+                return Batch { status: 1u8, updates: [] };
+            }
+            var j: u32 = 0;
+            while j < @len(opened) as u32 {
+                if iface::bytes_order(name, &opened[j].module[0..@len(opened[j].module)]:Read) == 0 {
+                    return Batch { status: 1u8, updates: [] };
+                }
+                j = j + 1u32;
+            }
+            @push(opened, copy_module(name)?)?;
+            mapped[slot] = i;
+        }
+        i = i + 1u32;
+    }
+    let targets: u32[] = target_slots(&*store:Read, &mapped[0..32]:Read)?;
+    var updates: Refresh[] = [];
+    i = 0u32;
+    while i < @len(targets) as u32 {
+        slot = targets[i];
+        let ticket: documents::Ticket = documents::current_ticket(&*store:Read, slot);
+        if mapped[slot] == NO_BINDING { @push(updates, revoke(store, ticket)?)?; }
+        else {
+            let binding: &Binding:Read = &bindings[mapped[slot]]:Read;
+            @push(updates, refresh_binding(store, ticket, binding, profile, frontend, &opened[0..@len(opened)]:Read)?)?;
+        }
+        i = i + 1u32;
+    }
+    return Batch { status: 0u8, updates: @move(updates) };
+}
+
+// 启动前由宿主绑定 URI 和模块，客户端文本只用于选择当前打开代。
+export struct Registration { uri: u8[], module: u8[], materials: document_deps::Material[], direct: u32[] }
+
+export function valid_registrations(registrations: &[Registration]:Read): bool {
+    if @len(registrations) > 32u64 { return false; }
+    var i: u32 = 0;
+    while i < @len(registrations) as u32 {
+        let row: &Registration:Read = &registrations[i]:Read;
+        let uri: &[u8] = &row.uri[0..@len(row.uri)]:Read;
+        let name: &[u8] = &row.module[0..@len(row.module)]:Read;
+        if !documents::valid_uri(uri) || @len(name) > 1024u64 || !iface::valid_module_name(name) { return false; }
+        var j: u32 = 0;
+        while j < i {
+            let peer: &Registration:Read = &registrations[j]:Read;
+            if iface::bytes_order(uri, &peer.uri[0..@len(peer.uri)]:Read) == 0 ||
+                iface::bytes_order(name, &peer.module[0..@len(peer.module)]:Read) == 0 { return false; }
+            j = j + 1u32;
+        }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+export function registration_for_uri(registrations: &[Registration]:Read, uri: &[u8]): u32 {
+    if @len(registrations) > 32u64 { return NO_BINDING; }
+    var i: u32 = 0;
+    while i < @len(registrations) as u32 {
+        let row: &Registration:Read = &registrations[i]:Read;
+        if iface::bytes_order(uri, &row.uri[0..@len(row.uri)]:Read) == 0 { return i; }
+        i = i + 1u32;
+    }
+    return NO_BINDING;
+}
+
+function refresh_registered_slot(store: &documents::Store:ReadWrite, ticket: documents::Ticket, row: &Registration:Read,
+    profile: &[u8], frontend: u64, opened: &[document_deps::OpenModule]:Read): Refresh!AllocError {
+    return refresh(store, ticket, &row.module[0..@len(row.module)]:Read, profile, frontend,
+        &row.materials[0..@len(row.materials)]:Read, &row.direct[0..@len(row.direct)]:Read, opened)?;
+}
+
+// 只匹配原样 URI，不归一化、不解码路径；关闭重开以新票据使用同一启动登记。
+export function refresh_registered(store: &documents::Store:ReadWrite, registrations: &[Registration]:Read, profile: &[u8], frontend: u64): Batch!AllocError {
+    if @len(registrations) > 32u64 { return Batch { status: 2u8, updates: [] }; }
+    if !valid_registrations(registrations) { return Batch { status: 1u8, updates: [] }; }
+    var mapped: u32[] = [];
+    var opened: document_deps::OpenModule[] = [];
+    var slot: u32 = 0;
+    while slot < 32u32 {
+        var match_at: u32 = NO_BINDING;
+        if documents::current_ticket(&*store:Read, slot).generation != 0u64 {
+            let uri: &json_string::Decoded:Read = &store.slots[slot].uri:Read;
+            match_at = registration_for_uri(registrations, &uri.data[0..@len(uri.data)]:Read);
+        }
+        @push(mapped, match_at)?;
+        if match_at != NO_BINDING {
+            let row: &Registration:Read = &registrations[match_at]:Read;
+            @push(opened, copy_module(&row.module[0..@len(row.module)]:Read)?)?;
+        }
+        slot = slot + 1u32;
+    }
+    let targets: u32[] = target_slots(&*store:Read, &mapped[0..32]:Read)?;
+    var updates: Refresh[] = [];
+    var i: u32 = 0;
+    while i < @len(targets) as u32 {
+        slot = targets[i];
+        let ticket: documents::Ticket = documents::current_ticket(&*store:Read, slot);
+        if mapped[slot] == NO_BINDING { @push(updates, revoke(store, ticket)?)?; }
+        else { @push(updates, refresh_registered_slot(store, ticket, &registrations[mapped[slot]]:Read, profile, frontend, &opened[0..@len(opened)]:Read)?)?; }
+        i = i + 1u32;
+    }
+    return Batch { status: 0u8, updates: @move(updates) };
+}

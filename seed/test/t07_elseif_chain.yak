@@ -1,0 +1,12 @@
+// t07: if/elseif/else 链 + 嵌套 let
+function main(): void {
+    let x: u32 = 10;
+    if x > 5 {
+        let y: u32 = 1;
+    } elseif x > 0 {
+        let z: u32 = 2;
+    } else {
+        let w: u32 = 3;
+    }
+    return;
+}

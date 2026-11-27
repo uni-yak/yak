@@ -1,0 +1,34 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Box { matrix: [[u32; 2]; 2], extra: u32[] }
+enum Failure { Bad }
+function make(calls: &u32:ReadWrite): Box {
+    assert(*calls == 0u32);
+    *calls = 1u32;
+    return Box { matrix: [[11u32, 12u32], [21u32, 22u32]], extra: [1u32] };
+}
+function index(ok: bool, step: u32, calls: &u32:ReadWrite): u32!Failure {
+    assert(*calls == step);
+    *calls = step + 1u32;
+    if !ok { return Failure::Bad; }
+    return 1u32;
+}
+function read(first: bool, second: bool, calls: &u32:ReadWrite): u32!Failure {
+    return make(calls).matrix[index(first, 1u32, calls)?][index(second, 2u32, calls)?];
+}
+function recover(e: &Failure): u32 { return 99u32; }
+function main(): void {
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        var a: u32 = 0u32;
+        assert(read(false, true, &a:ReadWrite).catch(&recover) == 99u32);
+        assert(a == 2u32);
+        var b: u32 = 0u32;
+        assert(read(true, false, &b:ReadWrite).catch(&recover) == 99u32);
+        assert(b == 3u32);
+        var c: u32 = 0u32;
+        assert(read(true, true, &c:ReadWrite).catch(&recover) == 22u32);
+        assert(c == 3u32);
+        i = i + 1u32;
+    }
+}

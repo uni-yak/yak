@@ -1,0 +1,49 @@
+// expected_exit: 0
+// expected_stdout:
+// spec: spec/lang/owner.md 3.2–3.6
+// 只读重借用退出后恢复独占访问，独占块退出后恢复原位置访问。
+foreign assert(cond: bool): void;
+
+struct Pair { left: u32, right: u32 }
+
+function main(): void {
+    var value: u32 = 7u32;
+    if true {
+        let exclusive: &u32:ReadWrite = &value:ReadWrite;
+        if true {
+            let shared: &u32 = &*exclusive;
+            assert(*shared == 7u32);
+        }
+        *exclusive = 9u32;
+    }
+    assert(value == 9u32);
+    if true {
+        let nested: &u32 = &*(&value:ReadWrite);
+        assert(*nested == 9u32);
+    }
+    value = 11u32;
+    assert(value == 11u32);
+    var pair: Pair = Pair { left: 1u32, right: 2u32 };
+    if true {
+        let projected: &Pair:ReadWrite = &pair:ReadWrite;
+        if true {
+            let left: &u32 = &projected.left;
+            assert(*left == 1u32);
+        }
+        projected.right = 3u32;
+        assert(projected.right == 3u32);
+    }
+    assert(pair.right == 3u32);
+
+    var first: u32 = 5u32;
+    var second: u32 = 6u32;
+    if true {
+        var target: &u32:ReadWrite = &first:ReadWrite;
+        *target = 7u32;
+        target = &second:ReadWrite;
+        let alias_ref: &u32:ReadWrite = @copy(target);
+        *alias_ref = 8u32;
+        assert(*target == 8u32);
+    }
+    assert(first == 7u32 && second == 8u32);
+}

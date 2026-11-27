@@ -1,0 +1,22 @@
+// arg: A
+foreign assert(cond: bool): void;
+foreign args_read(index: u32, buffer: &[u8]:ReadWrite): u32;
+enum Failure { Bad, }
+function flag(ok: bool): bool!Failure { if !ok { return Failure::Bad; } return true; }
+function index(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 0; }
+function forbidden(): u32 { assert(false); return 1; }
+function check(ok: bool): u32!Failure { assert(flag(ok)?); return 7; }
+function read_arg(ok: bool): u32!Failure {
+    var buffer: u8[] = [0];
+    if !ok { return args_read(index(ok)?, &buffer[0..forbidden()]:ReadWrite); }
+    let count: u32 = args_read(index(ok)?, &buffer[0..1]:ReadWrite);
+    assert(buffer[0] == 65);
+    return count;
+}
+function recover(e: &Failure): u32 { return 99; }
+function main(): void {
+    assert(check(false).catch(&recover) == 99);
+    assert(check(true).catch(&recover) == 7);
+    assert(read_arg(false).catch(&recover) == 99);
+    assert(read_arg(true).catch(&recover) == 1);
+}

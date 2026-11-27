@@ -1,0 +1,40 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 保留低五位嵌套级别、完整分配大小及 16 位操作数前缀。
+    let valid: [u8; 17] = [0xc8, 0, 0, 0, 0xc8, 0, 0xe0, 1,
+        0xc8, 0xff, 0xff, 31, 0x66, 0xc8, 16, 0, 3];
+    encoding(&valid[0..17]:Read, 0)?;
+    // 嵌套级字节缺失时，先以 E7101 拒绝截断。
+    encoding(&valid[12..16]:Read, 7101)?;
+    let aliases: [u8; 17] = [0xc8, 0, 0, 0x20, 0xc8, 0, 0xe0, 0x81,
+        0xc8, 0xff, 0xff, 0xff, 0x66, 0xc8, 16, 0, 0x43];
+    encoding(&aliases[0..4]:Read, 7102)?;
+    encoding(&aliases[4..8]:Read, 7102)?;
+    encoding(&aliases[8..12]:Read, 7102)?;
+    encoding(&aliases[12..17]:Read, 7102)?;
+    // 另有可缩短的冗余前缀时，维持 E7103 优先级。
+    let redundant: [u8; 5] = [0x40, 0xc8, 0, 0, 0x20];
+    encoding(&redundant[0..5]:Read, 7103)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let result: void!AllocError = verify();
+    @drop(result);
+    assert(false);
+    return;
+}

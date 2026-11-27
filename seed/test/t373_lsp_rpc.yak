@@ -1,0 +1,90 @@
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: json_string=../../compiler/lsp/json_string.yak
+// module: json=../../compiler/lsp/json.yak
+// module: rpc=../../compiler/lsp/rpc.yak
+import json;
+import rpc;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function dispatch(input: &[u8], phase: u8): rpc::Route!AllocError {
+    let doc: json::Document = json::parse(input)?;
+    return rpc::classify(&doc:Read, input, phase);
+}
+
+function expect(input: &[u8], before: u8, kind: u8, after: u8, code: i32, id_len: u32): void!AllocError {
+    let action: rpc::Route = dispatch(input, before)?;
+    assert(action.kind == kind && action.phase == after && action.code == code);
+    assert(action.id_end - action.id_start == id_len);
+    return;
+}
+
+function sharp_edges(): void!AllocError {
+    expect("{", 0, 1, 0, -32700i32, 0)?;
+    expect("[]", 0, 1, 0, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"1.0\",\"id\":3,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}", 2, 0, 2, 0, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":0,\"\\u0069d\":1,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"params\":{},\"params\":[]}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":-2147483648,\"method\":\"x\"}", 2, 1, 2, -32601i32, 11)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":2147483647,\"method\":\"x\"}", 2, 1, 2, -32601i32, 10)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":2147483648,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":-2147483649,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":1e0,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":1.4,\"method\":\"x\"}", 2, 1, 2, -32600i32, 0)?;
+    return;
+}
+
+function run(): void!AllocError {
+    sharp_edges()?;
+    let initialize: &[u8] = "{\"jsonrpc\":\"2.0\",\"id\":\"a\\u263A😀\",\"method\":\"in\\u0069tialize\",\"params\":{}}";
+    let bad_init: &[u8] = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\"}";
+    let initialized: &[u8] = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}";
+    let unknown: &[u8] = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"other\"}";
+    let notice: &[u8] = "{\"jsonrpc\":\"2.0\",\"method\":\"other\"}";
+    let shutdown: &[u8] = "{\"jsonrpc\":\"2.0\",\"id\":-0,\"method\":\"shutdown\",\"params\":null}";
+    let exit_notice: &[u8] = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}";
+    expect(unknown, 0, 1, 0, -32002i32, 1)?;
+    expect(notice, 0, 0, 0, 0, 0)?;
+    expect(initialized, 0, 0, 0, 0, 0)?;
+    expect(bad_init, 0, 1, 0, -32602i32, 1)?;
+    expect(initialize, 0, 2, 1, 0, 13)?;
+    let start: rpc::Route = dispatch(initialize, 0)?;
+    assert(start.params_id != 0 && initialize[start.id_start] == 34u8 && initialize[start.id_start + 2] == 92u8);
+    expect(initialize, 1, 1, 1, -32600i32, 13)?;
+    expect(unknown, 1, 1, 1, -32002i32, 1)?;
+    expect(initialized, 1, 3, 2, 0, 0)?;
+    expect(initialized, 2, 0, 2, 0, 0)?;
+    expect(unknown, 2, 1, 2, -32601i32, 1)?;
+    expect(notice, 2, 0, 2, 0, 0)?;
+    let open_notice: &[u8] = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{}}";
+    expect(open_notice, 0, 0, 0, 0, 0)?;
+    expect(open_notice, 1, 0, 1, 0, 0)?;
+    expect(open_notice, 2, 6, 2, 0, 0)?;
+    expect(open_notice, 3, 0, 3, 0, 0)?;
+    let open_route: rpc::Route = dispatch(open_notice, 2)?;
+    assert(open_route.params_id != 0u32 && rpc::document_method(open_route.kind) == 1u8);
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didCh\\u0061nge\",\"params\":{}}", 2, 7, 2, 0, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":[]}", 2, 0, 2, 0, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{}}", 2, 8, 2, 0, 0)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"textDocument/didClose\",\"params\":{}}", 2, 1, 2, -32601i32, 1)?;
+    expect("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"shutdown\",\"params\":{}}", 2, 1, 2, -32602i32, 1)?;
+    expect(shutdown, 2, 4, 3, 0, 2)?;
+    expect(unknown, 3, 1, 3, -32600i32, 1)?;
+    expect(notice, 3, 0, 3, 0, 0)?;
+    expect(exit_notice, 3, 5, 3, 0, 0)?;
+    let early: rpc::Route = dispatch(exit_notice, 0)?;
+    let clean: rpc::Route = dispatch(exit_notice, 3)?;
+    assert(early.kind == 5u8 && early.exit_code == 1u8 && clean.exit_code == 0u8);
+    expect("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"exit\"}", 2, 1, 2, -32601i32, 1)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run();
+    @drop(failed);
+    exit(1);
+}

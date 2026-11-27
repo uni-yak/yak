@@ -1,0 +1,17 @@
+// t83: 多 out 参数 by-ref 写回 + 调用方读取断言
+foreign assert(cond: bool): void;
+function divmod(a: u32, b: u32, out q: u32, out rem: u32): void {
+    q = a / b;
+    rem = a % b;
+    return;
+}
+function main(): void {
+    out q: u32;
+    out rem: u32;
+    divmod(17, 5, out q, out rem);
+    let qv: u32 = @move(q);
+    let rv: u32 = @move(rem);
+    assert(qv == 3);
+    assert(rv == 2);
+    return;
+}

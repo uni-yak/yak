@@ -1,0 +1,191 @@
+// 验算接口声明的名义布局及动态数组元素步长。
+import iface;
+import diag;
+import types;
+import resolve_refs;
+
+export struct LayoutBinding { bound: bool, targets: u32[] }
+// 名义摘要按导出编号排序，零表示目标不是带布局的名义类型。
+function summary_index_of(summaries: &[iface::LoadedSummary]:Read, id: u32): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = @len(summaries) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2;
+        if summaries[mid].type_export_id < id { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    if lo < @len(summaries) as u32 && summaries[lo].type_export_id == id { return lo + 1; }
+    return 0;
+}
+struct LayoutNode { cursor: u32, end: u32, request: u8, tag: u8, state: u8, external: bool, value: types::Measure }
+// 不沿动态数组或函数引用追踪元素；其对象布局独立于被引用类型。
+struct MemberLayout { size: u64, align: u8, dependency: u32, external: bool }
+function member_layout(sig: &resolve_refs::MemberSignature:Read, root: u32, nodes: &[LayoutNode]:Read, binding: &LayoutBinding:Read, candidates: &[iface::LoadedInterface]:Read): MemberLayout {
+    let item: resolve_refs::ImportType = sig.slots[root];
+    var info: MemberLayout = MemberLayout { size: 0, align: 1, dependency: 0, external: false };
+    if item.kind == 1 {
+        let align: u8 = types::builtin_align(item.a as u16);
+        return MemberLayout { size: align as u64, align: align, dependency: 0, external: false };
+    }
+    if item.kind == 2 {
+        if nodes[item.a - 1].state == 2 {
+            if nodes[item.a - 1].external { info.external = true; return info; }
+            let value: types::Measure = nodes[item.a - 1].value;
+            return MemberLayout { size: value.size, align: value.align, dependency: 0, external: false };
+        }
+        info.dependency = item.a;
+    } elseif item.kind == 3 {
+        if !binding.bound { info.external = true; return info; }
+        let target: u32 = binding.targets[item.a - 1];
+        if target == 0 { return info; }
+        let candidate: &iface::LoadedInterface:Read = &candidates[target - 1]:Read;
+        let index: u32 = summary_index_of(&candidate.summaries[0..@len(candidate.summaries)]:Read, item.b);
+        if index != 0 {
+            info.size = candidate.summaries[index - 1].size;
+            info.align = candidate.summaries[index - 1].align;
+        }
+    } elseif item.kind == 5 || item.kind == 11 {
+        info = member_layout(sig, item.a, nodes, binding, candidates);
+        if info.size == 0 { return info; }
+        if item.kind == 11 {
+            let value: types::Measure = types::union_layout(1, info.align, info.size);
+            return MemberLayout { size: value.size, align: value.align, dependency: 0, external: false };
+        }
+        if types::multiply_overflows(info.size, item.c) { info.size = 0; }
+        else { info.size = info.size * item.c; }
+    } elseif item.kind == 6 || item.kind == 10 {
+        info.align = 8;
+        info.size = 8;
+        if item.kind == 6 { info.size = 24; }
+    }
+    return info;
+}
+struct MemberRange { off: u32, len: u32 }
+// 动态数组不形成按值边，但签名中能独立求值的元素仍须有有效步长。
+function dynamic_layouts(sig: &resolve_refs::MemberSignature:Read, nodes: &[LayoutNode]:Read, binding: &LayoutBinding:Read, candidates: &[iface::LoadedInterface]:Read): u8 {
+    var status: u8 = 1;
+    var i: u32 = 0;
+    while i < @len(sig.slots) as u32 {
+        let item: resolve_refs::ImportType = sig.slots[i];
+        if item.kind == 6 {
+            let element: MemberLayout = member_layout(sig, item.a, nodes, binding, candidates);
+            if element.size == 0 && !element.external {
+                if element.dependency == 0 { return 0; }
+                status = 2;
+            }
+        }
+        i = i + 1;
+    }
+    return status;
+}
+// 本地按值边始终以成员计算；独立装载只推迟实际依赖外部摘要的部分。
+export function checked_layouts(loaded: &iface::LoadedInterface:Read, exports: &[resolve_refs::IfaceExport]:Read, binding: &LayoutBinding:Read, candidates: &[iface::LoadedInterface]:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    if @len(loaded.summaries) == 0 { return true; }
+    let sigs: &[u8]:Read = &loaded.sig_bytes[0..@len(loaded.sig_bytes)]:Read;
+    let names: &[u8]:Read = &loaded.name_bytes[0..@len(loaded.name_bytes)]:Read;
+    let dependency_count: u32 = @len(loaded.dependencies) as u32;
+    var nodes: LayoutNode[] = [];
+    var i: u32 = 0;
+    while i < @len(exports) as u32 {
+        let kind: u8 = exports[i].kind;
+        var node: LayoutNode = LayoutNode { cursor: 0, end: 0, request: 0, tag: 0, state: 0, external: false, value: types::Measure { size: 0, align: 1, payload_off: 0 } };
+        let slot: u32 = loaded.exports[i].aux_off / 16;
+        if kind == 2 {
+            let descriptor: iface::LoadedEnumDescriptor = loaded.enum_descriptors[slot];
+            node.cursor = descriptor.member_start;
+            node.end = node.cursor + descriptor.member_count;
+            node.request = descriptor.request_align;
+            node.tag = 1;
+            if descriptor.member_count > 256 { node.tag = 2; }
+        } elseif kind == 3 {
+            let descriptor: iface::LoadedStructDescriptor = loaded.struct_descriptors[slot];
+            node.cursor = descriptor.member_start;
+            node.end = node.cursor + descriptor.member_count;
+            node.request = descriptor.request_align;
+        }
+        @push(nodes, node)?;
+        i = i + 1;
+    }
+    var stack: u32[] = [];
+    var deferred: MemberRange[] = [];
+    i = 0;
+    while i < @len(loaded.summaries) as u32 {
+        let id: u32 = loaded.summaries[i].type_export_id - 1;
+        if nodes[id].state == 0 {
+            if @len(stack) == 0 { @push(stack, id)?; }
+            else { stack[0] = id; }
+            nodes[id].state = 1;
+            var depth: u32 = 1;
+            while depth != 0 {
+                let top: u32 = stack[depth - 1];
+                let record: u32 = nodes[top].cursor;
+                let tag: u8 = nodes[top].tag;
+                if record == nodes[top].end {
+                    if nodes[top].external {
+                        nodes[top].state = 2;
+                        depth = depth - 1;
+                        continue;
+                    }
+                    var info: types::Measure = nodes[top].value;
+                    if tag != 0 { info = types::union_layout(tag, info.align, info.size); }
+                    let request: u8 = nodes[top].request;
+                    if info.size == 0 || (request != 0 && request < info.align) { return false; }
+                    info.align = types::max_align(info.align, request);
+                    if types::alignment_overflows(info.size, info.align) { return false; }
+                    info.size = types::align_up(info.size, info.align);
+                    nodes[top].value = info;
+                    nodes[top].state = 2;
+                    depth = depth - 1;
+                } else {
+                    var off: u32 = 0;
+                    var len: u32 = 0;
+                    if tag != 0 {
+                        off = loaded.enum_members[record].payload_sig_off;
+                        len = loaded.enum_members[record].payload_sig_len;
+                    } else {
+                        off = loaded.struct_fields[record].type_sig_off;
+                        len = loaded.struct_fields[record].type_sig_len;
+                    }
+                    if len != 0 {
+                        let sig: resolve_refs::MemberSignature = resolve_refs::decode_interface_member_signature(&sigs[off..off + len]:Read, exports, names, diags, dependency_count)?;
+                        if !sig.valid { return false; }
+                        let field: MemberLayout = member_layout(&sig:Read, sig.root, &nodes[0..@len(nodes)]:Read, binding, candidates);
+                        if field.size == 0 && !field.external {
+                            if field.dependency == 0 || nodes[field.dependency - 1].state != 0 { return false; }
+                            let dep: u32 = field.dependency - 1;
+                            nodes[dep].state = 1;
+                            // 每个签名至多一条按值边；依赖完成后只需重访当前成员一次。
+                            if depth == @len(stack) as u32 { @push(stack, dep)?; }
+                            else { stack[depth] = dep; }
+                            depth = depth + 1;
+                            continue;
+                        }
+                        let dynamic: u8 = dynamic_layouts(&sig:Read, &nodes[0..@len(nodes)]:Read, binding, candidates);
+                        if dynamic == 0 { return false; }
+                        if dynamic == 2 { @push(deferred, MemberRange { off: off, len: len })?; }
+                        if field.external { nodes[top].external = true; }
+                        elseif tag == 0 {
+                            let size: u64 = nodes[top].value.size;
+                            if types::alignment_overflows(size, field.align) { return false; }
+                            let offset: u64 = types::align_up(size, field.align);
+                            if types::add_overflows(offset, field.size) { return false; }
+                            nodes[top].value.size = offset + field.size;
+                        } elseif field.size > nodes[top].value.size { nodes[top].value.size = field.size; }
+                        if !field.external { nodes[top].value.align = types::max_align(nodes[top].value.align, field.align); }
+                    }
+                    nodes[top].cursor = record + 1;
+                }
+            }
+        }
+        if !nodes[id].external && (nodes[id].value.size != loaded.summaries[i].size || nodes[id].value.align != loaded.summaries[i].align) { return false; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(deferred) as u32 {
+        let range: MemberRange = deferred[i];
+        let sig: resolve_refs::MemberSignature = resolve_refs::decode_interface_member_signature(&sigs[range.off..range.off + range.len]:Read, exports, names, diags, dependency_count)?;
+        if !sig.valid || dynamic_layouts(&sig:Read, &nodes[0..@len(nodes)]:Read, binding, candidates) != 1 { return false; }
+        i = i + 1;
+    }
+    return true;
+}

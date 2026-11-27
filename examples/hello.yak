@@ -1,0 +1,7 @@
+// 最小真实输出样例：字符串字面量落在静态字节池，经外部服务写到标准输出。
+// 验收方式：链接后运行，标准输出必须是 `yak` 加一个换行，退出码为 0。
+foreign write(data: &[u8]): void;
+function main(): void {
+    write("yak\n");
+    return;
+}

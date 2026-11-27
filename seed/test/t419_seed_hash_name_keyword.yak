@@ -1,0 +1,5 @@
+// expected_trap: lex: invalid HashName
+// 触发：HashName 的名字部分是关键字。
+function #function(): void { return; }
+
+function main(): void { return; }

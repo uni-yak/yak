@@ -1,0 +1,178 @@
+// 只记录原文跨度与子树边界；字符串在协议调用方选中后才解码。
+import json_string;
+
+const MAX_BYTES: u64 = 33554432;
+const MAX_DEPTH: u32 = 32;
+const MAX_NODES: u32 = 65536;
+const BAD_SYNTAX: u8 = 1;
+const OVER_BUDGET: u8 = 2;
+
+// kind：0 空、1 假、2 真、3 数值、4 字符串、5 数组、6 对象。
+// next 指向前序表中越过本子树的首项；对象键本身也占一项。
+export struct Node { kind: u8, start: u32, end: u32, next: u32 }
+// status：0 完整，1 语法错误，2 超预算；失败时节点表为空。
+export struct Document { status: u8, nodes: Node[] }
+// status：0 缺失，1 唯一，2 重复。只有唯一时 id 才可用。
+export struct Member { status: u8, id: u32 }
+struct Parser { pos: u32, end: u32, status: u8 }
+
+export function is_null(kind: u8): bool { return kind == 0u8; }
+export function is_true(kind: u8): bool { return kind == 2u8; }
+export function is_number(kind: u8): bool { return kind == 3u8; }
+export function is_string(kind: u8): bool { return kind == 4u8; }
+export function is_array(kind: u8): bool { return kind == 5u8; }
+export function is_object(kind: u8): bool { return kind == 6u8; }
+
+function whitespace(src: &[u8], p: &Parser:ReadWrite): void {
+    while p.pos < p.end {
+        let b: u8 = src[p.pos];
+        if b != 32u8 && b != 9u8 && b != 10u8 && b != 13u8 { return; }
+        p.pos = p.pos + 1;
+    }
+}
+
+function take(src: &[u8], p: &Parser:ReadWrite, byte: u8): bool {
+    if p.pos >= p.end || src[p.pos] != byte { return false; }
+    p.pos = p.pos + 1;
+    return true;
+}
+
+function literal(src: &[u8], p: &Parser:ReadWrite, text: &[u8]): bool {
+    let len: u32 = @len(text) as u32;
+    if p.end - p.pos < len { return false; }
+    var i: u32 = 0;
+    while i < len {
+        if src[p.pos + i] != text[i] { return false; }
+        i = i + 1;
+    }
+    p.pos = p.pos + len;
+    return true;
+}
+
+function digit(b: u8): bool { return b >= 48u8 && b <= 57u8; }
+
+function digits(src: &[u8], p: &Parser:ReadWrite): bool {
+    let start: u32 = p.pos;
+    while p.pos < p.end && digit(src[p.pos]) { p.pos = p.pos + 1; }
+    return p.pos != start;
+}
+
+function number(src: &[u8], p: &Parser:ReadWrite): bool {
+    if p.pos < p.end && src[p.pos] == 45u8 { p.pos = p.pos + 1; }
+    if !take(src, p, 48u8) && !digits(src, p) { return false; }
+    if take(src, p, 46u8) && !digits(src, p) { return false; }
+    if take(src, p, 101u8) || take(src, p, 69u8) {
+        if p.pos < p.end && (src[p.pos] == 43u8 || src[p.pos] == 45u8) { p.pos = p.pos + 1; }
+        if !digits(src, p) { return false; }
+    }
+    return true;
+}
+
+function reserve(p: &Parser:ReadWrite, doc: &Document:ReadWrite, kind: u8): u32!AllocError {
+    let id: u32 = @len(doc.nodes) as u32;
+    if id >= MAX_NODES { p.status = OVER_BUDGET; return MAX_NODES; }
+    @push(doc.nodes, Node { kind: kind, start: p.pos, end: p.pos, next: id + 1 })?;
+    return id;
+}
+
+function finish(doc: &Document:ReadWrite, id: u32, end: u32): void {
+    doc.nodes[id].end = end;
+    doc.nodes[id].next = @len(doc.nodes) as u32;
+}
+
+function key(src: &[u8], p: &Parser:ReadWrite, doc: &Document:ReadWrite): bool!AllocError {
+    let end: u32 = json_string::scan(src, p.pos, p.end);
+    if end == p.pos { return false; }
+    let id: u32 = reserve(p, doc, 4u8)?;
+    if id == MAX_NODES { return false; }
+    p.pos = end;
+    finish(doc, id, p.pos);
+    return true;
+}
+
+function container(src: &[u8], p: &Parser:ReadWrite, doc: &Document:ReadWrite, kind: u8, depth: u32): bool!AllocError {
+    var close: u8 = 93;
+    if kind == 6u8 { close = 125; }
+    p.pos = p.pos + 1;
+    whitespace(src, p);
+    if take(src, p, close) { return true; }
+    var more: bool = true;
+    while more {
+        if kind == 6u8 {
+            let valid_key: bool = key(src, p, doc)?;
+            if !valid_key { return false; }
+            whitespace(src, p);
+            if !take(src, p, 58u8) { return false; }
+            whitespace(src, p);
+        }
+        let valid_value: bool = value(src, p, doc, depth)?;
+        if !valid_value { return false; }
+        whitespace(src, p);
+        if take(src, p, close) { return true; }
+        more = take(src, p, 44u8);
+        whitespace(src, p);
+    }
+    return false;
+}
+
+function value(src: &[u8], p: &Parser:ReadWrite, doc: &Document:ReadWrite, depth: u32): bool!AllocError {
+    if p.pos >= p.end { return false; }
+    let b: u8 = src[p.pos];
+    var kind: u8 = 0;
+    if b == 110u8 { kind = 0; }
+    elseif b == 102u8 { kind = 1; }
+    elseif b == 116u8 { kind = 2; }
+    elseif b == 45u8 || digit(b) { kind = 3; }
+    elseif b == 34u8 { kind = 4; }
+    elseif b == 91u8 { kind = 5; }
+    elseif b == 123u8 { kind = 6; }
+    else { return false; }
+    if kind >= 5u8 && depth >= MAX_DEPTH { p.status = OVER_BUDGET; return false; }
+    let id: u32 = reserve(p, doc, kind)?;
+    if id == MAX_NODES { return false; }
+    var valid: bool = false;
+    if kind == 0u8 { valid = literal(src, p, "null"); }
+    elseif kind == 1u8 { valid = literal(src, p, "false"); }
+    elseif kind == 2u8 { valid = literal(src, p, "true"); }
+    elseif kind == 3u8 { valid = number(src, p); }
+    elseif kind == 4u8 {
+        let end: u32 = json_string::scan(src, p.pos, p.end);
+        valid = end != p.pos;
+        p.pos = end;
+    } else {
+        valid = container(src, p, doc, kind, depth + 1)?;
+    }
+    if valid { finish(doc, id, p.pos); }
+    return valid;
+}
+
+export function parse(src: &[u8]): Document!AllocError {
+    if @len(src) > MAX_BYTES { return Document { status: OVER_BUDGET, nodes: [] }; }
+    var p: Parser = Parser { pos: 0, end: @len(src) as u32, status: BAD_SYNTAX };
+    var doc: Document = Document { status: 0, nodes: [] };
+    whitespace(src, &p:ReadWrite);
+    let valid: bool = value(src, &p:ReadWrite, &doc:ReadWrite, 0)?;
+    whitespace(src, &p:ReadWrite);
+    if !valid || p.pos != p.end { return Document { status: p.status, nodes: [] }; }
+    return doc;
+}
+
+// 只在指定对象的直接成员中查找；子树按预计算的边界跳过。
+export function member(doc: &Document:Read, src: &[u8], object: u32, name: &[u8]): Member {
+    if object >= (@len(doc.nodes) as u32) || !is_object(doc.nodes[object].kind) {
+        return Member { status: 0, id: 0 };
+    }
+    let end: u32 = doc.nodes[object].next;
+    var i: u32 = object + 1;
+    var found: Member = Member { status: 0, id: 0 };
+    while i < end {
+        let item: Node = doc.nodes[i];
+        let id: u32 = i + 1;
+        if json_string::equals(src, item.start, item.end, name) {
+            if found.status == 1u8 { return Member { status: 2, id: 0 }; }
+            found = Member { status: 1, id: id };
+        }
+        i = doc.nodes[id].next;
+    }
+    return found;
+}

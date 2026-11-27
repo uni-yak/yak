@@ -1,0 +1,19 @@
+// expected_code: E6003
+// spec: spec/lang/base.md R-4；spec/lang/owner.md OW-1
+// 触发：@move 转移动态数组后继续使用源绑定（目标绑定 b 须被使用，避免 E4009 未使用声明先行）。
+foreign exit(code: u8): void;
+
+function run(): void!AllocError {
+    var a: u8[] = [];
+    @push(a, 1u8)?;
+    var b: u8[] = @move(a);
+    @push(b, 2u8)?;
+    @push(a, 3u8)?;
+    exit(0u8);
+    return;
+}
+
+function main(): void {
+    run();
+    return;
+}

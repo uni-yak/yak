@@ -1,0 +1,6 @@
+// expected_code: E3008
+// spec: spec/lang/base.md R-24
+// 触发：base 期在返回类型位使用 T?，按 R-24 以 E3008 拒绝。
+function bad(): i32? { return; }
+
+function main(): void { return; }

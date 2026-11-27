@@ -1,0 +1,17 @@
+// t17: while + continue + assert验证累加结果
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var i: u32 = 0;
+    var sum: u32 = 0;
+    while i < 10 {
+        i = i + 1;
+        if i == 3 {
+            continue;
+        }
+        sum = sum + i;
+    }
+    // i = 1..10, 跳过 3: 1+2+4+5+6+7+8+9+10 = 52
+    assert(sum == 52);
+    return;
+}

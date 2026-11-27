@@ -1,0 +1,119 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: positions=../../compiler/lsp/positions.yak
+// module: diagnostic_wire=../../compiler/lsp/diagnostic_wire.yak
+import buf;
+import types;
+import diag;
+import positions;
+import diagnostic_wire;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function equal(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var at: u32 = 0;
+    while (at as u64) < @len(a) {
+        if a[at] != b[at] { return false; }
+        at = at + 1u32;
+    }
+    return true;
+}
+
+function count_ranges(body: &buf::ByteBuf:Read): u32 {
+    var at: u32 = 0;
+    var count: u32 = 0;
+    while at + 8u32 <= body.pos {
+        if equal(&body.data[at..at + 8u32]:Read, "\"range\":") { count = count + 1u32; }
+        at = at + 1u32;
+    }
+    return count;
+}
+
+function put(buffer: &diag::DiagBuffer:ReadWrite, file: u16, unit: u16, offset: u32,
+    length: u32, code: u16, severity: u8): void!AllocError {
+    let span: types::Span = types::Span { file: file, offset: offset, length: length };
+    diag::diagbuf_emit(buffer, diag::Diag { code: types::error_code(code), severity: severity, span: span, unit: unit , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+
+function ranges(): void!AllocError {
+    let text: &[u8] = "A😀\r\nB";
+    let index: positions::Index = positions::build(text)?;
+    var entries: diag::DiagBuffer = diag::diagbuf_new();
+    put(&entries:ReadWrite, 2, 0, 0, 1, 1018, 0)?;
+    put(&entries:ReadWrite, 1, 0, 1, 6, 4002, 1)?;
+    put(&entries:ReadWrite, 1, 0, 2, 0, 1018, 0)?;
+    put(&entries:ReadWrite, 1, 0, 6, 0, 1018, 0)?;
+    put(&entries:ReadWrite, 1, 0, 7, 65535, 1018, 0)?;
+    put(&entries:ReadWrite, 1, 0, 8, 0, 1018, 2)?;
+    put(&entries:ReadWrite, 1, 1, 8, 0, 1018, 0)?;
+    let publication: diagnostic_wire::Publication = diagnostic_wire::encode("file:///C:/%20/中\"\\.yak",
+        2147483647i32, true, &index:Read, text, 1, &entries:Read)?;
+    let body: &buf::ByteBuf:Read = &publication.body:Read;
+    let prefix: &[u8] = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///C:/%20/中\\\"\\\\.yak\",\"version\":2147483647,\"diagnostics\":[";
+    let first: &[u8] = "{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":1,\"character\":0}},\"severity\":2,\"source\":\"yak\",\"code\":\"E4002\",\"message\":\"Yak 名称诊断 E4002\"},";
+    let second: &[u8] = "{\"range\":{\"start\":{\"line\":1,\"character\":1},\"end\":{\"line\":1,\"character\":1}},\"severity\":3,\"source\":\"yak\",\"code\":\"E1018\",\"message\":\"Yak 词法诊断 E1018\"}]}}";
+    let p: u32 = @len(prefix) as u32;
+    let q: u32 = p + (@len(first) as u32);
+    assert(publication.omitted && count_ranges(body) == 2u32);
+    assert(body.pos == q + (@len(second) as u32));
+    assert(equal(&body.data[0..p]:Read, prefix));
+    assert(equal(&body.data[p..q]:Read, first));
+    assert(equal(&body.data[q..body.pos]:Read, second));
+    return;
+}
+
+function bounds(): void!AllocError {
+    let index: positions::Index = positions::build("x")?;
+    var entries: diag::DiagBuffer = diag::diagbuf_new();
+    var i: u32 = 0;
+    while i < 64u32 {
+        put(&entries:ReadWrite, 2, 0, 0, 1, 1018, 0)?;
+        i = i + 1u32;
+    }
+    put(&entries:ReadWrite, 1, 0, 1, 0, 1018, 0)?;
+    let scan: diagnostic_wire::Publication = diagnostic_wire::encode("file:///x", 0, false,
+        &index:Read, "x", 1, &entries:Read)?;
+    assert(scan.omitted && count_ranges(&scan.body:Read) == 0u32);
+    var all: diag::DiagBuffer = diag::diagbuf_new();
+    i = 0u32;
+    while i < 17u32 {
+        put(&all:ReadWrite, 1, 0, 1, 0, 1018, 0)?;
+        i = i + 1u32;
+    }
+    let cap: diagnostic_wire::Publication = diagnostic_wire::encode("file:///x", 0, false,
+        &index:Read, "x", 1, &all:Read)?;
+    assert(cap.omitted && count_ranges(&cap.body:Read) == 16u32);
+    return;
+}
+
+function dropped_error(): void!AllocError {
+    var entries: diag::DiagBuffer = diag::diagbuf_limited(1u32);
+    put(&entries:ReadWrite, 1, 0, 0, 1, 4002, 1)?;
+    assert(entries.count == 1u32 && @len(entries.diags) == 1u64);
+    assert(!entries.truncated && !diag::diagbuf_has_error(&entries:Read));
+    assert(diag::diagbuf_events(&entries:Read) == 1u64);
+    put(&entries:ReadWrite, 1, 0, 1, 1, 4002, 0)?;
+    assert(entries.count == 1u32 && @len(entries.diags) == 1u64);
+    assert(entries.truncated && diag::diagbuf_has_error(&entries:Read));
+    assert(diag::diagbuf_events(&entries:Read) == 2u64);
+    assert(entries.diags[0].severity == 1u8 && entries.diags[0].span.offset == 0u32);
+    return;
+}
+
+function run(): void!AllocError {
+    ranges()?;
+    bounds()?;
+    dropped_error()?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run();
+    @drop(failed);
+    exit(1);
+}

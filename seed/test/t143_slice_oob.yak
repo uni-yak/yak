@@ -1,0 +1,2 @@
+// expected_trap: slice range out of bounds
+function main(): void { let a: u8[] = [1]; let s: &[u8] = &a[0..2]; }

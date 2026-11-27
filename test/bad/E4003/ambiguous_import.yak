@@ -1,0 +1,7 @@
+// expected_code: E4003
+// dependency: ambiguous_dep.yak
+// module_graph: ambiguous ambiguous_dep
+// spec: spec/lang/module.md#N-3、spec/lang/name.md#N-3
+// 触发：同一导入在两个独立源根中各命中一个源文件。
+import ambiguous_dep;
+function main(): void { return; }

@@ -1,0 +1,664 @@
+// 将表达式、投影与调用降为 MIR。
+import types;
+import ast;
+import diag;
+import resolve;
+import resolve_refs;
+import typecheck;
+import type_import;
+import mir;
+import mir_builder;
+import mir_lower_ops;
+
+const NONE: u32 = 4294967295u32;
+
+function lower_short(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, value_type_id: u32): u32!AllocError {
+    let data: u32 = pool.exprs[expr].data as u32;
+    let left: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.binaries[data].left)?;
+    let place: u32 = mir_builder::new_local(ctx, build, value_type_id, 2)?;
+    let rhs: u16 = mir_builder::new_block(ctx, build)?;
+    let constant: u16 = mir_builder::new_block(ctx, build)?;
+    let join: u16 = mir_builder::new_block(ctx, build)?;
+    if pool.binaries[data].op == 5 { mir_builder::term(ctx, build, 193, left, rhs as u32, constant as u32); }
+    else { mir_builder::term(ctx, build, 193, left, constant as u32, rhs as u32); }
+    build.current = rhs;
+    let right: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.binaries[data].right)?;
+    mir_builder::store(ctx, build, place, right)?;
+    mir_builder::term(ctx, build, 192, 0, join as u32, 0);
+    build.current = constant;
+    let value: u32 = mir_builder::const_bool(ctx, build, value_type_id, pool.binaries[data].op == 6)?;
+    mir_builder::store(ctx, build, place, value)?;
+    mir_builder::term(ctx, build, 192, 0, join as u32, 0);
+    build.current = join;
+    return mir_builder::read_local(ctx, build, place)?;
+}
+
+export function inject(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, target: u32, value: u32): u32!AllocError {
+    return mir_lower_ops::inject(ctx, build, tc, target, value)?;
+}
+
+function lower_question(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32): u32!AllocError {
+    let depth: u32 = build.expression_depth;
+    let carrier: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.exprs[expr].data as u32)?;
+    return mir_lower_ops::emit_question_branch(ctx, build, tc, expr, carrier, depth)?;
+}
+
+function lower_enum(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, ref: u32, call: u32): u32!AllocError {
+    let value_type_id: u32 = mir_builder::checked_type(build, tc, pool, expr);
+    if build.rejection.kind != 0 { return 0; }
+    let rk: u8 = resolution.refs.items[ref - 1].kind;
+    if rk != 3 && rk != 4 && rk != 5 { mir_builder::reject(build, 1, pool.exprs[expr].span); return 0; }
+    var variant: u32 = resolution.refs.items[ref - 1].y;
+    var expected: u32 = 0;
+    if rk == 3 {
+        let ei: u32 = mir::enum_index(tc, value_type_id);
+        if ei == 0 || variant >= @len(tc.enums.items[ei - 1].payloads) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+        expected = tc.enums.items[ei - 1].payloads[variant];
+    } elseif rk == 4 {
+        // 导入枚举构造：变体号来自解析引用的 z，载荷类型按变体表取消费方编号。
+        variant = resolution.refs.items[ref - 1].z;
+        let dep: u16 = resolution.refs.items[ref - 1].x as u16;
+        let export_id: u32 = resolution.refs.items[ref - 1].y;
+        if value_type_id == 0 || value_type_id > @len(tc.types.entries) as u32 { mir_builder::reject(build, 3, build.span); return 0; }
+        let entry: typecheck::TypeEntry = tc.types.entries[value_type_id - 1];
+        if entry.kind != 3 || entry.dep != dep || entry.export_id != export_id { mir_builder::reject(build, 3, build.span); return 0; }
+        if !mir::imported_enum_known(&tc.imported_enums:Read, dep, export_id) { mir_builder::reject(build, 3, build.span); return 0; }
+        expected = mir::imported_payload_of(&tc.imported_enums:Read, dep, export_id, variant);
+        if expected == NONE { mir_builder::reject(build, 7, build.span); return 0; }
+    } else {
+        if tc.types.entries[value_type_id - 1].builtin != 4108 { mir_builder::reject(build, 3, build.span); return 0; }
+    }
+    var payload: u32 = 0;
+    var count: u32 = 0;
+    if call != NONE { count = @len(pool.calls[call].args) as u32; }
+    if expected == 0 {
+        if count != 0 { mir_builder::reject(build, 7, build.span); return 0; }
+    } else {
+        if count != 1 || call == NONE || pool.calls[call].args[0].kind == 1 { mir_builder::reject(build, 7, build.span); return 0; }
+        payload = lower_expr(ctx, build, pool, tc, resolution, diags, pool.calls[call].args[0].value)?;
+        if mir::local_type(ctx, payload) != expected { mir_builder::reject(build, 7, build.span); return 0; }
+    }
+    return mir_builder::result_inst(ctx, build, 176, value_type_id, value_type_id, variant, payload as u64)?;
+}
+
+function lower_builtin(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, bid: u32): u32!AllocError {
+    let call: u32 = pool.exprs[expr].data as u32;
+    let count: u32 = @len(pool.calls[call].args) as u32;
+    if bid == 20483 {
+        let carrier: u32 = mir_builder::checked_type(build, tc, pool, expr);
+        if build.rejection.kind != 0 { return 0; }
+        let source_expr: u32 = pool.calls[call].args[0].value;
+        // 借读原值。可变绑定直接使用存储槽，不复制尚在原槽中持有的资源。
+        var source: u32 = mir_builder::place_local_of(build, ctx, pool, resolution, source_expr);
+        if source == 0 { source = lower_expr(ctx, build, pool, tc, resolution, diags, source_expr)?; }
+        if build.rejection.kind != 0 { return 0; }
+        let result: u32 = mir_builder::result_inst(ctx, build, 114, carrier, source, 0, 0)?;
+        // 子表达式产生的临时拥有值在克隆完成后释放，包括克隆失败的情况。
+        if source != 0 && mir_builder::bound_local_of(build, ctx, pool, resolution, source_expr) == 0 &&
+            !is_projection(pool, source_expr) {
+            mir_builder::inst(ctx, build, 115, 0, source, 0, 0, 0, 0, 0)?;
+        }
+        return result;
+    }
+    if bid == 20485 {
+        // @push：降为 178（a 结果载体，b 数组局部，c 元素局部，value 元素步长）。
+        // 数组必须是可写 `T[]` 原位或 `&T[]:ReadWrite`；同类型的拥有型元素按整值交接。
+        let value_type_id: u32 = mir_builder::checked_type(build, tc, pool, expr);
+        if build.rejection.kind != 0 { return 0; }
+        let arr_expr: u32 = pool.calls[call].args[0].value;
+        let arr_type: u32 = mir_builder::checked_type(build, tc, pool, arr_expr);
+        if build.rejection.kind != 0 || !mir::valid_type(&tc.types:Read, arr_type) { return 0; }
+        var arr_value: u32 = 0;
+        if tc.types.entries[arr_type - 1].kind == 4 {
+            if tc.types.entries[arr_type - 1].cap != 1 { mir_builder::reject(build, 3, pool.exprs[arr_expr].span); return 0; }
+            arr_value = lower_expr(ctx, build, pool, tc, resolution, diags, arr_expr)?;
+        } else { arr_value = lower_write_place(ctx, build, pool, tc, resolution, diags, arr_expr)?; }
+        if build.rejection.kind != 0 { return 0; }
+        let elem: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.calls[call].args[1].value)?;
+        if build.rejection.kind != 0 { return 0; }
+        return mir_lower_ops::emit_push_checked(ctx, build, pool, tc, expr, value_type_id, arr_type, arr_value, elem)?;
+    }
+    if bid != 20481 && bid != 20482 && bid != 20486 && bid != 20493 && bid != 20494 && bid != 20495 { mir_builder::reject(build, 1, pool.exprs[expr].span); return 0; }
+    var needed: u32 = 1;
+    if bid >= 20493 { needed = 2; }
+    if count != needed { mir_builder::reject(build, 7, build.span); return 0; }
+    var i: u32 = 0;
+    while i < count {
+        if pool.calls[call].args[i].kind != 0 { mir_builder::reject(build, 1, pool.calls[call].args[i].span); return 0; }
+        i = i + 1;
+    }
+    let first: u32 = pool.calls[call].args[0].value;
+    if bid == 20481 {
+        let slot: u32 = mir_builder::bound_local_of(build, ctx, pool, resolution, first);
+        if slot != 0 && ctx.locals[slot - 1].kind == 3 && ctx.locals[slot - 1].state == 10 {
+            let value_type_id: u32 = mir_builder::checked_type(build, tc, pool, expr);
+            if value_type_id != mir::local_type(ctx, slot) { mir_builder::reject(build, 7, build.span); return 0; }
+            return mir_builder::result_inst(ctx, build, 210, value_type_id, slot, 0, 0)?;
+        }
+    }
+    let left: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, first)?;
+    if build.rejection.kind != 0 { return 0; }
+    if bid == 20486 {
+        return mir_lower_ops::emit_len_builtin(ctx, build, pool, tc, resolution, expr, call, bid, left)?;
+    }
+    let value_type_id: u32 = mir_builder::checked_type(build, tc, pool, expr);
+    if bid == 20481 || bid == 20482 {
+        var op: u8 = 112;
+        if bid == 20482 { op = 113; }
+        return mir_builder::result_inst(ctx, build, op, value_type_id, left, 0, 0)?;
+    }
+    let right: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.calls[call].args[1].value)?;
+    return mir_builder::result_inst(ctx, build, (bid - 20493 + 22) as u8, value_type_id, left, right, 0)?;
+}
+
+// 访问实参在 MIR 中统一接收地址。隐式 Read 临时对象归调用方，保活到调用完成。
+function lower_argument(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, formal: u32, implicit_access: bool): u32!AllocError {
+    let target: u32 = typecheck::access_ref_target(&tc.types:Read, formal);
+    if implicit_access && target != 0 && target == mir_builder::checked_type(build, tc, pool, expr) {
+        let cap: u8 = tc.types.entries[formal - 1].cap;
+        var address: u32 = 0;
+        if cap == 1 {
+            address = lower_write_place(ctx, build, pool, tc, resolution, diags, expr)?;
+        } elseif is_projection(pool, expr) {
+            let hold: bool = build.hold_projection;
+            build.hold_projection = true;
+            address = lower_projected_place(ctx, build, pool, tc, resolution, diags, expr, false)?;
+            build.hold_projection = hold;
+        } else {
+            address = mir_builder::bound_local_of(build, ctx, pool, resolution, expr);
+            if address == 0 {
+                address = lower_expr(ctx, build, pool, tc, resolution, diags, expr)?;
+                mir_lower_ops::hold_owned_temp(&*ctx:Read, build, tc, address)?;
+            }
+        }
+        if build.rejection.kind != 0 || address == 0 { return 0; }
+        return mir_builder::result_inst(ctx, build, 128 + cap, formal, address, 0, 0)?;
+    }
+    return lower_expr(ctx, build, pool, tc, resolution, diags, expr)?;
+}
+
+// 所有调用先完成参数求值，再一次性写入连续的 MIR 实参向量。
+function lower_typed_call(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, call: u32, target: mir_lower_ops::CallTarget): u32!AllocError {
+    let depth: u32 = build.expression_depth;
+    let ret: u32 = mir_builder::checked_type(build, tc, pool, expr);
+    let count: u32 = @len(pool.calls[call].args) as u32;
+    if build.rejection.kind != 0 { return 0; }
+    if ret != target.result || count != target.count { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+    let yak_call: bool = mir::is_slot_call(target.op);
+    var collected: u32[] = [];
+    var out_seen: bool = false;
+    var i: u32 = 0;
+    while i < count {
+        let arg: ast::CallArg = pool.calls[call].args[i];
+        let formal: u32 = mir_lower_ops::call_formal(&*build:Read, tc, target, i);
+        var value: u32 = 0;
+        if arg.kind == 1 {
+            let payload: u32 = typecheck::write_ref_target(&tc.types:Read, formal);
+            if !yak_call || !mir::out_payload_supported(&tc.types:Read, payload) ||
+                !mir::out_return_supported(&tc.types:Read, ret) { mir_builder::reject(build, 3, arg.span); return 0; }
+            value = mir_lower_ops::out_argument_local(&*ctx:Read, &*build:Read, &resolution.refs:Read, call, i);
+            if mir::local_type(&*ctx:Read, value) != payload { mir_builder::reject(build, 7, arg.span); return 0; }
+            out_seen = true;
+        } else {
+            if (arg.kind != 0 && (arg.kind != 2 || !yak_call)) || !mir_builder::supported_cached(build, tc, formal, false) {
+                mir_builder::reject(build, 3, arg.span); return 0;
+            }
+            value = lower_argument(ctx, build, pool, tc, resolution, diags, arg.value, formal, yak_call)?;
+            if !mir::arg_type_compatible(&tc.types:Read, mir::local_type(&*ctx:Read, value), formal) {
+                mir_builder::reject(build, 7, arg.span); return 0;
+            }
+        }
+        @push(collected, value)?;
+        i = i + 1;
+    }
+    return mir_lower_ops::emit_typed_call_inst(ctx, build, pool, tc, expr, call, target, &collected:Read, ret, count, out_seen, depth)?;
+}
+
+function lower_indirect_call(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, call: u32): u32!AllocError {
+    let callee: u32 = pool.calls[call].callee;
+    let depth: u32 = build.expression_depth;
+    let hold: bool = build.hold_projection;
+    build.hold_projection = is_projection(pool, callee);
+    let address: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, callee)?;
+    build.hold_projection = hold;
+    if build.rejection.kind != 0 { return 0; }
+    if build.expression_depth != depth {
+        mir_lower_ops::drop_expression_temps(ctx, build, depth)?;
+        build.expression_depth = depth;
+    }
+    let id: u32 = mir::local_type(ctx, address);
+    if !mir::valid_type(&tc.types:Read, id) || tc.types.entries[id - 1].kind != 8 {
+        mir_builder::reject(build, 7, pool.exprs[callee].span); return 0;
+    }
+    let signature: typecheck::TypeEntry = tc.types.entries[id - 1];
+    let target: mir_lower_ops::CallTarget = mir_lower_ops::CallTarget { op: 148, identity: address, dep: 0,
+        formals: signature.members_start, count: signature.members_count, result: signature.elem, service: 0 };
+    return lower_typed_call(ctx, build, pool, tc, resolution, diags, expr, call, target)?;
+}
+
+function lower_call(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32): u32!AllocError {
+    let call: u32 = pool.exprs[expr].data as u32;
+    if call >= @len(pool.calls) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    let callee: u32 = pool.calls[call].callee;
+    if callee >= @len(pool.exprs) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    let ri: u32 = mir_builder::ref_index(&resolution.refs:Read, callee);
+    if ri == 0 { return lower_indirect_call(ctx, build, pool, tc, resolution, diags, expr, call)?; }
+    let source: resolve_refs::ResolvedRef = resolution.refs.items[ri - 1];
+    if source.kind == 3 || source.kind == 4 || source.kind == 5 { return lower_enum(ctx, build, pool, tc, resolution, diags, expr, ri, call)?; }
+    if source.kind == 1 { return lower_builtin(ctx, build, pool, tc, resolution, diags, expr, source.x)?; }
+    if source.kind == 2 {
+        if source.x == 0 || source.y == 0 { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+        if source.x > 65535 {
+            mir_builder::emit(diags, types::error_code(9001), pool.exprs[expr].span)?;
+            mir_builder::reject(build, 7, pool.exprs[expr].span);
+            return 0;
+        }
+        let row: u32 = type_import::import_signature(&resolution.refs:Read, source.x as u16, source.y);
+        if row == 0 { mir_builder::reject(build, 4, pool.exprs[expr].span); return 0; }
+        let signature: mir::MirImport = build.import_signatures[row - 1];
+        let target: mir_lower_ops::CallTarget = mir_lower_ops::CallTarget { op: 145, identity: source.y, dep: source.x,
+            formals: signature.param_start, count: signature.param_count as u32, result: signature.ret, service: 0 };
+        return lower_typed_call(ctx, build, pool, tc, resolution, diags, expr, call, target)?;
+    }
+    if source.kind != 0 { mir_builder::reject(build, 1, pool.exprs[expr].span); return 0; }
+    if source.y != 1 && source.y != 5 { return lower_indirect_call(ctx, build, pool, tc, resolution, diags, expr, call)?; }
+    let row: u32 = mir::func_sig(&tc.funcs:Read, source.x);
+    if row == 0 { mir_builder::reject(build, 4, pool.exprs[expr].span); return 0; }
+    let sig: &typecheck::FuncSig:Read = &tc.funcs.items[row - 1]:Read;
+    var op: u8 = 144;
+    if source.y == 5 {
+        if sig.service == 0 { mir_builder::reject(build, 1, pool.exprs[expr].span); return 0; }
+        op = 147;
+        if sig.service >= 2 && sig.service <= 4 { op = 149; }
+    }
+    let target: mir_lower_ops::CallTarget = mir_lower_ops::CallTarget { op: op, identity: source.x, dep: 0, formals: row - 1,
+        count: @len(sig.params) as u32, result: sig.ret, service: sig.service };
+    return lower_typed_call(ctx, build, pool, tc, resolution, diags, expr, call, target)?;
+}
+
+export function lower_expr(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32): u32!AllocError {
+    if !mir_builder::block_open(ctx, build) { return 0; }
+    if expr >= @len(pool.exprs) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    build.span = pool.exprs[expr].span;
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    if kind == 22 { return lower_call(ctx, build, pool, tc, resolution, diags, expr)?; }
+    let value_type_id: u32 = mir_builder::checked_type(build, tc, pool, expr);
+    if build.rejection.kind != 0 { return 0; }
+    if kind == 0 || kind == 25 {
+        let ri: u32 = mir_builder::ref_index(&resolution.refs:Read, expr);
+        if ri == 0 { mir_builder::reject(build, 7, build.span); return 0; }
+        let rk: u8 = resolution.refs.items[ri - 1].kind;
+        if rk == 3 || rk == 4 || rk == 5 { return lower_enum(ctx, build, pool, tc, resolution, diags, expr, ri, NONE)?; }
+        if rk != 0 { mir_builder::reject(build, 1, build.span); return 0; }
+        let def: u32 = resolution.refs.items[ri - 1].x;
+        if def == 0 { mir_builder::reject(build, 7, build.span); return 0; }
+        // 模块常量已在前端求值，优先按常量落指令；局部与参数仍走 def_map。
+        let constant: u32 = mir_builder::lower_module_const(ctx, build, pool, tc, def, value_type_id)?;
+        if constant != 0 { return constant; }
+        if build.rejection.kind != 0 { return 0; }
+        if def > @len(build.def_map) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+        return mir_builder::read_local(ctx, build, build.def_map[def - 1])?;
+    }
+    if kind == 2 || kind == 4 {
+        if !mir::is_scalar(&tc.types:Read, value_type_id) { mir_builder::reject(build, 3, build.span); return 0; }
+        return mir_builder::result_inst(ctx, build, 1, value_type_id, tc.types.entries[value_type_id - 1].builtin as u32, 0, pool.exprs[expr].data)?;
+    }
+    if kind == 3 { return mir_builder::const_bool(ctx, build, value_type_id, pool.exprs[expr].data != 0)?; }
+    // 字符串字面量：静态池索引指向 &[u8] 视图，结果 Local 按胖指针（指针+长度）承载。
+    if kind == 5 {
+        if !mir::is_u8_slice(&tc.types:Read, value_type_id) { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+        let static_index: u64 = pool.exprs[expr].data;
+        if static_index >= @len(pool.statics) as u64 { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+        return mir_builder::result_inst(ctx, build, 3, value_type_id, static_index as u32, 0, 0)?;
+    }
+    if kind == 13 { return lower_question(ctx, build, pool, tc, resolution, diags, expr)?; }
+    if kind == 20 {
+        let op: u8 = pool.binaries[data].op;
+        if op == 5 || op == 6 { return lower_short(ctx, build, pool, tc, resolution, diags, expr, value_type_id)?; }
+        let opcode: u8 = mir_builder::arithmetic_opcode(op);
+        if opcode == 0 { mir_builder::reject(build, 1, build.span); return 0; }
+        let left: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.binaries[data].left)?;
+        let right: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.binaries[data].right)?;
+        if (opcode >= 16 && opcode <= 21) || opcode == 35 || opcode == 36 { build.needs_trap = true; }
+        return mir_builder::result_inst(ctx, build, opcode, value_type_id, left, right, 0)?;
+    }
+    if kind == 21 {
+        let op: u8 = pool.unaries[data].op;
+        let operand: u32 = pool.unaries[data].operand;
+        if op == 19 && pool.exprs[operand].kind == 27 { return lower_slice(ctx, build, pool, tc, resolution, diags, operand, value_type_id, true)?; }
+        if op == 19 {
+            let reference: typecheck::TypeEntry = tc.types.entries[value_type_id - 1];
+            if reference.kind == 8 {
+                let ri: u32 = mir_builder::ref_index(&resolution.refs:Read, operand);
+                if ri == 0 { mir_builder::reject(build, 7, build.span); return 0; }
+                let target: resolve_refs::ResolvedRef = resolution.refs.items[ri - 1];
+                if target.kind == 0 && target.y == 1 { return mir_builder::result_inst(ctx, build, 5, value_type_id, target.x, 0, 0)?; }
+                if target.kind == 2 && target.z == 1 && target.x <= 65535 {
+                    return mir_builder::result_inst(ctx, build, 5, value_type_id, target.y, target.x, 0)?;
+                }
+                mir_builder::reject(build, 7, build.span);
+                return 0;
+            }
+            if reference.kind != 4 || reference.cap > 1 { mir_builder::reject(build, 3, build.span); return 0; }
+            var address: u32 = 0;
+            if pool.exprs[operand].kind == 23 { address = lower_member_addr(ctx, build, pool, tc, resolution, diags, operand, reference.cap == 1)?; }
+            elseif pool.exprs[operand].kind == 24 { address = lower_index_addr(ctx, build, pool, tc, resolution, diags, operand, reference.cap == 1)?; }
+            elseif is_projection(pool, operand) { address = lower_deref_addr(ctx, build, pool, tc, resolution, diags, operand, reference.cap == 1)?; }
+            else { address = mir_builder::bound_local_of(build, ctx, pool, resolution, operand); }
+            if address == 0 { mir_builder::reject(build, 3, build.span); return 0; }
+            return mir_builder::result_inst(ctx, build, 128 + reference.cap, value_type_id, address, 0, 0)?;
+        }
+        if op == 13 {
+            let address: u32 = lower_deref_addr(ctx, build, pool, tc, resolution, diags, expr, false)?;
+            if address == 0 { return 0; }
+            return mir_builder::result_inst(ctx, build, 80, value_type_id, address, 0, 0)?;
+        }
+        if op != 12 && op != 18 { mir_builder::reject(build, 1, build.span); return 0; }
+        // 最小值的幅值不能先作为同类型正数取负，否则会误触发溢出。
+        if op == 12 && pool.exprs[operand].kind == 2 && mir::is_scalar(&tc.types:Read, value_type_id) {
+            let builtin: u16 = tc.types.entries[value_type_id - 1].builtin;
+            let bits: u64 = pool.exprs[operand].data;
+            if (builtin == 4101 && bits == 128) || (builtin == 4102 && bits == 32768) || (builtin == 4103 && bits == 2147483648) || (builtin == 4104 && bits == 9223372036854775808u64) {
+                return mir_builder::result_inst(ctx, build, 1, value_type_id, builtin as u32, 0, bits)?;
+            }
+        }
+        let value: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, operand)?;
+        if op == 18 {
+            let zero: u32 = mir_builder::const_bool(ctx, build, value_type_id, false)?;
+            return mir_builder::result_inst(ctx, build, 48, value_type_id, value, zero, 0)?;
+        }
+        build.needs_trap = true;
+        return mir_builder::result_inst(ctx, build, 21, value_type_id, value, 0, 0)?;
+    }
+    if kind == 28 {
+        let operand: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.casts[data].operand)?;
+        if !mir::is_scalar(&tc.types:Read, value_type_id) || !mir::is_scalar(&tc.types:Read, mir::local_type(ctx, operand)) { mir_builder::reject(build, 3, build.span); return 0; }
+        return mir_builder::result_inst(ctx, build, 64, value_type_id, operand, value_type_id, 0)?;
+    }
+    // 聚合表达式：结构体构造、数组构造、成员访问与索引。
+    // 成员与索引按「取地址 + 载入」两步降低，地址由 field_addr / index_addr 产出。
+    if kind == 30 { return lower_struct_ctor(ctx, build, pool, tc, resolution, diags, expr, value_type_id)?; }
+    if kind == 26 { return lower_array_ctor(ctx, build, pool, tc, resolution, diags, expr, value_type_id)?; }
+    if kind == 27 { return lower_slice(ctx, build, pool, tc, resolution, diags, expr, value_type_id, false)?; }
+    if kind == 23 || kind == 24 {
+        var addr: u32 = 0;
+        if kind == 23 {
+            let member: ast::MemberExpr = pool.members[data];
+            let property: u8 = typecheck::expr_array_property(&tc.types:Read, &tc.expr_types:Read, pool, expr);
+            if property != 0 {
+                let object_type: u32 = mir_builder::checked_type(build, tc, pool, member.object);
+                if build.rejection.kind != 0 { return 0; }
+                let object_kind: u8 = tc.types.entries[object_type - 1].kind;
+                if object_kind == 6 && !is_projection(pool, member.object) &&
+                    mir_builder::bound_local_of(build, ctx, pool, resolution, member.object) == 0 {
+                    // 先读取运行期头，再释放仅用于本次投影求值的动态数组。
+                    let source: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, member.object)?;
+                    if build.rejection.kind != 0 { return 0; }
+                    let field: u32 = property as u32 - 1;
+                    addr = mir_builder::result_inst(ctx, build, 82, build.ptr_ty, source, mir::array_field_offset(object_kind, field), field as u64 << 32u64)?;
+                    let value: u32 = mir_builder::result_inst(ctx, build, 80, value_type_id, addr, 0, 0)?;
+                    mir_builder::inst(ctx, build, 115, 0, source, 0, 0, 0, 0, 0)?;
+                    return value;
+                }
+            }
+            addr = lower_member_addr(ctx, build, pool, tc, resolution, diags, expr, false)?;
+        }
+        else { addr = lower_index_addr(ctx, build, pool, tc, resolution, diags, expr, false)?; }
+        if addr == 0 { return 0; }
+        return mir_builder::result_inst(ctx, build, 80, value_type_id, addr, 0, 0)?;
+    }
+    mir_builder::reject(build, 1, pool.exprs[expr].span);
+    return 0;
+}
+
+function lower_member_addr(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, writing: bool): u32!AllocError {
+    let data: u32 = pool.exprs[expr].data as u32;
+    if data >= @len(pool.members) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    let object: u32 = pool.members[data].object;
+    let object_type: u32 = mir_builder::checked_type(build, tc, pool, object);
+    if build.rejection.kind != 0 { return 0; }
+    let reference: typecheck::TypeEntry = tc.types.entries[object_type - 1];
+    var base_type: u32 = object_type;
+    if reference.kind == 4 {
+        if reference.cap > 1 || (writing && reference.cap != 1) || !mir::valid_type(&tc.types:Read, reference.elem) { mir_builder::reject(build, 3, build.span); return 0; }
+        base_type = reference.elem;
+    }
+    let resolved: mir_lower_ops::MemberOffset = mir_lower_ops::resolve_member_offset(build, pool, tc, diags, data, base_type, writing)?;
+    if !resolved.ok { return 0; }
+    var object_local: u32 = 0;
+    var pointee: u64 = 0;
+    if reference.kind == 4 {
+        object_local = lower_expr(ctx, build, pool, tc, resolution, diags, object)?;
+        pointee = base_type as u64;
+    } elseif is_projection(pool, object) {
+        object_local = lower_projected_place(ctx, build, pool, tc, resolution, diags, object, writing)?;
+        pointee = base_type as u64;
+    } elseif writing { object_local = lower_write_place(ctx, build, pool, tc, resolution, diags, object)?; }
+    else {
+        object_local = mir_builder::bound_local_of(build, ctx, pool, resolution, object);
+        if object_local == 0 {
+            object_local = lower_expr(ctx, build, pool, tc, resolution, diags, object)?;
+            if build.hold_projection { mir_lower_ops::hold_owned_temp(&*ctx:Read, build, tc, object_local)?; }
+        }
+    }
+    if object_local == 0 || build.rejection.kind != 0 { return 0; }
+    return mir_builder::result_inst(ctx, build, 82, build.ptr_ty, object_local, resolved.offset as u32, (resolved.field as u64 << 32u64) | pointee)?;
+}
+
+// 显式借用可取可写定长数组槽；动态数组缓冲由所有权检查保护。
+function lower_slice(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, value_type_id: u32, explicit: bool): u32!AllocError {
+    let range: ast::SliceExpr = pool.slices[pool.exprs[expr].data as u32];
+    let base_type: u32 = mir_builder::checked_type(build, tc, pool, range.object);
+    if !mir::valid_type(&tc.types:Read, base_type) || !mir::is_slice_view(&tc.types:Read, value_type_id) { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    let array: typecheck::TypeEntry = tc.types.entries[base_type - 1];
+    if (array.kind != 7 && array.kind != 6 && array.kind != 5) || tc.types.entries[value_type_id - 1].elem != array.elem { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    let writable: bool = tc.types.entries[value_type_id - 1].cap == 1;
+    if array.kind == 5 && writable && array.cap != 1 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    var base: u32 = 0;
+    var pointee: u64 = 0;
+    if is_projection(pool, range.object) {
+        // 字段/索引/解引用投影上的切片：先取原地数组基址，再把目标数组类型编码进 value 高 32 位。
+        base = lower_projected_place(ctx, build, pool, tc, resolution, diags, range.object, writable)?;
+        if base == 0 || build.rejection.kind != 0 { return 0; }
+        pointee = base_type as u64;
+    } elseif array.kind == 5 {
+        // 已有切片视图的子切片：直接按值读取源切片局部，不要求其为可变槽位。
+        base = lower_expr(ctx, build, pool, tc, resolution, diags, range.object)?;
+        if base == 0 || build.rejection.kind != 0 { return 0; }
+    } else {
+        let ri: u32 = mir_builder::ref_index(&resolution.refs:Read, range.object);
+        if ri == 0 || resolution.refs.items[ri - 1].kind != 0 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+        let def: u32 = resolution.refs.items[ri - 1].x;
+        if def == 0 || def > @len(build.def_map) as u32 { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+        let entry: resolve::DefEntry = resolution.result.tables.defs[def - 1];
+        if (entry.kind != 7 && entry.kind != 8 && (entry.kind != 9 || (!explicit && array.kind != 6))) || (writable && entry.kind != 9) || entry.scope == 0 || !mir_lower_ops::scope_belongs_to(&resolution.result.tables:Read, entry.scope, ctx.def) { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+        base = build.def_map[def - 1];
+        if base == 0 || mir::local_type(ctx, base) != base_type { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+        let slot_kind: u8 = ctx.locals[base - 1].kind;
+        if (slot_kind != 0 && slot_kind != 2) || (writable && slot_kind != 2) { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+    }
+    let low: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, range.low)?;
+    let high: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, range.high)?;
+    build.needs_trap = true;
+    let result: u32 = mir_builder::result_inst(ctx, build, 130, value_type_id, base, low, (pointee << 32u64) | high as u64)?;
+    if result != 0 && array.kind == 6 { build.dyn_views[result - 1] = true; }
+    return result;
+}
+
+// 索引按布局步长取址；左值须从原位派生。
+function lower_index_addr(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, writing: bool): u32!AllocError {
+    let data: u32 = pool.exprs[expr].data as u32;
+    if data >= @len(pool.indices) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    let object: u32 = pool.indices[data].object;
+    let object_type: u32 = mir_builder::checked_type(build, tc, pool, object);
+    if build.rejection.kind != 0 { return 0; }
+    if !mir::valid_type(&tc.types:Read, object_type) { mir_builder::reject(build, 3, build.span); return 0; }
+    let reference: typecheck::TypeEntry = tc.types.entries[object_type - 1];
+    var base_type: u32 = object_type;
+    if reference.kind == 4 {
+        if reference.cap > 1 || (writing && reference.cap != 1) || !mir::valid_type(&tc.types:Read, reference.elem) { mir_builder::reject(build, 3, build.span); return 0; }
+        base_type = reference.elem;
+    }
+    let object_kind: u8 = tc.types.entries[base_type - 1].kind;
+    if object_kind != 7 && object_kind != 6 && !mir::is_slice_view(&tc.types:Read, base_type) { mir_builder::reject(build, 3, build.span); return 0; }
+    let index_type: u32 = mir_builder::checked_type(build, tc, pool, pool.indices[data].index);
+    if !mir::valid_type(&tc.types:Read, index_type) || tc.types.entries[index_type - 1].kind != 1 || tc.types.entries[index_type - 1].builtin < 4097 || tc.types.entries[index_type - 1].builtin > 4104 { mir_builder::reject(build, 3, build.span); return 0; }
+    let element: u32 = mir_lower_ops::element_type(&tc.types:Read, base_type);
+    if element == 0 { mir_builder::reject(build, 3, build.span); return 0; }
+    if writing && object_kind != 7 && object_kind != 6 && !(object_kind == 5 && tc.types.entries[base_type - 1].cap == 1) { mir_builder::reject(build, 3, build.span); return 0; }
+    var width: u64 = mir::layout_size(&build.layouts:Read, element);
+    if object_kind == 7 {
+        let count: u64 = tc.types.entries[base_type - 1].length;
+        if count == 0 { mir_builder::reject(build, 3, build.span); return 0; }
+        width = mir::layout_size(&build.layouts:Read, base_type) / count;
+    }
+    if width == 0 || width > 2147483647u64 { mir_builder::reject(build, 3, build.span); return 0; }
+    var object_local: u32 = 0;
+    var pointee: u64 = 0;
+    if reference.kind == 4 {
+        object_local = lower_expr(ctx, build, pool, tc, resolution, diags, object)?;
+        pointee = base_type as u64;
+    } elseif writing {
+        object_local = lower_write_place(ctx, build, pool, tc, resolution, diags, object)?;
+        if is_projection(pool, object) { pointee = base_type as u64; }
+    } elseif is_projection(pool, object) {
+        object_local = lower_projected_place(ctx, build, pool, tc, resolution, diags, object, false)?;
+        pointee = base_type as u64;
+    } else {
+        object_local = mir_builder::bound_local_of(build, ctx, pool, resolution, object);
+        if object_local == 0 {
+            object_local = lower_expr(ctx, build, pool, tc, resolution, diags, object)?;
+            if build.hold_projection { mir_lower_ops::hold_owned_temp(&*ctx:Read, build, tc, object_local)?; }
+        }
+    }
+    if object_local == 0 || build.rejection.kind != 0 { return 0; }
+    let index_local: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.indices[data].index)?;
+    if build.rejection.kind != 0 { return 0; }
+    build.needs_trap = true;
+    return mir_builder::result_inst(ctx, build, 83, build.ptr_ty, object_local, index_local, (pointee << 32u64) | width)?;
+}
+
+// 投影左值逐级取址；根必须是已登记的可写局部。
+export function is_projection(pool: &ast::AstPool:Read, expr: u32): bool {
+    return mir_lower_ops::is_projection(pool, expr);
+}
+
+// 普通引用槽已经存放目标地址；读取或写入时按引用目标类型核验。
+function lower_deref_addr(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, writing: bool): u32!AllocError {
+    let operand: u32 = pool.unaries[pool.exprs[expr].data as u32].operand;
+    let ty: u32 = mir_builder::checked_type(build, tc, pool, operand);
+    if !mir::valid_type(&tc.types:Read, ty) { return 0; }
+    let entry: typecheck::TypeEntry = tc.types.entries[ty - 1];
+    if entry.kind != 4 || entry.cap > 1 || (writing && entry.cap != 1) { mir_builder::reject(build, 3, build.span); return 0; }
+    return lower_expr(ctx, build, pool, tc, resolution, diags, operand)?;
+}
+
+function lower_projected_place(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, writing: bool): u32!AllocError {
+    let kind: u8 = pool.exprs[expr].kind;
+    if kind == 23 { return lower_member_addr(ctx, build, pool, tc, resolution, diags, expr, writing)?; }
+    if kind == 24 { return lower_index_addr(ctx, build, pool, tc, resolution, diags, expr, writing)?; }
+    return lower_deref_addr(ctx, build, pool, tc, resolution, diags, expr, writing)?;
+}
+
+export function lower_write_place(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32): u32!AllocError {
+    if is_projection(pool, expr) { return lower_projected_place(ctx, build, pool, tc, resolution, diags, expr, true)?; }
+    let place: u32 = mir_builder::place_local_of(build, ctx, pool, resolution, expr);
+    if place == 0 { mir_builder::reject(build, 2, build.span); }
+    return place;
+}
+
+export function refresh_write_addr(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, place: u32, first: u32, before: u32): u32!AllocError {
+    return mir_lower_ops::refresh_write_addr(ctx, build, tc, place, first, before)?;
+}
+
+// 结构体构造按源码顺序求值，随后按字段声明序排列结果。
+// 等所有初始器求值完成后再追加参数，避免嵌套表达式插入其他指令的参数。
+function lower_struct_ctor(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, value_type_id: u32): u32!AllocError {
+    let data: u32 = pool.exprs[expr].data as u32;
+    if data >= @len(pool.ctors) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    let count: u32 = mir_lower_ops::count_struct_fields(build, pool, tc, diags, data, value_type_id)?;
+    if count == 0 { return 0; }
+    var values: u32[] = [];
+    var f: u32 = 0;
+    while f < count { @push(values, 0)?; f = f + 1; }
+    f = 0;
+    while f < count {
+        let ordinal: u32 = tc.expr_types.ctors[data].fields[f];
+        if ordinal == 0 || ordinal > count || values[ordinal - 1] != 0 {
+            mir_lower_ops::reject_unbound_field(build, diags, pool.ctors[data].fields[f].span)?;
+            return 0;
+        }
+        let value: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.ctors[data].fields[f].value)?;
+        if build.rejection.kind != 0 { return 0; }
+        values[ordinal - 1] = value;
+        f = f + 1;
+    }
+    if @len(ctx.args) + @len(values) > 4294967295u64 { mir_builder::reject(build, 5, build.span); return 0; }
+    let start: u32 = @len(ctx.args) as u32;
+    f = 0;
+    while f < count { @push(ctx.args, values[f])?; f = f + 1; }
+    return mir_builder::result_inst_args(ctx, build, 96, value_type_id, start, count)?;
+}
+
+function lower_dyn_array_ctor(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, data: u32, value_type_id: u32, element: u32, count: u32, span: types::Span): u32!AllocError {
+    let stride: u64 = mir::layout_size(&build.layouts:Read, element);
+    let carrier_type: u32 = mir_lower_ops::array_push_type(&tc.types:Read);
+    if stride == 0 || stride > 4294967295u64 || carrier_type == 0 { mir_builder::reject(build, 3, span); return 0; }
+    let failure_type: u32 = tc.types.entries[carrier_type - 1].elem;
+    let depth: u32 = build.expression_depth;
+    let place: u32 = mir_builder::new_local(ctx, build, value_type_id, 2)?;
+    let empty: u32 = mir_builder::result_inst_args(ctx, build, 97, value_type_id, 0, 0)?;
+    mir_builder::store(ctx, build, place, empty)?;
+    if build.rejection.kind != 0 { return 0; }
+    if depth == @len(build.expression_temps) as u32 { @push(build.expression_temps, place)?; }
+    else { build.expression_temps[depth] = place; }
+    build.expression_depth = depth + 1;
+    var i: u32 = 0;
+    while i < count {
+        let elem: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.arrays[data].elements[i])?;
+        if build.rejection.kind != 0 { return 0; }
+        build.span = span;
+        if mir::local_type(ctx, elem) != element { mir_builder::reject(build, 3, span); return 0; }
+        let result: u32 = mir_lower_ops::emit_dyn_push(ctx, build, carrier_type, place, elem, stride)?;
+        let ok: u16 = mir_builder::new_block(ctx, build)?;
+        let err: u16 = mir_builder::new_block(ctx, build)?;
+        let failure: u32 = mir_builder::new_local(ctx, build, failure_type, 0)?;
+        if build.rejection.kind != 0 { return 0; }
+        ctx.blocks[err].payload = failure;
+        mir_builder::term(ctx, build, 162, result, ok as u32, err as u32);
+        build.current = err;
+        // 追加已消费本项；剩余本帧所有者由陷阱清理遍历处理。
+        mir_builder::term(ctx, build, 195, 0, 0, 0);
+        build.current = ok;
+        i = i + 1;
+    }
+    build.expression_depth = depth;
+    return mir_builder::result_inst(ctx, build, 112, value_type_id, place, 0, 0)?;
+}
+
+function lower_array_ctor(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, diags: &diag::DiagBuffer:ReadWrite, expr: u32, value_type_id: u32): u32!AllocError {
+    let data: u32 = pool.exprs[expr].data as u32;
+    if data >= @len(pool.arrays) as u32 { mir_builder::reject(build, 7, build.span); return 0; }
+    let element: u32 = mir_lower_ops::element_type(&tc.types:Read, value_type_id);
+    if element == 0 { mir_builder::reject(build, 3, build.span); return 0; }
+    let count: u32 = @len(pool.arrays[data].elements) as u32;
+    // 空字面量只对动态数组合法：生成 24 字节全零头（ptr/len/cap 均为 0）。
+    var type_kind: u8 = 0;
+    if value_type_id != 0 && value_type_id <= @len(tc.types.entries) as u32 { type_kind = tc.types.entries[value_type_id - 1].kind; }
+    if (count == 0 && type_kind != 6) || count > 4096 { mir_builder::reject(build, 3, build.span); return 0; }
+    if count != 0 && type_kind == 6 { return lower_dyn_array_ctor(ctx, build, pool, tc, resolution, diags, data, value_type_id, element, count, pool.exprs[expr].span)?; }
+    var values: u32[] = [];
+    var e: u32 = 0;
+    while e < count {
+        let value: u32 = lower_expr(ctx, build, pool, tc, resolution, diags, pool.arrays[data].elements[e])?;
+        if build.rejection.kind != 0 { return 0; }
+        @push(values, value)?;
+        e = e + 1;
+    }
+    if @len(ctx.args) + @len(values) > 4294967295u64 { mir_builder::reject(build, 5, build.span); return 0; }
+    let start: u32 = @len(ctx.args) as u32;
+    e = 0;
+    while e < count { @push(ctx.args, values[e])?; e = e + 1; }
+    return mir_builder::result_inst_args(ctx, build, 97, value_type_id, start, count)?;
+}

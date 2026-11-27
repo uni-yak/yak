@@ -1,0 +1,11 @@
+// expected_code: E6101
+// spec: spec/lang/base.md R-13
+// 触发：局部绑定声明 Write 通道（非 out 通道建立 Write）。
+function f(x: &u32): void {
+    let y: &u32:Write = x;
+    return;
+}
+
+function main(): void {
+    return;
+}

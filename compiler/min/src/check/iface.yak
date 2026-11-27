@@ -1,0 +1,546 @@
+// YKIF format 2 的公共数据、摘要、签名编码与身份排序。
+import types;
+import lextables;
+import diag;
+import resolve_refs;
+import typecheck;
+
+const IFACE_UNSUPPORTED: u16 = 7012;
+// 与接口签名解码器保持一致；种子解释器不支持跨模块常量引用。
+const SIGNATURE_DEPTH: u32 = 64;
+
+const TK_VOID: u8 = 0;
+const TK_BUILTIN: u8 = 1;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FN_REF: u8 = 8;
+const TK_FALLIBLE: u8 = 9;
+const TK_NULLABLE: u8 = 10;
+const TK_ERROR_SET: u8 = 11;
+
+export struct ByteSink { bytes: u8[] }
+export struct ExportMap { defs: u32[], exports: u32[] }
+
+export struct LoadedSummary { type_export_id: u32, size: u64, align: u8 }
+export struct LoadedEnumMember { enum_export_id: u32, name_off: u32, name_len: u16, variant_id: u16, flags: u16, payload_sig_off: u32, payload_sig_len: u32, name_hash: u64 }
+export struct LoadedEnumDescriptor { export_id: u32, member_start: u32, member_count: u32, summary_index: u32, request_align: u8 }
+export struct LoadedStructField { struct_export_id: u32, name_off: u32, name_len: u16, field_id: u16, type_sig_off: u32, type_sig_len: u32, name_hash: u64 }
+export struct LoadedStructDescriptor { export_id: u32, member_start: u32, member_count: u32, summary_index: u32, request_align: u8 }
+export struct NameIndexRecord { export_id: u32, member_id: u16 }
+export struct LoadedExport { name_off: u32, name_len: u16, kind: u8, flags: u8, export_id: u32, sig_off: u32, sig_len: u32, aux_off: u32, name_hash: u64 }
+// 未导出顶层声明的名称与种类；只用于把“未导出”与“不存在”区分开。
+export struct LoadedPrivate { name_off: u32, name_len: u16, kind: u8, name_hash: u64 }
+export struct LoadedDependency { name_off: u32, name_len: u16, digest: u8[] }
+export struct LoadedInterface { module_name: u8[], name_bytes: u8[], dependencies: LoadedDependency[], sig_bytes: u8[], exports: LoadedExport[], digest: u8[], summaries: LoadedSummary[], enum_descriptors: LoadedEnumDescriptor[], enum_members: LoadedEnumMember[], enum_name_index: NameIndexRecord[], struct_descriptors: LoadedStructDescriptor[], struct_fields: LoadedStructField[], struct_field_name_index: NameIndexRecord[], privates: LoadedPrivate[] }
+
+// 类型表形参与模块同名时，通过本地入口构造名义错误码。
+function iface_error(raw: u16): types::ErrorCode { return types::error_code(raw); }
+
+export function emit(diags: &diag::DiagBuffer:ReadWrite, code: types::ErrorCode): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: code, severity: 0, span: types::Span { file: 0, offset: 0, length: 0 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+export function emit_unsupported(diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    emit(diags, types::error_code(IFACE_UNSUPPORTED))?;
+    return;
+}
+function put_u8(sink: &ByteSink:ReadWrite, value: u8): void!AllocError { @push(sink.bytes, value)?; return; }
+function put_u16(sink: &ByteSink:ReadWrite, value: u16): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    return;
+}
+function put_u32(sink: &ByteSink:ReadWrite, value: u32): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 16) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 24) & 255) as u8)?;
+    return;
+}
+function put_u64(sink: &ByteSink:ReadWrite, value: u64): void!AllocError {
+    var i: u32 = 0;
+    while i < 8 { @push(sink.bytes, ((value >> ((i as u64) * 8)) & 255) as u8)?; i = i + 1; }
+    return;
+}
+// ── SHA-256 ──
+// 轮常量按规范顺序存放；压缩循环不为查表分配堆空间。
+const SHA_K: [u32; 64] = [
+    1116352408u32, 1899447441u32, 3049323471u32, 3921009573u32,
+    961987163u32, 1508970993u32, 2453635748u32, 2870763221u32,
+    3624381080u32, 310598401u32, 607225278u32, 1426881987u32,
+    1925078388u32, 2162078206u32, 2614888103u32, 3248222580u32,
+    3835390401u32, 4022224774u32, 264347078u32, 604807628u32,
+    770255983u32, 1249150122u32, 1555081692u32, 1996064986u32,
+    2554220882u32, 2821834349u32, 2952996808u32, 3210313671u32,
+    3336571891u32, 3584528711u32, 113926993u32, 338241895u32,
+    666307205u32, 773529912u32, 1294757372u32, 1396182291u32,
+    1695183700u32, 1986661051u32, 2177026350u32, 2456956037u32,
+    2730485921u32, 2820302411u32, 3259730800u32, 3345764771u32,
+    3516065817u32, 3600352804u32, 4094571909u32, 275423344u32,
+    430227734u32, 506948616u32, 659060556u32, 883997877u32,
+    958139571u32, 1322822218u32, 1537002063u32, 1747873779u32,
+    1955562222u32, 2024104815u32, 2227730452u32, 2361852424u32,
+    2428436474u32, 2756734187u32, 3204031479u32, 3329325298u32
+];
+export function sha256(data: &[u8]): u8[]!AllocError {
+    return sha256_words(data, 16)?;
+}
+// 容器摘要字段为首块内对齐的 32 字节。只清零对应消息字，不复制输入。
+export function sha256_zero_header_digest(data: &[u8], offset: u32): u8[]!AllocError {
+    if @len(data) < 64 || offset > 32 || offset % 4 != 0 { return []; }
+    return sha256_words(data, offset / 4)?;
+}
+function sha256_words(data: &[u8], zero_word: u32): u8[]!AllocError {
+    // 完整消息块直接读取，只为末尾余数和长度字段分配补位缓冲。
+    let size: u64 = @len(data);
+    let full_size: u64 = size - size % 64u64;
+    let original_bits: u64 = @wrap_mul(size, 8u64);
+    var tail: u8[] = [];
+    var source: u64 = full_size;
+    while source < size { @push(tail, data[source])?; source = source + 1; }
+    @push(tail, 128)?;
+    while @len(tail) % 64u64 != 56u64 { @push(tail, 0)?; }
+    var length_index: u32 = 8;
+    while length_index > 0 {
+        length_index = length_index - 1;
+        @push(tail, ((original_bits >> ((length_index as u64) * 8)) & 255) as u8)?;
+    }
+    var h0: u32 = 1779033703u32;
+    var h1: u32 = 3144134277u32;
+    var h2: u32 = 1013904242u32;
+    var h3: u32 = 2773480762u32;
+    var h4: u32 = 1359893119u32;
+    var h5: u32 = 2600822924u32;
+    var h6: u32 = 528734635u32;
+    var h7: u32 = 1541459225u32;
+    // 整次摘要重用同一张定长消息调度表，避免堆分配与逐项压入。
+    var w: [u32; 64] = [
+        0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32,
+        0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32,
+        0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32,
+        0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32
+    ];
+    let full_blocks: u64 = full_size / 64u64;
+    let blocks: u64 = full_blocks + @len(tail) / 64u64;
+    var block: u64 = 0;
+    while block < blocks {
+        var t: u32 = 0;
+        if block < full_blocks {
+            var base: u64 = block * 64u64;
+            while t < 16 {
+                w[t] = ((data[base] as u32) << 24) | ((data[base + 1] as u32) << 16) | ((data[base + 2] as u32) << 8) | (data[base + 3] as u32);
+                w[t + 1] = ((data[base + 4] as u32) << 24) | ((data[base + 5] as u32) << 16) | ((data[base + 6] as u32) << 8) | (data[base + 7] as u32);
+                w[t + 2] = ((data[base + 8] as u32) << 24) | ((data[base + 9] as u32) << 16) | ((data[base + 10] as u32) << 8) | (data[base + 11] as u32);
+                w[t + 3] = ((data[base + 12] as u32) << 24) | ((data[base + 13] as u32) << 16) | ((data[base + 14] as u32) << 8) | (data[base + 15] as u32);
+                t = t + 4;
+                base = base + 16;
+            }
+        } else {
+            var base: u64 = (block - full_blocks) * 64u64;
+            while t < 16 {
+                w[t] = ((tail[base] as u32) << 24) | ((tail[base + 1] as u32) << 16) | ((tail[base + 2] as u32) << 8) | (tail[base + 3] as u32);
+                w[t + 1] = ((tail[base + 4] as u32) << 24) | ((tail[base + 5] as u32) << 16) | ((tail[base + 6] as u32) << 8) | (tail[base + 7] as u32);
+                w[t + 2] = ((tail[base + 8] as u32) << 24) | ((tail[base + 9] as u32) << 16) | ((tail[base + 10] as u32) << 8) | (tail[base + 11] as u32);
+                w[t + 3] = ((tail[base + 12] as u32) << 24) | ((tail[base + 13] as u32) << 16) | ((tail[base + 14] as u32) << 8) | (tail[base + 15] as u32);
+                t = t + 4;
+                base = base + 16;
+            }
+        }
+        if block == 0 && zero_word != 16 {
+            var z: u32 = zero_word;
+            while z < zero_word + 8 { w[z] = 0; z = z + 1; }
+        }
+        // 每次扩展四个消息字，内联单次临时表达式以降低解释步数。
+        var previous: u32 = w[0];
+        while t < 64 {
+            let x0: u32 = w[t - 15];
+            let y0: u32 = w[t - 2];
+            let word0: u32 = @wrap_add(@wrap_add(@wrap_add(previous, ((x0 >> 7) | (x0 << 25)) ^ ((x0 >> 18) | (x0 << 14)) ^ (x0 >> 3)), w[t - 7]), ((y0 >> 17) | (y0 << 15)) ^ ((y0 >> 19) | (y0 << 13)) ^ (y0 >> 10));
+            w[t] = word0;
+            let x1: u32 = w[t - 14];
+            let y1: u32 = w[t - 1];
+            let word1: u32 = @wrap_add(@wrap_add(@wrap_add(x0, ((x1 >> 7) | (x1 << 25)) ^ ((x1 >> 18) | (x1 << 14)) ^ (x1 >> 3)), w[t - 6]), ((y1 >> 17) | (y1 << 15)) ^ ((y1 >> 19) | (y1 << 13)) ^ (y1 >> 10));
+            w[t + 1] = word1;
+            let x2: u32 = w[t - 13];
+            w[t + 2] = @wrap_add(@wrap_add(@wrap_add(x1, ((x2 >> 7) | (x2 << 25)) ^ ((x2 >> 18) | (x2 << 14)) ^ (x2 >> 3)), w[t - 5]), ((word0 >> 17) | (word0 << 15)) ^ ((word0 >> 19) | (word0 << 13)) ^ (word0 >> 10));
+            let x3: u32 = w[t - 12];
+            w[t + 3] = @wrap_add(@wrap_add(@wrap_add(x2, ((x3 >> 7) | (x3 << 25)) ^ ((x3 >> 18) | (x3 << 14)) ^ (x3 >> 3)), w[t - 4]), ((word1 >> 17) | (word1 << 15)) ^ ((word1 >> 19) | (word1 << 13)) ^ (word1 >> 10));
+            previous = x3;
+            t = t + 4;
+        }
+        var a: u32 = h0;
+        var b: u32 = h1;
+        var c: u32 = h2;
+        var d: u32 = h3;
+        var e: u32 = h4;
+        var f: u32 = h5;
+        var g: u32 = h6;
+        var h: u32 = h7;
+        var round: u32 = 0;
+        // 每轮仅更新两个状态字；八轮后变量自然归位，无需交换；逐轮递增 round 避免重复计算偏移。
+        while round < 64 {
+            let first0: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(h, ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7))), g ^ (e & (f ^ g))), SHA_K[round]), w[round]);
+            d = @wrap_add(d, first0);
+            h = @wrap_add(first0, @wrap_add(((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10)), (a & b) | (c & (a | b))));
+            round = round + 1;
+            let first1: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(g, ((d >> 6) | (d << 26)) ^ ((d >> 11) | (d << 21)) ^ ((d >> 25) | (d << 7))), f ^ (d & (e ^ f))), SHA_K[round]), w[round]);
+            c = @wrap_add(c, first1);
+            g = @wrap_add(first1, @wrap_add(((h >> 2) | (h << 30)) ^ ((h >> 13) | (h << 19)) ^ ((h >> 22) | (h << 10)), (h & a) | (b & (h | a))));
+            round = round + 1;
+            let first2: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(f, ((c >> 6) | (c << 26)) ^ ((c >> 11) | (c << 21)) ^ ((c >> 25) | (c << 7))), e ^ (c & (d ^ e))), SHA_K[round]), w[round]);
+            b = @wrap_add(b, first2);
+            f = @wrap_add(first2, @wrap_add(((g >> 2) | (g << 30)) ^ ((g >> 13) | (g << 19)) ^ ((g >> 22) | (g << 10)), (g & h) | (a & (g | h))));
+            round = round + 1;
+            let first3: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(e, ((b >> 6) | (b << 26)) ^ ((b >> 11) | (b << 21)) ^ ((b >> 25) | (b << 7))), d ^ (b & (c ^ d))), SHA_K[round]), w[round]);
+            a = @wrap_add(a, first3);
+            e = @wrap_add(first3, @wrap_add(((f >> 2) | (f << 30)) ^ ((f >> 13) | (f << 19)) ^ ((f >> 22) | (f << 10)), (f & g) | (h & (f | g))));
+            round = round + 1;
+            let first4: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(d, ((a >> 6) | (a << 26)) ^ ((a >> 11) | (a << 21)) ^ ((a >> 25) | (a << 7))), c ^ (a & (b ^ c))), SHA_K[round]), w[round]);
+            h = @wrap_add(h, first4);
+            d = @wrap_add(first4, @wrap_add(((e >> 2) | (e << 30)) ^ ((e >> 13) | (e << 19)) ^ ((e >> 22) | (e << 10)), (e & f) | (g & (e | f))));
+            round = round + 1;
+            let first5: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(c, ((h >> 6) | (h << 26)) ^ ((h >> 11) | (h << 21)) ^ ((h >> 25) | (h << 7))), b ^ (h & (a ^ b))), SHA_K[round]), w[round]);
+            g = @wrap_add(g, first5);
+            c = @wrap_add(first5, @wrap_add(((d >> 2) | (d << 30)) ^ ((d >> 13) | (d << 19)) ^ ((d >> 22) | (d << 10)), (d & e) | (f & (d | e))));
+            round = round + 1;
+            let first6: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(b, ((g >> 6) | (g << 26)) ^ ((g >> 11) | (g << 21)) ^ ((g >> 25) | (g << 7))), a ^ (g & (h ^ a))), SHA_K[round]), w[round]);
+            f = @wrap_add(f, first6);
+            b = @wrap_add(first6, @wrap_add(((c >> 2) | (c << 30)) ^ ((c >> 13) | (c << 19)) ^ ((c >> 22) | (c << 10)), (c & d) | (e & (c | d))));
+            round = round + 1;
+            let first7: u32 = @wrap_add(@wrap_add(@wrap_add(@wrap_add(a, ((f >> 6) | (f << 26)) ^ ((f >> 11) | (f << 21)) ^ ((f >> 25) | (f << 7))), h ^ (f & (g ^ h))), SHA_K[round]), w[round]);
+            e = @wrap_add(e, first7);
+            a = @wrap_add(first7, @wrap_add(((b >> 2) | (b << 30)) ^ ((b >> 13) | (b << 19)) ^ ((b >> 22) | (b << 10)), (b & c) | (d & (b | c))));
+            round = round + 1;
+        }
+        h0 = @wrap_add(h0, a);
+        h1 = @wrap_add(h1, b);
+        h2 = @wrap_add(h2, c);
+        h3 = @wrap_add(h3, d);
+        h4 = @wrap_add(h4, e);
+        h5 = @wrap_add(h5, f);
+        h6 = @wrap_add(h6, g);
+        h7 = @wrap_add(h7, h);
+        block = block + 1;
+    }
+    var digest: u8[] = [];
+    let values: [u32; 8] = [h0, h1, h2, h3, h4, h5, h6, h7];
+    var v: u32 = 0;
+    while v < 8 {
+        var shift: u32 = 4;
+        while shift > 0 {
+            shift = shift - 1;
+            @push(digest, ((values[v] >> (shift * 8)) & 255) as u8)?;
+        }
+        v = v + 1;
+    }
+    return digest;
+}
+// ── type_signatures ──
+// 按 DefId 查导出编号；0 表示该定义不是本模块导出项。
+export function export_id_of(map: &ExportMap:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(map.defs) as u32 {
+        if map.defs[i] == def { return map.exports[i]; }
+        i = i + 1;
+    }
+    return 0;
+}
+export function encode_type(types: &typecheck::TypeTable:Read, map: &ExportMap:Read, type_id: u32, sink: &ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, dependency_count: u32): void!AllocError {
+    let export_kinds: u32[] = [];
+    let loaded: LoadedInterface[] = [];
+    let order: u32[] = [];
+    encode_type_for(types, map, type_id, sink, diags, &export_kinds[0..0]:Read, &loaded[0..0]:Read, &order[0..0]:Read, dependency_count, false, 1)?;
+    return;
+}
+// 非空排名表示编码接口；此时 loaded 与 order 给出该接口的依赖身份，用于校验依赖名义目标。
+// 依赖名义编号沿用当前单元的内部依赖编号，消费方按模块名和摘要重映射到自己的编号。
+function nominal_target_known(loaded: &[LoadedInterface]:Read, order: &[u32]:Read, dep: u32, id: u32): bool {
+    if dep == 0 || dep as u64 > @len(order) || order[dep - 1] as u64 >= @len(loaded) { return false; }
+    let target: &LoadedInterface:Read = &loaded[order[dep - 1]]:Read;
+    if id == 0 || id as u64 > @len(target.exports) { return false; }
+    let item: LoadedExport = target.exports[id - 1];
+    // 加载器已拒绝泛型名义描述符；这里只接受连续编号的结构体或枚举。
+    return item.export_id == id && (item.kind == 2 || item.kind == 3);
+}
+// 成员存储的导入名义目标：必须是 struct/enum 且带正尺寸/对齐的布局摘要。
+function stored_nominal_known(loaded: &[LoadedInterface]:Read, order: &[u32]:Read, dep: u32, id: u32): bool {
+    if !nominal_target_known(loaded, order, dep, id) { return false; }
+    let target: &LoadedInterface:Read = &loaded[order[dep - 1]]:Read;
+    var i: u32 = 0;
+    while i < @len(target.summaries) as u32 {
+        if target.summaries[i].type_export_id == id && target.summaries[i].size > 0 && target.summaries[i].align > 0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+export function encode_type_for(types: &typecheck::TypeTable:Read, map: &ExportMap:Read, type_id: u32, sink: &ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, export_kinds: &[u32]:Read, loaded: &[LoadedInterface]:Read, order: &[u32]:Read, dependency_count: u32, stored_member: bool, depth: u32): void!AllocError {
+    encode_type_at(types, map, type_id, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, !stored_member, depth)?;
+    return;
+}
+function encode_type_at(types: &typecheck::TypeTable:Read, map: &ExportMap:Read, type_id: u32, sink: &ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, export_kinds: &[u32]:Read, loaded: &[LoadedInterface]:Read, order: &[u32]:Read, dependency_count: u32, stored_member: bool, allow_view: bool, depth: u32): void!AllocError {
+    if depth > SIGNATURE_DEPTH { emit(diags, iface_error(9001))?; return; }
+    if type_id == 0 || type_id > @len(types.entries) as u32 { emit_unsupported(diags)?; return; }
+    let kind: u8 = types.entries[type_id - 1].kind;
+    // 接口中的视图只允许出现在形参的直接类型位。
+    if !allow_view && (kind == TK_REF || kind == TK_SLICE) { emit(diags, iface_error(7011))?; return; }
+    if kind == TK_VOID {
+        put_u8(sink, 1)?;
+        put_u16(sink, 4107)?;
+        put_u16(sink, 0)?;
+    } elseif kind == TK_BUILTIN {
+        put_u8(sink, 1)?;
+        put_u16(sink, types.entries[type_id - 1].builtin)?;
+        put_u16(sink, 0)?;
+    } elseif kind == TK_LOCAL {
+        let export_id: u32 = export_id_of(map, types.entries[type_id - 1].def);
+        if export_id == 0 { emit(diags, iface_error(4008))?; return; }
+        put_u8(sink, 2)?;
+        put_u32(sink, export_id)?;
+        put_u16(sink, 0)?;
+    } elseif kind == TK_IMPORTED {
+        let dep: u16 = types.entries[type_id - 1].dep;
+        let export_id: u32 = types.entries[type_id - 1].export_id;
+        // YSM 只记录直接依赖；类型检查保留的传递编号不能写入产物。
+        if @len(export_kinds) == 0 && (dep == 0 || dep as u32 > dependency_count) { emit(diags, iface_error(7026))?; return; }
+        if dep == 0 || export_id == 0 { emit_unsupported(diags)?; return; }
+        // 接口编码必须能在已载入依赖里找到同名名义导出，否则消费方无法重映射到本地编号。
+        if @len(export_kinds) != 0 && !nominal_target_known(loaded, order, dep as u32, export_id) { emit_unsupported(diags)?; return; }
+        // 按值存储的外部名义类型必须提供布局摘要，消费方据此计算偏移。
+        if @len(export_kinds) != 0 && stored_member && !stored_nominal_known(loaded, order, dep as u32, export_id) { emit_unsupported(diags)?; return; }
+        put_u8(sink, 3)?;
+        put_u16(sink, dep)?;
+        put_u32(sink, export_id)?;
+        put_u16(sink, 0)?;
+    } elseif kind == TK_FIXED_ARRAY {
+        put_u8(sink, 5)?;
+        put_u64(sink, types.entries[type_id - 1].length)?;
+        encode_type_at(types, map, types.entries[type_id - 1].elem, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+    } elseif kind == TK_DYN_ARRAY {
+        put_u8(sink, 6)?;
+        encode_type_at(types, map, types.entries[type_id - 1].elem, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+    } elseif kind == TK_REF {
+        put_u8(sink, 7)?;
+        put_u8(sink, types.entries[type_id - 1].cap)?;
+        encode_type_at(types, map, types.entries[type_id - 1].elem, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+    } elseif kind == TK_SLICE {
+        put_u8(sink, 8)?;
+        put_u8(sink, types.entries[type_id - 1].cap)?;
+        encode_type_at(types, map, types.entries[type_id - 1].elem, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+    } elseif kind == TK_FN_REF {
+        // 格式中的形参数为 u16，不能截断内部计数。
+        if types.entries[type_id - 1].members_count > 65535 { emit(diags, iface_error(9001))?; return; }
+        let start: u32 = types.entries[type_id - 1].members_start;
+        let count: u32 = types.entries[type_id - 1].members_count;
+        let total: u32 = @len(types.members) as u32;
+        if start > total || count > total - start { emit_unsupported(diags)?; return; }
+        put_u8(sink, 9)?;
+        put_u16(sink, types.entries[type_id - 1].members_count as u16)?;
+        var i: u32 = 0;
+        while i < types.entries[type_id - 1].members_count {
+            encode_type_at(types, map, types.members[start + i], sink, diags, export_kinds, loaded, order, dependency_count, false, true, depth + 1)?;
+            i = i + 1;
+        }
+        encode_type_at(types, map, types.entries[type_id - 1].elem, sink, diags, export_kinds, loaded, order, dependency_count, false, false, depth + 1)?;
+    } elseif kind == TK_FALLIBLE {
+        put_u8(sink, 10)?;
+        encode_type_at(types, map, types.entries[type_id - 1].success, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+        let errorset: u32 = types.entries[type_id - 1].elem;
+        if errorset == 0 || errorset > @len(types.entries) as u32 { emit_unsupported(diags)?; return; }
+        let set: typecheck::TypeEntry = types.entries[errorset - 1];
+        let total: u32 = @len(types.members) as u32;
+        if set.kind != TK_ERROR_SET || set.members_count == 0 || set.members_count > 65536 || set.members_start > total || set.members_count > total - set.members_start { emit_unsupported(diags)?; return; }
+        let canonical: bool = @len(export_kinds) != 0;
+        let success_id: u32 = types.entries[type_id - 1].success;
+        var identities: u64[] = [];
+        var member_index: u32 = 0;
+        while member_index < set.members_count {
+            let id: u32 = types.members[set.members_start + member_index];
+            if id == 0 || id > @len(types.entries) as u32 { emit_unsupported(diags)?; return; }
+            let member: typecheck::TypeEntry = types.entries[id - 1];
+            if (member.kind == TK_BUILTIN && member.builtin != 4108) || (member.kind != TK_BUILTIN && member.kind != TK_LOCAL && member.kind != TK_IMPORTED) { emit_unsupported(diags)?; return; }
+            if success_id != 0 && success_id <= @len(types.entries) as u32 {
+                let success: typecheck::TypeEntry = types.entries[success_id - 1];
+                if (member.kind == TK_BUILTIN && success.kind == TK_BUILTIN && member.builtin == success.builtin) || (member.kind == TK_LOCAL && success.kind == TK_LOCAL && member.def == success.def) || (member.kind == TK_IMPORTED && success.kind == TK_IMPORTED && member.dep == success.dep && member.export_id == success.export_id) { emit_unsupported(diags)?; return; }
+            }
+            if canonical && member.kind == TK_LOCAL {
+                let id: u32 = export_id_of(map, member.def);
+                if id == 0 { emit(diags, iface_error(4008))?; return; }
+                if export_kinds[id] != 2 { emit_unsupported(diags)?; return; }
+            }
+            if canonical && member.kind == TK_IMPORTED {
+                if !nominal_target_known(loaded, order, member.dep as u32, member.export_id) || loaded[order[member.dep as u32 - 1]].exports[member.export_id - 1].kind != 2 { emit_unsupported(diags)?; return; }
+            }
+            // 两种产物均保留类型检查后的规范标签顺序；编号只用于检查重复身份。
+            var identity: u64 = (member.kind as u64) << 48;
+            if member.kind == TK_BUILTIN { identity = identity | member.builtin as u64; }
+            elseif member.kind == TK_LOCAL { identity = identity | member.def as u64; }
+            else { identity = identity | ((member.dep as u64) << 32) | member.export_id as u64; }
+
+            @push(identities, identity)?;
+            member_index = member_index + 1;
+        }
+        resolve_refs::sort_identity(&identities:ReadWrite);
+        var i: u32 = 1;
+        while i < set.members_count {
+            let left: u64 = identities[i - 1];
+            let right: u64 = identities[i];
+            if left == right { emit_unsupported(diags)?; return; }
+            i = i + 1;
+        }
+        put_u32(sink, set.members_count)?;
+        i = 0;
+        while i < set.members_count {
+            let id: u32 = types.members[set.members_start + i];
+            encode_type_at(types, map, id, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+            i = i + 1;
+        }
+    } elseif kind == TK_ERROR_SET {
+        // 独立错误集只允许出现在审计镜像的局部类型位；公开签名不得携带（fail closed）。
+        if @len(export_kinds) != 0 { emit_unsupported(diags)?; return; }
+        let set: typecheck::TypeEntry = types.entries[type_id - 1];
+        let count: u32 = set.members_count;
+        let total: u32 = @len(types.members) as u32;
+        if count == 0 || count > 65536 || set.members_start > total || count > total - set.members_start { emit_unsupported(diags)?; return; }
+        put_u8(sink, 13)?;
+        put_u32(sink, count)?;
+        var mi: u32 = 0;
+        while mi < count {
+            let id: u32 = types.members[set.members_start + mi];
+            if id == 0 || id > @len(types.entries) as u32 { emit_unsupported(diags)?; return; }
+            let member: typecheck::TypeEntry = types.entries[id - 1];
+            if (member.kind == TK_BUILTIN && member.builtin != 4108) || (member.kind != TK_BUILTIN && member.kind != TK_LOCAL && member.kind != TK_IMPORTED) { emit_unsupported(diags)?; return; }
+            encode_type_at(types, map, id, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+            mi = mi + 1;
+        }
+    } elseif kind == TK_NULLABLE {
+        put_u8(sink, 11)?;
+        encode_type_at(types, map, types.entries[type_id - 1].elem, sink, diags, export_kinds, loaded, order, dependency_count, stored_member, false, depth + 1)?;
+    } else {
+        emit_unsupported(diags)?;
+    }
+    return;
+}
+export function encode_function_signature(types: &typecheck::TypeTable:Read, funcs: &typecheck::FuncTable:Read, map: &ExportMap:Read, def: u32, sink: &ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, dependency_count: u32): void!AllocError {
+    let export_kinds: u32[] = [];
+    let loaded: LoadedInterface[] = [];
+    let order: u32[] = [];
+    encode_function_for(types, funcs, map, def, sink, diags, &export_kinds[0..0]:Read, &loaded[0..0]:Read, &order[0..0]:Read, dependency_count)?;
+    return;
+}
+export function encode_function_for(types: &typecheck::TypeTable:Read, funcs: &typecheck::FuncTable:Read, map: &ExportMap:Read, def: u32, sink: &ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, export_kinds: &[u32]:Read, loaded: &[LoadedInterface]:Read, order: &[u32]:Read, dependency_count: u32): void!AllocError {
+    var index: u32 = 0;
+    while index < @len(funcs.items) as u32 {
+        if funcs.items[index].def == def { break; }
+        index = index + 1;
+    }
+    if index >= @len(funcs.items) as u32 { emit_unsupported(diags)?; return; }
+    if @len(funcs.items[index].params) > 65535 { emit(diags, iface_error(9001))?; return; }
+    put_u16(sink, 0)?;
+    put_u16(sink, @len(funcs.items[index].params) as u16)?;
+    var p: u32 = 0;
+    while p < @len(funcs.items[index].params) as u32 {
+        encode_type_at(types, map, funcs.items[index].params[p], sink, diags, export_kinds, loaded, order, dependency_count, false, true, 1)?;
+        p = p + 1;
+    }
+    encode_type_at(types, map, funcs.items[index].ret, sink, diags, export_kinds, loaded, order, dependency_count, false, false, 1)?;
+    return;
+}
+
+export struct InterfaceResult { data: ByteSink, export_count: u32, digest: u8[] }
+export struct ExportInput { def: u32, name: u32, kind: u8 }
+export struct IndexPair { export_id: u32, member_id: u16, name: u32 }
+export struct IndexPairTable { items: IndexPair[] }
+export struct LayoutData { sizes: u64[], aligns: u8[], known: bool[] }
+// 负数、零、正数分别表示字节序小于、等于、大于。
+export function bytes_order(left: &[u8], right: &[u8]): i32 {
+    let ll: u32 = @len(left) as u32;
+    let rl: u32 = @len(right) as u32;
+    var i: u32 = 0;
+    while i < ll && i < rl {
+        if left[i] != right[i] { return left[i] as i32 - right[i] as i32; }
+        i = i + 1;
+    }
+    if ll < rl { return -1; }
+    if ll > rl { return 1; }
+    return 0;
+}
+export function export_key_less(lh: u64, left: &[u8], lk: u8, rh: u64, right: &[u8], rk: u8): bool {
+    if lh != rh { return lh < rh; }
+    let order: i32 = bytes_order(left, right);
+    return order < 0 || (order == 0 && lk < rk);
+}
+export function dependency_less(ld: &[u8], ln: &[u8], rd: &[u8], rn: &[u8]): bool {
+    let order: i32 = bytes_order(ld, rd);
+    return order < 0 || (order == 0 && bytes_order(ln, rn) < 0);
+}
+// 排序已校验的接口身份，只移动索引；次键使同名的不同摘要保持相邻。
+export function identity_order(loaded: &[LoadedInterface]:Read, order: &u32[]:ReadWrite, count: u32, by_name: bool): void!AllocError {
+    if count < 2 { return; }
+    var scratch: u32[] = [];
+    var i: u32 = 0;
+    while i < count { @push(scratch, 0u32)?; i = i + 1; }
+    var width: u32 = 1;
+    while width < count {
+        var start: u32 = 0;
+        while start < count {
+            var mid: u32 = count;
+            if width < count - start { mid = start + width; }
+            var end: u32 = count;
+            if width < count - mid { end = mid + width; }
+            var a: u32 = start;
+            var b: u32 = mid;
+            i = start;
+            while i < end {
+                var take_right: bool = a == mid;
+                if a < mid && b < end {
+                    let left: &LoadedInterface:Read = &loaded[order[a]]:Read;
+                    let right: &LoadedInterface:Read = &loaded[order[b]]:Read;
+                    let ln: &[u8] = &left.module_name[0..@len(left.module_name)]:Read;
+                    let rn: &[u8] = &right.module_name[0..@len(right.module_name)]:Read;
+                    if by_name { take_right = dependency_less(rn, &right.digest[0..32]:Read, ln, &left.digest[0..32]:Read); }
+                    else { take_right = dependency_less(&right.digest[0..32]:Read, rn, &left.digest[0..32]:Read, ln); }
+                }
+                if take_right { scratch[i] = order[b]; b = b + 1; }
+                else { scratch[i] = order[a]; a = a + 1; }
+                i = i + 1;
+            }
+            start = end;
+        }
+        i = 0;
+        while i < count { order[i] = scratch[i]; i = i + 1; }
+        if width >= count - width { break; }
+        width = width * 2;
+    }
+    return;
+}
+
+// 当前参考组件只支持 ASCII 标识符；按词法表排除保留字与占位字。
+export function valid_identifier(bytes: &[u8]): bool {
+    let size: u32 = @len(bytes) as u32;
+    if size == 0 || (size == 1 && bytes[0] == 95) { return false; }
+    var i: u32 = 0;
+    while i < size {
+        let b: u8 = bytes[i];
+        let letter: bool = b == 95 || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+        if !letter && (i == 0 || b < 48 || b > 57) { return false; }
+        i = i + 1;
+    }
+    return lextables::keyword(bytes, 0, size) == 255 && !lextables::reserved(bytes, 0, size);
+}
+export function valid_module_name(bytes: &[u8]): bool {
+    let size: u32 = @len(bytes) as u32;
+    var start: u32 = 0;
+    while start < size {
+        var end: u32 = start;
+        while end < size && bytes[end] != 58 { end = end + 1; }
+        if !valid_identifier(&bytes[start..end]:Read) { return false; }
+        if end == size { return true; }
+        if end + 2 >= size || bytes[end + 1] != 58 { return false; }
+        start = end + 2;
+    }
+    return false;
+}

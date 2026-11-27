@@ -1,0 +1,138 @@
+// JSON 字符串扫描与按需解码；起止偏移均是原始 UTF-8 字节位置。
+import utf8;
+
+struct Step { value: u32, width: u32 }
+export struct Decoded { ok: bool, data: u8[] }
+
+function invalid(): Step { return Step { value: 0, width: 0 }; }
+
+function hex(byte: u8): u32 {
+    if byte >= 48u8 && byte <= 57u8 { return (byte - 48u8) as u32; }
+    if byte >= 65u8 && byte <= 70u8 { return (byte - 65u8) as u32 + 10; }
+    if byte >= 97u8 && byte <= 102u8 { return (byte - 97u8) as u32 + 10; }
+    return 16;
+}
+
+function hex4(src: &[u8], pos: u32, end: u32): u32 {
+    if end - pos < 4 { return 65536; }
+    var i: u32 = 0;
+    var value: u32 = 0;
+    while i < 4 {
+        let digit: u32 = hex(src[pos + i]);
+        if digit == 16 { return 65536; }
+        value = value * 16 + digit;
+        i = i + 1;
+    }
+    return value;
+}
+
+function escaped(src: &[u8], pos: u32, end: u32): Step {
+    if end - pos < 2 { return invalid(); }
+    let byte: u8 = src[pos + 1];
+    if byte == 34u8 || byte == 47u8 || byte == 92u8 { return Step { value: byte as u32, width: 2 }; }
+    if byte == 98u8 { return Step { value: 8, width: 2 }; }
+    if byte == 102u8 { return Step { value: 12, width: 2 }; }
+    if byte == 110u8 { return Step { value: 10, width: 2 }; }
+    if byte == 114u8 { return Step { value: 13, width: 2 }; }
+    if byte == 116u8 { return Step { value: 9, width: 2 }; }
+    if byte != 117u8 { return invalid(); }
+    let first: u32 = hex4(src, pos + 2, end);
+    if first == 65536 || (first >= 56320 && first <= 57343) { return invalid(); }
+    if first < 55296 || first > 56319 { return Step { value: first, width: 6 }; }
+    if end - pos < 12 || src[pos + 6] != 92u8 || src[pos + 7] != 117u8 { return invalid(); }
+    let second: u32 = hex4(src, pos + 8, end);
+    if second < 56320 || second > 57343 { return invalid(); }
+    return Step { value: 65536 + (first - 55296) * 1024 + second - 56320, width: 12 };
+}
+
+// 不消费未转义引号；范围末端必须在合法标量边界。
+function step(src: &[u8], pos: u32, end: u32): Step {
+    let byte: u8 = src[pos];
+    if byte < 32u8 || byte == 34u8 { return invalid(); }
+    if byte == 92u8 { return escaped(src, pos, end); }
+    if byte < 128u8 { return Step { value: byte as u32, width: 1 }; }
+    let scalar: utf8::Scalar = utf8::decode(src, pos);
+    if scalar.width > end - pos { return invalid(); }
+    return Step { value: scalar.value, width: scalar.width };
+}
+
+// 成功时返回闭合引号之后的偏移；失败时返回传入的起点。
+export function scan(src: &[u8], start: u32, end: u32): u32 {
+    if start >= end || (end as u64) > @len(src) || src[start] != 34u8 { return start; }
+    var pos: u32 = start + 1;
+    while pos < end {
+        if src[pos] == 34u8 { return pos + 1; }
+        let item: Step = step(src, pos, end);
+        if item.width == 0 { return start; }
+        pos = pos + item.width;
+    }
+    return start;
+}
+
+function quoted(src: &[u8], start: u32, end: u32): bool {
+    return end > start && end - start >= 2 && (end as u64) <= @len(src)
+        && src[start] == 34u8 && src[end - 1] == 34u8;
+}
+
+// 不分配键的副本，比较字面或转义后的完整标量序列。
+export function equals(src: &[u8], start: u32, end: u32, text: &[u8]): bool {
+    if !quoted(src, start, end) || @len(text) > 33554432u64 { return false; }
+    var left: u32 = start + 1;
+    var right: u32 = 0;
+    let stop: u32 = end - 1;
+    let length: u32 = @len(text) as u32;
+    while left < stop && right < length {
+        let a: Step = step(src, left, stop);
+        let b: utf8::Scalar = utf8::decode(text, right);
+        if a.width == 0 || b.width == 0 || a.value != b.value { return false; }
+        left = left + a.width;
+        right = right + b.width;
+    }
+    return left == stop && right == length;
+}
+
+function width(value: u32): u32 {
+    if value < 128 { return 1; }
+    if value < 2048 { return 2; }
+    if value < 65536 { return 3; }
+    return 4;
+}
+
+function append(decoded: &Decoded:ReadWrite, value: u32, count: u32): void!AllocError {
+    if count == 1 { @push(decoded.data, value as u8)?; return; }
+    if count == 2 {
+        @push(decoded.data, (192 + value / 64) as u8)?;
+    } elseif count == 3 {
+        @push(decoded.data, (224 + value / 4096) as u8)?;
+    } else {
+        @push(decoded.data, (240 + value / 262144) as u8)?;
+        @push(decoded.data, (128 + value / 4096 % 64) as u8)?;
+    }
+    if count >= 3 { @push(decoded.data, (128 + value / 64 % 64) as u8)?; }
+    @push(decoded.data, (128 + value % 64) as u8)?;
+    return;
+}
+
+// 先核对解码长度，再分配；无效或过限时不返回部分字符串。
+export function decode(src: &[u8], start: u32, end: u32, limit: u32): Decoded!AllocError {
+    if !quoted(src, start, end) { return Decoded { ok: false, data: [] }; }
+    let stop: u32 = end - 1;
+    var pos: u32 = start + 1;
+    var size: u32 = 0;
+    while pos < stop {
+        let item: Step = step(src, pos, stop);
+        if item.width == 0 { return Decoded { ok: false, data: [] }; }
+        let n: u32 = width(item.value);
+        if n > limit - size { return Decoded { ok: false, data: [] }; }
+        size = size + n;
+        pos = pos + item.width;
+    }
+    var decoded: Decoded = Decoded { ok: true, data: [] };
+    pos = start + 1;
+    while pos < stop {
+        let item: Step = step(src, pos, stop);
+        append(&decoded:ReadWrite, item.value, width(item.value))?;
+        pos = pos + item.width;
+    }
+    return decoded;
+}

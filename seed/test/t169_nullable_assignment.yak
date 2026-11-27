@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { var a: u8? = null; a = 42; assert((a ?? 0) == 42); a = null; assert((a ?? 7) == 7); }

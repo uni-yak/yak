@@ -1,0 +1,6 @@
+// expected_code: E5810
+// spec: spec/lang/type/enum.md#EN-7
+// 触发：将只可在模式中作通配符的单独下划线声明为枚举标签。
+enum Bad { _, Good }
+
+function main(): void { return; }

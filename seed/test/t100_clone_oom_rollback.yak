@@ -1,0 +1,13 @@
+// t100: @clone OOM 触发回滚 → Err(AllocError) → ? 传播 → 顶层 trap（owner.md 5.4）
+// mem_limit: 245000
+// expected_trap: uncaught error propagation
+function main(): void {
+    var arr: u32[] = [];
+    var i: u32 = 0;
+    while i < 2000 {
+        @push(arr, i);
+        i = i + 1;
+    }
+    let v: u32[] = @clone(arr)?;
+    return;
+}

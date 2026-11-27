@@ -1,0 +1,686 @@
+// YSM 格式 4/5：序列化并用同一读侧校验编码后的指令流。格式 5 仅用于携带私有陷阱边。
+// TypeSig 和摘要复用接口模块，格式真源为 spec/ir/ysm.md。
+import types;
+import diag;
+import typecheck;
+import mir;
+import iface;
+import layout;
+import ysm;
+import ysm_validate;
+import ysm_write_sig;
+
+// header 常量（ysm.md 三）
+const YSM_MAGIC_0: u8 = 89;
+const YSM_MAGIC_1: u8 = 75;
+const YSM_MAGIC_2: u8 = 77;
+const YSM_MAGIC_3: u8 = 73;
+const YSM_VERSION: u16 = 4;
+// 带私有陷阱边的格式版本：模块存在任一非零 trap 边时改用该版本。
+const YSM_VERSION_TRAP_EDGES: u16 = 5;
+// 带扩展 TypeSig 与 drop 守卫的格式版本：模块含私有/传递名义或非零 drop 守卫时使用。
+const YSM_VERSION_TYPE_REFS: u16 = 6;
+const YSM_SECTION_SIZE: u32 = 16;
+const YSM_SECTION_COUNT: u16 = 7;
+const YSM_TABLE_OFFSET: u32 = 64;
+// 首个节的最小起点：header 与目录之后
+const YSM_FIRST_SECTION: u32 = 176;
+// header 内字段偏移
+const H_FLAGS: u32 = 6;
+const H_SECTION_COUNT: u32 = 8;
+const H_PROFILE: u32 = 10;
+const H_TABLE_OFFSET: u32 = 12;
+const H_FILE_SIZE: u32 = 16;
+const H_FUNCTION_COUNT: u32 = 20;
+const H_STATIC_COUNT: u32 = 24;
+const H_SHA256: u32 = 28;
+
+// 节 kind 取值（ysm.md 四）
+const SEC_TYPE_SIGS: u16 = 1;
+const SEC_STATICS: u16 = 2;
+const SEC_FUNCTIONS: u16 = 3;
+const SEC_LOCALS: u16 = 4;
+const SEC_BLOCKS: u16 = 5;
+const SEC_INSTS: u16 = 6;
+const SEC_DEPENDENCIES: u16 = 7;
+
+const E_Y4: u16 = 7026;
+const E_Y7: u16 = 7029;
+
+// 固定记录宽度（ysm.md 4.1–4.5）
+const DEPENDENCY_RECORD: u32 = 40;
+const DEPENDENCY_LIMIT: u32 = 65535;
+const STATIC_RECORD: u32 = 16;
+const DIGEST_SIZE: u32 = 32;
+// 无 trap_target 的哨兵值（ysm.md 4.3）
+const NO_TRAP_TARGET: u16 = 65535;
+
+// 终结指令 opcode（mir.md 4.13）
+const TERM_CARRIER_DISPATCH: u8 = 162;
+const TERM_ENUM_DISPATCH: u8 = 177;
+const TERM_BR: u8 = 192;
+const TERM_BRANCH: u8 = 193;
+const TERM_RET: u8 = 194;
+const TERM_TRAP: u8 = 195;
+const TERM_UNREACHABLE: u8 = 196;
+const TERM_EXIT: u8 = 197;
+
+// 指令字节形态（见 encode_inst 与 inst_size 的分支）
+const S_INVALID: u8 = 0;
+const S_INT: u8 = 1;
+const S_BOOL: u8 = 2;
+const S_STATIC: u8 = 3;
+const S_AB: u8 = 4;
+const S_A: u8 = 5;
+const S_A_SIG: u8 = 6;
+const S_STORE: u8 = 7;
+const S_DROP: u8 = 8;
+const S_FIELD: u8 = 9;
+const S_AGG: u8 = 10;
+const S_CALL: u8 = 11;
+const S_SLICE: u8 = 12;
+const S_ENUM: u8 = 13;
+// 聚合常量复制（mir.md 0x04）：result + static_index + byte_len，不编码 TypeSig，
+// 结果类型由 locals 节承载、条目类型由 statics 记录的 type_sig_off 承载。
+const S_CONST_AGG: u8 = 21;
+const S_DYN_PUSH: u8 = 22;
+const S_CLONE: u8 = 23;
+const S_FUNCTION_ADDR: u8 = 24;
+
+// ── 字节写出 ──
+
+function op_shape(op: u8): u8 {
+    return (ysm::op_info(op) & 31u16) as u8;
+}
+
+// ── 指令编码 ──
+
+// 写指令参数向量：count:u32 后随 count 个 LocalId。
+function put_locals(sink: &iface::ByteSink:ReadWrite, f: &mir::MirFunction:Read, start: u32, count: u32): void!AllocError {
+    ysm_write_sig::put_u32(sink, count)?;
+    var i: u32 = 0;
+    while i < count {
+        ysm_write_sig::put_u32(sink, f.args[start + i])?;
+        i = i + 1;
+    }
+    return;
+}
+// 调用指令的目标编码：形态由 opcode 决定（mir.md 4.10）。
+function put_call_target(sink: &iface::ByteSink:ReadWrite, inst: mir::MirInst): void!AllocError {
+    if mir::is_far_call(inst.op) { ysm_write_sig::put_u16(sink, inst.c as u16)?; ysm_write_sig::put_u32(sink, inst.b)?; return; }
+    if inst.op == 146 { ysm_write_sig::put_u16(sink, inst.b as u16)?; return; }
+    ysm_write_sig::put_u32(sink, inst.b)?;
+    return;
+}
+// 按 opcode 形态写一条普通指令；终结指令由 encode_terminator 负责。
+// 格式 5 下可陷阱指令额外携带私有清理块边，因此先写指令体再统一补后缀。
+function encode_inst(sink: &iface::ByteSink:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, f: &mir::MirFunction:Read, inst: mir::MirInst, ctx: &ysm_write_sig::SigCtx:ReadWrite, trap_edges: bool, extended: bool, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    encode_inst_body(sink, module, facts, f, inst, ctx, extended, diags)?;
+    // 指令体已失败时不再写边，错误由调用处统一收束。
+    if diags.has_error { return; }
+    if !trap_edges || !mir::has_trap_edge(inst.op) { return; }
+    // 序列化域宽是 u16：超出即显式拒绝，不得截断。
+    if inst.trap > 65535 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    ysm_write_sig::put_u16(sink, inst.trap as u16)?;
+    return;
+}
+// 指令体编码：按镜像格式逐形态写出操作数，不含陷阱边。
+function encode_inst_body(sink: &iface::ByteSink:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, f: &mir::MirFunction:Read, inst: mir::MirInst, ctx: &ysm_write_sig::SigCtx:ReadWrite, extended: bool, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    let shape: u8 = op_shape(inst.op);
+    if shape == S_INVALID || ysm::is_terminator(inst.op) { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    ysm_write_sig::put_u8(sink, inst.op)?;
+    if shape == S_INT { ysm_write_sig::put_u32(sink, inst.a)?; ysm_write_sig::put_u64(sink, inst.value)?; ysm_write_sig::put_u16(sink, inst.b as u16)?; return; }
+    if shape == S_BOOL { ysm_write_sig::put_u32(sink, inst.a)?; ysm_write_sig::put_u8(sink, (inst.value & 255) as u8)?; return; }
+    if shape == S_STATIC { ysm_write_sig::put_u32(sink, inst.a)?; ysm_write_sig::put_u32(sink, inst.b)?; return; }
+    if shape == S_FUNCTION_ADDR {
+        if inst.a == 0 || inst.b == 0 || inst.c > DEPENDENCY_LIMIT || inst.value != 0 || inst.args_count != 0 {
+            ysm::emit_code(diags, types::error_code(E_Y4))?; return;
+        }
+        ysm_write_sig::put_u32(sink, inst.a)?;
+        ysm_write_sig::put_u16(sink, inst.c as u16)?;
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        return;
+    }
+    if shape == S_CONST_AGG {
+        // 字节长度在 MIR 抽象层是 u64，序列化域宽是 u32：超界必须显式拒绝，不得截断。
+        if inst.value > 4294967295u64 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        ysm_write_sig::put_u32(sink, inst.a)?;
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        ysm_write_sig::put_u32(sink, inst.value as u32)?;
+        return;
+    }
+    if shape == S_AB { ysm_write_sig::put_u32(sink, inst.a)?; ysm_write_sig::put_u32(sink, inst.b)?; ysm_write_sig::put_u32(sink, inst.c)?; return; }
+    if shape == S_A { ysm_write_sig::put_u32(sink, inst.a)?; ysm_write_sig::put_u32(sink, inst.b)?; return; }
+    if shape == S_CLONE {
+        if inst.c != 0 || inst.value != 0 || inst.args_count != 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        ysm_write_sig::put_u32(sink, inst.a)?;
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        return;
+    }
+    if shape == S_A_SIG { encode_a_sig(sink, module, facts, inst, ctx, diags)?; return; }
+    if shape == S_STORE { ysm_write_sig::put_u32(sink, inst.b)?; ysm_write_sig::put_u32(sink, inst.c)?; return; }
+    if shape == S_DROP {
+        // drop：src 之后，format 6 追加可选 bool 守卫 LocalId；0 表示无守卫。
+        // 未被编码的字段必须先显式拒绝，避免把非法 MIR 静默写成“无该字段”的镜像。
+        if inst.a != 0 || inst.value != 0 || inst.args_count != 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        if inst.b == 0 || inst.b > @len(f.locals) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        if inst.c != 0 {
+            if inst.c > @len(f.locals) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+            if f.locals[inst.c - 1].kind != 2 || f.locals[inst.b - 1].kind == 3 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+            if !mir::is_bool(&module.types:Read, f.locals[inst.c - 1].value_type_id) { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        }
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        if extended {
+            ysm_write_sig::put_u32(sink, inst.c)?;
+        } elseif inst.c != 0 {
+            // 旧版本没有守卫字段；不能静默丢弃。
+            ysm::emit_code(diags, types::error_code(E_Y4))?;
+            return;
+        }
+        return;
+    }
+    if shape == S_FIELD {
+        let field: u32 = mir::projection_field(inst);
+        if field > 65535 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        ysm_write_sig::put_u32(sink, inst.a)?;
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        ysm_write_sig::put_u16(sink, field as u16)?;
+        return;
+    }
+    if shape == S_SLICE {
+        let high: u32 = inst.value as u32;
+        if high == 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        ysm_write_sig::put_u32(sink, inst.a)?;
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        ysm_write_sig::put_u32(sink, inst.c)?;
+        ysm_write_sig::put_u32(sink, high)?;
+        ysm_write_sig::put_u8(sink, 0)?;
+        return;
+    }
+    if shape == S_DYN_PUSH {
+        if inst.value == 0 || inst.value > 4294967295u64 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        ysm_write_sig::put_u32(sink, inst.a)?;
+        ysm_write_sig::put_u32(sink, inst.b)?;
+        ysm_write_sig::put_u32(sink, inst.c)?;
+        ysm_write_sig::put_u32(sink, inst.value as u32)?;
+        return;
+    }
+    if shape == S_AGG { encode_agg(sink, module, facts, f, inst, ctx, diags)?; return; }
+    if shape == S_CALL { encode_call(sink, f, inst, diags)?; return; }
+    if shape == S_ENUM { encode_enum(sink, module, facts, inst, ctx, diags)?; return; }
+    ysm::emit_code(diags, types::error_code(E_Y4))?;
+    return;
+}
+// result + 局部 + TypeSig：cast / load / carrier_ok / carrier_err / slot_decl。
+function encode_a_sig(sink: &iface::ByteSink:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, inst: mir::MirInst, ctx: &ysm_write_sig::SigCtx:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    ysm_write_sig::put_u32(sink, inst.a)?;
+    ysm_write_sig::put_u32(sink, inst.b)?;
+    var type_id: u32 = inst.c;
+    // carrier_ok / carrier_err 的 c 是错误集或成功类型；独立错误集在 TypeSig 中无编码，
+    // 因此这两类与 load / slot_decl 一样编码承载类型 inst.type，载荷类型可由其成功/错误位推出。
+    if inst.op == 80 || inst.op == 208 || inst.op == 160 || inst.op == 161 { type_id = inst.value_type_id; }
+    let offset: u32 = ysm_write_sig::sig_type(ctx, module, facts, type_id, diags)?;
+    ysm_write_sig::put_u32(sink, offset)?;
+    return;
+}
+// 聚合构造：result + 类型 sig + 元素向量。
+function encode_agg(sink: &iface::ByteSink:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, f: &mir::MirFunction:Read, inst: mir::MirInst, ctx: &ysm_write_sig::SigCtx:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    ysm_write_sig::put_u32(sink, inst.a)?;
+    let offset: u32 = ysm_write_sig::sig_type(ctx, module, facts, inst.value_type_id, diags)?;
+    ysm_write_sig::put_u32(sink, offset)?;
+    put_locals(sink, f, inst.args_start, inst.args_count)?;
+    return;
+}
+// 调用：可选结果 + 目标 + 参数向量。
+function encode_call(sink: &iface::ByteSink:ReadWrite, f: &mir::MirFunction:Read, inst: mir::MirInst, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    // MIR 槽位是 u32；必须在压成 u16 前拒绝，避免高位丢失后误指向有效依赖。
+    if mir::is_far_call(inst.op) && inst.c > DEPENDENCY_LIMIT { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    if (mir::is_indirect_call(inst.op) || inst.op == 149) && (inst.c != 0 || inst.value != 0) { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    var has_result: u8 = 0;
+    if inst.a != 0 { has_result = 1; }
+    ysm_write_sig::put_u8(sink, has_result)?;
+    if has_result == 1 { ysm_write_sig::put_u32(sink, inst.a)?; }
+    put_call_target(sink, inst)?;
+    put_locals(sink, f, inst.args_start, inst.args_count)?;
+    return;
+}
+// enum 构造：result + 类型 sig + 变体 + 可选 payload。
+function encode_enum(sink: &iface::ByteSink:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, inst: mir::MirInst, ctx: &ysm_write_sig::SigCtx:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    ysm_write_sig::put_u32(sink, inst.a)?;
+    let offset: u32 = ysm_write_sig::sig_type(ctx, module, facts, inst.value_type_id, diags)?;
+    ysm_write_sig::put_u32(sink, offset)?;
+    ysm_write_sig::put_u16(sink, inst.c as u16)?;
+    var has_payload: u8 = 0;
+    if inst.value != 0 { has_payload = 1; }
+    ysm_write_sig::put_u8(sink, has_payload)?;
+    if has_payload == 1 { ysm_write_sig::put_u32(sink, inst.value as u32)?; }
+    return;
+}
+// 终结指令编码（ysm.md 4.6）。
+function encode_terminator(sink: &iface::ByteSink:ReadWrite, term: mir::MirTerminator, arms: &mir::MirArm[]:Read, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    ysm_write_sig::put_u8(sink, term.op)?;
+    if term.op == TERM_BR { ysm_write_sig::put_u16(sink, term.b as u16)?; return; }
+    if term.op == TERM_BRANCH { ysm_write_sig::put_u32(sink, term.a)?; ysm_write_sig::put_u16(sink, term.b as u16)?; ysm_write_sig::put_u16(sink, term.c as u16)?; return; }
+    if term.op == TERM_RET {
+        var has_value: u8 = 0;
+        if term.a != 0 { has_value = 1; }
+        ysm_write_sig::put_u8(sink, has_value)?;
+        if has_value == 1 { ysm_write_sig::put_u32(sink, term.a)?; }
+        return;
+    }
+    if term.op == TERM_TRAP { ysm_write_sig::put_u8(sink, term.a as u8)?; return; }
+    if term.op == TERM_UNREACHABLE { return; }
+    if term.op == TERM_EXIT { ysm_write_sig::put_u32(sink, term.a)?; return; }
+    if term.op == TERM_CARRIER_DISPATCH { ysm_write_sig::put_u32(sink, term.a)?; ysm_write_sig::put_u16(sink, term.b as u16)?; ysm_write_sig::put_u16(sink, term.c as u16)?; return; }
+    if term.op == TERM_ENUM_DISPATCH {
+        // 形态见 ysm.md 4.13：src:u32、arm_count:u32、臂表 (variant:u16, block:u16)×N、has_default:u8。
+        if term.b > @len((*arms)) as u32 || term.c > @len((*arms)) as u32 - term.b { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        ysm_write_sig::put_u32(sink, term.a)?;
+        ysm_write_sig::put_u32(sink, term.c)?;
+        var i: u32 = 0;
+        while i < term.c {
+            ysm_write_sig::put_u16(sink, (*arms)[term.b + i].variant)?;
+            ysm_write_sig::put_u16(sink, (*arms)[term.b + i].block)?;
+            i = i + 1;
+        }
+        ysm_write_sig::put_u8(sink, 0)?;
+        return;
+    }
+    ysm::emit_code(diags, types::error_code(E_Y4))?;
+    return;
+}
+
+// ── 各节构建 ──
+
+// statics 节：记录表后紧跟 static_bytes 子节（ysm.md 4.2）。
+// 记录中的 byte_off 相对 static_bytes 子节起点。
+function build_statics(stats: &[ysm::YsmStatic], ctx: &ysm_write_sig::SigCtx:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, data: &iface::ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var bytes: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var table: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var i: u32 = 0;
+    while i < @len(stats) as u32 {
+        let sig_off: u32 = ysm_write_sig::sig_type(ctx, module, facts, stats[i].type_sig, diags)?;
+        if diags.has_error { return; }
+        let byte_off: u32 = @len(bytes.bytes) as u32;
+        ysm_write_sig::put_u32(&table:ReadWrite, i)?;
+        ysm_write_sig::put_u32(&table:ReadWrite, sig_off)?;
+        ysm_write_sig::put_u32(&table:ReadWrite, byte_off)?;
+        ysm_write_sig::put_u32(&table:ReadWrite, @len(stats[i].bytes) as u32)?;
+        ysm_write_sig::put_bytes(&bytes:ReadWrite, &stats[i].bytes[0..@len(stats[i].bytes) as u32]:Read)?;
+        i = i + 1;
+    }
+    ysm_write_sig::put_bytes(data, &table.bytes[0..@len(table.bytes) as u32]:Read)?;
+    ysm_write_sig::put_bytes(data, &bytes.bytes[0..@len(bytes.bytes) as u32]:Read)?;
+    return;
+}
+
+// functions / locals / blocks / insts 四节同源构建，保证索引一致。
+struct MirSections {
+    functions: iface::ByteSink,
+    locals: iface::ByteSink,
+    blocks: iface::ByteSink,
+    insts: iface::ByteSink,
+    function_count: u32,
+    local_count: u32,
+    block_count: u32,
+    inst_count: u32,
+}
+function mirsections_new(): MirSections {
+    return MirSections {
+        functions: iface::ByteSink { bytes: [] },
+        locals: iface::ByteSink { bytes: [] },
+        blocks: iface::ByteSink { bytes: [] },
+        insts: iface::ByteSink { bytes: [] },
+        function_count: 0,
+        local_count: 0,
+        block_count: 0,
+        inst_count: 0,
+    };
+}
+function build_mir(sections: &MirSections:ReadWrite, module: &mir::MirModule:Read, layouts: &layout::LayoutTable:ReadWrite, facts: &ysm::YsmFacts:Read, ctx: &ysm_write_sig::SigCtx:ReadWrite, trap_edges: bool, extended: bool, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var fi: u32 = 0;
+    while fi < @len(module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &module.functions[fi]:Read;
+        let sig_off: u32 = ysm_write_sig::sig_function(ctx, module, facts, f.def, diags)?;
+        if diags.has_error { return; }
+        let local_start: u32 = sections.local_count;
+        build_locals(sections, module, layouts, facts, f, ctx, diags)?;
+        if diags.has_error { return; }
+        let block_start: u32 = sections.block_count;
+        build_blocks(sections, module, facts, f, ctx, trap_edges, extended, diags)?;
+        if diags.has_error { return; }
+        let local_count: u32 = sections.local_count - local_start;
+        let block_count: u32 = sections.block_count - block_start;
+        ysm_write_sig::put_u32(&sections.functions:ReadWrite, f.def)?;
+        ysm_write_sig::put_u32(&sections.functions:ReadWrite, sig_off)?;
+        ysm_write_sig::put_u32(&sections.functions:ReadWrite, local_start)?;
+        ysm_write_sig::put_u32(&sections.functions:ReadWrite, local_count)?;
+        ysm_write_sig::put_u32(&sections.functions:ReadWrite, block_start)?;
+        ysm_write_sig::put_u32(&sections.functions:ReadWrite, block_count)?;
+        ysm_write_sig::put_u16(&sections.functions:ReadWrite, f.entry)?;
+        ysm_write_sig::put_u16(&sections.functions:ReadWrite, function_trap(f))?;
+        ysm_write_sig::put_u16(&sections.functions:ReadWrite, function_flags(f))?;
+        ysm_write_sig::put_u16(&sections.functions:ReadWrite, 0)?;
+        sections.function_count = sections.function_count + 1;
+        fi = fi + 1;
+    }
+    return;
+}
+// 模块是否携带私有陷阱边：任一指令的 trap 非零即需要格式 5。
+function module_has_trap_edges(module: &mir::MirModule:Read): bool {
+    var fi: u32 = 0;
+    while fi < @len(module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &module.functions[fi]:Read;
+        var ii: u32 = 0;
+        while ii < @len(f.insts) as u32 {
+            if f.insts[ii].trap != 0 { return true; }
+            ii = ii + 1;
+        }
+        fi = fi + 1;
+    }
+    return false;
+}
+function function_trap(f: &mir::MirFunction:Read): u16 {
+    if !f.has_trap_target { return NO_TRAP_TARGET; }
+    return f.trap_target;
+}
+// flags：bit0=declared_no_alloc、bit1=no_alloc（ysm.md 4.3）。
+function function_flags(f: &mir::MirFunction:Read): u16 {
+    var flags: u16 = 0;
+    if f.declared_no_alloc { flags = flags | 1; }
+    if f.no_alloc { flags = flags | 2; }
+    return flags;
+}
+function build_locals(sections: &MirSections:ReadWrite, module: &mir::MirModule:Read, layouts: &layout::LayoutTable:ReadWrite, facts: &ysm::YsmFacts:Read, f: &mir::MirFunction:Read, ctx: &ysm_write_sig::SigCtx:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var projected: u32[] = [];
+    var caps: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(f.locals) as u32 { @push(projected, 0)?; @push(caps, 0)?; i = i + 1; }
+    i = 0;
+    while i < @len(f.insts) as u32 {
+        let inst: mir::MirInst = f.insts[i];
+        let projection: bool = inst.op == 82 || inst.op == 83;
+        let writing: bool = inst.op == 81 || inst.op == 129 || inst.op == 178;
+        if projection || writing {
+            if inst.b == 0 || inst.b > @len(f.locals) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+            if writing { caps[inst.b - 1] = 1; }
+            if projection {
+                if inst.a == 0 || inst.a > @len(f.locals) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+                var base: u32 = mir::projection_base(inst);
+                if base == 0 { base = f.locals[inst.b - 1].value_type_id; }
+                // 只按需计算本地字段布局，未使用的类型不参与编码校验。
+                if inst.op == 82 && base > 0 && base <= @len(module.types.entries) as u32 {
+                    let entry: typecheck::TypeEntry = module.types.entries[base - 1];
+                    let field: u32 = mir::projection_field(inst);
+                    if entry.kind == 2 && entry.def != 0 && field <= 65535 {
+                        let offset: u64 = layout::field_byte_offset_with_cache(&module.types:Read, &module.fields:Read, &module.enums:Read, &module.imported_layouts:Read, &module.imported_enums:Read, layouts, entry.def, field)?;
+                        if offset >= 4294967295u64 || offset != inst.c as u64 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+                    }
+                }
+                let pointee: u32 = mir::projection_pointee_with_layout(module, &*layouts:Read, base, inst);
+                if pointee == 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+                projected[inst.a - 1] = pointee;
+            }
+        }
+        i = i + 1;
+    }
+    // 从实际写入处向投影根回传能力，不把只读间接基址冒充成可写引用。
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        i = @len(f.insts) as u32;
+        while i > 0 {
+            i = i - 1;
+            let inst: mir::MirInst = f.insts[i];
+            if (inst.op == 82 || inst.op == 83) && caps[inst.a - 1] == 1 && caps[inst.b - 1] == 0 {
+                caps[inst.b - 1] = 1;
+                changed = true;
+            }
+        }
+    }
+    i = 0;
+    while i < @len(f.locals) as u32 {
+        let rec: mir::MirLocal = f.locals[i];
+        var sig_off: u32 = 0;
+        if projected[i] == 0 { sig_off = ysm_write_sig::sig_type(ctx, module, facts, rec.value_type_id, diags)?; }
+        else { sig_off = ysm_write_sig::sig_projection(ctx, module, facts, projected[i], caps[i], diags)?; }
+        if diags.has_error { return; }
+        ysm_write_sig::put_u32(&sections.locals:ReadWrite, sig_off)?;
+        ysm_write_sig::put_u8(&sections.locals:ReadWrite, rec.kind)?;
+        ysm_write_sig::put_u8(&sections.locals:ReadWrite, rec.state)?;
+        ysm_write_sig::put_u16(&sections.locals:ReadWrite, 0)?;
+        ysm_write_sig::put_padding(&sections.locals:ReadWrite)?;
+        sections.local_count = sections.local_count + 1;
+        i = i + 1;
+    }
+    return;
+}
+function build_blocks(sections: &MirSections:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, f: &mir::MirFunction:Read, ctx: &ysm_write_sig::SigCtx:ReadWrite, trap_edges: bool, extended: bool, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(f.blocks) as u32 {
+        let b: mir::MirBlock = f.blocks[i];
+        let inst_off: u32 = @len(sections.insts.bytes) as u32;
+        build_block_insts(sections, module, facts, f, b, ctx, trap_edges, extended, diags)?;
+        if diags.has_error { return; }
+        ysm_write_sig::put_u16(&sections.blocks:ReadWrite, b.id)?;
+        ysm_write_sig::put_u32(&sections.blocks:ReadWrite, b.inst_count)?;
+        ysm_write_sig::put_u32(&sections.blocks:ReadWrite, inst_off)?;
+        ysm_write_sig::put_u8(&sections.blocks:ReadWrite, b.terminator.op)?;
+        // format 4：偏移 11 保留 1 字节 0，12..16 为臂载荷 LocalId，16..24 为零填充。
+        ysm_write_sig::put_u8(&sections.blocks:ReadWrite, 0)?;
+        ysm_write_sig::put_u32(&sections.blocks:ReadWrite, b.payload)?;
+        ysm_write_sig::put_padding(&sections.blocks:ReadWrite)?;
+        sections.block_count = sections.block_count + 1;
+        i = i + 1;
+    }
+    return;
+}
+function build_block_insts(sections: &MirSections:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, f: &mir::MirFunction:Read, b: mir::MirBlock, ctx: &ysm_write_sig::SigCtx:ReadWrite, trap_edges: bool, extended: bool, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    if b.inst_start > @len(f.insts) as u32 || b.inst_count > @len(f.insts) as u32 - b.inst_start {
+        ysm::emit_code(diags, types::error_code(E_Y4))?;
+        return;
+    }
+    var j: u32 = 0;
+    while j < b.inst_count {
+        let inst: mir::MirInst = f.insts[b.inst_start + j];
+        encode_inst(&sections.insts:ReadWrite, module, facts, f, inst, ctx, trap_edges, extended, diags)?;
+        if diags.has_error { return; }
+        sections.inst_count = sections.inst_count + 1;
+        j = j + 1;
+    }
+    encode_terminator(&sections.insts:ReadWrite, b.terminator, &f.arms:Read, diags)?;
+    sections.inst_count = sections.inst_count + 1;
+    return;
+}
+
+// dependencies 节：40 字节定长记录，按 dependency_id 严格连续升序（ysm.md 4.1）。
+function build_dependencies(data: &iface::ByteSink:ReadWrite, deps: &[ysm::YsmDependency], diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(deps) as u32 {
+        if deps[i].dependency_id as u32 != i + 1 { ysm::emit_code(diags, types::error_code(E_Y7))?; return; }
+        if @len(deps[i].interface_digest) as u32 != DIGEST_SIZE { ysm::emit_code(diags, types::error_code(E_Y7))?; return; }
+        ysm_write_sig::put_u16(data, deps[i].dependency_id)?;
+        ysm_write_sig::put_u16(data, 0)?;
+        ysm_write_sig::put_bytes(data, &deps[i].interface_digest[0..@len(deps[i].interface_digest) as u32]:Read)?;
+        ysm_write_sig::put_u32(data, 0)?;
+        i = i + 1;
+    }
+    return;
+}
+
+// ── 总装 ──
+
+// 目录项字段偏移（节目录自 YSM_TABLE_OFFSET 起，每项 16 字节）。
+function dir_offset(index: u32, field: u32): u32 {
+    return YSM_TABLE_OFFSET + index * YSM_SECTION_SIZE + field;
+}
+// 写入一条目录项；offset 相对文件起点。
+function set_dir(buf: &u8[]:ReadWrite, index: u32, kind: u16, offset: u32, length: u32, count: u32): void {
+    ysm_write_sig::set_u16(buf, dir_offset(index, 0), kind);
+    ysm_write_sig::set_u16(buf, dir_offset(index, 2), 0);
+    ysm_write_sig::set_u32(buf, dir_offset(index, 4), offset);
+    ysm_write_sig::set_u32(buf, dir_offset(index, 8), length);
+    ysm_write_sig::set_u32(buf, dir_offset(index, 12), count);
+    return;
+}
+// 追加一个节，并把目录项写入预留的目录区。
+function append_section(buf: &u8[]:ReadWrite, index: u32, kind: u16, data: &[u8], count: u32): void!AllocError {
+    let offset: u32 = @len(*buf) as u32;
+    let size: u32 = @len(data) as u32;
+    set_dir(buf, index, kind, offset, size, count);
+    // 每组八字节只检查一次尾界；剩余字节仍保持原顺序追加。
+    let full: u32 = size - size % 8;
+    var i: u32 = 0;
+    while i < full {
+        @push(*buf, data[i])?;
+        @push(*buf, data[i + 1])?;
+        @push(*buf, data[i + 2])?;
+        @push(*buf, data[i + 3])?;
+        @push(*buf, data[i + 4])?;
+        @push(*buf, data[i + 5])?;
+        @push(*buf, data[i + 6])?;
+        @push(*buf, data[i + 7])?;
+        i = i + 8;
+    }
+    while i < size { @push(*buf, data[i])?; i = i + 1; }
+    return;
+}
+
+// 合并静态池：MIR 模块自身的 const_bytes 静态池在前，调用方补充的条目在后。
+// 这样 static_index 的顺序与 MIR 指令中的索引一致，反序列化可按索引逐条还原。
+function collect_statics(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, diags: &diag::DiagBuffer:ReadWrite): ysm::YsmStatic[]!AllocError {
+    var entries: ysm::YsmStatic[] = [];
+    var i: u32 = 0;
+    while i < @len(module.statics) as u32 {
+        let entry: mir::MirStatic = module.statics[i];
+        if entry.offset > @len(module.static_bytes) as u32 || entry.length > @len(module.static_bytes) as u32 - entry.offset {
+            ysm::emit_code(diags, types::error_code(E_Y4))?;
+            return entries;
+        }
+        var bytes: u8[] = [];
+        var j: u32 = 0;
+        while j < entry.length {
+            @push(bytes, module.static_bytes[entry.offset + j])?;
+            j = j + 1;
+        }
+        @push(entries, ysm::YsmStatic { type_sig: entry.value_type_id, bytes: @move(bytes) })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(facts.statics) as u32 {
+        @push(entries, ysm::YsmStatic { type_sig: facts.statics[i].type_sig, bytes: ysm::copy_bytes(&facts.statics[i].bytes[0..@len(facts.statics[i].bytes) as u32]:Read) })?;
+        i = i + 1;
+    }
+    return entries;
+}
+
+// 由写侧的原始节字节流重建最小文件结构，供 validate_inst_stream 逐指令扫描：
+// 校验对象是真正写出的字节，而不是内存里的 MIR 结构。各节起点为 0，
+// 与 build_blocks 的 inst_off、build_statics 的 byte_off、functions 的 local_start 口径一致。
+function self_file(mirs: &MirSections:Read, combined_len: u32, statics: &[u8], deps: &[u8], type_sigs: &[u8]): ysm::YsmFile!AllocError {
+    let dep_len: u32 = @len(deps) as u32;
+    let dep_section: ysm::YsmSection = ysm::YsmSection { kind: SEC_DEPENDENCIES, flags: 0, offset: 0, length: dep_len, count: dep_len / DEPENDENCY_RECORD };
+    var stats_section: ysm::YsmSection = ysm::YsmSection { kind: SEC_STATICS, flags: 0, offset: 0, length: @len(statics) as u32, count: combined_len };
+    var funcs_section: ysm::YsmSection = ysm::YsmSection { kind: SEC_FUNCTIONS, flags: 0, offset: 0, length: @len(mirs.functions.bytes) as u32, count: mirs.function_count };
+    var locals_section: ysm::YsmSection = ysm::YsmSection { kind: SEC_LOCALS, flags: 0, offset: 0, length: @len(mirs.locals.bytes) as u32, count: mirs.local_count };
+    var blocks_section: ysm::YsmSection = ysm::YsmSection { kind: SEC_BLOCKS, flags: 0, offset: 0, length: @len(mirs.blocks.bytes) as u32, count: mirs.block_count };
+    var records: ysm::YsmStaticRecord[] = ysm::parse_statics(&statics[0..@len(statics) as u32]:Read, stats_section)?;
+    var pool: u8[] = [];
+    var p: u32 = combined_len * STATIC_RECORD;
+    while p < @len(statics) as u32 { @push(pool, statics[p])?; p = p + 1; }
+    return ysm::YsmFile {
+        header: ysm::YsmHeader {
+            magic0: 0, magic1: 0, magic2: 0, magic3: 0,
+            version: 0, flags: 0, section_count: 0, target_profile: 0,
+            section_table_offset: 0, file_size: 0, function_count: 0, static_count: 0,
+            sha256: [], reserved1: [],
+        },
+        sections: [],
+        type_sigs: ysm::copy_bytes(type_sigs),
+        static_bytes: @move(pool), statics: @move(records),
+        functions: ysm::parse_functions(&mirs.functions.bytes[0..@len(mirs.functions.bytes) as u32]:Read, funcs_section)?,
+        locals: ysm::parse_locals(&mirs.locals.bytes[0..@len(mirs.locals.bytes) as u32]:Read, locals_section)?,
+        blocks: ysm::parse_blocks(&mirs.blocks.bytes[0..@len(mirs.blocks.bytes) as u32]:Read, blocks_section)?,
+        insts: [],
+        dependencies: ysm::parse_dependencies(deps, dep_section)?, inst_total: mirs.inst_count,
+    };
+}
+
+// 序列化入口：成功时 data 为完整 .ysm 字节，失败时 accepted=false 且 code 为拒绝码。
+export function write_module(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, diags: &diag::DiagBuffer:ReadWrite): ysm::YsmResult!AllocError {
+    let before: u32 = diags.count;
+    if @len(facts.dependencies) > DEPENDENCY_LIMIT as u64 {
+        ysm::emit_code(diags, types::error_code(E_Y7))?;
+        return failed(diags, before);
+    }
+    var buf: u8[] = [];
+    var z: u32 = 0;
+    while z < YSM_FIRST_SECTION {
+        @push(buf, 0)?;
+        z = z + 1;
+    }
+    var ctx: ysm_write_sig::SigCtx = ysm_write_sig::sigctx_new();
+    var mirs: MirSections = mirsections_new();
+    var layouts: layout::LayoutTable = layout::LayoutTable { items: [], states: [], field_order: 0 };
+    // 无私有陷阱边且无扩展类型/守卫时保持格式 4；有扩展形态时升到格式 6。
+    let extended: bool = ysm_write_sig::module_needs_extended(module, facts);
+    // 格式 6 也逐条保留陷阱边后缀；没有私有目标时写零。
+    let trap_edges: bool = extended || module_has_trap_edges(module);
+    build_mir(&mirs:ReadWrite, module, &layouts:ReadWrite, facts, &ctx:ReadWrite, trap_edges, extended, diags)?;
+    if diags.has_error { return failed(diags, before); }
+    var statics: iface::ByteSink = iface::ByteSink { bytes: [] };
+    let combined: ysm::YsmStatic[] = collect_statics(module, facts, diags)?;
+    if diags.has_error { return failed(diags, before); }
+    build_statics(&combined[0..@len(combined) as u32]:Read, &ctx:ReadWrite, module, facts, &statics:ReadWrite, diags)?;
+    if diags.has_error { return failed(diags, before); }
+    var deps: iface::ByteSink = iface::ByteSink { bytes: [] };
+    build_dependencies(&deps:ReadWrite, &facts.dependencies[0..@len(facts.dependencies) as u32]:Read, diags)?;
+    if diags.has_error { return failed(diags, before); }
+    // 自校验使用编码后的指令和对应记录，而非 MIR 或调用方事实的替代视图。
+    let self_view: ysm::YsmFile = self_file(&mirs:Read, @len(combined) as u32, &statics.bytes[0..@len(statics.bytes) as u32]:Read, &deps.bytes[0..@len(deps.bytes) as u32]:Read, &ctx.sink.bytes[0..@len(ctx.sink.bytes)]:Read)?;
+    if ysm_validate::validate_inst_bytes_v6(&self_view:Read, &mirs.insts.bytes[0..@len(mirs.insts.bytes)]:Read, trap_edges, extended, diags)? != 0 { return failed(diags, before); }
+    append_section(&buf:ReadWrite, 0, SEC_TYPE_SIGS, &ctx.sink.bytes[0..@len(ctx.sink.bytes) as u32]:Read, (@len(ctx.type_keys) + @len(ctx.ref_keys)) as u32)?;
+    append_section(&buf:ReadWrite, 1, SEC_STATICS, &statics.bytes[0..@len(statics.bytes) as u32]:Read, @len(combined) as u32)?;
+    append_section(&buf:ReadWrite, 2, SEC_FUNCTIONS, &mirs.functions.bytes[0..@len(mirs.functions.bytes) as u32]:Read, mirs.function_count)?;
+    append_section(&buf:ReadWrite, 3, SEC_LOCALS, &mirs.locals.bytes[0..@len(mirs.locals.bytes) as u32]:Read, mirs.local_count)?;
+    append_section(&buf:ReadWrite, 4, SEC_BLOCKS, &mirs.blocks.bytes[0..@len(mirs.blocks.bytes) as u32]:Read, mirs.block_count)?;
+    append_section(&buf:ReadWrite, 5, SEC_INSTS, &mirs.insts.bytes[0..@len(mirs.insts.bytes) as u32]:Read, mirs.inst_count)?;
+    append_section(&buf:ReadWrite, 6, SEC_DEPENDENCIES, &deps.bytes[0..@len(deps.bytes) as u32]:Read, @len(facts.dependencies) as u32)?;
+    let size: u32 = @len(buf) as u32;
+    buf[0] = YSM_MAGIC_0;
+    buf[1] = YSM_MAGIC_1;
+    buf[2] = YSM_MAGIC_2;
+    buf[3] = YSM_MAGIC_3;
+    var version: u16 = YSM_VERSION;
+    if trap_edges { version = YSM_VERSION_TRAP_EDGES; }
+    if extended { version = YSM_VERSION_TYPE_REFS; }
+    ysm_write_sig::set_u16(&buf:ReadWrite, 4, version);
+    var header_flags: u16 = 0;
+    if extended { header_flags = 1; }
+    ysm_write_sig::set_u16(&buf:ReadWrite, H_FLAGS, header_flags);
+    ysm_write_sig::set_u16(&buf:ReadWrite, H_SECTION_COUNT, YSM_SECTION_COUNT);
+    ysm_write_sig::set_u16(&buf:ReadWrite, H_PROFILE, facts.target_profile);
+    ysm_write_sig::set_u32(&buf:ReadWrite, H_TABLE_OFFSET, YSM_TABLE_OFFSET);
+    ysm_write_sig::set_u32(&buf:ReadWrite, H_FILE_SIZE, size);
+    ysm_write_sig::set_u32(&buf:ReadWrite, H_FUNCTION_COUNT, mirs.function_count);
+    ysm_write_sig::set_u32(&buf:ReadWrite, H_STATIC_COUNT, @len(combined) as u32);
+    var d: u32 = 0;
+    while d < DIGEST_SIZE {
+        buf[H_SHA256 + d] = 0;
+        d = d + 1;
+    }
+    let digest: u8[] = iface::sha256(&buf[0..size]:Read)?;
+    d = 0;
+    while d < DIGEST_SIZE {
+        buf[H_SHA256 + d] = digest[d];
+        d = d + 1;
+    }
+    return ysm::YsmResult { accepted: true, data: @move(buf), code: types::error_code(0) };
+}
+function failed(diags: &diag::DiagBuffer:Read, before: u32): ysm::YsmResult {
+    return ysm::YsmResult { accepted: false, data: [], code: last_code(diags, before) };
+}
+function last_code(diags: &diag::DiagBuffer:Read, before: u32): types::ErrorCode {
+    if @len(diags.diags) as u32 <= before { return types::error_code(E_Y4); }
+    return diags.diags[@len(diags.diags) as u32 - 1].code;
+}

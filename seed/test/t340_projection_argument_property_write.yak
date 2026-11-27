@@ -1,0 +1,6 @@
+// expected_trap: reference capability mismatch (OW-5)
+function write(value: &u64:ReadWrite): void { *value = 0u64; }
+function main(): void {
+    var data: u32[] = [6u32];
+    write(data.len);
+}

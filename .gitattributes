@@ -1,0 +1,27 @@
+* text=auto eol=lf
+
+*.md text eol=lf
+*.sh text eol=lf
+*.lock text eol=lf
+*.yak text eol=lf
+*.ysm text eol=lf
+*.def text eol=lf
+*.jsonl text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.githooks/pre-commit text eol=lf
+
+# 故意测试非法编码或裸 CR 的负例夹具保留原始字节，不做换行归一化。
+test/bad/E1001/* -text
+test/bad/E1017/* -text
+seed/test/t424_seed_bare_cr.yak -text
+
+*.iface binary
+*.sym binary
+
+*.exe binary
+*.elf binary
+*.o binary
+*.obj binary
+*.pdb binary

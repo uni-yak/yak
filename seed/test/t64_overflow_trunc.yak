@@ -1,0 +1,12 @@
+// t64: 整数溢出截断assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let x: u8 = 256 as u8;
+    assert(x == 0);
+    let y: u8 = 257 as u8;
+    assert(y == 1);
+    let z: u8 = (255 + 2) as u8;
+    assert(z == 1);
+    return;
+}

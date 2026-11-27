@@ -1,0 +1,8 @@
+// t71: &x 取引用 + *r 解引用读
+foreign assert(cond: bool): void;
+function main(): void {
+    let x: u32 = 42;
+    let r: &u32 = &x;
+    assert(*r == 42);
+    return;
+}

@@ -1,0 +1,10 @@
+// t02: if/else 分支
+function main(): void {
+    let x: u32 = 10;
+    if x > 5 {
+        let y: u32 = 1;
+    } else {
+        let z: u32 = 2;
+    }
+    return;
+}

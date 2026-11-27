@@ -1,0 +1,13 @@
+foreign assert(cond: bool): void;
+function present(): i64? {
+    return 42;
+}
+function missing(): i64? {
+    return null;
+}
+function main(): void {
+    let a: i64? = present();
+    let b: i64? = missing();
+    assert((a ?? 0) == 42);
+    assert((b ?? 42) == 42);
+}

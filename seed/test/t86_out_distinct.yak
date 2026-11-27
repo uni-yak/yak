@@ -1,0 +1,12 @@
+// t86: 同一调用 out 实参指向相同槽位 → trap（owner.md 4.2）
+// expected_trap: out args must be distinct slots
+function f(out a: u32, out b: u32): void {
+    a = 1;
+    b = 2;
+    return;
+}
+function main(): void {
+    out r: u32;
+    f( out r, out r);
+    return;
+}

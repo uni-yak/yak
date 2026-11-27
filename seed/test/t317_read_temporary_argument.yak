@@ -1,0 +1,33 @@
+// module: source=fixtures/read_argument.yak
+// mem_limit: 600000
+import source;
+foreign assert(cond: bool): void;
+function read(value: &u32:Read): u32 {
+    let view: &u32 = &*value;
+    return *view;
+}
+function pair(left: &u32, right: &u32): bool { return *left == 1u32 && *right == 2u32; }
+function step(state: &u32:ReadWrite, expected: u32, next: u32): u32 {
+    assert(*state == expected);
+    *state = next;
+    return next;
+}
+function first(values: &u32[]): u32 { return (*values)[0u32]; }
+function main(): void {
+    let indirect: &function(&source::Item): u32 = &source::read;
+    let existing: u32 = 11u32;
+    assert(read(&existing) == 11u32);
+    assert(read(7) == 7u32);
+    assert(first([17, 18u32]) == 17u32);
+    var state: u32 = 0u32;
+    let counter: &u32:ReadWrite = &state:ReadWrite;
+    assert(pair(step(counter, 0u32, 1u32), step(counter, 1u32, 2u32)));
+    assert(*counter == 2u32);
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(source::read(source::make(i)) == i);
+        assert(indirect(source::make(i)) == i);
+        assert(read(source::make(i).data[0u32]) == i);
+        i = i + 1u32;
+    }
+}

@@ -1,0 +1,226 @@
+// 目标布局构建与按需运行时符号登记。
+// 负责逐函数发射机器码、拼装静态只读区与形态描述，供 COFF 与 ELF 后端共用。
+
+import pe;
+import mir;
+import typecheck;
+import diag;
+import layout;
+import coff_code;
+import coff_state;
+import coff_place;
+import coff_func;
+
+function text_copy(s: &[u8]:Read): u8[]!AllocError {
+    var d: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(s) as u32 { @push(d, s[i])?; i = i + 1; }
+    return d;
+}
+
+function module_has_op(module: &mir::MirModule:Read, op: u8): bool {
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &module.functions[i]:Read;
+        var k: u32 = 0;
+        while k < @len(f.insts) as u32 {
+            if f.insts[k].op == op { return true; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+function module_has_dyn_array(module: &mir::MirModule:Read): bool {
+    let table: &typecheck::TypeTable:Read = &module.types:Read;
+    var i: u32 = 0;
+    while i < @len(table.entries) as u32 {
+        if table.entries[i].kind == 6 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+function symbol_present(table: &coff_state::LinkTable:Read, def: u64): bool {
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        if table.symbols[i].def == def { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 内建运行时入口按需追加：`@push` 需要 yak_rt_push，动态数组析构需要 yak_rt_free。
+// 这些符号只在本对象出现对应形态时登记，不改变既有对象的符号表与字节布局。
+export function augment_runtime_symbols(module: &mir::MirModule:Read, table: &coff_state::LinkTable:Read, planned: &coff_state::ObjectLayout:Read): coff_state::LinkTable!AllocError {
+    var dst: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var i: u32 = 0;
+    while i < @len(table.symbols) as u32 {
+        // 逐字段重建：LinkSymbol 含 owning 名称，不能按投影整体移动（OW-10）。
+        @push(dst.symbols, coff_state::LinkSymbol { def: table.symbols[i].def, kind: table.symbols[i].kind, name: @clone(table.symbols[i].name)? })?;
+        i = i + 1;
+    }
+    let has_push: bool = module_has_op(module, 178);
+    if has_push && !symbol_present(&dst:Read, coff_state::rt_symbol_push()) {
+        @push(dst.symbols, coff_state::LinkSymbol { def: coff_state::rt_symbol_push(), kind: 1, name: text_copy("yak_rt_push")? })?;
+    }
+    if module_has_op(module, 114) && !symbol_present(&dst:Read, coff_state::rt_symbol_clone()) {
+        @push(dst.symbols, coff_state::LinkSymbol { def: coff_state::rt_symbol_clone(), kind: 1, name: text_copy("yak_rt_clone_value")? })?;
+    }
+    if (has_push || module_has_dyn_array(module)) && !symbol_present(&dst:Read, coff_state::rt_symbol_free()) {
+        @push(dst.symbols, coff_state::LinkSymbol { def: coff_state::rt_symbol_free(), kind: 1, name: text_copy("yak_rt_free")? })?;
+    }
+    let drop_symbol: u64 = coff_state::rt_symbol_drop_value();
+    i = 0;
+    while i < @len(planned.functions) as u32 {
+        var j: u32 = 0;
+        while j < @len(planned.functions[i].calls) as u32 {
+            if planned.functions[i].calls[j].symbol == drop_symbol {
+                if !symbol_present(&dst:Read, drop_symbol) {
+                    @push(dst.symbols, coff_state::LinkSymbol { def: drop_symbol, kind: 1, name: text_copy("yak_rt_drop_value")? })?;
+                }
+                return dst;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return dst;
+}
+
+export function object_text_offset(): u32 { return 140u32; }
+
+// 逐函数发射并按顺序拼接 .text；函数入口偏移记入布局，供重定位与符号值使用。
+// 任一函数出现未识别 opcode 或符号性不匹配时，把首次拒绝记到布局上，由 emit_object 转成拒绝码。
+export function build_layout(module: &mir::MirModule:Read): coff_state::ObjectLayout!AllocError {
+    var unused_bytes: coff_code::Bytes = coff_code::bytes_new();
+    return build_layout_mode(module, true, false, &unused_bytes:ReadWrite)?;
+}
+
+export function build_sysv_layout(module: &mir::MirModule:Read): coff_state::ObjectLayout!AllocError {
+    var unused_bytes: coff_code::Bytes = coff_code::bytes_new();
+    return build_layout_mode(module, false, true, &unused_bytes:ReadWrite)?;
+}
+
+// 初始化模块级发射器状态，将类型尺寸、标记与静态长度表独立构建。
+function init_emitter(module: &mir::MirModule:Read, layout_table: layout::LayoutTable, fields_ordered: bool, dyn_flags: u8[], sysv: bool): coff_state::Emitter!AllocError {
+    var type_sizes: u32[] = [];
+    var type_tags: u8[] = [];
+    var type_payloads: u32[] = [];
+    var ti: u32 = 0;
+    while ti < @len(layout_table.items) as u32 {
+        let item: layout::LayoutInfo = layout_table.items[ti];
+        var sz: u32 = 0;
+        if item.known && item.size <= 4294967295u64 { sz = item.size as u32; }
+        @push(type_sizes, sz)?;
+        @push(type_tags, item.tag_size)?;
+        var po: u32 = 0;
+        if item.payload_off <= 4294967295u64 { po = item.payload_off as u32; }
+        @push(type_payloads, po)?;
+        ti = ti + 1;
+    }
+    let lengths: u32[] = coff_state::copy_static_lengths(&module.statics[0..@len(module.statics)]:Read)?;
+    var em: coff_state::Emitter = coff_state::Emitter { code: pe::code_new(), slots: [], widths: [],
+        types: coff_state::copy_types(&module.types:Read)?, fields: coff_state::copy_fields(&module.fields:Read)?,
+        enums: coff_state::copy_enums(&module.enums:Read)?, layouts: @move(layout_table),
+        imported_fields: mir::copy_imported_fields(&module.imported_fields:Read)?, imported_fields_ordered: fields_ordered,
+        imported_enums: mir::copy_imported_enums(&module.imported_enums:Read)?, locals: [], slice_flags: [],
+        agg_sizes: [], by_ptr: [], sret: 0,
+        trap_status: 0, resume_jumps: [], drop_scratch: 0, drop_depth: 0,
+        dyn_flags: @move(dyn_flags),
+        type_sizes: @move(type_sizes), type_tags: @move(type_tags), type_payloads: @move(type_payloads),
+        frame_size: 0, out_slots: 0,
+        block_offsets: [], fixups: [], arm_fixups: [], trap: 0, calls: [], data_refs: [],
+        static_lengths: @move(lengths), value_shapes: [], shape_indices: [], shape_refs: [], rejected: 0, reject_kind: 0 };
+    em.code.sysv = sysv;
+    return em;
+}
+
+// 装配只读静态字节区并附加四字节对齐的形态描述，溢出时返回 false。
+function pack_rdata(module: &mir::MirModule:Read, value_shapes: &[u32], shape_refs: &[u32], rdata: &u8[]:ReadWrite, offsets: &u32[]:ReadWrite, already_rejected: bool): bool!AllocError {
+    var s: u32 = 0;
+    while s < @len(module.statics) as u32 {
+        @push(*offsets, module.statics[s].offset)?;
+        s = s + 1;
+    }
+    if @len(value_shapes) != 0 && @len(*rdata) + 3u64 + @len(value_shapes) * 4u64 > 4294967295u64 {
+        return false;
+    }
+    if @len(value_shapes) != 0 && !already_rejected {
+        while @len(*rdata) % 4u64 != 0 { @push(*rdata, 0u8)?; }
+        let start: u32 = @len(*rdata) as u32;
+        s = 0;
+        while s < @len(shape_refs) as u32 {
+            @push(*offsets, start + shape_refs[s] * 4u32)?;
+            s = s + 1;
+        }
+        s = 0;
+        while s < @len(value_shapes) as u32 {
+            let word: u32 = value_shapes[s];
+            @push(*rdata, word as u8)?;
+            @push(*rdata, (word >> 8u32) as u8)?;
+            @push(*rdata, (word >> 16u32) as u8)?;
+            @push(*rdata, (word >> 24u32) as u8)?;
+            s = s + 1;
+        }
+    }
+    return true;
+}
+
+export function build_layout_mode(module: &mir::MirModule:Read, collect_text: bool, sysv: bool, bytes: &coff_code::Bytes:ReadWrite): coff_state::ObjectLayout!AllocError {
+    // 整张模块布局表、动态数组成员标记、析构嵌套深度与发射器不变量仅构建一次，供所有函数复用。
+    var layout_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let layout_table: layout::LayoutTable = layout::layout_table_with_imports(&module.types:Read, &module.fields:Read, &module.enums:Read, &module.imported_layouts:Read, &module.imported_enums:Read, &layout_diags:ReadWrite)?;
+    let fields_ordered: bool = layout::imported_fields_ordered(&module.imported_fields:Read);
+    let dyn_flags: u8[] = coff_place::compute_dyn_flags(module, fields_ordered)?;
+    let drop_depths: u32[] = coff_place::compute_drop_depths(module, fields_ordered, &dyn_flags[0..@len(dyn_flags)]:Read)?;
+    var em: coff_state::Emitter = init_emitter(module, @move(layout_table), fields_ordered, @move(dyn_flags), sysv)?;
+    // 两种目标的生产发射都连续追加机器码；只有 COFF 在同一缓冲内预留对象头。
+    if !collect_text && !sysv {
+        let header_size: u32 = object_text_offset();
+        var pad: u32 = 0;
+        while pad < header_size { pe::code_u8(&em.code:ReadWrite, 0)?; pad = pad + 1; }
+    }
+    var text: u8[] = [];
+    var text_offset: u32 = 0;
+    var funcs: coff_state::FunctionLayout[] = [];
+    var first_rejected: u8 = 0;
+    var first_kind: u8 = 0;
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        let fref: &mir::MirFunction:Read = &module.functions[i]:Read;
+        var one: coff_state::FunctionLayout = coff_func::emit_function_mode(&em:ReadWrite, fref, module,
+            &drop_depths[0..@len(drop_depths)]:Read, collect_text, !collect_text)?;
+        one.text_offset = text_offset;
+        text_offset = text_offset + one.code_size;
+        // 只记首次拒绝，保证同一输入得到同一拒绝码（确定性）。
+        if first_rejected == 0 && one.rejected != 0 {
+            first_rejected = one.rejected;
+            first_kind = one.reject_kind;
+        }
+        if collect_text {
+            var k: u32 = 0;
+            while k < @len(one.code) as u32 {
+                @push(text, one.code[k])?;
+                k = k + 1;
+            }
+        }
+        @push(funcs, @move(one))?;
+        i = i + 1;
+    }
+    // 静态池保持原偏移。目标专用形态描述对齐到四字节，附加到同一只读段。
+    var rdata: u8[] = @clone(module.static_bytes)?;
+    var offsets: u32[] = [];
+    if !pack_rdata(module, &em.value_shapes[0..@len(em.value_shapes)]:Read, &em.shape_refs[0..@len(em.shape_refs)]:Read, &rdata:ReadWrite, &offsets:ReadWrite, first_rejected != 0)? {
+        first_rejected = 255;
+        first_kind = 4;
+    }
+    if !collect_text && first_rejected == 0 {
+        let body: u8[] = coff_state::copy_code(&em.code:Read)?;
+        if sysv { text = @move(body); }
+        else { bytes.data = @move(body); }
+    }
+    return coff_state::ObjectLayout { functions: funcs, text: text, rdata: rdata, data: [],
+        static_offsets: offsets, rejected: first_rejected, reject_kind: first_kind };
+}

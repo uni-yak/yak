@@ -1,0 +1,2 @@
+// expected_trap: invalid nullable payload type
+function main(): void { let a: void? = null; }

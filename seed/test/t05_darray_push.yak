@@ -1,0 +1,9 @@
+// t05: 动态数组 + @push + @len + as
+function main(): void {
+    var arr: u8[] = [];
+    @push(arr, 65);
+    @push(arr, 66);
+    @push(arr, 67);
+    let n: u32 = @len(arr) as u32;
+    return;
+}

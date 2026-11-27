@@ -1,0 +1,10 @@
+// t94: @push owning 元素移动源（owner.md 2.3）
+foreign assert(cond: bool): void;
+function main(): void {
+    let a: u32[] = [1, 2];
+    var b: u32[][] = [];
+    @push(b, a);
+    assert(@len(b) == 1);
+    assert(@len(b[0]) == 2);
+    return;
+}

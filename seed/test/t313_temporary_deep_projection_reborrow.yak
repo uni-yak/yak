@@ -1,0 +1,21 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Leaf { value: u32, owned: u32[] }
+struct Item { data: Leaf[] }
+enum Failure { Bad }
+function index(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 0u32; }
+function read(data: &Item[]:ReadWrite, ok: bool): u32!Failure {
+    return (&(*data)[0u32..1u32]:ReadWrite)[0u32].data[index(ok)?].value;
+}
+function recover(e: &Failure): u32 { return 999u32; }
+function main(): void {
+    var items: Item[] = [Item { data: [Leaf { value: 1u32, owned: [5u32] }] }];
+    let parent: &Item[]:ReadWrite = &items:ReadWrite;
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(read(&*parent:ReadWrite, false).catch(&recover) == 999u32);
+        (*parent)[0u32].data[0u32].value = i;
+        assert(read(&*parent:ReadWrite, true).catch(&recover) == i);
+        i = i + 1u32;
+    }
+}

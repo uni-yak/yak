@@ -1,0 +1,6 @@
+// expected_trap: eval: exclusively borrowed place (OW-2)
+function increment(value: &u32:ReadWrite): u32 { *value = *value + 1u32; return *value; }
+function main(): void {
+    var count: u32 = 3u32;
+    let total: u32 = increment(count) + increment(count);
+}

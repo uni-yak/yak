@@ -1,0 +1,51 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 窄寄存器立即数使用内嵌寄存器号；64 位生产发码保留完整立即数。
+    var code: pe::Code = pe::code_new();
+    pe::mov_int(&code:ReadWrite, 8, 0xa5, 1)?;
+    pe::mov_int(&code:ReadWrite, 8, 0xb6a5, 2)?;
+    pe::mov_int(&code:ReadWrite, 8, 0x89abb6a5, 4)?;
+    pe::mov_int(&code:ReadWrite, 8, 0xffffffffffffff80, 8)?;
+    assert(pe::code_len(&code:Read) == 24);
+    assert(code.bytes[0] == 0x41 && code.bytes[1] == 0xb0 && code.bytes[2] == 0xa5);
+    assert(code.bytes[3] == 0x66 && code.bytes[4] == 0x41 && code.bytes[5] == 0xb8 && code.bytes[7] == 0xb6);
+    assert(code.bytes[8] == 0x41 && code.bytes[9] == 0xb8 && code.bytes[13] == 0x89);
+    assert(code.bytes[14] == 0x49 && code.bytes[15] == 0xb8 && code.bytes[16] == 0x80 && code.bytes[23] == 0xff);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+
+    // 同宽长编码仅在寄存器直寻址可缩短；缺少立即数先报截断。
+    let direct: [u8; 17] = [0x41, 0xc6, 0xc0, 0xa5, 0x66, 0x41, 0xc7, 0xc0, 0xa5, 0xb6,
+        0x41, 0xc7, 0xc0, 0xa5, 0xb6, 0xab, 0x89];
+    encoding(&direct[0..4]:Read, 7103)?;
+    encoding(&direct[4..10]:Read, 7103)?;
+    encoding(&direct[10..17]:Read, 7103)?;
+    encoding(&direct[0..3]:Read, 7101)?;
+    encoding(&direct[4..9]:Read, 7101)?;
+    encoding(&direct[10..16]:Read, 7101)?;
+    let memory: [u8; 14] = [0xc6, 0x01, 0xa5, 0x66, 0xc7, 0x01, 0xa5, 0xb6,
+        0xc7, 0x01, 0xa5, 0xb6, 0xab, 0x89];
+    encoding(&memory[0..14]:Read, 0)?;
+    encoding(&memory[8..13]:Read, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

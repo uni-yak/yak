@@ -1,0 +1,26 @@
+import host;
+import host_args;
+
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function roundtrip(): void!AllocError {
+    let packed: u8[] = host::load_args()?;
+    let args: &[u8] = &packed[0..@len(packed)]:Read;
+    assert(host_args::count(args) == 3);
+    let last: u8[] = host_args::get(args, 2)?;
+    assert(@len(last) == 3 && last[0u64] == 228u8 && last[1u64] == 184u8 && last[2u64] == 173u8);
+    let empty: u8[] = host_args::get(args, 1)?;
+    assert(@len(empty) == 0);
+    let input: u8[] = host_args::get(args, 0)?;
+    let data: u8[] = host::input_bytes(&input[0..@len(input)]:Read)?;
+    host::output_bytes("echo", &data[0..@len(data)]:Read);
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = roundtrip();
+    @drop(failed);
+    exit(1);
+}

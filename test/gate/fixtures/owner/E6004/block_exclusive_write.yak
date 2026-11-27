@@ -1,0 +1,11 @@
+// expected_code: E6004
+// spec: spec/lang/base.md R-5; spec/lang/owner.md OW-2
+// 触发：块级独占借用仍活跃时直接写原位置。
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var value: u32 = 0u32;
+    let exclusive: &u32:ReadWrite = &value:ReadWrite;
+    value = 1u32;
+    assert(*exclusive == 1u32);
+}

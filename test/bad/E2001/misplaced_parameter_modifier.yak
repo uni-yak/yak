@@ -1,0 +1,6 @@
+// expected_code: E2001
+// spec: spec/lang/parse.md P-1
+// 触发：保留名 move 不属于参数声明的前缀产生式。
+function bad(move x: &i32): void { return; }
+
+function main(): void { return; }

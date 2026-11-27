@@ -1,0 +1,385 @@
+// 扩展 LSP 响应编码器：成员/跨文件补全、格式化、重命名、Code Action、工作区符号与请求取消。
+import documents;
+import json_string;
+import lsp_complete;
+import lsp_edit;
+import lsp_format;
+import positions;
+import rpc;
+import rpc_reply;
+import types;
+import workspace_index;
+
+function push_bytes(dst: &u8[]:ReadWrite, bytes: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(bytes) as u32 { @push(*dst, bytes[i])?; i = i + 1u32; }
+    return;
+}
+
+function push_u32(dst: &u8[]:ReadWrite, value: u32): void!AllocError {
+    var scale: u32 = 1;
+    while value / scale >= 10u32 { scale = scale * 10u32; }
+    while scale != 0u32 {
+        @push(*dst, 48u8 + ((value / scale) % 10u32) as u8)?;
+        scale = scale / 10u32;
+    }
+    return;
+}
+
+function push_json_str(dst: &u8[]:ReadWrite, text: &[u8]): void!AllocError {
+    @push(*dst, 34u8)?;
+    var i: u32 = 0;
+    while i < @len(text) as u32 {
+        let b: u8 = text[i];
+        if b == 34u8 { @push(*dst, 92u8)?; @push(*dst, 34u8)?; }
+        elseif b == 92u8 { @push(*dst, 92u8)?; @push(*dst, 92u8)?; }
+        elseif b == 10u8 { @push(*dst, 92u8)?; @push(*dst, 110u8)?; }
+        elseif b == 13u8 { @push(*dst, 92u8)?; @push(*dst, 114u8)?; }
+        elseif b == 9u8 { @push(*dst, 92u8)?; @push(*dst, 116u8)?; }
+        elseif b >= 32u8 { @push(*dst, b)?; }
+        i = i + 1u32;
+    }
+    @push(*dst, 34u8)?;
+    return;
+}
+
+function push_pos(dst: &u8[]:ReadWrite, p: positions::Position): void!AllocError {
+    push_bytes(dst, "{\"line\":")?;
+    push_u32(dst, p.line)?;
+    push_bytes(dst, ",\"character\":")?;
+    push_u32(dst, p.character)?;
+    @push(*dst, 125u8)?;
+    return;
+}
+
+function push_range(dst: &u8[]:ReadWrite, r: positions::Range): void!AllocError {
+    push_bytes(dst, "{\"start\":")?;
+    push_pos(dst, r.start)?;
+    push_bytes(dst, ",\"end\":")?;
+    push_pos(dst, r.end)?;
+    @push(*dst, 125u8)?;
+    return;
+}
+
+function begin_reply(action: &rpc::Route:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    if action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 {
+        return rpc_reply::Reply { status: 2, bytes: [] };
+    }
+    var reply: rpc_reply::Reply = rpc_reply::Reply { status: 1, bytes: [] };
+    push_bytes(&reply.bytes:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    push_bytes(&reply.bytes:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    return @move(reply);
+}
+
+// 对已通过 $/cancelRequest 取消的请求返回标准 LSP -32800 错误。
+export function encode_cancelled(action: &rpc::Route:Read, src: &[u8]): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    push_bytes(&reply.bytes:ReadWrite, ",\"error\":{\"code\":-32800,\"message\":\"Request cancelled\"}}")?;
+    return @move(reply);
+}
+
+export function encode_ext_completion(action: &rpc::Route:Read, src: &[u8], ext: &lsp_complete::ExtCompletion:Read): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":{\"isIncomplete\":")?;
+    if ext.incomplete { push_bytes(&reply.bytes:ReadWrite, "true")?; }
+    else { push_bytes(&reply.bytes:ReadWrite, "false")?; }
+    push_bytes(&reply.bytes:ReadWrite, ",\"items\":[")?;
+    var i: u32 = 0;
+    while i < @len(ext.items) as u32 {
+        let item: &lsp_complete::ExtItem:Read = &ext.items[i]:Read;
+        let label: &[u8] = &item.label[0..@len(item.label)]:Read;
+        if i != 0u32 { @push(reply.bytes, 44u8)?; }
+        push_bytes(&reply.bytes:ReadWrite, "{\"label\":")?;
+        push_json_str(&reply.bytes:ReadWrite, label)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"kind\":")?;
+        push_u32(&reply.bytes:ReadWrite, item.kind as u32)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"textEdit\":{\"range\":")?;
+        push_range(&reply.bytes:ReadWrite, ext.range)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"newText\":")?;
+        push_json_str(&reply.bytes:ReadWrite, label)?;
+        push_bytes(&reply.bytes:ReadWrite, "}}")?;
+        i = i + 1u32;
+    }
+    push_bytes(&reply.bytes:ReadWrite, "]}}")?;
+    return @move(reply);
+}
+
+// 合并同文件普通补全与工作区跨文件模块/导出候选。
+export function encode_merged_completion(
+    action: &rpc::Route:Read,
+    src: &[u8],
+    base: &documents::Completion:Read,
+    text: &[u8],
+    words: &[u8],
+    extra: &[lsp_complete::ExtItem]:Read
+): rpc_reply::Reply!AllocError {
+    if @len(extra) == 0u64 || base.status != 2u8 {
+        return rpc_reply::encode_completion(action, src, base, text, words)?;
+    }
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":{\"isIncomplete\":")?;
+    if base.incomplete { push_bytes(&reply.bytes:ReadWrite, "true")?; }
+    else { push_bytes(&reply.bytes:ReadWrite, "false")?; }
+    push_bytes(&reply.bytes:ReadWrite, ",\"items\":[")?;
+    var count: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(base.items) as u32 {
+        let item: documents::CompletionItem = base.items[i];
+        let end: u32 = item.offset + item.length;
+        if count != 0u32 { @push(reply.bytes, 44u8)?; }
+        push_bytes(&reply.bytes:ReadWrite, "{\"label\":\"")?;
+        if item.hash_name { @push(reply.bytes, 35u8)?; }
+        if item.kind == 14u8 { push_bytes(&reply.bytes:ReadWrite, &words[item.offset..end]:Read)?; }
+        else { push_bytes(&reply.bytes:ReadWrite, &text[item.offset..end]:Read)?; }
+        push_bytes(&reply.bytes:ReadWrite, "\",\"kind\":")?;
+        push_u32(&reply.bytes:ReadWrite, item.kind as u32)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"textEdit\":{\"range\":")?;
+        push_range(&reply.bytes:ReadWrite, base.range)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"newText\":\"")?;
+        if item.hash_name { @push(reply.bytes, 35u8)?; }
+        if item.kind == 14u8 { push_bytes(&reply.bytes:ReadWrite, &words[item.offset..end]:Read)?; }
+        else { push_bytes(&reply.bytes:ReadWrite, &text[item.offset..end]:Read)?; }
+        push_bytes(&reply.bytes:ReadWrite, "\"}}")?;
+        count = count + 1u32;
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(extra) as u32 && count < 48u32 {
+        let ext: &lsp_complete::ExtItem:Read = &extra[i]:Read;
+        let label: &[u8] = &ext.label[0..@len(ext.label)]:Read;
+        if count != 0u32 { @push(reply.bytes, 44u8)?; }
+        push_bytes(&reply.bytes:ReadWrite, "{\"label\":")?;
+        push_json_str(&reply.bytes:ReadWrite, label)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"kind\":")?;
+        push_u32(&reply.bytes:ReadWrite, ext.kind as u32)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"textEdit\":{\"range\":")?;
+        push_range(&reply.bytes:ReadWrite, base.range)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"newText\":")?;
+        push_json_str(&reply.bytes:ReadWrite, label)?;
+        push_bytes(&reply.bytes:ReadWrite, "}}")?;
+        count = count + 1u32;
+        i = i + 1u32;
+    }
+    push_bytes(&reply.bytes:ReadWrite, "]}}")?;
+    return @move(reply);
+}
+
+export function encode_formatting(action: &rpc::Route:Read, src: &[u8], fmt: &lsp_format::FormatResult:Read): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    if fmt.status == 0u8 {
+        push_bytes(&reply.bytes:ReadWrite, ",\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}")?;
+        return @move(reply);
+    }
+    if fmt.status == 1u8 || !fmt.changed {
+        push_bytes(&reply.bytes:ReadWrite, ",\"result\":[]}")?;
+        return @move(reply);
+    }
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":[{\"range\":")?;
+    push_range(&reply.bytes:ReadWrite, fmt.range)?;
+    push_bytes(&reply.bytes:ReadWrite, ",\"newText\":")?;
+    push_json_str(&reply.bytes:ReadWrite, &fmt.new_text[0..@len(fmt.new_text)]:Read)?;
+    push_bytes(&reply.bytes:ReadWrite, "}]}")?;
+    return @move(reply);
+}
+
+export function encode_prepare_rename(action: &rpc::Route:Read, src: &[u8], prep: &lsp_edit::PrepareRenameResult:Read, text: &[u8]): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    if prep.status == 0u8 {
+        push_bytes(&reply.bytes:ReadWrite, ",\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}")?;
+        return @move(reply);
+    }
+    if prep.status != 2u8 || (prep.offset as u64) + (prep.length as u64) > @len(text) {
+        push_bytes(&reply.bytes:ReadWrite, ",\"result\":null}")?;
+        return @move(reply);
+    }
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":{\"range\":")?;
+    push_range(&reply.bytes:ReadWrite, prep.range)?;
+    push_bytes(&reply.bytes:ReadWrite, ",\"placeholder\":")?;
+    push_json_str(&reply.bytes:ReadWrite, &text[prep.offset..prep.offset + prep.length]:Read)?;
+    push_bytes(&reply.bytes:ReadWrite, "}}")?;
+    return @move(reply);
+}
+
+export function encode_rename(action: &rpc::Route:Read, src: &[u8], ren: &lsp_edit::RenameResult:Read, uri: &[u8]): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    if ren.status == 0u8 {
+        push_bytes(&reply.bytes:ReadWrite, ",\"error\":{\"code\":-32602,\"message\":\"Invalid rename identifier or scope collision\"}}")?;
+        return @move(reply);
+    }
+    if ren.status != 2u8 {
+        push_bytes(&reply.bytes:ReadWrite, ",\"result\":null}")?;
+        return @move(reply);
+    }
+    let name: &[u8] = &ren.new_name[0..@len(ren.new_name)]:Read;
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":{\"changes\":{")?;
+    push_json_str(&reply.bytes:ReadWrite, uri)?;
+    push_bytes(&reply.bytes:ReadWrite, ":[")?;
+    var i: u32 = 0;
+    while i < @len(ren.ranges) as u32 {
+        if i != 0u32 { @push(reply.bytes, 44u8)?; }
+        push_bytes(&reply.bytes:ReadWrite, "{\"range\":")?;
+        push_range(&reply.bytes:ReadWrite, ren.ranges[i])?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"newText\":")?;
+        push_json_str(&reply.bytes:ReadWrite, name)?;
+        @push(reply.bytes, 125u8)?;
+        i = i + 1u32;
+    }
+    push_bytes(&reply.bytes:ReadWrite, "]}}}")?;
+    return @move(reply);
+}
+
+export function encode_code_actions(action: &rpc::Route:Read, src: &[u8], ca: &lsp_edit::CodeActionResult:Read, uri: &[u8]): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    if ca.status == 0u8 {
+        push_bytes(&reply.bytes:ReadWrite, ",\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}")?;
+        return @move(reply);
+    }
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":[")?;
+    var i: u32 = 0;
+    while i < @len(ca.items) as u32 {
+        let item: &lsp_edit::CodeActionItem:Read = &ca.items[i]:Read;
+        if i != 0u32 { @push(reply.bytes, 44u8)?; }
+        push_bytes(&reply.bytes:ReadWrite, "{\"title\":")?;
+        push_json_str(&reply.bytes:ReadWrite, &item.title[0..@len(item.title)]:Read)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"kind\":")?;
+        push_json_str(&reply.bytes:ReadWrite, &item.kind[0..@len(item.kind)]:Read)?;
+        push_bytes(&reply.bytes:ReadWrite, ",\"edit\":{\"changes\":{")?;
+        push_json_str(&reply.bytes:ReadWrite, uri)?;
+        push_bytes(&reply.bytes:ReadWrite, ":[")?;
+        var j: u32 = 0;
+        while j < @len(item.edits) as u32 {
+            let ed: &lsp_edit::TextEdit:Read = &item.edits[j]:Read;
+            if j != 0u32 { @push(reply.bytes, 44u8)?; }
+            push_bytes(&reply.bytes:ReadWrite, "{\"range\":")?;
+            push_range(&reply.bytes:ReadWrite, ed.range)?;
+            push_bytes(&reply.bytes:ReadWrite, ",\"newText\":")?;
+            push_json_str(&reply.bytes:ReadWrite, &ed.new_text[0..@len(ed.new_text)]:Read)?;
+            @push(reply.bytes, 125u8)?;
+            j = j + 1u32;
+        }
+        push_bytes(&reply.bytes:ReadWrite, "]}}}")?;
+        i = i + 1u32;
+    }
+    push_bytes(&reply.bytes:ReadWrite, "]}")?;
+    return @move(reply);
+}
+
+function folded_ascii(b: u8): u8 {
+    if b >= 65u8 && b <= 90u8 { return b + 32u8; }
+    return b;
+}
+
+function subseq_match(name: &[u8], query: &[u8]): bool {
+    var i: u32 = 0;
+    var q: u32 = 0;
+    while i < @len(name) as u32 && q < @len(query) as u32 {
+        if folded_ascii(name[i]) == folded_ascii(query[q]) { q = q + 1u32; }
+        i = i + 1u32;
+    }
+    return q == @len(query) as u32;
+}
+
+function uri_open_in_store(store: &documents::Store:Read, uri: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(store.slots) as u32 {
+        if store.slots[i].generation != 0u64 {
+            let u: &json_string::Decoded:Read = &store.slots[i].uri:Read;
+            let su: &[u8] = &u.data[0..@len(u.data)]:Read;
+            if workspace_index::bytes_equal(su, uri) { return true; }
+        }
+        i = i + 1u32;
+    }
+    return false;
+}
+
+// 默认 stdio 入口的 workspace/symbol：联合检索所有已打开文档与工作区同步文件。
+export function encode_default_workspace_symbols(
+    action: &rpc::Route:Read,
+    src: &[u8],
+    store: &documents::Store:Read,
+    ws: &workspace_index::Index:Read,
+    query: &[u8]
+): rpc_reply::Reply!AllocError {
+    var reply: rpc_reply::Reply = begin_reply(action, src)?;
+    if reply.status != 1u8 { return @move(reply); }
+    push_bytes(&reply.bytes:ReadWrite, ",\"result\":[")?;
+    var emitted: u32 = 0;
+    // 先输出所有已打开文档的实时符号。
+    var s: u32 = 0;
+    while s < @len(store.slots) as u32 && emitted < 256u32 {
+        if store.slots[s].generation != 0u64 {
+            let snap: &documents::Snapshot:Read = &store.slots[s].snapshot:Read;
+            let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+            let uri: &[u8] = &store.slots[s].uri.data[0..@len(store.slots[s].uri.data)]:Read;
+            let file_id: u16 = (s + 1u32) as u16;
+            var j: u32 = 0;
+            while j < @len(snap.definitions.symbols) as u32 && emitted < 256u32 {
+                let sym: types::DocumentSymbolSpan = snap.definitions.symbols[j];
+                let sel: types::Span = sym.selection;
+                if sel.length != 0u32 && (sel.offset as u64) + (sel.length as u64) <= @len(text) {
+                    let name: &[u8] = &text[sel.offset..sel.offset + sel.length]:Read;
+                    if subseq_match(name, query) {
+                        let mapped: positions::RangeResult = positions::span_range(&snap.index:Read, text, sel.file, file_id, sel.offset, sel.length);
+                        if mapped.valid {
+                            if emitted != 0u32 { @push(reply.bytes, 44u8)?; }
+                            push_bytes(&reply.bytes:ReadWrite, "{\"name\":")?;
+                            push_json_str(&reply.bytes:ReadWrite, name)?;
+                            push_bytes(&reply.bytes:ReadWrite, ",\"kind\":")?;
+                            push_u32(&reply.bytes:ReadWrite, sym.kind as u32)?;
+                            push_bytes(&reply.bytes:ReadWrite, ",\"location\":{\"uri\":")?;
+                            push_json_str(&reply.bytes:ReadWrite, uri)?;
+                            push_bytes(&reply.bytes:ReadWrite, ",\"range\":")?;
+                            push_range(&reply.bytes:ReadWrite, mapped.range)?;
+                            push_bytes(&reply.bytes:ReadWrite, "}}")?;
+                            emitted = emitted + 1u32;
+                        }
+                    }
+                }
+                j = j + 1u32;
+            }
+        }
+        s = s + 1u32;
+    }
+    // 再补充未打开工作区文件的符号（已打开缓冲自动遮蔽磁盘副本）。
+    var f: u32 = 0;
+    while f < @len(ws.files) as u32 && emitted < 256u32 {
+        let wf: &workspace_index::WorkspaceFile:Read = &ws.files[f]:Read;
+        if wf.active {
+            let uri: &[u8] = &wf.uri[0..@len(wf.uri)]:Read;
+            if !uri_open_in_store(store, uri) {
+                let fsrc: &[u8] = &wf.source[0..@len(wf.source)]:Read;
+                var j: u32 = 0;
+                while j < @len(wf.symbols) as u32 && emitted < 256u32 {
+                    let sym: workspace_index::ExportSymbol = wf.symbols[j];
+                    if (sym.name_start as u64) + (sym.name_len as u64) <= @len(fsrc) {
+                        let name: &[u8] = &fsrc[sym.name_start..sym.name_start + sym.name_len]:Read;
+                        if subseq_match(name, query) {
+                            if emitted != 0u32 { @push(reply.bytes, 44u8)?; }
+                            push_bytes(&reply.bytes:ReadWrite, "{\"name\":")?;
+                            push_json_str(&reply.bytes:ReadWrite, name)?;
+                            push_bytes(&reply.bytes:ReadWrite, ",\"kind\":")?;
+                            push_u32(&reply.bytes:ReadWrite, sym.kind as u32)?;
+                            push_bytes(&reply.bytes:ReadWrite, ",\"location\":{\"uri\":")?;
+                            push_json_str(&reply.bytes:ReadWrite, uri)?;
+                            push_bytes(&reply.bytes:ReadWrite, ",\"range\":")?;
+                            push_range(&reply.bytes:ReadWrite, sym.range)?;
+                            push_bytes(&reply.bytes:ReadWrite, "}}")?;
+                            emitted = emitted + 1u32;
+                        }
+                    }
+                    j = j + 1u32;
+                }
+            }
+        }
+        f = f + 1u32;
+    }
+    push_bytes(&reply.bytes:ReadWrite, "]}")?;
+    return @move(reply);
+}

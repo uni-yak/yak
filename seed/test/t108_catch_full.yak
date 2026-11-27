@@ -1,0 +1,21 @@
+// t108: 多成员 .catch handler 表 —— 全覆盖：命中→T，Ok→解包（S-9.2）
+foreign assert(cond: bool): void;
+enum E1 { Bad1, }
+enum E2 { Bad2, }
+function load(x: u32): u32!(E1 | E2) {
+    if x == 0 { return E1::Bad1; }
+    if x == 1 { return E2::Bad2; }
+    return x;
+}
+function recover_e1(e: &E1): u32 { return 100; }
+function recover_e2(e: &E2): u32 { return 200; }
+
+function main(): void {
+    let a: u32 = load(0).catch(E1 => &recover_e1, E2 => &recover_e2);
+    let b: u32 = load(1).catch(E1 => &recover_e1, E2 => &recover_e2);
+    let c: u32 = load(5).catch(E1 => &recover_e1, E2 => &recover_e2);
+    assert(a == 100);
+    assert(b == 200);
+    assert(c == 5);
+    return;
+}

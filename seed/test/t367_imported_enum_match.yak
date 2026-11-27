@@ -1,0 +1,16 @@
+// 定向回归：导入枚举的显式变体 match 按声明模块身份与名称分派（module.md）。
+// module: enum_simple_dep=enum_simple_dep.yak
+// expected_stdout: ok
+import enum_simple_dep;
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    let v: enum_simple_dep::E = enum_simple_dep::make();
+    var r: u32 = 0u32;
+    match v {
+        A => { r = 1u32; },
+        B => { r = 2u32; }
+    }
+    if r == 1u32 { write("ok"); }
+    return;
+}

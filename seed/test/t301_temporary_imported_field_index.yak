@@ -1,0 +1,15 @@
+// mem_limit: 500000
+// module: nested=fixtures/nested_fields.yak
+import nested;
+foreign assert(cond: bool): void;
+struct Inner { data: [u32; 1], value: u32 }
+struct Outer { inner: Inner }
+function main(): void {
+    let local: Outer = Outer { inner: Inner { data: [3u32], value: 4u32 } };
+    assert(local.inner.data[0u32] == 3u32);
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(nested::make().inner.data[0u32] == 8u32);
+        i = i + 1u32;
+    }
+}

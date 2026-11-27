@@ -1,0 +1,108 @@
+// 诊断 JSONL 定向用例：精确字节、引用表、空参数表、转义与非法记录整体拒绝。
+// module: buf=../../compiler/min/lib/buf.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: diag_jsonl=../../compiler/min/src/diag/diag_jsonl.yak
+// module: host=../../compiler/min/host/seed/host.yak
+// output: jsonl
+// expected_file_hex: jsonl=7b22756e6974223a2264656d6f3a3a6d61696e222c22636f6465223a343030312c227365766572697479223a227761726e696e67222c227370616e223a7b226f6666223a372c226c656e223a317d2c2272656673223a5b7b226b696e64223a22696d706f7274222c226964223a5b332c3930305d7d2c7b226b696e64223a226c6f63616c222c226964223a347d2c7b226b696e64223a226669656c64222c226964223a31327d5d2c2261726773223a7b7d7d0a7b22756e6974223a2264656d6f3a3a6d61696e222c22636f6465223a343030322c227365766572697479223a22696e666f222c227370616e223a7b226f6666223a372c226c656e223a337d2c2272656673223a5b7b226b696e64223a22646566222c226964223a31317d2c7b226b696e64223a22646566222c226964223a32327d5d2c2261726773223a7b7d7d0a
+import buf;
+import types;
+import diag;
+import diag_jsonl;
+import host;
+
+foreign assert(cond: bool): void;
+
+// 导入引用带真实依赖编号，局部与字段引用只带各自 id 域。
+function refs_sample(): diag::DiagRefs {
+    return diag::DiagRefs { items: [
+        diag::DiagRef { kind: 2, value: 900, dep: 3 },
+        diag::DiagRef { kind: 5, value: 4, dep: 0 },
+        diag::DiagRef { kind: 3, value: 12, dep: 0 },
+        diag::DiagRef { kind: 0, value: 0, dep: 0 }], count: 3 };
+}
+
+// 单元名逐字节构造，不经过字符串字面量与名称驻留。
+function unit_bytes(): u8[] {
+    var name: u8[] = [];
+    @push(name, 100 as u8)?;
+    @push(name, 101 as u8)?;
+    @push(name, 109 as u8)?;
+    @push(name, 111 as u8)?;
+    @push(name, 58 as u8)?;
+    @push(name, 58 as u8)?;
+    @push(name, 109 as u8)?;
+    @push(name, 97 as u8)?;
+    @push(name, 105 as u8)?;
+    @push(name, 110 as u8)?;
+    return name;
+}
+
+function main(): void {
+    let unit: u8[] = unit_bytes();
+    let slice: &[u8] = &unit[0..@len(unit)]:Read;
+
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    // 逆序发射：排序后按偏移与码位稳定输出，级别取自记录自身。
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4002), severity: 2, span: types::Span { file: 1, offset: 7, length: 3 }, unit: 0, refs: diag::diag_refs_def_pair(11, 22), args: diag::diag_args_none() })?;
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4001), severity: 1, span: types::Span { file: 1, offset: 7, length: 1 }, unit: 0, refs: refs_sample(), args: diag::diag_args_none() })?;
+    diag::diagbuf_sort(&d:ReadWrite);
+    var jsonl: buf::ByteBuf = buf::buf_new();
+    assert(diag_jsonl::write_into(&jsonl:ReadWrite, &d:Read, slice)?);
+    // 定向夹具捕获序列化字节；生产诊断名 diag 使用独立的宿主帧门禁。
+    host::output_bytes("jsonl", &jsonl.data[0..buf::buf_len(&jsonl:Read)]);
+
+    // 空缓冲不产生任何字节。
+    var empty: diag::DiagBuffer = diag::diagbuf_new();
+    var empty_out: buf::ByteBuf = buf::buf_new();
+    assert(diag_jsonl::write_into(&empty_out:ReadWrite, &empty:Read, slice)?);
+    assert(buf::buf_len(&empty_out:Read) == 0u32);
+
+    // 非法级别整体拒绝，且不留下半条记录。
+    var bad: diag::DiagBuffer = diag::diagbuf_new();
+    diag::diagbuf_emit(&bad:ReadWrite, diag::Diag { code: types::error_code(4001), severity: 0, span: types::Span { file: 1, offset: 1, length: 1 }, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    diag::diagbuf_emit(&bad:ReadWrite, diag::Diag { code: types::error_code(4002), severity: 9, span: types::Span { file: 1, offset: 2, length: 1 }, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    var bad_out: buf::ByteBuf = buf::buf_new();
+    assert(!diag_jsonl::write_into(&bad_out:ReadWrite, &bad:Read, slice)?);
+    assert(buf::buf_len(&bad_out:Read) == 0u32);
+
+    // 非零参数表没有既定键名，必须拒绝而不是丢项。
+    var argd: diag::DiagBuffer = diag::diagbuf_new();
+    diag::diagbuf_emit(&argd:ReadWrite, diag::Diag { code: types::error_code(4001), severity: 0, span: types::Span { file: 1, offset: 1, length: 1 }, unit: 0, refs: diag::diag_refs_none(), args: diag::DiagArgs { items: [diag::DiagArg { kind: 3, value: 42 }, diag::DiagArg { kind: 0, value: 0 }, diag::DiagArg { kind: 0, value: 0 }, diag::DiagArg { kind: 0, value: 0 }], count: 1 } })?;
+    var argd_out: buf::ByteBuf = buf::buf_new();
+    assert(!diag_jsonl::write_into(&argd_out:ReadWrite, &argd:Read, slice)?);
+    assert(buf::buf_len(&argd_out:Read) == 0u32);
+
+    // 导入引用缺依赖编号时不是合法引用。
+    var badref: diag::DiagBuffer = diag::diagbuf_new();
+    diag::diagbuf_emit(&badref:ReadWrite, diag::Diag { code: types::error_code(4001), severity: 0, span: types::Span { file: 1, offset: 1, length: 1 }, unit: 0, refs: diag::DiagRefs { items: [diag::DiagRef { kind: 2, value: 5, dep: 0 }, diag::DiagRef { kind: 0, value: 0, dep: 0 }, diag::DiagRef { kind: 0, value: 0, dep: 0 }, diag::DiagRef { kind: 0, value: 0, dep: 0 }], count: 1 }, args: diag::diag_args_none() })?;
+    var badref_out: buf::ByteBuf = buf::buf_new();
+    assert(!diag_jsonl::write_into(&badref_out:ReadWrite, &badref:Read, slice)?);
+    assert(buf::buf_len(&badref_out:Read) == 0u32);
+
+    // 引用域越界（NameId、ScopeId 等非诊断域）必须整体拒绝，不得降级输出。
+    var badkind: diag::DiagBuffer = diag::diagbuf_new();
+    diag::diagbuf_emit(&badkind:ReadWrite, diag::Diag { code: types::error_code(4001), severity: 0, span: types::Span { file: 1, offset: 1, length: 1 }, unit: 0, refs: diag::DiagRefs { items: [diag::DiagRef { kind: 6, value: 7, dep: 0 }, diag::DiagRef { kind: 0, value: 0, dep: 0 }, diag::DiagRef { kind: 0, value: 0, dep: 0 }, diag::DiagRef { kind: 0, value: 0, dep: 0 }], count: 1 }, args: diag::diag_args_none() })?;
+    var badkind_out: buf::ByteBuf = buf::buf_new();
+    assert(!diag_jsonl::write_into(&badkind_out:ReadWrite, &badkind:Read, slice)?);
+    assert(buf::buf_len(&badkind_out:Read) == 0u32);
+
+    // 最小转义：引号、反斜杠、制表与换行。
+    var quoted: u8[] = [];
+    @push(quoted, 97 as u8)?;
+    @push(quoted, 34 as u8)?;
+    @push(quoted, 98 as u8)?;
+    @push(quoted, 92 as u8)?;
+    @push(quoted, 99 as u8)?;
+    @push(quoted, 9 as u8)?;
+    @push(quoted, 100 as u8)?;
+    @push(quoted, 10 as u8)?;
+    @push(quoted, 101 as u8)?;
+    var escaped: diag::DiagBuffer = diag::diagbuf_new();
+    diag::diagbuf_emit(&escaped:ReadWrite, diag::Diag { code: types::error_code(4001), severity: 0, span: types::Span { file: 1, offset: 0, length: 0 }, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    var escaped_out: buf::ByteBuf = buf::buf_new();
+    assert(diag_jsonl::write_into(&escaped_out:ReadWrite, &escaped:Read, &quoted[0..@len(quoted)]:Read)?);
+    assert(buf::buf_len(&escaped_out:Read) == 101u32);
+    return;
+}

@@ -1,0 +1,85 @@
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+import mir_verify;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+function check(src: &[u8]): void!AllocError {
+    let l: lex::LexResult = lex::lex_scan(src, 1)?;
+    assert(@len(l.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_lexed(&l:Read, 1)?;
+    assert(@len(p.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let r: resolve_refs::Resolution = resolve_unit::resolve_unit(&p.file:Read, &p.pool:Read, &l.names:Read, &deps:Read, "", &d:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&p.file:Read, &p.pool:Read, &r:Read, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    let m: mir::MirResult = mir_lower::build_mir(&p.file:Read, &p.pool:Read, &r:Read, &tc:Read, &d:ReadWrite)?;
+    if !m.accepted {
+        if m.rejection.kind == 1 { write("reject-expr\n"); }
+        elseif m.rejection.kind == 3 { write("reject-type\n"); }
+        elseif m.rejection.kind == 4 { write("reject-missing-type\n"); }
+        elseif m.rejection.kind == 6 { write("reject-cfg\n"); }
+        elseif m.rejection.kind == 7 { write("reject-language\n"); }
+    }
+    assert(m.rejection.kind == 0);
+    assert(m.accepted);
+    assert(mir_verify::verify_module(&m.module:Read)?);
+    return;
+}
+function main(): void {
+    write("literal\n");
+    check("function f(): u32 { return 1; }\n")?;
+    write("place\n");
+    check("function f(x: u32): u32 { const c: u32 = 2; var n: u32 = x + c; n = n * 3; return n; }\n")?;
+    write("if\n");
+    check("function f(x: bool): u32 { if x { return 1; } else { return 2; } }\n")?;
+    write("elseif\n");
+    check("function f(x: u32): u32 { if x == 0 { return 1; } elseif x == 1 { return 2; } else { return 3; } }\n")?;
+    write("while\n");
+    check("function f(x: u32): u32 { var n: u32 = 0; outer: while n < x { n = n + 1; while n < 5 { if n == 2 { continue outer; } break; } if n == 7 { break outer; } } return n; }\n")?;
+    write("short\n");
+    check("function f(x: bool, y: bool): bool { var n: bool = x && (!y || x); if !n { n = x || y; } return n; }\n")?;
+    write("calls\n");
+    check("function id(x: u32): u32 { return x; } function add(x: u32, y: u32): u32 { return x + y; } function f(): u32 { return add(id(1), add(id(2), id(3))); }\n")?;
+    write("foreign\n");
+    check("foreign assert(x: bool): void; foreign exit(x: u8): void; function f(x: bool): void { assert(x); if x { exit(0); } return; }\n")?;
+    write("neg\n");
+    check("function f(x: i32, y: i32): i32 { return -x + y - 2; }\n")?;
+    write("bit\n");
+    check("function f(a: i32): i32 { return (a & 3) | (a ^ 4); }\n")?;
+    write("shift\n");
+    check("function f(b: i32): i32 { return (b << 1) >> 1; }\n")?;
+    write("carrier-early\n");
+    check("enum E { Bad(u32), Empty } function f(x: bool): u32!E { if x { return 7; } return E::Bad(2); } function g(x: bool): u32!E { let y: u32 = f(x)?; return y + 1; }\n")?;
+    write("void-carrier-early\n");
+    check("enum E { Bad } function f(x: bool): void!E { if x { return; } return E::Bad; } function g(x: bool): void!E { f(x)?; return; }\n")?;
+    write("subset-early\n");
+    check("enum E { Bad(u32) } enum F { Bad } function f(): u32!E { return E::Bad(3); } function g(): u32!(E | F) { return f()?; }\n")?;
+    write("wrap-simple\n");
+    check("function f(x: u32, y: u32): u32 { return @wrap_add(x, y); }\n")?;
+    write("wrap\n");
+    check("function f(c: i32, y: i32): i32 { return @wrap_add(@wrap_sub(c, 1), @wrap_mul(y, 3)); }\n")?;
+    write("ops\n");
+    check("function f(x: i32, y: i32): u32 { let a: i32 = -x + y - 2; let b: i32 = (a & 3) | (a ^ 4); let c: i32 = (b << 1) >> 1; let d: i32 = @wrap_add(@wrap_sub(c, 1), @wrap_mul(y, 3)); return d as u32; }\n")?;
+    write("bytes\n");
+    check("foreign write(data: &[u8]): void; function f(): void { let s: &[u8] = \"hi\"; write(s); }\n")?;
+    write("char\n");
+    check("function f(): char { return 'x'; }\n")?;
+    write("carrier\n");
+    check("enum E { Bad(u32), Empty } function f(x: bool): u32!E { if x { return 7; } return E::Bad(2); } function g(x: bool): u32!E { let y: u32 = f(x)?; return y + 1; }\n")?;
+    write("void-carrier\n");
+    check("enum E { Bad } function f(x: bool): void!E { if x { return; } return E::Bad; } function g(x: bool): void!E { f(x)?; return; }\n")?;
+    write("subset\n");
+    check("enum E { Bad(u32) } enum F { Bad } function f(): u32!E { return E::Bad(3); } function g(): u32!(E | F) { return f()?; }\n")?;
+    write("recursion\n");
+    check("function #f(n: u32): u32 { if n == 0 { return 0; } return g(n - 1); } function #g(n: u32): u32 { return f(n); }\n")?;
+    write("passed\n");
+    return;
+}

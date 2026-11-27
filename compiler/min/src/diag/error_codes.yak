@@ -1,0 +1,260 @@
+// 由 tools/error_codes.py 生成；请勿手改。
+// 源摘要：8a527d4852d0f3f885d9d95b8dd6b2791c3adfaf199febdb6dc7211ce505b219
+// 源文件：spec/proc/error.def（197 条登记码位，32 个子领域）；摘要对 LF 规范化后的字节取 SHA-256。
+//
+// 静态表形态：base 子集不允许结构体常量，因此条目字段拆成并行定长数组，
+// 引用与描述统一存进分块静态字节区，由 text_byte 按全局偏移取字节。
+
+// 单条登记码位的只读视图。
+export struct ErrorEntry {
+    code: u16,
+    segment: u8,       // 大段（千位，0-9）
+    sub: u8,           // 子领域（百位，0-9）
+    seq: u8,           // 序号（01-99）
+    ref_off: u32,      // 引用在静态字节区中的偏移
+    ref_len: u16,      // 引用字节数
+    desc_off: u32,     // 描述在静态字节区中的偏移
+    desc_len: u16,     // 描述字节数
+}
+
+// 未登记码位在查表接口中的返回值。
+const NO_ENTRY: u32 = 4294967295u32;
+
+// 登记码位总数（197）。
+const ENTRY_COUNT: u32 = 197u32;
+
+const CODES_0: [u16; 60] = [1001u16, 1002u16, 1003u16, 1004u16, 1005u16, 1006u16, 1007u16, 1008u16, 1009u16, 1010u16, 1011u16, 1012u16, 1013u16, 1014u16, 1015u16, 1016u16, 1017u16, 1018u16, 1019u16, 1020u16, 1021u16, 1022u16, 2001u16, 2002u16, 2003u16, 2004u16, 2005u16, 2006u16, 2007u16, 2008u16, 2009u16, 2010u16, 2011u16, 2012u16, 2013u16, 2014u16, 2015u16, 3001u16, 3002u16, 3003u16, 3004u16, 3005u16, 3006u16, 3007u16, 3008u16, 4001u16, 4002u16, 4003u16, 4004u16, 4005u16, 4006u16, 4007u16, 4008u16, 4009u16, 4010u16, 4011u16, 5001u16, 5002u16, 5003u16, 5004u16];
+const CODES_1: [u16; 60] = [5005u16, 5006u16, 5007u16, 5008u16, 5101u16, 5501u16, 5502u16, 5503u16, 5504u16, 5505u16, 5506u16, 5507u16, 5508u16, 5509u16, 5510u16, 5511u16, 5801u16, 5802u16, 5803u16, 5804u16, 5805u16, 5806u16, 5807u16, 5808u16, 5809u16, 5810u16, 5811u16, 5812u16, 5813u16, 5814u16, 5815u16, 5816u16, 5817u16, 5818u16, 5819u16, 5820u16, 5821u16, 5822u16, 5823u16, 6001u16, 6002u16, 6003u16, 6004u16, 6005u16, 6006u16, 6007u16, 6008u16, 6009u16, 6010u16, 6011u16, 6101u16, 6102u16, 6103u16, 6104u16, 6105u16, 6201u16, 6202u16, 6203u16, 6204u16, 6205u16];
+const CODES_2: [u16; 60] = [6206u16, 7001u16, 7002u16, 7003u16, 7004u16, 7005u16, 7006u16, 7007u16, 7008u16, 7009u16, 7010u16, 7011u16, 7012u16, 7013u16, 7014u16, 7015u16, 7016u16, 7017u16, 7018u16, 7019u16, 7020u16, 7021u16, 7022u16, 7023u16, 7024u16, 7025u16, 7026u16, 7027u16, 7028u16, 7029u16, 7030u16, 7031u16, 7032u16, 7033u16, 7034u16, 7035u16, 7036u16, 7101u16, 7102u16, 7103u16, 8001u16, 8002u16, 8003u16, 8004u16, 8005u16, 8006u16, 8007u16, 8008u16, 8009u16, 8010u16, 8011u16, 8012u16, 8013u16, 8014u16, 8015u16, 8016u16, 8017u16, 8018u16, 8019u16, 8020u16];
+const CODES_3: [u16; 17] = [8021u16, 8022u16, 8023u16, 9001u16, 9002u16, 9003u16, 9004u16, 9005u16, 9201u16, 9202u16, 9203u16, 9204u16, 9205u16, 9206u16, 9207u16, 9208u16, 9209u16];
+const SEGMENTS_0: [u8; 60] = [1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 1u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 3u8, 4u8, 4u8, 4u8, 4u8, 4u8, 4u8, 4u8, 4u8, 4u8, 4u8, 4u8, 5u8, 5u8, 5u8, 5u8];
+const SEGMENTS_1: [u8; 60] = [5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8, 6u8];
+const SEGMENTS_2: [u8; 60] = [6u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 7u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8];
+const SEGMENTS_3: [u8; 17] = [8u8, 8u8, 8u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8, 9u8];
+const SUBS_0: [u8; 60] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+const SUBS_1: [u8; 60] = [0u8, 0u8, 0u8, 0u8, 1u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 5u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 8u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 1u8, 1u8, 1u8, 1u8, 1u8, 2u8, 2u8, 2u8, 2u8, 2u8];
+const SUBS_2: [u8; 60] = [2u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 1u8, 1u8, 1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+const SUBS_3: [u8; 17] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8, 2u8];
+const SEQS_0: [u8; 60] = [1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 16u8, 17u8, 18u8, 19u8, 20u8, 21u8, 22u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 1u8, 2u8, 3u8, 4u8];
+const SEQS_1: [u8; 60] = [5u8, 6u8, 7u8, 8u8, 1u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 16u8, 17u8, 18u8, 19u8, 20u8, 21u8, 22u8, 23u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 1u8, 2u8, 3u8, 4u8, 5u8, 1u8, 2u8, 3u8, 4u8, 5u8];
+const SEQS_2: [u8; 60] = [6u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 16u8, 17u8, 18u8, 19u8, 20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8, 28u8, 29u8, 30u8, 31u8, 32u8, 33u8, 34u8, 35u8, 36u8, 1u8, 2u8, 3u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 16u8, 17u8, 18u8, 19u8, 20u8];
+const SEQS_3: [u8; 17] = [21u8, 22u8, 23u8, 1u8, 2u8, 3u8, 4u8, 5u8, 1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8];
+const REF_OFFS_0: [u32; 60] = [0u32, 10u32, 20u32, 30u32, 40u32, 50u32, 60u32, 70u32, 80u32, 90u32, 101u32, 112u32, 123u32, 134u32, 145u32, 156u32, 167u32, 178u32, 189u32, 200u32, 211u32, 222u32, 233u32, 245u32, 257u32, 269u32, 281u32, 293u32, 305u32, 317u32, 329u32, 341u32, 354u32, 367u32, 380u32, 393u32, 406u32, 419u32, 432u32, 445u32, 458u32, 471u32, 484u32, 497u32, 510u32, 522u32, 533u32, 544u32, 555u32, 566u32, 577u32, 588u32, 599u32, 610u32, 621u32, 633u32, 645u32, 656u32, 667u32, 678u32];
+const REF_OFFS_1: [u32; 60] = [689u32, 700u32, 720u32, 740u32, 760u32, 772u32, 786u32, 800u32, 814u32, 828u32, 842u32, 856u32, 870u32, 884u32, 898u32, 913u32, 928u32, 955u32, 982u32, 1007u32, 1032u32, 1057u32, 1082u32, 1109u32, 1134u32, 1159u32, 1184u32, 1211u32, 1238u32, 1265u32, 1292u32, 1319u32, 1346u32, 1372u32, 1398u32, 1424u32, 1450u32, 1478u32, 1506u32, 1534u32, 1545u32, 1556u32, 1567u32, 1578u32, 1589u32, 1600u32, 1627u32, 1639u32, 1651u32, 1663u32, 1675u32, 1687u32, 1699u32, 1711u32, 1723u32, 1750u32, 1762u32, 1774u32, 1786u32, 1798u32];
+const REF_OFFS_2: [u32; 60] = [1820u32, 1842u32, 1855u32, 1868u32, 1881u32, 1894u32, 1907u32, 1920u32, 1933u32, 1946u32, 1959u32, 1973u32, 1987u32, 2001u32, 2015u32, 2029u32, 2043u32, 2057u32, 2071u32, 2085u32, 2099u32, 2115u32, 2131u32, 2147u32, 2163u32, 2179u32, 2195u32, 2211u32, 2227u32, 2243u32, 2259u32, 2275u32, 2291u32, 2307u32, 2323u32, 2339u32, 2355u32, 2371u32, 2391u32, 2411u32, 2431u32, 2443u32, 2468u32, 2493u32, 2518u32, 2543u32, 2568u32, 2593u32, 2618u32, 2643u32, 2663u32, 2683u32, 2703u32, 2723u32, 2750u32, 2777u32, 2804u32, 2831u32, 2852u32, 2873u32];
+const REF_OFFS_3: [u32; 17] = [2894u32, 2915u32, 2940u32, 2965u32, 2977u32, 2989u32, 3001u32, 3013u32, 3024u32, 3046u32, 3068u32, 3090u32, 3112u32, 3134u32, 3146u32, 3158u32, 3170u32];
+const REF_LENS_0: [u16; 60] = [10u16, 10u16, 10u16, 10u16, 10u16, 10u16, 10u16, 10u16, 10u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 12u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 12u16, 12u16, 11u16, 11u16, 11u16, 11u16];
+const REF_LENS_1: [u16; 60] = [11u16, 20u16, 20u16, 20u16, 12u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 15u16, 15u16, 27u16, 27u16, 25u16, 25u16, 25u16, 25u16, 27u16, 25u16, 25u16, 25u16, 27u16, 27u16, 27u16, 27u16, 27u16, 27u16, 26u16, 26u16, 26u16, 26u16, 28u16, 28u16, 28u16, 11u16, 11u16, 11u16, 11u16, 11u16, 11u16, 27u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 12u16, 27u16, 12u16, 12u16, 12u16, 12u16, 22u16];
+const REF_LENS_2: [u16; 60] = [22u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 13u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 14u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 16u16, 20u16, 20u16, 20u16, 12u16, 25u16, 25u16, 25u16, 25u16, 25u16, 25u16, 25u16, 25u16, 20u16, 20u16, 20u16, 20u16, 27u16, 27u16, 27u16, 27u16, 21u16, 21u16, 21u16];
+const REF_LENS_3: [u16; 17] = [21u16, 25u16, 25u16, 12u16, 12u16, 12u16, 12u16, 11u16, 22u16, 22u16, 22u16, 22u16, 22u16, 12u16, 12u16, 12u16, 12u16];
+const DESC_OFFS_0: [u32; 60] = [3182u32, 3214u32, 3239u32, 3279u32, 3318u32, 3348u32, 3378u32, 3406u32, 3423u32, 3447u32, 3470u32, 3528u32, 3580u32, 3628u32, 3652u32, 3676u32, 3727u32, 3744u32, 3777u32, 3795u32, 3822u32, 3861u32, 3903u32, 3933u32, 3947u32, 3995u32, 4010u32, 4055u32, 4082u32, 4106u32, 4134u32, 4167u32, 4194u32, 4215u32, 4259u32, 4301u32, 4357u32, 4394u32, 4424u32, 4452u32, 4492u32, 4510u32, 4519u32, 4544u32, 4565u32, 4604u32, 4634u32, 4652u32, 4670u32, 4682u32, 4700u32, 4730u32, 4745u32, 4772u32, 4787u32, 4825u32, 4861u32, 4879u32, 4909u32, 4927u32];
+const DESC_OFFS_1: [u32; 60] = [4962u32, 5007u32, 5068u32, 5113u32, 5157u32, 5199u32, 5250u32, 5280u32, 5321u32, 5376u32, 5426u32, 5485u32, 5546u32, 5587u32, 5608u32, 5634u32, 5675u32, 5710u32, 5736u32, 5764u32, 5807u32, 5856u32, 5904u32, 5937u32, 5971u32, 6016u32, 6056u32, 6105u32, 6161u32, 6222u32, 6258u32, 6315u32, 6351u32, 6396u32, 6438u32, 6492u32, 6528u32, 6573u32, 6604u32, 6630u32, 6665u32, 6686u32, 6719u32, 6773u32, 6818u32, 6854u32, 6920u32, 6932u32, 6959u32, 6986u32, 7049u32, 7095u32, 7152u32, 7200u32, 7298u32, 7340u32, 7382u32, 7440u32, 7500u32, 7527u32];
+const DESC_OFFS_2: [u32; 60] = [7578u32, 7611u32, 7637u32, 7658u32, 7682u32, 7715u32, 7746u32, 7781u32, 7825u32, 7858u32, 7872u32, 7915u32, 7942u32, 8000u32, 8032u32, 8086u32, 8123u32, 8168u32, 8213u32, 8278u32, 8342u32, 8402u32, 8445u32, 8480u32, 8502u32, 8520u32, 8555u32, 8585u32, 8600u32, 8629u32, 8668u32, 8707u32, 8739u32, 8774u32, 8799u32, 8826u32, 8867u32, 8894u32, 8921u32, 8975u32, 9005u32, 9035u32, 9056u32, 9080u32, 9095u32, 9116u32, 9139u32, 9169u32, 9205u32, 9247u32, 9269u32, 9292u32, 9327u32, 9356u32, 9381u32, 9419u32, 9461u32, 9505u32, 9527u32, 9551u32];
+const DESC_OFFS_3: [u32; 17] = [9587u32, 9617u32, 9678u32, 9718u32, 9736u32, 9763u32, 9799u32, 9824u32, 9851u32, 9920u32, 9947u32, 9984u32, 10015u32, 10057u32, 10090u32, 10123u32, 10162u32];
+const DESC_LENS_0: [u16; 60] = [32u16, 25u16, 40u16, 39u16, 30u16, 30u16, 28u16, 17u16, 24u16, 23u16, 58u16, 52u16, 48u16, 24u16, 24u16, 51u16, 17u16, 33u16, 18u16, 27u16, 39u16, 42u16, 30u16, 14u16, 48u16, 15u16, 45u16, 27u16, 24u16, 28u16, 33u16, 27u16, 21u16, 44u16, 42u16, 56u16, 37u16, 30u16, 28u16, 40u16, 18u16, 9u16, 25u16, 21u16, 39u16, 30u16, 18u16, 18u16, 12u16, 18u16, 30u16, 15u16, 27u16, 15u16, 38u16, 36u16, 18u16, 30u16, 18u16, 35u16];
+const DESC_LENS_1: [u16; 60] = [45u16, 61u16, 45u16, 44u16, 42u16, 51u16, 30u16, 41u16, 55u16, 50u16, 59u16, 61u16, 41u16, 21u16, 26u16, 41u16, 35u16, 26u16, 28u16, 43u16, 49u16, 48u16, 33u16, 34u16, 45u16, 40u16, 49u16, 56u16, 61u16, 36u16, 57u16, 36u16, 45u16, 42u16, 54u16, 36u16, 45u16, 31u16, 26u16, 35u16, 21u16, 33u16, 54u16, 45u16, 36u16, 66u16, 12u16, 27u16, 27u16, 63u16, 46u16, 57u16, 48u16, 98u16, 42u16, 42u16, 58u16, 60u16, 27u16, 51u16];
+const DESC_LENS_2: [u16; 60] = [33u16, 26u16, 21u16, 24u16, 33u16, 31u16, 35u16, 44u16, 33u16, 14u16, 43u16, 27u16, 58u16, 32u16, 54u16, 37u16, 45u16, 45u16, 65u16, 64u16, 60u16, 43u16, 35u16, 22u16, 18u16, 35u16, 30u16, 15u16, 29u16, 39u16, 39u16, 32u16, 35u16, 25u16, 27u16, 41u16, 27u16, 27u16, 54u16, 30u16, 30u16, 21u16, 24u16, 15u16, 21u16, 23u16, 30u16, 36u16, 42u16, 22u16, 23u16, 35u16, 29u16, 25u16, 38u16, 42u16, 44u16, 22u16, 24u16, 36u16];
+const DESC_LENS_3: [u16; 17] = [30u16, 61u16, 40u16, 18u16, 27u16, 36u16, 25u16, 27u16, 69u16, 27u16, 37u16, 31u16, 42u16, 33u16, 33u16, 39u16, 30u16];
+const TEXT0: &[u8] = "lex.md:L-1lex.md:L-2lex.md:L-3lex.md:L-4lex.md:L-5lex.md:L-6lex.md:L-7lex.md:L-8lex.md:L-9lex.md:L-10lex.md:L-11lex.md:L-12lex.md:L-13lex.md:L-14lex.md:L-15lex.md:L-16lex.md:L-17lex.md:L-18lex.md:L-19lex.md:L-20lex.md:L-21lex.md:L-22parse.md:P-1parse.md:P-2parse.md:P-3parse.md:P-4parse.md:P-5parse.md:P-6parse.md:P-7parse.md:P-8parse.md:P-9parse.md:P-10parse.md:P-11parse.md:P-12parse.md:P-13parse.md:P-14parse.md:P-15sugar.md:SU-1sugar.md:SU-2sugar.md:SU-3sugar.md:SU-4sugar.md:SU-5sugar.md:SU-6sugar.md:SU-7base.md:R-24name.md:N-1name.md:N-2name.md:N-3name.md:N-4name.md:N-5name.md:N-6name.md:N-7name.md:N-8name.md:N-9name.md:N-10name.md:N-11base.md:R-1base.md:R-9base.md:6.6base.md:6.6base.md:4.7../lang/const.md:C-1../lang/const.md:C-2../lang/const.md:C-5base.md:R-17layout.md:LY-1layout.md:LY-2layout.md:LY-3layout.md:LY-4layout.md:LY-5layout.md:LY-6layout.md:LY-7layout.md:LY-8layout.md:LY-9layout.md:LY-10layout.md:LY-11../lang/type/result.md:RE-2../lang/type/result.md:RE-3../lang/type/enum.md:EN-1../lang/type/enum.md:EN-2../lang/type/enum.md:EN-3../lang/type/enum.md:EN-4../lang/type/result.md:RE-1../lang/type/enum.md:EN-5../lang/type/enum.md:EN-6../lang/type/enum.md:EN-7../lang/type/result.md:RE-8../lang/type/result.md:RE-9../lang/type/option.md:OP-1../lang/type/option.md:OP-2../lang/type/option.md:OP-3../lang/type/option.md:OP-4../lang/type/union.md:UN-1../lang/type/union.md:UN-2../lang/type/union.md:UN-3../lang/type/union.md:UN-4../lang/type/result.md:RE-10../lang/type/result.md:RE-11../lang/type/result.md:RE-12base.md:R-2base.md:R-3base.md:R-4base.md:R-5base.md:R-6base.md:R-7../lang/type/result.md:RE-4base.md:R-14base.md:R-15base.md:R-16base.md:R-18base.md:R-13base.md:R-22base.md:R-23base.md:R-25../lang/type/result.md:RE-6base.md:R-19base.md:R-20base.md:R-21base.md:R-26../lang/owner.md:OW-10../lang/owner.md:OW-11symbol.md:S-1symbol.md:S-2symbol.md:S-3symbol.md:S-4symbol.md:S-5symbol.md:S-6symbol.md:S-7symbol.md:S-8symbol.md:S-9symbol.md:S-10symbol.md:S-11symbol.md:S-12symbol.md:S-13symbol.md:S-14symbol.md:S-15symbo";
+const TEXT1: &[u8] = "l.md:S-16symbol.md:S-17symbol.md:S-18symbol.md:S-19../ir/mir.md:M-7../ir/mir.md:M-8../ir/mir.md:M-9../ir/ysm.md:Y-1../ir/ysm.md:Y-2../ir/ysm.md:Y-3../ir/ysm.md:Y-4../ir/ysm.md:Y-5../ir/ysm.md:Y-6../ir/ysm.md:Y-7../ir/ysm.md:Y-8../ir/mir.md:M-1../ir/mir.md:M-2../ir/mir.md:M-3../ir/mir.md:M-4../ir/mir.md:M-5../ir/mir.md:M-6../target/x86.md:X-1../target/x86.md:X-2../target/x86.md:X-3base.md:R-11../target/emitter.md:EM-1../target/emitter.md:EM-2../target/emitter.md:EM-3../target/emitter.md:EM-4../target/abi-win.md:AW-1../target/abi-win.md:AW-2../target/abi-win.md:AW-3../target/abi-win.md:AW-4../target/pe.md:PE-1../target/pe.md:PE-2../target/pe.md:PE-3../target/pe.md:PE-4../target/abi-linux.md:AL-1../target/abi-linux.md:AL-2../target/abi-linux.md:AL-3../target/abi-linux.md:AL-4../target/elf.md:EL-1../target/elf.md:EL-2../target/elf.md:EL-3../target/elf.md:EL-4../target/emitter.md:EM-5../target/emitter.md:EM-6base.md:R-12base.md:7.15base.md:10.3base.md:T-12base.md:5.7../lang/foreign.md:F-2../lang/foreign.md:F-3../lang/foreign.md:F-4../lang/foreign.md:F-5../lang/foreign.md:3.5host.md:HS-1host.md:HS-2host.md:HS-3host.md:HS-4非UTF-8字节序列BOM代理对base期出现文档注释@被写作用户标识符的组成部分整数字面量溢出目标类型范围字符串字面量含裸换行字面量含非法转义序列base期出现浮点字面量base期出现nullbase期类型位出现T?..出现在非索引位@单独出现后随非标识符或未登记原语注解名字节字面量为空多字节或使用Unicode转义原始字符串未闭合或井号界定不匹配模板字符串未闭合模板插值洞未闭合#未形成合法HashName或出现未登记源字符单独CR行结束文件末尾换行不符合约定块注释未闭合token长度超过Span范围整数进制数字或后缀形态非法字符标量数非法或字面量未闭合产生式不匹配语法错误match不穷尽match标签payload形态与绑定写法不匹配if条件非boolreturn表达式类型与函数返回不匹配赋值目标非可写左值out声明带";
+const TEXT2: &[u8] = "初始化器let-var-const缺初始化器视图类型出现在非法位置T?出现在base期类型位多级自动解引用match作用于T!E-T?-ErrorSet或普通联合match标签不属于scrutinee的enum类型match标签重复通配臂重复或通配臂后仍有armHashName出现在非callable声明位未登记的高阶语法出现脱糖后仍含非base形态脱糖引入新的MIR opcode或BuiltinIdif-let作用于T!E..=溢出顶层let-var循环依赖泛型单态化失败使用保留占位字或未启用形态同一作用域内重复声明名字解析失败名字解析歧义前向引用循环模块依赖import引入名被重新声明模块自导入未导出项被外部引用未使用绑定match臂绑定遮蔽同臂已有绑定参数遮蔽同函数域其他参数隐式类型转换浮点字面量或浮点类型整数算术溢出as窄化截断编译期可证诊断整数字面量无法唯一定型且无后缀base const初始器含不允许表达式或不可物化类型const enum payload或定长数组元素非法const整数运算溢出除零或移位越界用户定义参数化类型或泛型函数布局计算的大小偏移步长或乘积溢出u64构造零大小可存储对象enum变体或ErrorSet成员数超过65536void用作对象存储字段数组元素或泛型实参未实例化类型参数进入MIR-YSM-布局或ABI读取比较哈希或语义复制padding或inactive payload未冻结动态interface对象进入稳定ABI或foreign边界未登记layout profile的类型进入ABI按值布局依赖环struct字段数超过65536align注解对象值或对齐方向非法错误集联合E1-E2成员可重叠构造T!E时T与E可重叠同一enum内标签名重复标签构造payload形态与声明不匹配标签构造payload类型不可赋给声明类型普通表达式位置使用无前缀标签构造ErrorSet操作数不是enum类型读取写入或转换enum原始tagenum payload不可比较却使用相等比较单独的下划线不可作enum标签名T!E出现在非返回或局部carrier绑定位置裸组合carrier后缀或把carrier";
+const TEXT3: &[u8] = "伪装为普通联合null没有唯一预期可空类型或可空内部类型非法非可空接收者使用可空操作可空载体使用错误传播恢复或普通联合分流裸组合后缀或伪造可空状态普通联合成员非法或规范化后重叠构造读取或转换普通联合内部tag普通联合使用carrier专用操作或is目标非法未冻结的普通联合分流形态catch-handler-table成员不属于E的memberscatch-handler-table成员重复unwrap接收者非T!E或T?match scrutinee不是owning enum值越界编译期可证移动或析构后继续使用源ReadWrite活跃期间访问原变量名或其他引用引用逃逸宿主区域或返回局部借用以引用或切片表达环自引用普通值使用问号或T!E传播的返回类型错误集不兼容能力升级对let绑定请求ReadWrite依赖多层隐式解引用视图作为字段enum payload元素泛型实参或返回类型用户书写Write或在非out通道建立Write对out槽位读取部分写入重复填充借用或转发控制流合流点对同一槽位状态不一致out的T为视图函数静态引用void普通联合T?或T!E，或含out调用返回未登记carrier含out的T!E调用保存到绑定后判定隐式clone-move-drop或copy收窄为clone对非Copy类型使用copy-Copy类型拥有需析构资源clone未登记克隆契约或作用于Copy类型视图或T!Emove-drop作用于非owning对struct字段或数组元素的投影部分移动drop作用于投影而非整place混用任意两套id系统随机化哈希种子固有符号分区越界用户名字进入BuiltinId分区保留字重复进入symbol.defNameId-ScopeId-DefId跨单元传播程序运行期加载sym或iface作为依赖错误路径运行期查符号表统一id位宽symbol.def生成表与产物摘要不一致以视图作字段或返回接口容器签名摘要或目标profile非法或不匹配拷贝接口字节进本地arena在2.1声明分区字段之外做位域打包或抽取默认快速构建生成或解析JSON普通标准库函数重复登记为BuiltinId配置源含执行";
+const TEXT4: &[u8] = "代码或未登记派生项名字解析完成后仍以名称或作用域id表示语义引用名称intern或接口bridge后仍重复hash或扫描名称字节#函数可达调用图含增操作或非no_alloc导入目标#函数含不可验证的间接函数调用#泛型函数当前profile未激活YSM含NameId或ScopeIdYSM节目录非法YSM保留字段或禁止flags非零YSM指令操作数与MIR不符YSM排序违规YSM函数no_alloc flags非法YSM依赖接口摘要非法或不匹配YSM target_profile不一致或不匹配MIR使用moved或dropped的placeborrow_rw活跃期访问重叠placeMIR保留NameId或ScopeIdMIR含不可达块未删除enum_dispatch或carrier_dispatch非穷尽out槽位状态转移非法使用允许子集外指令编码歧义同一opcode操作数产生多字节序列多余前缀或非最短编码未登记的外部服务调用链接符号未定义链接符号重复定义重定位失败目标格式不支持Win栈未16字节对齐Win shadow space不足32字节Win被调方保存寄存器未恢复Win修饰名非法字符或非确定digestPE TimeDateStamp非零PE未知节或节属性PE重定位类型宽度加数非法PE符号表未按LinkId升序Linux栈未16字节对齐Linux被调方保存寄存器未恢复syscall clobber寄存器泄漏到ABI边界Linux修饰名非法字符或非确定digestELF header字段非法ELF未知节或节属性ELF重定位类型宽度加数非法ELF符号表未按LinkId升序条件跳转符号性不匹配或wrap运算误发溢出跳转ABI 值形态不被当前 profile 支持资源上限超出运行期越界索引切片运行期不正常完成路径触发AllocError堆分配失败栈溢出递归深度超限foreign参数或返回类型非法(owning/Write/carrier/函数引用)向foreign边界传递Writeforeign服务失败未映射为陷阱foreign声明使用export前缀断言服务条件为假未映射为陷阱种子宿主登记或选项非法参数索引或接收缓冲非法访问未登记的输入或输出名称受限文件服务执行失败";
+const KIND_OFFS: [u32; 6] = [0u32, 5u32, 14u32, 23u32, 30u32, 39u32];
+const KIND_LENS: [u8; 6] = [5u8, 9u8, 9u8, 7u8, 9u8, 7u8];
+const KIND_NAMES: &[u8] = "DefIdBuiltinIdImportRefFieldIdVariantIdLocalId";
+const SOURCE_SHA256_START: u32 = 24u32;
+const SOURCE_SHA256: &[u8] = "YAK-ERROR-DEF-SHA256-V1:8a527d4852d0f3f885d9d95b8dd6b2791c3adfaf199febdb6dc7211ce505b219:END-YAK-ERROR-DEF";
+
+// ── 并行表按块派发 ──
+
+function codes_at(index: u32): u16 {
+    if index < 60u32 { return CODES_0[index]; }
+    if index < 120u32 { return CODES_1[index - 60u32]; }
+    if index < 180u32 { return CODES_2[index - 120u32]; }
+    if index < 197u32 { return CODES_3[index - 180u32]; }
+    return 0u16;
+}
+function segments_at(index: u32): u8 {
+    if index < 60u32 { return SEGMENTS_0[index]; }
+    if index < 120u32 { return SEGMENTS_1[index - 60u32]; }
+    if index < 180u32 { return SEGMENTS_2[index - 120u32]; }
+    if index < 197u32 { return SEGMENTS_3[index - 180u32]; }
+    return 0u8;
+}
+function subs_at(index: u32): u8 {
+    if index < 60u32 { return SUBS_0[index]; }
+    if index < 120u32 { return SUBS_1[index - 60u32]; }
+    if index < 180u32 { return SUBS_2[index - 120u32]; }
+    if index < 197u32 { return SUBS_3[index - 180u32]; }
+    return 0u8;
+}
+function seqs_at(index: u32): u8 {
+    if index < 60u32 { return SEQS_0[index]; }
+    if index < 120u32 { return SEQS_1[index - 60u32]; }
+    if index < 180u32 { return SEQS_2[index - 120u32]; }
+    if index < 197u32 { return SEQS_3[index - 180u32]; }
+    return 0u8;
+}
+function ref_offs_at(index: u32): u32 {
+    if index < 60u32 { return REF_OFFS_0[index]; }
+    if index < 120u32 { return REF_OFFS_1[index - 60u32]; }
+    if index < 180u32 { return REF_OFFS_2[index - 120u32]; }
+    if index < 197u32 { return REF_OFFS_3[index - 180u32]; }
+    return 0u32;
+}
+function ref_lens_at(index: u32): u16 {
+    if index < 60u32 { return REF_LENS_0[index]; }
+    if index < 120u32 { return REF_LENS_1[index - 60u32]; }
+    if index < 180u32 { return REF_LENS_2[index - 120u32]; }
+    if index < 197u32 { return REF_LENS_3[index - 180u32]; }
+    return 0u16;
+}
+function desc_offs_at(index: u32): u32 {
+    if index < 60u32 { return DESC_OFFS_0[index]; }
+    if index < 120u32 { return DESC_OFFS_1[index - 60u32]; }
+    if index < 180u32 { return DESC_OFFS_2[index - 120u32]; }
+    if index < 197u32 { return DESC_OFFS_3[index - 180u32]; }
+    return 0u32;
+}
+function desc_lens_at(index: u32): u16 {
+    if index < 60u32 { return DESC_LENS_0[index]; }
+    if index < 120u32 { return DESC_LENS_1[index - 60u32]; }
+    if index < 180u32 { return DESC_LENS_2[index - 120u32]; }
+    if index < 197u32 { return DESC_LENS_3[index - 180u32]; }
+    return 0u16;
+}
+
+// ── 静态字节区取字节 ──
+
+// 按全局偏移读静态字节区；越界返回 0，长度判定由各接口负责。
+function text_byte(off: u32): u8 {
+    if off < 2048u32 { return TEXT0[off]; }
+    if off < 4094u32 { return TEXT1[off - 2048u32]; }
+    if off < 6140u32 { return TEXT2[off - 4094u32]; }
+    if off < 8186u32 { return TEXT3[off - 6140u32]; }
+    if off < 10192u32 { return TEXT4[off - 8186u32]; }
+    return 0u8;
+}
+
+// ── 码位查询 ──
+
+export function error_count(): u32 { return ENTRY_COUNT; }
+
+// 线性查表；条目数量固定为一个错误码文件的规模，结果与顺序都确定。
+export function error_index(code: u16): u32 {
+    var i: u32 = 0u32;
+    while i < ENTRY_COUNT {
+        if codes_at(i) == code { return i; }
+        i = i + 1u32;
+    }
+    return NO_ENTRY;
+}
+
+// 码位是否已在 error.def 登记；组件发出未登记码位即构建失败。
+export function error_exists(code: u16): bool { return error_index(code) != NO_ENTRY; }
+
+// 越界索引返回全零条目，调用方须先用 error_exists 区分。
+export function error_entry_at(index: u32): ErrorEntry {
+    if index >= ENTRY_COUNT {
+        return ErrorEntry { code: 0u16, segment: 0u8, sub: 0u8, seq: 0u8, ref_off: 0u32, ref_len: 0u16, desc_off: 0u32, desc_len: 0u16 };
+    }
+    return ErrorEntry { code: codes_at(index), segment: segments_at(index), sub: subs_at(index), seq: seqs_at(index), ref_off: ref_offs_at(index), ref_len: ref_lens_at(index), desc_off: desc_offs_at(index), desc_len: desc_lens_at(index) };
+}
+
+export function error_entry(code: u16): ErrorEntry { return error_entry_at(error_index(code)); }
+
+// ── 引用与描述字节 ──
+
+export function error_ref_len(index: u32): u16 {
+    if index >= ENTRY_COUNT { return 0u16; }
+    return ref_lens_at(index);
+}
+
+export function error_ref_at(index: u32, at: u32): u8 {
+    if index >= ENTRY_COUNT { return 0u8; }
+    if at >= (ref_lens_at(index) as u32) { return 0u8; }
+    return text_byte(ref_offs_at(index) + at);
+}
+
+export function error_ref_eq(index: u32, expected: &[u8]): bool {
+    if index >= ENTRY_COUNT { return false; }
+    if (ref_lens_at(index) as u32) != (@len(expected) as u32) { return false; }
+    var i: u32 = 0u32;
+    while i < (@len(expected) as u32) {
+        if error_ref_at(index, i) != expected[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+export function error_desc_len(index: u32): u16 {
+    if index >= ENTRY_COUNT { return 0u16; }
+    return desc_lens_at(index);
+}
+
+export function error_desc_at(index: u32, at: u32): u8 {
+    if index >= ENTRY_COUNT { return 0u8; }
+    if at >= (desc_lens_at(index) as u32) { return 0u8; }
+    return text_byte(desc_offs_at(index) + at);
+}
+
+export function error_desc_eq(index: u32, expected: &[u8]): bool {
+    if index >= ENTRY_COUNT { return false; }
+    if (desc_lens_at(index) as u32) != (@len(expected) as u32) { return false; }
+    var i: u32 = 0u32;
+    while i < (@len(expected) as u32) {
+        if error_desc_at(index, i) != expected[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+// ── 生成源摘要（拒绝形态 ER-2：配置源、生成表与产物摘要必须一致）──
+
+export function error_source_sha256_len(): u32 { return 64u32; }
+
+export function error_source_sha256_at(at: u32): u8 {
+    if at >= error_source_sha256_len() { return 0u8; }
+    return SOURCE_SHA256[SOURCE_SHA256_START + at];
+}
+
+export function error_source_sha256_eq(expected: &[u8]): bool {
+    if (error_source_sha256_len() as u64) != @len(expected) { return false; }
+    var i: u32 = 0u32;
+    while i < error_source_sha256_len() {
+        if error_source_sha256_at(i) != expected[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+// ── 引用种类校验（独立于错误码域，拒绝形态 ER-1：不得混域）──
+
+// 合法种类数量：0=DefId，1=BuiltinId，2=ImportRef，3=FieldId，4=VariantId，5=LocalId。
+export function error_ref_kind_count(): u8 { return 6u8; }
+
+// NameId、ScopeId 等不在此域，任何 >=6 的取值一律拒绝。
+export function error_ref_kind_valid(kind: u8): bool { return kind < 6u8; }
+
+export function error_ref_kind_label_len(kind: u8): u8 {
+    if kind >= 6u8 { return 0u8; }
+    return KIND_LENS[kind as u32];
+}
+
+export function error_ref_kind_label_at(kind: u8, at: u32): u8 {
+    if kind >= 6u8 { return 0u8; }
+    if at >= (KIND_LENS[kind as u32] as u32) { return 0u8; }
+    return KIND_NAMES[KIND_OFFS[kind as u32] + at];
+}
+
+export function error_ref_kind_label_eq(kind: u8, expected: &[u8]): bool {
+    if kind >= 6u8 { return false; }
+    if (KIND_LENS[kind as u32] as u32) != (@len(expected) as u32) { return false; }
+    var i: u32 = 0u32;
+    while i < (@len(expected) as u32) {
+        if error_ref_kind_label_at(kind, i) != expected[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}

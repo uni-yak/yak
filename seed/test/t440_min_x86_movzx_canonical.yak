@@ -1,0 +1,51 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 无需改变指令字节数的 W 别名与可移除整个 REX 的长形态分别拒绝。
+    let bytes: [u8; 46] = [0x0f, 0xb6, 0xc0, 0x40, 0x0f, 0xb6, 0xc4, 0x44, 0x0f, 0xb7, 0x00,
+        0x42, 0x0f, 0xb6, 0x04, 0x20, 0x48, 0x0f, 0xbe, 0xc4, 0x48, 0x0f, 0xb6, 0xc0,
+        0x48, 0x0f, 0xb6, 0xc4, 0x4c, 0x0f, 0xb7, 0x00, 0x4a, 0x0f, 0xb6, 0x04, 0x20,
+        0x4a, 0x0f, 0xb6, 0xc4, 0x4c, 0x0f, 0xb7, 0x4d, 0x0f];
+    encoding(&bytes[0..20]:Read, 0)?;
+    encoding(&bytes[20..24]:Read, 7103)?;
+    encoding(&bytes[24..28]:Read, 7102)?;
+    encoding(&bytes[28..32]:Read, 7102)?;
+    encoding(&bytes[32..37]:Read, 7102)?;
+    // X 与 W 均可清除，但 SPL 仍要求裸 REX。
+    encoding(&bytes[37..41]:Read, 7102)?;
+    encoding(&bytes[41..44]:Read, 7101)?;
+    encoding(&bytes[44..46]:Read, 7101)?;
+    // 同宽字到字扩展未登记。字节到字合法，REX.W 存在时 66 对宽度无效。
+    let words: [u8; 33] = [0x66, 0x0f, 0xb7, 0xc1, 0x66, 0x0f, 0xbf, 0x01,
+        0x66, 0x44, 0x0f, 0xb7, 0x45, 0x01, 0x66, 0x0f, 0xb6, 0xc4,
+        0x66, 0x40, 0x0f, 0xbe, 0xc4, 0x66, 0x48, 0x0f, 0xbf, 0x01,
+        0x66, 0x4c, 0x0f, 0xb7, 0xc1];
+    encoding(&words[0..4]:Read, 7101)?;
+    encoding(&words[4..8]:Read, 7101)?;
+    encoding(&words[8..14]:Read, 7101)?;
+    encoding(&words[8..13]:Read, 7101)?;
+    encoding(&words[14..23]:Read, 0)?;
+    encoding(&words[23..28]:Read, 7103)?;
+    encoding(&words[28..33]:Read, 7103)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

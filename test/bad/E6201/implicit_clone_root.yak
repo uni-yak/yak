@@ -1,0 +1,16 @@
+// expected_code: E6201
+// dependency: implicit_clone_dep.yak
+// spec: spec/lang/base.md R-19；spec/lang/owner.md OW-6
+// 触发：导入 owning 聚合的整值实参未显式移动。
+import implicit_clone_dep;
+
+function take(x: implicit_clone_dep::Leaf): void {
+    @drop(x);
+    return;
+}
+
+function main(): void {
+    let x: implicit_clone_dep::Leaf = implicit_clone_dep::Leaf { first: [], second: [] };
+    take(x);
+    return;
+}

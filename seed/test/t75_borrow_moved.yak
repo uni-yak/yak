@@ -1,0 +1,8 @@
+// t75: 对 moved place 取引用 → OW-1 trap
+// expected_trap: place moved/dropped
+function main(): void {
+    let a: u32[] = [1, 2, 3];
+    let b: u32[] = a;
+    let r: &u32[] = &a;
+    return;
+}

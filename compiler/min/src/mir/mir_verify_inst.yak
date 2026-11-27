@@ -1,0 +1,395 @@
+// 逐条核验 MIR 指令的操作码、操作数与目标类型约束。
+import typecheck;
+import layout;
+import mir;
+
+const NONE: u32 = 4294967295u32;
+
+function defined_local(ctx: &mir::MirFunction:Read, id: u32): bool { return id > 0 && id <= @len(ctx.locals) as u32; }
+
+function find_import_sorted(module: &mir::MirModule:Read, dep: u32, export_id: u32): u32 {
+    var low: u32 = 0;
+    var high: u32 = @len(module.imports) as u32;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2;
+        let rec: mir::MirImport = module.imports[mid];
+        let rd: u32 = rec.dep as u32;
+        if rd < dep || (rd == dep && rec.export_id < export_id) { low = mid + 1; }
+        elseif rd == dep && rec.export_id == export_id { return mid; }
+        else { high = mid; }
+    }
+    return @len(module.imports) as u32;
+}
+
+export function functions_ordered(module: &mir::MirModule:Read): bool {
+    var i: u32 = 1;
+    let n: u32 = @len(module.functions) as u32;
+    while i < n {
+        if module.functions[i].def <= module.functions[i - 1].def { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function has_local_function(module: &mir::MirModule:Read, def: u32, ordered_funcs: bool): bool {
+    if !ordered_funcs { return mir::function_index(module, def) != 0; }
+    var low: u32 = 0;
+    var high: u32 = @len(module.functions) as u32;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2;
+        let cur: u32 = module.functions[mid].def;
+        if cur < def { low = mid + 1; }
+        elseif cur == def { return true; }
+        else { high = mid; }
+    }
+    return false;
+}
+
+function verify_function_address(module: &mir::MirModule:Read, inst: mir::MirInst, ordered_funcs: bool): bool {
+    if inst.a == 0 || inst.b == 0 || inst.c > 65535 || inst.value != 0 || inst.args_count != 0 { return false; }
+    if inst.c == 0 {
+        let row: u32 = mir::func_sig(&module.signatures:Read, inst.b);
+        if row == 0 || !has_local_function(module, inst.b, ordered_funcs) { return false; }
+        let sig: &typecheck::FuncSig:Read = &module.signatures.items[row - 1]:Read;
+        return mir::function_ref_matches(&module.types:Read, inst.value_type_id, &sig.params[0..@len(sig.params)]:Read, sig.ret);
+    }
+    let idx: u32 = find_import_sorted(module, inst.c, inst.b);
+    if idx == @len(module.imports) as u32 { return false; }
+    let sig: mir::MirImport = module.imports[idx];
+    let total: u32 = @len(module.import_params) as u32;
+    if sig.param_start > total || sig.param_count as u32 > total - sig.param_start { return false; }
+    let end: u32 = sig.param_start + sig.param_count as u32;
+    return mir::function_ref_matches(&module.types:Read, inst.value_type_id, &module.import_params[sig.param_start..end]:Read, sig.ret);
+}
+
+function valid_call_arg(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, inst: mir::MirInst, p: u32, formal: u32): bool {
+    let arg: u32 = ctx.args[inst.args_start + p];
+    if !defined_local(ctx, arg) || !mir::valid_type(&module.types:Read, formal) { return false; }
+    let payload: u32 = typecheck::write_ref_target(&module.types:Read, formal);
+    if payload != 0 {
+        return mir::is_slot_call(inst.op) && ctx.locals[arg - 1].kind == 3 && ctx.locals[arg - 1].state == 10 &&
+            mir::local_type(ctx, arg) == payload && mir::out_return_supported(&module.types:Read, inst.value_type_id);
+    }
+    return ctx.locals[arg - 1].kind != 3 && mir::arg_type_compatible(&module.types:Read, mir::local_type(ctx, arg), formal);
+}
+
+function verify_indirect_call(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, inst: mir::MirInst): bool {
+    if inst.c != 0 || inst.value != 0 || !defined_local(ctx, inst.b) || ctx.locals[inst.b - 1].kind == 3 { return false; }
+    let callee: u32 = mir::local_type(ctx, inst.b);
+    if !mir::valid_type(&module.types:Read, callee) { return false; }
+    let ty: typecheck::TypeEntry = module.types.entries[callee - 1];
+    let total: u32 = @len(module.types.members) as u32;
+    if ty.kind != 8 || ty.elem != inst.value_type_id || (inst.a == 0) != mir::is_void(&module.types:Read, ty.elem) ||
+        ty.members_count != inst.args_count || ty.members_start > total || ty.members_count > total - ty.members_start { return false; }
+    var p: u32 = 0;
+    while p < ty.members_count {
+        let formal: u32 = module.types.members[ty.members_start + p];
+        if !mir::valid_type(&module.types:Read, formal) { return false; }
+        let kind: u8 = module.types.entries[formal - 1].kind;
+        if (kind != 4 && kind != 5 && kind != 8) || !valid_call_arg(module, ctx, inst, p, formal) { return false; }
+        p = p + 1;
+    }
+    return true;
+}
+
+export function verify_instruction(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, layouts: &layout::LayoutTable:Read, instruction: mir::MirInst, ordered_fields: bool, ordered_funcs: bool, pointees: &u32[]:ReadWrite, readonly_addrs: &bool[]:ReadWrite, readonly_projections: &u32[]:ReadWrite, site: u32): bool!AllocError {
+    let op: u8 = instruction.op;
+    if op == 80 {
+        // 直接存储槽的类型必须与载入类型一致；其他地址局部承载指针值。
+        if !defined_local(ctx, instruction.b) { return false; }
+        if ctx.locals[instruction.b - 1].kind == 2 { if mir::local_type(ctx, instruction.b) != instruction.value_type_id { return false; } }
+        elseif !mir::is_pointer(&module.types:Read, mir::local_type(ctx, instruction.b)) && (*pointees)[instruction.b - 1] == 0 { return false; }
+    } elseif op == 81 {
+        // 写入：`b` 是聚合存储槽（地址），`c` 是被写入的值，两者类型必须与指令类型自洽。
+        if instruction.a != 0 || !defined_local(ctx, instruction.b) { return false; }
+        if !defined_local(ctx, instruction.c) || mir::local_type(ctx, instruction.c) != instruction.value_type_id { return false; }
+        if ctx.locals[instruction.b - 1].kind == 2 { if mir::local_type(ctx, instruction.b) != instruction.value_type_id { return false; } }
+        elseif !mir::is_pointer(&module.types:Read, mir::local_type(ctx, instruction.b)) && (*pointees)[instruction.b - 1] == 0 { return false; }
+    } elseif op == 82 || op == 83 {
+        // 地址局部的类型固定为内建 u64（4100）；元素下标按整型，元素宽度由 value 承载。
+        if !mir::is_pointer(&module.types:Read, instruction.value_type_id) { return false; }
+        if !defined_local(ctx, instruction.b) { return false; }
+        let indirect: u32 = mir::projection_base(instruction);
+        var base: u32 = mir::local_type(ctx, instruction.b);
+        if indirect != 0 {
+            if ctx.locals[instruction.b - 1].kind == 2 || ctx.locals[instruction.b - 1].kind == 3 { return false; }
+            if !mir::is_pointer(&module.types:Read, base) && (*pointees)[instruction.b - 1] != indirect { return false; }
+            base = indirect;
+        }
+        if !mir::valid_type(&module.types:Read, base) { return false; }
+        let base_kind: u8 = module.types.entries[base - 1].kind;
+        if op == 82 {
+            let field: u32 = mir::projection_pointee_indexed(module, layouts, base, instruction, ordered_fields);
+            if !mir::valid_type(&module.types:Read, field) { return false; }
+            (*pointees)[instruction.a - 1] = field;
+            (*readonly_addrs)[instruction.a - 1] = base_kind == 5 || base_kind == 6;
+        } else {
+            if !ctx.has_trap_target || !defined_local(ctx, instruction.c) { return false; }
+            let index: u32 = mir::local_type(ctx, instruction.c);
+            let stride: u64 = mir::projection_stride(instruction) as u64;
+            if base_kind != 7 && base_kind != 6 && !mir::is_slice_view(&module.types:Read, base) { return false; }
+            if !mir::valid_type(&module.types:Read, module.types.entries[base - 1].elem) { return false; }
+            if !mir::valid_type(&module.types:Read, index) || module.types.entries[index - 1].kind != 1 || module.types.entries[index - 1].builtin < 4097 || module.types.entries[index - 1].builtin > 4104 { return false; }
+            if stride == 0 || stride > 2147483647u64 { return false; }
+            if base_kind == 7 {
+                if module.types.entries[base - 1].length == 0 { return false; }
+                let size: u64 = mir::layout_size(layouts, base);
+                if size == 0 || size % module.types.entries[base - 1].length != 0 || size / module.types.entries[base - 1].length != stride { return false; }
+            } else {
+                let elem_size: u64 = mir::layout_size(layouts, module.types.entries[base - 1].elem);
+                if elem_size != stride { return false; }
+            }
+            (*pointees)[instruction.a - 1] = module.types.entries[base - 1].elem;
+            (*readonly_addrs)[instruction.a - 1] = base_kind == 5 && module.types.entries[base - 1].cap == 0;
+        }
+        @push(*readonly_projections, site)?;
+    } elseif op == 1 {
+        if !mir::is_scalar(&module.types:Read, instruction.value_type_id) || instruction.b != module.types.entries[instruction.value_type_id - 1].builtin as u32 { return false; }
+        if instruction.b == 4106 && (instruction.value > 1114111u64 || (instruction.value >= 55296u64 && instruction.value <= 57343u64)) { return false; }
+    } elseif op == 2 {
+        if !mir::is_bool(&module.types:Read, instruction.value_type_id) || instruction.value > 1 { return false; }
+    } elseif (op >= 16 && op <= 24) || (op >= 32 && op <= 36) {
+        if !typecheck::is_integer_type(&module.types:Read, instruction.value_type_id) || mir::local_type(ctx, instruction.b) != instruction.value_type_id { return false; }
+        if op != 21 && mir::local_type(ctx, instruction.c) != instruction.value_type_id { return false; }
+        if ((op >= 16 && op <= 21) || op == 35 || op == 36) && !ctx.has_trap_target { return false; }
+    } elseif op >= 48 && op <= 53 {
+        let operand: u32 = mir::local_type(ctx, instruction.b);
+        if !mir::is_bool(&module.types:Read, instruction.value_type_id) || !mir::valid_type(&module.types:Read, operand) || operand != mir::local_type(ctx, instruction.c) { return false; }
+        if op >= 50 {
+            if !typecheck::is_ordered_type(&module.types:Read, operand) { return false; }
+        } elseif !mir::supports_equality(&module.types:Read, &module.enums:Read, &module.imported_enums:Read, operand, 0) { return false; }
+    } elseif op == 128 || op == 129 {
+        if instruction.a == 0 || !defined_local(ctx, instruction.b) || instruction.c != 0 || instruction.value != 0 || instruction.args_count != 0 { return false; }
+        let reference: typecheck::TypeEntry = module.types.entries[instruction.value_type_id - 1];
+        if reference.kind != 4 || reference.cap != op - 128 || ctx.locals[instruction.a - 1].kind != 1 || ctx.locals[instruction.b - 1].kind == 3 { return false; }
+    } elseif mir::is_local_call(op) || mir::is_foreign_call(op) {
+        let sig: u32 = mir::func_sig(&module.signatures:Read, instruction.b);
+        if sig == 0 || instruction.args_count != @len(module.signatures.items[sig - 1].params) as u32 || instruction.value_type_id != module.signatures.items[sig - 1].ret { return false; }
+        if op == 149 {
+            let service: u8 = module.signatures.items[sig - 1].service;
+            if service < 2 || service > 4 || !ctx.has_trap_target || instruction.c != 0 || instruction.value != 0 { return false; }
+        }
+        if (instruction.a == 0) != mir::is_void(&module.types:Read, instruction.value_type_id) { return false; }
+        var p: u32 = 0;
+        while p < instruction.args_count {
+            let formal: u32 = module.signatures.items[sig - 1].params[p];
+            if !valid_call_arg(module, ctx, instruction, p, formal) { return false; }
+            p = p + 1;
+        }
+        if mir::is_local_call(op) && !has_local_function(module, instruction.b, ordered_funcs) { return false; }
+    } elseif mir::is_far_call(op) {
+        // 调用目标、形参与返回类型必须与模块保存的接口事实一致；imports 已由 verify_import_signatures 保证有序。
+        if instruction.b == 0 || instruction.c == 0 || instruction.c > 65535 { return false; }
+        if instruction.value != 0 { return false; }
+        let target: u32 = find_import_sorted(module, instruction.c, instruction.b);
+        if target == @len(module.imports) as u32 || instruction.args_count != module.imports[target].param_count as u32 { return false; }
+        let start: u32 = module.imports[target].param_start;
+        if start > @len(module.import_params) as u32 || instruction.args_count > @len(module.import_params) as u32 - start { return false; }
+        if !mir::valid_type(&module.types:Read, module.imports[target].ret) || instruction.value_type_id != module.imports[target].ret { return false; }
+        if (instruction.a == 0) != mir::is_void(&module.types:Read, instruction.value_type_id) { return false; }
+        var p: u32 = 0;
+        while p < instruction.args_count {
+            let expected: u32 = module.import_params[start + p];
+            if !valid_call_arg(module, ctx, instruction, p, expected) { return false; }
+            p = p + 1;
+        }
+    } elseif op == 112 || op == 113 {
+        if !mir::arg_type_compatible(&module.types:Read, mir::local_type(ctx, instruction.b), instruction.value_type_id) { return false; }
+    } elseif op == 115 {
+        // drop（mir.md 4.8）：src 进入 dropped 状态，无结果局部。
+        if instruction.a != 0 || instruction.value != 0 || instruction.args_count != 0 { return false; }
+        if !defined_local(ctx, instruction.b) { return false; }
+        if instruction.c != 0 {
+            if !defined_local(ctx, instruction.c) || ctx.locals[instruction.c - 1].kind != 2 || ctx.locals[instruction.b - 1].kind == 3 { return false; }
+            if !mir::is_bool(&module.types:Read, mir::local_type(ctx, instruction.c)) { return false; }
+        }
+        let dropped: u32 = mir::local_type(ctx, instruction.b);
+        if dropped == 0 || dropped > @len(module.types.entries) as u32 { return false; }
+        if module.types.entries[dropped - 1].kind == 5 { return false; }
+    } elseif op == 64 {
+        if instruction.c != instruction.value_type_id || !mir::is_scalar(&module.types:Read, instruction.value_type_id) || !mir::is_scalar(&module.types:Read, mir::local_type(ctx, instruction.b)) { return false; }
+        if !typecheck::cast_allowed(&module.types:Read, mir::local_type(ctx, instruction.b), instruction.value_type_id) { return false; }
+    } elseif op == 160 || op == 161 {
+        let carrier: typecheck::TypeEntry = module.types.entries[instruction.value_type_id - 1];
+        if carrier.kind != 9 { return false; }
+        if op == 160 {
+            if instruction.c != carrier.elem { return false; }
+            if instruction.b == 0 { if !mir::is_void(&module.types:Read, carrier.success) { return false; } }
+            elseif mir::local_type(ctx, instruction.b) != carrier.success { return false; }
+        } else {
+            if instruction.c != carrier.success || !mir::error_subset(&module.types:Read, mir::local_type(ctx, instruction.b), carrier.elem) { return false; }
+        }
+    } elseif op == 96 || op == 97 {
+        let agg: typecheck::TypeEntry = module.types.entries[instruction.value_type_id - 1];
+        // 0x60 结构体构造：本地结构体（kind 2）与导入结构体（kind 3）都按字段声明序核验；
+        // 0x61 数组构造：定长数组逐元素，动态数组只接受空字面量。
+        if op == 96 && agg.kind != 2 && agg.kind != 3 { return false; }
+        if op == 97 && agg.kind != 7 && agg.kind != 6 { return false; }
+        // 动态数组只允许空字面量（非空构造在类型检查阶段要求定长数组）。
+        if instruction.args_count == 0 {
+            if op != 97 || agg.kind != 6 { return false; }
+        }
+        if op == 97 && agg.kind == 7 && (agg.length != instruction.args_count as u64 || !mir::valid_type(&module.types:Read, agg.elem)) { return false; }
+        // 导入结构体按有序表二分定位起始位置；字段声明序、类型和实参数量须全部匹配。
+        if op == 96 && agg.kind == 3 {
+            var p: u32 = 0;
+            var k: u32 = layout::imported_fields_start(&module.imported_fields:Read, agg.dep, agg.export_id, ordered_fields);
+            while k < @len(module.imported_fields.items) as u32 {
+                let entry: &layout::ImportedFieldLayout:Read = &module.imported_fields.items[k]:Read;
+                if entry.dep == agg.dep && entry.export_id == agg.export_id {
+                    if p >= instruction.args_count || entry.field != p + 1 || !entry.known || !mir::valid_type(&module.types:Read, entry.value_type_id) { return false; }
+                    let item: u32 = ctx.args[instruction.args_start + p];
+                    if !defined_local(ctx, item) || mir::local_type(ctx, item) != entry.value_type_id { return false; }
+                    p = p + 1;
+                } elseif ordered_fields { break; }
+                k = k + 1;
+            }
+            if p == 0 || p != instruction.args_count { return false; }
+        } else {
+            var p: u32 = 0;
+            var field: u32 = 0;
+            while p < instruction.args_count {
+                let item: u32 = ctx.args[instruction.args_start + p];
+                if !defined_local(ctx, item) { return false; }
+                var expected: u32 = agg.elem;
+                if op == 96 {
+                    while field < @len(module.fields.items) as u32 && module.fields.items[field].def != agg.def { field = field + 1; }
+                    if field >= @len(module.fields.items) as u32 { return false; }
+                    expected = module.fields.items[field].type_id;
+                    field = field + 1;
+                }
+                if !mir::valid_type(&module.types:Read, expected) || mir::local_type(ctx, item) != expected { return false; }
+                p = p + 1;
+            }
+            if op == 96 {
+                while field < @len(module.fields.items) as u32 {
+                    if module.fields.items[field].def == agg.def { return false; }
+                    field = field + 1;
+                }
+            }
+        }
+    } elseif op == 178 {
+        // @push 降级：a 为 void!AllocError 载体，b 为数组（T[] 或 &T[]），c 为元素。
+        if instruction.args_count != 2 { return false; }
+        if instruction.a == 0 || instruction.b == 0 || instruction.c == 0 { return false; }
+        if !defined_local(ctx, instruction.b) || !defined_local(ctx, instruction.c) { return false; }
+        if instruction.value == 0 || instruction.value > 4294967295u64 { return false; }
+        let carrier_type: u32 = mir::local_type(ctx, instruction.a);
+        if carrier_type == 0 || carrier_type > @len(module.types.entries) as u32 { return false; }
+        if module.types.entries[carrier_type - 1].kind != 9 { return false; }
+        if !mir::is_void(&module.types:Read, module.types.entries[carrier_type - 1].success) { return false; }
+        if instruction.value_type_id != carrier_type { return false; }
+        if ctx.args[instruction.args_start] != instruction.b { return false; }
+        if ctx.args[instruction.args_start + 1] != instruction.c { return false; }
+    } elseif op == 146 {
+        // call_builtin（mir.md 4.10）：按 BuiltinId 分派，实参个数与结果形态随不同原语而异。
+        if instruction.b == 20486 {
+            // @len(x: &[T]): u64：单实参、切片类型，结果固定为 u64 标量。
+            if instruction.args_count != 1 { return false; }
+            if !defined_local(ctx, ctx.args[instruction.args_start]) { return false; }
+            let arg_type: u32 = mir::local_type(ctx, ctx.args[instruction.args_start]);
+            if arg_type == 0 || arg_type > @len(module.types.entries) as u32 { return false; }
+            if module.types.entries[arg_type - 1].kind != 5 && module.types.entries[arg_type - 1].kind != 6 { return false; }
+            if instruction.a == 0 || !mir::is_pointer(&module.types:Read, instruction.value_type_id) { return false; }
+        } else { return false; }
+    } elseif op == 130 {
+        let indirect: u32 = mir::projection_base(instruction);
+        var base: u32 = mir::local_type(ctx, instruction.b);
+        let high: u32 = instruction.value as u32;
+        if !ctx.has_trap_target || high == 0 || instruction.args_count != 0 { return false; }
+        if indirect != 0 {
+            if ctx.locals[instruction.b - 1].kind == 2 || ctx.locals[instruction.b - 1].kind == 3 { return false; }
+            if !mir::is_pointer(&module.types:Read, base) && (*pointees)[instruction.b - 1] != indirect { return false; }
+            base = indirect;
+        } else {
+            if !mir::valid_type(&module.types:Read, base) { return false; }
+            let slot_kind: u8 = ctx.locals[instruction.b - 1].kind;
+            if module.types.entries[base - 1].kind == 5 {
+                if slot_kind == 3 { return false; }
+                if module.types.entries[instruction.value_type_id - 1].cap == 1 && module.types.entries[base - 1].cap != 1 { return false; }
+            } else {
+                if slot_kind != 0 && slot_kind != 2 { return false; }
+                if module.types.entries[instruction.value_type_id - 1].cap == 1 && slot_kind != 2 { return false; }
+            }
+        }
+        if !mir::valid_type(&module.types:Read, base) { return false; }
+        let array_kind: u8 = module.types.entries[base - 1].kind;
+        if array_kind != 7 && array_kind != 6 && array_kind != 5 { return false; }
+        if !mir::is_slice_view(&module.types:Read, instruction.value_type_id) || module.types.entries[instruction.value_type_id - 1].elem != module.types.entries[base - 1].elem { return false; }
+        if !typecheck::is_integer_type(&module.types:Read, mir::local_type(ctx, instruction.c)) || !typecheck::is_integer_type(&module.types:Read, mir::local_type(ctx, high)) { return false; }
+    } elseif op >= 208 && op <= 210 {
+        if instruction.value != 0 || instruction.args_count != 0 { return false; }
+        if op == 208 {
+            if ctx.locals[instruction.a - 1].state != 10 || instruction.b != 0 || instruction.c != 0 { return false; }
+        } else {
+            if !defined_local(ctx, instruction.b) || ctx.locals[instruction.b - 1].kind != 3 || mir::local_type(ctx, instruction.b) != instruction.value_type_id { return false; }
+            if op == 209 {
+                if instruction.a != 0 || ctx.locals[instruction.b - 1].state != 11 || mir::local_type(ctx, instruction.c) != instruction.value_type_id { return false; }
+            } elseif ctx.locals[instruction.b - 1].state != 10 || instruction.c != 0 { return false; }
+        }
+    } elseif op == 3 {
+        // const_bytes：结果 Local 必须是 &[u8]，静态索引必须落在池内且条目类型一致。
+        if !mir::is_u8_slice(&module.types:Read, instruction.value_type_id) { return false; }
+        if instruction.b >= @len(module.statics) as u32 { return false; }
+        let entry: mir::MirStatic = module.statics[instruction.b];
+        if entry.value_type_id != instruction.value_type_id { return false; }
+        if entry.offset > @len(module.static_bytes) as u32 || entry.length > @len(module.static_bytes) as u32 - entry.offset { return false; }
+        if instruction.c != 0 || instruction.value != 0 || instruction.args_count != 0 { return false; }
+    } elseif op == 4 {
+        // const_aggregate：把静态池里的聚合常量镜像整块复制到结果聚合局部。
+        if instruction.c != 0 || instruction.args_count != 0 { return false; }
+        if instruction.b >= @len(module.statics) as u32 { return false; }
+        let entry: mir::MirStatic = module.statics[instruction.b];
+        if !mir::aggregate_static_type(&module.types:Read, &module.enums:Read, entry.value_type_id) { return false; }
+        if entry.value_type_id != instruction.value_type_id { return false; }
+        if entry.offset > @len(module.static_bytes) as u32 || entry.length > @len(module.static_bytes) as u32 - entry.offset { return false; }
+        if instruction.value != entry.length as u64 { return false; }
+        if instruction.value == 0 || instruction.value > 4294967295u64 { return false; }
+        if instruction.value != mir::layout_size(layouts, instruction.value_type_id) { return false; }
+    } elseif op == 5 {
+        if !verify_function_address(module, instruction, ordered_funcs) { return false; }
+    } elseif op == 176 {
+        if instruction.b != instruction.value_type_id || instruction.value > 4294967295u64 { return false; }
+        let enum_type: typecheck::TypeEntry = module.types.entries[instruction.value_type_id - 1];
+        if instruction.value != 0 && mir::storage_shape(&module.types:Read, &module.fields:Read, &module.enums:Read,
+            &module.imported_fields:Read, &module.imported_enums:Read, mir::local_type(ctx, instruction.value as u32), 0) == 0 { return false; }
+        if enum_type.kind == 2 {
+            let def: u32 = enum_type.def;
+            var index: u32 = 0;
+            while index < @len(module.enums.items) as u32 && module.enums.items[index].def != def { index = index + 1; }
+            if index == @len(module.enums.items) as u32 || instruction.c >= @len(module.enums.items[index].payloads) as u32 { return false; }
+            let expected: u32 = module.enums.items[index].payloads[instruction.c];
+            if expected == 0 { if instruction.value != 0 { return false; } }
+            elseif instruction.value == 0 || mir::local_type(ctx, instruction.value as u32) != expected { return false; }
+        } elseif enum_type.kind == 3 {
+            // 导入枚举：变体表必须完整，载荷类型按消费方映射核对。
+            if !mir::imported_enum_known(&module.imported_enums:Read, enum_type.dep, enum_type.export_id) { return false; }
+            let expected: u32 = mir::imported_payload_of(&module.imported_enums:Read, enum_type.dep, enum_type.export_id, instruction.c);
+            if expected == NONE { return false; }
+            if expected == 0 { if instruction.value != 0 { return false; } }
+            elseif instruction.value == 0 || mir::local_type(ctx, instruction.value as u32) != expected { return false; }
+        } elseif !(enum_type.kind == 1 && enum_type.builtin == 4108) { return false; }
+        elseif instruction.c != 0 || instruction.value != 0 { return false; }
+    } elseif op == 114 {
+        // 克隆结果为 T!AllocError，源仍然保持存活。
+        if instruction.args_count != 0 || instruction.c != 0 || instruction.value != 0 { return false; }
+        if instruction.a == 0 || instruction.b == 0 { return false; }
+        if !defined_local(ctx, instruction.b) { return false; }
+        let carrier: typecheck::TypeEntry = module.types.entries[instruction.value_type_id - 1];
+        if carrier.kind != 9 { return false; }
+        let src_type: u32 = mir::local_type(ctx, instruction.b);
+        if !mir::valid_type(&module.types:Read, src_type) || carrier.success != src_type { return false; }
+        if !mir::valid_type(&module.types:Read, carrier.elem) { return false; }
+        let set: typecheck::TypeEntry = module.types.entries[carrier.elem - 1];
+        if set.kind != 11 || set.members_count != 1 || set.members_start >= @len(module.types.members) as u32 { return false; }
+        let err_type: u32 = module.types.members[set.members_start];
+        if !mir::valid_type(&module.types:Read, err_type) { return false; }
+        let err: typecheck::TypeEntry = module.types.entries[err_type - 1];
+        if err.kind != 1 || err.builtin != 4108 { return false; }
+        if mir::storage_shape(&module.types:Read, &module.fields:Read, &module.enums:Read,
+            &module.imported_fields:Read, &module.imported_enums:Read, src_type, 0) != 2 { return false; }
+    } elseif mir::is_indirect_call(op) {
+        if !verify_indirect_call(module, ctx, instruction) { return false; }
+    } else { return false; }
+    return true;
+}

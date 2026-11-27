@@ -1,0 +1,17 @@
+// t31: 嵌套 while + assert验证总迭代数
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var i: u32 = 0;
+    var total: u32 = 0;
+    while i < 5 {
+        var j: u32 = 0;
+        while j < 5 {
+            j = j + 1;
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    assert(total == 25);
+    return;
+}

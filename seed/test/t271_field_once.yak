@@ -1,0 +1,23 @@
+foreign assert(cond: bool): void;
+struct Item { len: u32, cap: u32, other: u32, }
+function next(counter: &u32:ReadWrite): u32 {
+    let index: u32 = *counter;
+    *counter = index + 1u32;
+    return index;
+}
+function main(): void {
+    let items: [Item; 2] = [Item { len: 10u32, cap: 20u32, other: 30u32 }, Item { len: 11u32, cap: 21u32, other: 31u32 }];
+    var counter: u32 = 0;
+    assert(items[next(&counter:ReadWrite)].len == 10u32);
+    assert(counter == 1u32);
+    counter = 0;
+    assert(items[next(&counter:ReadWrite)].cap == 20u32);
+    assert(counter == 1u32);
+    counter = 0;
+    assert(items[next(&counter:ReadWrite)].other == 30u32);
+    assert(counter == 1u32);
+    let item: &Item = &items[0];
+    assert(item.len == 10u32 && item.cap == 20u32);
+    let text: &[u8] = "abc";
+    assert(text.len == 3u64);
+}

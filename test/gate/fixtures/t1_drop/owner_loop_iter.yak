@@ -1,0 +1,15 @@
+// 循环两迭代：每轮取得局部；第一轮显式析构，第二轮由块出口清理。
+function loop_iter(): void!AllocError {
+    var i: u32 = 0;
+    while i < 2u32 {
+        var a: u32[] = [];
+        @push(a, 121u32 + i)?;
+        if i == 0u32 {
+            @drop(a);
+        }
+        i = i + 1u32;
+    }
+    return;
+}
+
+function main(): void { loop_iter(); return; }

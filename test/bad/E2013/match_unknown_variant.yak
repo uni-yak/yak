@@ -1,0 +1,7 @@
+// expected_code: E2013
+// spec: spec/lang/parse.md P-13
+// 触发：所写标签不在被匹配枚举的成员中，通配臂排除遗漏标签诊断。
+enum Choice { A }
+function bad(e: Choice): void { match e { Missing => { return; }, _ => { return; } } }
+
+function main(): void { return; }

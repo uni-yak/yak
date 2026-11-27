@@ -1,0 +1,5 @@
+// expected_trap: lex: invalid HashName
+// 触发：HashName 的名字部分是单独的下划线。
+function #_(): void { return; }
+
+function main(): void { return; }

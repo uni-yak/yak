@@ -1,0 +1,4 @@
+// 负例根：缺少规定的 main 入口，构建必须失败且不发布或覆盖 root.exe。
+function helper(): void {
+    return;
+}

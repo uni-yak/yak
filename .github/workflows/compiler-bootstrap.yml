@@ -1,0 +1,60 @@
+name: 编译器冷启动与自举
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.YAK_LINUX_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 180
+    steps:
+      - name: 核对运行器
+        run: |
+          test "$RUNNER_ENVIRONMENT" = self-hosted || { echo '错误：请配置 YAK_LINUX_RUNNER 指向锁定的 Linux runner' >&2; exit 2; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          persist-credentials: false
+      - name: 执行冷启动门禁和自举
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.commit || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          SEED_URL: ${{ vars.YAK_SEED_URL }}
+          YAK_CI_WINE: ${{ vars.YAK_CI_WINE }}
+        run: bash test/gate/ci_bootstrap.sh "$SOURCE_COMMIT" "$GITHUB_RUN_ID"
+      - name: 上传共享候选
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bootstrap-candidate
+          path: test/gate/tmp/ci-candidate/
+          if-no-files-found: error
+          overwrite: true
+      - name: 归档自举的原始产物
+        if: "!cancelled()"
+        shell: bash
+        run: |
+          work=.cold-start/test/gate/tmp/ci-bootstrap-candidate
+          if [[ -d "$work" ]]; then
+            tar -czf test/gate/tmp/ci-bootstrap-evidence/selfhost-originals.tar.gz -C "$work" .
+          fi
+      - name: 上传冷启动和自举回执
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: compiler-bootstrap-evidence
+          path: |
+            test/gate/tmp/ci-bootstrap-evidence/
+            !test/gate/tmp/ci-bootstrap-evidence/wine/**
+          compression-level: 0
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 90

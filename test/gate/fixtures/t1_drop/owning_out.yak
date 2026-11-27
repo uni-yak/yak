@@ -1,0 +1,28 @@
+foreign assert(cond: bool): void;
+
+struct Payload { prefix: u8, first: u32[], marker: u32, second: u32[] }
+
+function fill(dst: &Payload:Write, src: Payload): void {
+    *dst = @move(src);
+    return;
+}
+
+// 两条路径各拥有两块独立缓冲；一条移动后显式析构，另一条退出时析构满槽。
+function exercise(take: bool, first: u32, second: u32): void!AllocError {
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, first)?;
+    @push(b, second)?;
+    let payload: Payload = Payload { prefix: 253u8, first: @move(a), marker: 4294901761u32, second: @move(b) };
+    out dst: Payload;
+    fill(out dst, @move(payload));
+    if take {
+        let received: Payload = @move(dst);
+        assert(received.prefix == 253u8 && received.marker == 4294901761u32);
+        @drop(received);
+        return;
+    }
+    return;
+}
+
+function main(): void { exercise(true, 41u32, 42u32); exercise(false, 43u32, 44u32); return; }

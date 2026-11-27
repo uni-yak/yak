@@ -1,0 +1,7 @@
+// t82: &let:ReadWrite → OW-5 trap（ReadWrite 借用要求 var place）
+// expected_trap: ReadWrite requires var place
+function main(): void {
+    let x: u32 = 0;
+    let r: &u32 = &x:ReadWrite;
+    return;
+}

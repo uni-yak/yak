@@ -1,0 +1,14 @@
+// t09: 函数调用 + 参数传递 + 返回值 + assert
+foreign assert(cond: bool): void;
+
+function add(a: u32, b: u32): u32 {
+    return a + b;
+}
+
+function main(): void {
+    let r: u32 = add(3, 4);
+    assert(r == 7);
+    assert(add(0, 0) == 0);
+    assert(add(100, 200) == 300);
+    return;
+}

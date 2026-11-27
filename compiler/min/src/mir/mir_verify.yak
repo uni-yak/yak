@@ -1,0 +1,292 @@
+// 独立验证 MIR 的类型、布局、控制流和槽位交接。
+import types;
+import typecheck;
+import diag;
+import layout;
+import mir;
+import mir_verify_flow;
+import mir_verify_inst;
+import copy_facts;
+
+const NONE: u32 = 4294967295u32;
+
+export struct Validation { ok: bool, code: types::ErrorCode }
+
+function defined_local(ctx: &mir::MirFunction:Read, id: u32): bool { return id > 0 && id <= @len(ctx.locals) as u32; }
+
+// 非规范顺序时区分完整的乱序表与缺变体的表；正常顺序不需要这张位图。
+function covers_enum_variants(ctx: &mir::MirFunction:Read, start: u32, count: u32): bool!AllocError {
+    var seen: bool[] = [];
+    var i: u32 = 0;
+    while i < count { @push(seen, false)?; i = i + 1; }
+    i = 0;
+    while i < count {
+        let variant: u32 = ctx.arms[start + i].variant as u32;
+        if variant >= count || seen[variant] { return false; }
+        seen[variant] = true;
+        i = i + 1;
+    }
+    return true;
+}
+
+function add_definition(ctx: &mir::MirFunction:Read, defs: &u32[]:ReadWrite, local: u32, block: u32): bool {
+    if !defined_local(ctx, local) || ctx.locals[local - 1].kind == 2 { return false; }
+    if (*defs)[local - 1] != NONE { return false; }
+    (*defs)[local - 1] = block;
+    return true;
+}
+
+// 局部值先按既有出口计划清理；仍由被调方拥有的已提交输出随后逆序回滚。
+export function insert_slot_rollbacks(ctx: &mir::MirFunction:ReadWrite, tt: &typecheck::TypeTable:Read, ret: u32, spans: &types::Span[]:ReadWrite, span: types::Span, track: bool): bool!AllocError {
+    return mir_verify_flow::insert_slot_rollbacks(ctx, tt, ret, spans, span, track)?;
+}
+
+function verify_function(module: &mir::MirModule:Read, ctx: &mir::MirFunction:Read, layouts: &layout::LayoutTable:Read, ordered_fields: bool, ordered_funcs: bool, copy_order: u8, cache: &typecheck::CopyFacts:ReadWrite, code: &u16:ReadWrite): bool!AllocError {
+    if ctx.signature == 0 || ctx.signature > @len(module.signatures.items) as u32 || @len(ctx.blocks) == 0 || @len(ctx.blocks) > 65536u64 { return false; }
+    let signature: u32 = ctx.signature - 1;
+    if module.signatures.items[signature].def != ctx.def || @len(ctx.params) != @len(module.signatures.items[signature].params) { return false; }
+    if ctx.entry as u32 >= @len(ctx.blocks) as u32 { return false; }
+    if ctx.has_trap_target && (ctx.trap_target as u32 >= @len(ctx.blocks) as u32 || ctx.blocks[ctx.trap_target].terminator.op != 195 || ctx.blocks[ctx.trap_target].terminator.a != 0) { return false; }
+    var defs: u32[] = [];
+    var positions: u32[] = [];
+    var pointees: u32[] = [];
+    var readonly_addrs: bool[] = [];
+    var readonly_projections: u32[] = [];
+    var has_caller_slots: bool = false;
+    var has_parameter_slots: bool = false;
+    var i: u32 = 0;
+    while i < @len(ctx.locals) as u32 {
+        let local: mir::MirLocal = ctx.locals[i];
+        if local.id != i + 1 || !mir::valid_type(&module.types:Read, local.value_type_id) || local.kind > 3 { return false; }
+        if typecheck::write_ref_target(&module.types:Read, local.value_type_id) != 0 { return false; }
+        if local.kind == 3 {
+            if !mir::out_payload_supported(&module.types:Read, local.value_type_id) || mir::layout_size(layouts, local.value_type_id) == 0 { return false; }
+            if local.state != 10 && local.state != 11 { *code = 7036; return false; }
+            if local.state == 10 { has_caller_slots = true; } else { has_parameter_slots = true; }
+        } elseif local.state != 0 { return false; }
+        @push(defs, NONE)?;
+        @push(positions, NONE)?;
+        let value_entry: typecheck::TypeEntry = module.types.entries[local.value_type_id - 1];
+        var target: u32 = 0;
+        if value_entry.kind == 4 {
+            if value_entry.cap > 1 || !mir::valid_type(&module.types:Read, value_entry.elem) { return false; }
+            if local.kind != 2 { target = value_entry.elem; }
+        }
+        @push(pointees, target)?;
+        @push(readonly_addrs, target != 0 && value_entry.cap == 0)?;
+        if ctx.locals[i].kind == 2 { defs[i] = ctx.entry as u32; positions[i] = 0; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(ctx.params) as u32 {
+        let local: u32 = ctx.params[i];
+        if !add_definition(ctx, &defs:ReadWrite, local, ctx.entry as u32) { return false; }
+        let formal: u32 = module.signatures.items[signature].params[i];
+        let payload: u32 = typecheck::write_ref_target(&module.types:Read, formal);
+        if payload != 0 {
+            if ctx.locals[local - 1].kind != 3 || ctx.locals[local - 1].state != 11 || mir::local_type(ctx, local) != payload || !mir::out_return_supported(&module.types:Read, module.signatures.items[signature].ret) { return false; }
+        } elseif ctx.locals[local - 1].kind == 3 || mir::local_type(ctx, local) != formal { return false; }
+        positions[local - 1] = 0;
+        i = i + 1;
+    }
+    let n: u32 = @len(ctx.blocks) as u32;
+    var trap_origins: u32[] = [];
+    var trap_positions: u32[] = [];
+    i = 0;
+    while i < n { @push(trap_origins, NONE)?; @push(trap_positions, 0)?; i = i + 1; }
+    var cursor: u32 = 0;
+    i = 0;
+    while i < @len(ctx.blocks) as u32 {
+        if ctx.blocks[i].id as u32 != i || ctx.blocks[i].inst_start != cursor || ctx.blocks[i].inst_count > @len(ctx.insts) as u32 - cursor { return false; }
+        if ctx.blocks[i].payload != 0 {
+            if !add_definition(ctx, &defs:ReadWrite, ctx.blocks[i].payload, i) { return false; }
+            if ctx.locals[ctx.blocks[i].payload - 1].kind == 3 { return false; }
+            positions[ctx.blocks[i].payload - 1] = 0;
+        }
+        let end: mir::MirTerminator = ctx.blocks[i].terminator;
+        if end.op != 192 && end.op != 193 && end.op != 194 && end.op != 195 && end.op != 196 && end.op != 197 && end.op != 162 && end.op != 177 { return false; }
+        if end.op == 195 && (end.a > 2 || end.b != 0 || end.c != 0) { return false; }
+        if end.op == 197 && (end.b != 0 || end.c != 0 || !defined_local(ctx, end.a)) { return false; }
+        if end.op == 192 && end.b >= n { return false; }
+        if end.op == 193 && (end.b >= n || end.c >= n) { return false; }
+        if end.op == 162 && (end.b >= n || end.c >= n) { *code = 7035; return false; }
+        if end.op == 177 {
+            // enum_dispatch：scrutinee 必须是 enum，臂表覆盖全部变体且按 VariantId 升序。
+            if !defined_local(ctx, end.a) { return false; }
+            let total: u32 = mir::enum_count_of(&module.types:Read, &module.enums:Read, &module.imported_enums:Read, mir::local_type(ctx, end.a));
+            if total == 0 || end.c > total { return false; }
+            if end.c < total || end.b > @len(ctx.arms) as u32 || end.c > @len(ctx.arms) as u32 - end.b { *code = 7035; return false; }
+            var k: u32 = 0;
+            while k < end.c {
+                let arm: mir::MirArm = ctx.arms[end.b + k];
+                if arm.block as u32 >= n { *code = 7035; return false; }
+                if arm.variant as u32 != k {
+                    if !covers_enum_variants(ctx, end.b, end.c)? { *code = 7035; }
+                    return false;
+                }
+                k = k + 1;
+            }
+        }
+        var j: u32 = 0;
+        while j < ctx.blocks[i].inst_count {
+            let instruction: mir::MirInst = ctx.insts[cursor + j];
+            if mir::is_checked_call(instruction.op) && !ctx.has_trap_target { return false; }
+            if instruction.trap != 0 {
+                let target: u32 = instruction.trap - 1;
+                if !mir::has_trap_edge(instruction.op) || !ctx.has_trap_target || target >= n || target == i || target == ctx.entry as u32 || target == ctx.trap_target as u32 { return false; }
+                if trap_origins[target] != NONE || ctx.blocks[target].terminator.op != 195 || ctx.blocks[target].payload != 0 || ctx.blocks[target].inst_count == 0 { return false; }
+                if ctx.blocks[target].terminator.a != mir::trap_reason(instruction.op) { return false; }
+                trap_origins[target] = i;
+                trap_positions[target] = j;
+            }
+            if instruction.args_start > @len(ctx.args) as u32 || instruction.args_count > @len(ctx.args) as u32 - instruction.args_start { return false; }
+            if instruction.op != 115 && !mir::valid_type(&module.types:Read, instruction.value_type_id) { return false; }
+            if instruction.a != 0 {
+                if !add_definition(ctx, &defs:ReadWrite, instruction.a, i) || mir::local_type(ctx, instruction.a) != instruction.value_type_id { return false; }
+                if (ctx.locals[instruction.a - 1].kind == 3) != (instruction.op == 208) { return false; }
+                positions[instruction.a - 1] = j + 1;
+            } else {
+                if instruction.op != 81 && !mir::is_slot_call(instruction.op) && !mir::is_foreign_call(instruction.op) && instruction.op != 115 && instruction.op != 209 { return false; }
+            }
+            if !mir_verify_inst::verify_instruction(module, ctx, layouts, instruction, ordered_fields, ordered_funcs, &pointees:ReadWrite, &readonly_addrs:ReadWrite, &readonly_projections:ReadWrite, cursor + j)? { return false; }
+            j = j + 1;
+        }
+        cursor = cursor + ctx.blocks[i].inst_count;
+        i = i + 1;
+    }
+    if cursor != @len(ctx.insts) as u32 { return false; }
+    // 仅遍历已验证的投影；块号不保证按支配顺序排列，因此迭代到稳定。
+    var changed_ro: bool = true;
+    let projection_count: u32 = @len(readonly_projections) as u32;
+    while changed_ro {
+        changed_ro = false;
+        var p: u32 = 0;
+        while p < projection_count {
+            let projection: mir::MirInst = ctx.insts[readonly_projections[p]];
+            if readonly_addrs[projection.b - 1] && !readonly_addrs[projection.a - 1] {
+                readonly_addrs[projection.a - 1] = true;
+                changed_ro = true;
+            }
+            p = p + 1;
+        }
+    }
+    let def_view: &[u32] = &defs[0..@len(defs)]:Read;
+    let pos_view: &[u32] = &positions[0..@len(positions)]:Read;
+    return mir_verify_flow::verify_flow(module, ctx, layouts, signature, def_view, pos_view,
+        &pointees:Read, &readonly_addrs:Read, &trap_origins:Read, &trap_positions:Read,
+        has_parameter_slots, has_caller_slots, copy_order, cache, code)?;
+}
+
+// 导入字段表的偏移供后端直接寻址，不能只信任已知标记或对象边界。
+function verify_imported_fields(module: &mir::MirModule:Read, layouts: &layout::LayoutTable:Read): bool!AllocError {
+    if @len(module.imported_fields.items) != @len(module.imported_field_types.items) { return false; }
+    if @len(module.imported_fields.items) == 0 { return true; }
+    let canonical: layout::ImportedFieldLayoutTable = layout::imported_field_layouts(&module.imported_field_types:Read, layouts, &module.imported_layouts:Read)?;
+    if @len(canonical.items) != @len(module.imported_fields.items) { return false; }
+    var i: u32 = 0;
+    while i < @len(canonical.items) as u32 {
+        let entry: layout::ImportedFieldLayout = module.imported_fields.items[i];
+        let expected: layout::ImportedFieldLayout = canonical.items[i];
+        let signature: typecheck::ImportedFieldType = module.imported_field_types.items[i];
+        if entry.dep != signature.dep || entry.export_id != signature.export_id || entry.field != signature.field || entry.value_type_id != signature.value_type_id { return false; }
+        // 未知字段可为未使用的导入保留，但不能升格为真实偏移。
+        if entry.field != expected.field || entry.known != expected.known || entry.offset != expected.offset || entry.size != expected.size || entry.align != expected.align { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 签名按依赖编号、导出编号收集；形参连续存放，不允许重复身份或孤立槽。
+function verify_import_signatures(module: &mir::MirModule:Read): bool {
+    let limit: u32 = @len(module.import_params) as u32;
+    var consumed: u32 = 0;
+    var prev_dep: u16 = 0;
+    var prev_export: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(module.imports) as u32 {
+        let record: mir::MirImport = module.imports[i];
+        let count: u32 = record.param_count as u32;
+        if record.dep == 0 || record.export_id == 0 || record.dep < prev_dep || (record.dep == prev_dep && record.export_id <= prev_export) { return false; }
+        if record.param_start != consumed || count > limit - consumed || !mir::valid_type(&module.types:Read, record.ret) { return false; }
+        let end: u32 = consumed + count;
+        while consumed < end {
+            if !mir::valid_type(&module.types:Read, module.import_params[consumed]) { return false; }
+            consumed = consumed + 1;
+        }
+        prev_dep = record.dep;
+        prev_export = record.export_id;
+        i = i + 1;
+    }
+    return consumed == limit;
+}
+
+// 先核验整张变体表，避免未使用的变体或同布局载荷身份逃过检查。
+function verify_imported_enum_signatures(module: &mir::MirModule:Read): bool {
+    if @len(module.imported_enums.items) != @len(module.imported_enum_signatures.items) { return false; }
+    var i: u32 = 0;
+    while i < @len(module.imported_enums.items) as u32 {
+        let entry: typecheck::ImportedEnumVariant = module.imported_enums.items[i];
+        let source: typecheck::ImportedEnumVariant = module.imported_enum_signatures.items[i];
+        if entry.dep == 0 || entry.export_id == 0 || entry.variant >= 65536 { return false; }
+        if entry.dep != source.dep || entry.export_id != source.export_id || entry.variant != source.variant || entry.known != source.known || entry.payload != source.payload { return false; }
+        // 已知的空载荷不是未知签名；未知签名也不能拥有可用类型。
+        if entry.payload != 0 && (!entry.known || !mir::valid_type(&module.types:Read, entry.payload) || mir::is_void(&module.types:Read, entry.payload)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function verify_module_core(module: &mir::MirModule:Read, code: &u16:ReadWrite): bool!AllocError {
+    var i: u32 = 0;
+    while i < @len(module.fields.items) as u32 {
+        if module.fields.items[i].name != 0 { *code = 7033; return false; }
+        i = i + 1;
+    }
+    var layout_scratch: diag::DiagBuffer = diag::diagbuf_new();
+    let layout_res: layout::LayoutResult = layout::layout_unit_with_imports(&module.types:Read, &module.fields:Read, &module.enums:Read, &module.imported_layouts:Read, &module.imported_enums:Read, &layout_scratch:ReadWrite)?;
+    if @len(module.imported_fields.items) != 0 && diag::diagbuf_has_error(&layout_scratch:Read) { return false; }
+    if !verify_import_signatures(module) || !verify_imported_enum_signatures(module) || !verify_imported_fields(module, &layout_res.table:Read)? { return false; }
+    i = 0;
+    while i < @len(module.signatures.items) as u32 {
+        if !mir::valid_type(&module.types:Read, module.signatures.items[i].ret) { return false; }
+        var p: u32 = 0;
+        while p < @len(module.signatures.items[i].params) as u32 {
+            if !mir::valid_type(&module.types:Read, module.signatures.items[i].params[p]) { return false; }
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(module.statics) as u32 {
+        let entry: mir::MirStatic = module.statics[i];
+        // 池不变量「扩域不换义」：允许新的条目类型域（kind7 定长数组 / kind2 名义枚举），
+        // 但 &[u8] 视图的判定与语义原样保留——两类条目都必须类型有效且区间落在池内。
+        if !mir::is_u8_slice(&module.types:Read, entry.value_type_id) {
+            if !mir::aggregate_static_type(&module.types:Read, &module.enums:Read, entry.value_type_id) { return false; }
+            if entry.length as u64 != mir::layout_size(&layout_res.table:Read, entry.value_type_id) { return false; }
+        }
+        if entry.offset > @len(module.static_bytes) as u32 || entry.length > @len(module.static_bytes) as u32 - entry.offset { return false; }
+        i = i + 1;
+    }
+    i = 0;
+    let ordered_fields: bool = layout::imported_fields_ordered(&module.imported_fields:Read);
+    let ordered_funcs: bool = mir_verify_inst::functions_ordered(module);
+    let copy_order: u8 = copy_facts::imported_table_order(&module.imported_enum_signatures:Read, &module.imported_field_types:Read);
+    var copy_cache: typecheck::CopyFacts = typecheck::CopyFacts { items: [] };
+    while i < @len(module.functions) as u32 {
+        if !verify_function(module, &module.functions[i]:Read, &layout_res.table:Read, ordered_fields, ordered_funcs, copy_order, &copy_cache:ReadWrite, code)? { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function validate_module(module: &mir::MirModule:Read): Validation!AllocError {
+    var code: u16 = 0;
+    let ok: bool = verify_module_core(module, &code:ReadWrite)?;
+    return Validation { ok: ok, code: types::error_code(code) };
+}
+
+export function verify_module(module: &mir::MirModule:Read): bool!AllocError {
+    let validation: Validation = validate_module(module)?;
+    return validation.ok;
+}

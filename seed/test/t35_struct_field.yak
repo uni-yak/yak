@@ -1,0 +1,17 @@
+// t35: 结构体字段访问 + assert
+foreign assert(cond: bool): void;
+
+struct Pair {
+    first: u32,
+    second: u32,
+}
+
+function main(): void {
+    let p: Pair = Pair { first: 10, second: 20 };
+    let f: u32 = p.first;
+    let s: u32 = p.second;
+    assert(f == 10);
+    assert(s == 20);
+    assert(p.first + p.second == 30);
+    return;
+}

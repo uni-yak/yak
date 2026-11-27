@@ -1,0 +1,6 @@
+// expected_code: E2012
+// spec: spec/lang/parse.md P-12
+// 触发：合法的局部可错载体不能作为 match 的被匹配值。
+enum Fault { Bad }
+function work(): u32!Fault { return 7u32; }
+function main(): void { let result: u32!Fault = work(); match result { _ => { return; } } }

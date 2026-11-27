@@ -1,0 +1,66 @@
+foreign assert(condition: bool): void;
+
+struct Record { first: u64, second: u64, third: u64 }
+enum Choice { Empty, Bytes(u8[]) }
+enum Failure { Bad }
+
+function read(value: &u64): u64 { return *value; }
+
+function fill_enum(dst: &Choice:Write, bad: bool): Record!Failure {
+    *dst = Choice::Bytes([19u8]);
+    if bad { return Failure::Bad; }
+    return Record { first: 31u64, second: 32u64, third: 33u64 };
+}
+
+function fill_nested(dst: &u8[][]:Write): &function(&u64): u64 {
+    *dst = [[23u8], [24u8]];
+    return &read;
+}
+
+function fill_copy(dst: &Record:Write, choice: Choice): void {
+    *dst = Record { first: 8u64, second: 9u64, third: 10u64 };
+    match @move(choice) {
+        Empty => { return; },
+        Bytes => { return; }
+    }
+}
+
+function check_enum(bad: bool): void!Failure {
+    out slot: Choice;
+    let result: Record = fill_enum(out slot, bad)?;
+    let value: Choice = @move(slot);
+    assert(result.first == 31u64 && result.second == 32u64 && result.third == 33u64);
+    match @move(value) {
+        Empty => { assert(false); },
+        Bytes(payload) => { assert(payload[0u64] == 19u8); }
+    }
+    return;
+}
+
+function main(): void {
+    var step: u8 = 0u8;
+    while step < 3u8 {
+        step = step + 1u8;
+        out slot: u8[][];
+        let callback: &function(&u64): u64 = fill_nested(out slot);
+        let value: u8[][] = @move(slot);
+        assert(callback(42u64) == 42u64 && value[0u64][0u64] == 23u8 && value[1u64][0u64] == 24u8);
+        if step == 1u8 { continue; }
+        if step == 2u8 { break; }
+    }
+    if step == 2u8 {
+        out untouched: Record;
+        let empty: Choice = Choice::Empty;
+        fill_copy(out untouched, @move(empty));
+    }
+    out across_match: u8[][];
+    let callback: &function(&u64): u64 = fill_nested(out across_match);
+    match Choice::Empty {
+        Empty => { assert(callback(44u64) == 44u64); },
+        Bytes => { assert(false); }
+    }
+    let success: void!Failure = check_enum(false);
+    let failure: void!Failure = check_enum(true);
+    @drop(success);
+    @drop(failure);
+}

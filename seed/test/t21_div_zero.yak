@@ -1,0 +1,8 @@
+// t21: 除零陷阱（应 trap）
+// expected_trap: division by zero
+function main(): void {
+    let x: u32 = 10;
+    let y: u32 = 0;
+    let z: u32 = x / y;
+    return;
+}

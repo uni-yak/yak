@@ -1,0 +1,12 @@
+// t24: 变量遮蔽（嵌套作用域同名）+ assert
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let x: u32 = 1;
+    if x > 0 {
+        let x: u32 = 2;
+        assert(x == 2);
+    }
+    assert(x == 1);
+    return;
+}

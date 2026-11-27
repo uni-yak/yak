@@ -1,0 +1,8 @@
+// expected_code: E7021
+// expected_diagnostics: E7021
+// spec: spec/ir/mir.md#M-8
+// 触发：无增函数的可达调用图中存在目标未知的间接调用。
+function run(callback: &function(): void): void { callback(); }
+function #verify(callback: &function(): void): void { run(callback); }
+
+function main(): void { return; }

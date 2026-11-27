@@ -1,0 +1,7 @@
+// t56: 数组越界（应 trap）
+// expected_trap: index out of bounds
+function main(): void {
+    let arr: u8[] = [1, 2];
+    let x: u8 = arr[5];
+    return;
+}

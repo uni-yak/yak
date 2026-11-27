@@ -1,0 +1,164 @@
+// types.yak —— 基础类型定义（lib/README.md 设计）
+// 依赖：base 内建类型
+// 无 import 依赖
+
+// 错误码的 u16 编码不属于 BuiltinId 或其他编号域。
+export struct ErrorCode { raw: u16 }
+
+// 由已知码位或底层数值检测结果进入诊断域；登记有效性在正式驱动检查。
+export function error_code(raw: u16): ErrorCode { return ErrorCode { raw: raw }; }
+
+
+// 源位置（lex.md 9.1）；长度采用 u32 以避免长文档多记号跨度截断。
+export struct Span {
+    file: u16,
+    offset: u32,
+    length: u32,
+}
+
+// 编辑器仅持有当前文档区间、展示文本与接口身份，不持有 AST 或单元内编号。
+export struct DefinitionLink { use_offset: u32, use_length: u32, target_offset: u32, target_length: u32 }
+// 导出编号仅在此模块和接口摘要限定的身份内有效。
+export struct ImportedInterface { module: u8[], digest: u8[] }
+// interface_row 为快照中从一开始的接口行号，不是解析器的依赖编号。
+export struct ImportedDefinitionUse { offset: u32, length: u32, interface_row: u32, export_id: u32 }
+export struct HoverLink { offset: u32, length: u32, text_at: u32, text_length: u32 }
+export struct CompletionGroup { offset: u32, length: u32, first: u32, count: u32 }
+export struct CompletionBinding { start: u32, end: u32, available: u32, rank: u32, kind: u8, hash_name: bool }
+export struct CompletionToken { offset: u32, length: u32, kind: u8 }
+// 只有整份词法扫描成功时才保存着色记号，类别与协议图例顺序一致。
+export struct SemanticToken { offset: u32, length: u32, kind: u8 }
+export struct DocumentSymbolSpan { start: u32, end: u32, selection: Span, kind: u8 }
+export struct DocumentFoldSpan { start: u32, end: u32 }
+// 同文件安全重命名声明表（按 offset 升序），含所属作用域区间供冲突检测。
+export struct RenameDecl { offset: u32, length: u32, scope_start: u32, scope_end: u32, kind: u8, hash_name: bool }
+// 结构体字段与枚举变体成员表（kind：5 为字段，20 为枚举变体）。
+export struct MemberEntry { owner_offset: u32, owner_length: u32, member_offset: u32, member_length: u32, kind: u8 }
+// 绑定到名义类型名的映射（供 `.` 成员补全使用）。
+export struct BindingTypeEntry { name_offset: u32, name_length: u32, start: u32, end: u32, type_offset: u32, type_length: u32 }
+// 文档级轻量诊断摘要（供 codeAction 生成 Quick Fix，不依赖完整 DiagBuffer）。
+export struct DocumentDiag { code: u16, span: Span }
+export struct DocumentDefinitions {
+    structure_ready: bool, symbols: DocumentSymbolSpan[], folds: DocumentFoldSpan[],
+    semantic_ready: bool, semantic_tokens: SemanticToken[],
+    links: DefinitionLink[], imported_interfaces: ImportedInterface[], imported_uses: ImportedDefinitionUse[],
+    hovers: HoverLink[], hover_text: u8[],
+    completion_groups: CompletionGroup[], completion_bindings: CompletionBinding[], completion_tokens: CompletionToken[], completion_keywords: u8[],
+    rename_decls: RenameDecl[], member_entries: MemberEntry[], binding_types: BindingTypeEntry[],
+    diagnostics: DocumentDiag[],
+}
+
+export function empty_definitions(): DocumentDefinitions {
+    return DocumentDefinitions { structure_ready: false, symbols: [], folds: [], semantic_ready: false, semantic_tokens: [], links: [], imported_interfaces: [], imported_uses: [], hovers: [], hover_text: [], completion_groups: [], completion_bindings: [], completion_tokens: [], completion_keywords: [], rename_decls: [], member_entries: [], binding_types: [], diagnostics: [] };
+}
+
+export function rename_decl_at(definitions: &DocumentDefinitions:Read, offset: u32): RenameDecl {
+    var lo: u32 = 0;
+    var hi: u32 = @len(definitions.rename_decls) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        let item: RenameDecl = definitions.rename_decls[mid];
+        if offset < item.offset { hi = mid; }
+        elseif offset - item.offset < item.length { return item; }
+        else { lo = mid + 1u32; }
+    }
+    return RenameDecl { offset: 0, length: 0, scope_start: 0, scope_end: 0, kind: 0, hash_name: false };
+}
+
+export function hover_at(definitions: &DocumentDefinitions:Read, offset: u32): HoverLink {
+    var lo: u32 = 0;
+    var hi: u32 = @len(definitions.hovers) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        let link: HoverLink = definitions.hovers[mid];
+        if offset < link.offset { hi = mid; }
+        elseif offset - link.offset < link.length { return link; }
+        else { lo = mid + 1u32; }
+    }
+    return HoverLink { offset: 0, length: 0, text_at: 0, text_length: 0 };
+}
+
+export function definition_at(definitions: &DocumentDefinitions:Read, offset: u32): DefinitionLink {
+    var lo: u32 = 0;
+    var hi: u32 = @len(definitions.links) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        let link: DefinitionLink = definitions.links[mid];
+        if offset < link.use_offset { hi = mid; }
+        elseif offset - link.use_offset < link.use_length { return link; }
+        else { lo = mid + 1u32; }
+    }
+    return DefinitionLink { use_offset: 0, use_length: 0, target_offset: 0, target_length: 0 };
+}
+
+export function imported_definition_at(definitions: &DocumentDefinitions:Read, offset: u32): ImportedDefinitionUse {
+    var lo: u32 = 0;
+    var hi: u32 = @len(definitions.imported_uses) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        let item: ImportedDefinitionUse = definitions.imported_uses[mid];
+        if offset < item.offset { hi = mid; }
+        elseif offset - item.offset < item.length { return item; }
+        else { lo = mid + 1u32; }
+    }
+    return ImportedDefinitionUse { offset: 0, length: 0, interface_row: 0, export_id: 0 };
+}
+
+// 跨单元导入引用
+export struct ImportRef {
+    dependency: u16,
+    export_id: u32,
+}
+
+// TypeSig 节内引用（编译器内部以 offset+length 引用，不复制字节）
+export struct TypeSigRef {
+    off: u32,
+    len: u32,
+}
+
+// yak64-v1 布局算术；带标签联合返回零尺寸表示溢出。
+export struct Measure { size: u64, align: u8, payload_off: u64 }
+const LAYOUT_U64_MAX: u64 = 18446744073709551615u64;
+export function align_up(value: u64, alignment: u8): u64 {
+    if alignment <= 1 { return value; }
+    let a: u64 = alignment as u64;
+    let remainder: u64 = value % a;
+    if remainder == 0 { return value; }
+    let delta: u64 = a - remainder;
+    if value > LAYOUT_U64_MAX - delta { return LAYOUT_U64_MAX; }
+    return value + delta;
+}
+// 最大 u64 也是合法尺寸，不能把对齐结果本身当作溢出哨兵。
+export function alignment_overflows(value: u64, alignment: u8): bool {
+    if alignment <= 1 { return false; }
+    let remainder: u64 = value % (alignment as u64);
+    if remainder == 0 { return false; }
+    return value > LAYOUT_U64_MAX - ((alignment as u64) - remainder);
+}
+export function add_overflows(left: u64, right: u64): bool {
+    return left > LAYOUT_U64_MAX - right;
+}
+export function multiply_overflows(left: u64, right: u64): bool {
+    if left == 0 || right == 0 { return false; }
+    return left > LAYOUT_U64_MAX / right;
+}
+export function max_align(left: u8, right: u8): u8 {
+    if left > right { return left; }
+    return right;
+}
+export function builtin_align(builtin: u16): u8 {
+    if builtin == 4097 || builtin == 4101 || builtin == 4105 || builtin == 4108 { return 1; }
+    if builtin == 4098 || builtin == 4102 { return 2; }
+    if builtin == 4099 || builtin == 4103 || builtin == 4106 { return 4; }
+    if builtin == 4100 || builtin == 4104 { return 8; }
+    return 0;
+}
+export function union_layout(tag_size: u8, payload_align: u8, payload_size: u64): Measure {
+    let payload_off: u64 = align_up(tag_size as u64, payload_align);
+    if add_overflows(payload_off, payload_size) { return Measure { size: 0, align: 1, payload_off: 0 }; }
+    let align: u8 = max_align(1, max_align(tag_size, payload_align));
+    let end: u64 = payload_off + payload_size;
+    if alignment_overflows(end, align) { return Measure { size: 0, align: 1, payload_off: 0 }; }
+    let size: u64 = align_up(end, align);
+    return Measure { size: size, align: align, payload_off: payload_off };
+}

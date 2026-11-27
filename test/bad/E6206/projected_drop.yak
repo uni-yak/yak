@@ -1,0 +1,8 @@
+// expected_code: E6206
+// spec: spec/lang/owner.md OW-11
+// 触发：对数组元素投影单独析构，而非析构整个数组。
+function main(): void {
+    let items: [u32[]; 2] = [[1u32], [2u32]];
+    @drop(items[0u32]);
+    return;
+}

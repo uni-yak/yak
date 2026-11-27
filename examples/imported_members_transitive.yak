@@ -1,0 +1,12 @@
+// 根单元只导入中间单元；Pair 的身份与布局由传递接口提供。
+import imported_members_mid;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function main(): void {
+    let b: imported_members_mid::Box = imported_members_mid::Box { pair: imported_members_mid::make_pair(42u32) };
+    let c: imported_members_mid::Box = imported_members_mid::Box { pair: imported_members_mid::make_pair(7u32) };
+    assert(imported_members_mid::read_pair(c.pair) == 7u32);
+    exit(imported_members_mid::read_pair(b.pair) as u8);
+    return;
+}

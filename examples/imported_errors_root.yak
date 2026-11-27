@@ -1,0 +1,18 @@
+// 从依赖载入错误集，并在传播时加入排在两个用户枚举之前的固有枚举。
+import imported_errors_dep;
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+export function widen(x: u32): void!(imported_errors_dep::Widthy | AllocError | imported_errors_dep::Z) {
+    let value: u32 = imported_errors_dep::value(x)?;
+    write("ok");
+    exit(value as u8);
+    return;
+}
+
+function main(): void {
+    widen(0u32);
+    widen(1u32);
+    widen(42u32);
+    return;
+}

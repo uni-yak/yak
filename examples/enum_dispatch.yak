@@ -1,0 +1,28 @@
+// 枚举构造与 match 分派：标签构造（176）与 enum_dispatch（177）产出真实机器码。
+// 验收方式：链接后运行，退出码必须是 20（pick(1) 得到 One，score 返回 20）。
+foreign exit(code: u8): void;
+
+enum E { Zero, One, Two }
+
+function pick(x: u32): E {
+    if x == 0u32 { return E::Zero; }
+    if x == 1u32 { return E::One; }
+    return E::Two;
+}
+
+function score(e: E): u32 {
+    var r: u32 = 0u32;
+    match e {
+        Zero => { r = 10u32; },
+        One => { r = 20u32; },
+        Two => { r = 30u32; }
+    }
+    return r;
+}
+
+function main(): void {
+    let e: E = pick(1u32);
+    let s: u32 = score(e);
+    exit(s as u8);
+    return;
+}

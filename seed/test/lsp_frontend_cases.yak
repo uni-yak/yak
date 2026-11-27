@@ -1,0 +1,1041 @@
+import buf;
+import lex;
+import diag;
+import pipeline;
+import layout;
+import typecheck;
+import ast;
+import parse;
+import owner_flow;
+import owner;
+import resolve_refs;
+import resolve_unit;
+import typecheck_driver;
+foreign assert(cond: bool): void;
+
+// 无导入时，对拍两个入口的状态、诊断顺序和完整结构化位置。
+export function compare(source: &[u8], file: u16, accepted: bool, wanted: u16): void!AllocError {
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let batch_ok: bool = pipeline::run_frontend(source, file, &batch:ReadWrite)?;
+    let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, file)?;
+    assert(batch_ok == accepted);
+    if accepted { assert(pipeline::analysis_checked(document.status)); }
+    else { assert(pipeline::analysis_rejected(document.status)); }
+    let count: u32 = diag::diagbuf_count(&batch:Read);
+    assert(count == diag::diagbuf_count(&document.diagnostics:Read));
+    assert(diag::diagbuf_has_error(&batch:Read) == diag::diagbuf_has_error(&document.diagnostics:Read));
+    var i: u32 = 0;
+    var found: bool = false;
+    while i < count {
+        let left: diag::Diag = batch.diags[i];
+        let right: diag::Diag = document.diagnostics.diags[i];
+        assert(left.code.raw == right.code.raw && left.severity == right.severity && left.unit == right.unit);
+        assert(left.span.file == right.span.file && left.span.offset == right.span.offset && left.span.length == right.span.length);
+        if right.code.raw == wanted { found = true; }
+        i = i + 1;
+    }
+    if wanted != 0 { assert(found); }
+    else { assert(count == 0); }
+    return;
+}
+
+export function check_imports(): void!AllocError {
+    let source: &[u8] = "import lib;\nfunction f(): u8 { return lib::get(); }\n";
+    let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 40)?;
+    assert(pipeline::analysis_needs_dependencies(document.status));
+    assert(diag::diagbuf_count(&document.diagnostics:Read) == 0);
+    var old: diag::DiagBuffer = diag::diagbuf_new();
+    let complete: bool = pipeline::run_frontend(source, 40, &old:ReadWrite)?;
+    assert(!complete && diag::diagbuf_has_error(&old:Read));
+
+    let lexical: pipeline::DocumentAnalysis = pipeline::run_document_frontend("import lib;\nfunction f(): void { let x = \"", 41)?;
+    assert(pipeline::analysis_rejected(lexical.status));
+    assert(diag::diagbuf_count(&lexical.diagnostics:Read) == 1);
+    assert(lexical.diagnostics.diags[0].span.file == 41);
+    let syntax: pipeline::DocumentAnalysis = pipeline::run_document_frontend("import lib;\nfunction f( {}\n", 42)?;
+    assert(pipeline::analysis_rejected(syntax.status));
+    assert(diag::diagbuf_count(&syntax.diagnostics:Read) > 0);
+    assert(syntax.diagnostics.diags[0].span.file == 42);
+
+    // 当前文本不补末尾换行，EOF 诊断仍保留原始零宽跨度。
+    let no_lf: &[u8] = "import lib;";
+    let eof: pipeline::DocumentAnalysis = pipeline::run_document_frontend(no_lf, 47)?;
+    assert(pipeline::analysis_rejected(eof.status));
+    assert(diag::diagbuf_count(&eof.diagnostics:Read) == 1);
+    let tail: diag::Diag = eof.diagnostics.diags[0];
+    assert(tail.code.raw == 1018u16 && tail.span.file == 47u16);
+    assert(tail.span.offset == (@len(no_lf) as u32) && tail.span.length == 0u32);
+    return;
+}
+
+function check_limited(source: &[u8], count: u32, code: u16): void!AllocError {
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let batch_ok: bool = pipeline::run_frontend(source, 48u16, &batch:ReadWrite)?;
+    let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 48u16)?;
+    let retained: &diag::DiagBuffer:Read = &document.diagnostics:Read;
+    assert(!batch_ok && batch.count == count && !batch.truncated);
+    assert(retained.count == 64u32 && diag::diagbuf_has_error(retained));
+    assert(pipeline::analysis_rejected(document.status) == (count == 64u32));
+    assert(pipeline::analysis_diagnostics_truncated(document.status) == (count > 64u32));
+    var i: u32 = 0;
+    while i < retained.count {
+        let left: diag::Diag = batch.diags[i];
+        let right: diag::Diag = retained.diags[i];
+        assert(right.code.raw == code && right.severity == 0u8 && right.span.file == 48u16);
+        assert(left.code.raw == right.code.raw && left.span.offset == right.span.offset && left.span.length == right.span.length);
+        i = i + 1u32;
+    }
+    return;
+}
+
+export function collection(): void!AllocError {
+    var parse_source: buf::ByteBuf = buf::buf_new();
+    var names_source: buf::ByteBuf = buf::buf_new();
+    var i: u32 = 0;
+    while i < 65u32 {
+        buf::buf_push_bytes(&parse_source:ReadWrite, "; function f(): void {}\n")?;
+        buf::buf_push_bytes(&names_source:ReadWrite, "function f")?;
+        buf::buf_push_u8(&names_source:ReadWrite, 48u8 + ((i / 10u32) as u8))?;
+        buf::buf_push_u8(&names_source:ReadWrite, 48u8 + ((i % 10u32) as u8))?;
+        buf::buf_push_bytes(&names_source:ReadWrite, "(): void { return missing; }\n")?;
+        i = i + 1u32;
+        if i == 64u32 || i == 65u32 {
+            check_limited(&parse_source.data[0..parse_source.pos]:Read, i, 2001u16)?;
+            check_limited(&names_source.data[0..names_source.pos]:Read, i, 4002u16)?;
+        }
+    }
+    compare("function f(): void {}\n", 48u16, true, 0u16)?;
+    return;
+}
+
+export function dead_collection(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function f(x: u32[]): void { while false { @drop(x);")?;
+    var i: u32 = 0;
+    while i < 65u32 {
+        buf::buf_push_bytes(&text:ReadWrite, " @drop(x);")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, " } @drop(x); }\n")?;
+    let src: &[u8] = &text.data[0..text.pos]:Read;
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let batch_ok: bool = pipeline::run_frontend(src, 49u16, &batch:ReadWrite)?;
+    let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(src, 49u16)?;
+    assert(batch_ok && batch.count == 0u32);
+    let retained: &diag::DiagBuffer:Read = &document.diagnostics:Read;
+    assert(pipeline::analysis_diagnostics_truncated(document.status));
+    assert(retained.count == 0u32 && retained.truncated && !diag::diagbuf_has_error(retained));
+    return;
+}
+
+export function parse_depth(): void!AllocError {
+    var level: u32 = 30;
+    while level <= 31u32 {
+        var text: buf::ByteBuf = buf::buf_new();
+        buf::buf_push_bytes(&text:ReadWrite, "function f(): u32 { return ")?;
+        var i: u32 = 0;
+        while i < level { buf::buf_push_u8(&text:ReadWrite, 40u8)?; i = i + 1u32; }
+        buf::buf_push_bytes(&text:ReadWrite, "1u32")?;
+        i = 0;
+        while i < level { buf::buf_push_u8(&text:ReadWrite, 41u8)?; i = i + 1u32; }
+        buf::buf_push_bytes(&text:ReadWrite, "; }\n")?;
+        let source: &[u8] = &text.data[0..text.pos]:Read;
+        let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 50u16)?;
+        assert(document.diagnostics.count == 0u32 && !document.diagnostics.truncated);
+        assert(pipeline::analysis_checked(document.status) == (level == 30u32));
+        assert(pipeline::analysis_parse_depth_exceeded(document.status) == (level == 31u32));
+        var batch: diag::DiagBuffer = diag::diagbuf_new();
+        let accepted: bool = pipeline::run_frontend(source, 50u16, &batch:ReadWrite)?;
+        assert(accepted && batch.count == 0u32);
+        level = level + 1u32;
+    }
+    // 连续结构结束后归还活动入口额度，不把配额当作累计次数。
+    var sequential: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&sequential:ReadWrite, "function f(): void { ")?;
+    var branch: u32 = 0;
+    while branch < 80u32 {
+        buf::buf_push_bytes(&sequential:ReadWrite, "if true {} ")?;
+        branch = branch + 1u32;
+    }
+    buf::buf_push_bytes(&sequential:ReadWrite, "}\n")?;
+    compare(&sequential.data[0..sequential.pos]:Read, 50u16, true, 0u16)?;
+    compare("function f(): void {}\n", 50u16, true, 0u16)?;
+    return;
+}
+
+export function expression_depth(): void!AllocError {
+    var level: u32 = 63;
+    while level <= 64u32 {
+        var text: buf::ByteBuf = buf::buf_new();
+        buf::buf_push_bytes(&text:ReadWrite, "function f(): u32 { return 1u32")?;
+        var i: u32 = 0;
+        while i < level { buf::buf_push_bytes(&text:ReadWrite, " + 1u32")?; i = i + 1u32; }
+        buf::buf_push_bytes(&text:ReadWrite, "; }\n")?;
+        let source: &[u8] = &text.data[0..text.pos]:Read;
+        let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 51u16)?;
+        assert(document.diagnostics.count == 0u32 && !document.diagnostics.truncated);
+        assert(pipeline::analysis_checked(document.status) == (level == 63u32));
+        assert(pipeline::analysis_expression_depth_exceeded(document.status) == (level == 64u32));
+        var batch: diag::DiagBuffer = diag::diagbuf_new();
+        let accepted: bool = pipeline::run_frontend(source, 51u16, &batch:ReadWrite)?;
+        assert(accepted && batch.count == 0u32);
+        level = level + 1u32;
+    }
+    compare("function f(): void {}\n", 51u16, true, 0u16)?;
+    return;
+}
+
+export function layout_graph_depth(): void!AllocError {
+    var table: typecheck::TypeTable = typecheck::new_table();
+    var fields: typecheck::FieldTable = typecheck::FieldTable { items: [] };
+    let enums: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    var i: u32 = 1;
+    while i <= 65u32 {
+        let id: u32 = typecheck::intern_local(&table:ReadWrite, i)?;
+        assert(id == i);
+        if i > 1u32 { typecheck::add_field(&fields:ReadWrite, i - 1u32, 1u32, i)?; }
+        i = i + 1u32;
+    }
+    let fits: bool = layout::value_depth_within(&table:Read, &fields:Read, &enums:Read, 65u32)?;
+    let exceeds: bool = layout::value_depth_within(&table:Read, &fields:Read, &enums:Read, 64u32)?;
+    assert(fits && !exceeds);
+    return;
+}
+
+// 按依赖先声明的顺序建立类型链，覆盖缓存最长后缀。
+function type_name(text: &buf::ByteBuf:ReadWrite, index: u32): void!AllocError {
+    buf::buf_push_u8(text, 84u8)?;
+    buf::buf_push_u8(text, 48u8 + (index / 10u32) as u8)?;
+    buf::buf_push_u8(text, 48u8 + (index % 10u32) as u8)?;
+    return;
+}
+
+function type_chain(text: &buf::ByteBuf:ReadWrite, links: u32): void!AllocError {
+    var i: u32 = 0;
+    while i < links {
+        let at: u32 = links - i - 1u32;
+        buf::buf_push_bytes(text, "struct ")?;
+        type_name(text, at)?;
+        buf::buf_push_bytes(text, " { v: ")?;
+        if at + 1u32 == links { buf::buf_push_bytes(text, "u32")?; }
+        else { type_name(text, at + 1u32)?; }
+        buf::buf_push_bytes(text, " }\n")?;
+        i = i + 1u32;
+    }
+    return;
+}
+
+export function type_depth(): void!AllocError {
+    var links: u32 = 63;
+    while links <= 64u32 {
+        var text: buf::ByteBuf = buf::buf_new();
+        type_chain(&text:ReadWrite, links)?;
+        let source: &[u8] = &text.data[0..text.pos]:Read;
+        let document: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 52u16)?;
+        assert(document.diagnostics.count == 0u32 && !document.diagnostics.truncated);
+        assert(pipeline::analysis_checked(document.status) == (links == 63u32));
+        assert(pipeline::analysis_value_depth_exceeded(document.status) == (links == 64u32));
+        var batch: diag::DiagBuffer = diag::diagbuf_new();
+        let accepted: bool = pipeline::run_frontend(source, 52u16, &batch:ReadWrite)?;
+        assert(accepted && batch.count == 0u32);
+        links = links + 1u32;
+    }
+    compare("struct A { v: A }\n", 52u16, false, 5509u16)?;
+    compare("struct A { v: A[] }\n", 52u16, true, 0u16)?;
+    return;
+}
+
+export function lexical_limits(): void!AllocError {
+    let exact: lex::LexResult = lex::lex_scan_limited("a /* x */ b // y\n", 53u16, 2u32, 1u32)?;
+    assert(exact.resource_status == 0u8 && @len(exact.tokens) == 3u64);
+    assert(exact.tokens[2].kind == 9u8 && @len(exact.diagnostics) == 0u64);
+    let overflow: lex::LexResult = lex::lex_scan_limited("a b c\n", 53u16, 2u32, 1u32)?;
+    assert(lex::lex_token_limit_exceeded(overflow.resource_status));
+    assert(@len(overflow.tokens) == 0u64 && @len(overflow.diagnostics) == 0u64);
+    let name: lex::LexResult = lex::lex_scan_limited("a bb\n", 53u16, 2u32, 1u32)?;
+    let names: &lex::NameTable:Read = &name.names:Read;
+    assert(lex::lex_name_limit_exceeded(name.resource_status));
+    assert(@len(names.entries) == 1u64 && @len(name.tokens) == 0u64);
+    let bad: lex::LexResult = lex::lex_scan_limited("a b /** bad */\n", 53u16, 2u32, 1u32)?;
+    assert(bad.resource_status == 0u8 && bad.diagnostics[0].code.raw == 1002u16);
+
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function ")?;
+    var i: u32 = 0;
+    while i < 1025u32 { buf::buf_push_u8(&text:ReadWrite, 97u8)?; i = i + 1u32; }
+    buf::buf_push_bytes(&text:ReadWrite, "(): void {}\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 53u16)?;
+    assert(pipeline::analysis_name_limit_exceeded(doc.status) && doc.diagnostics.count == 0u32);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 53u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+export function copy_walk_limit(): void!AllocError {
+    let source: &[u8] = "struct D0 { left: u32, right: u32 }\nstruct D1 { left: D0, right: D0 }\nstruct D2 { left: D1, right: D1 }\nstruct D3 { left: D2, right: D2 }\nstruct D4 { left: D3, right: D3 }\nstruct D5 { left: D4, right: D4 }\nstruct D6 { left: D5, right: D5 }\nstruct D7 { left: D6, right: D6 }\nstruct D8 { left: D7, right: D7 }\nstruct D9 { left: D8, right: D8 }\nfunction f(p: D9): D9 { return p; }\n";
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 54u16)?;
+    assert(pipeline::analysis_copy_walk_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 54u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+export function write_visit_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function ping(): void {}\nfunction fill(flag: bool, a: &u32:Write, b: &u32:Write, c: &u32:Write, d: &u32:Write, e: &u32:Write, f: &u32:Write, g: &u32:Write, h: &u32:Write, i: &u32:Write, j: &u32:Write, k: &u32:Write, l: &u32:Write, m: &u32:Write, n: &u32:Write, o: &u32:Write, p: &u32:Write): void { ")?;
+    // 每个形参走访 257 次；16 个形参合计 4112 次。
+    buf::buf_push_bytes(&text:ReadWrite, "*a = 1u32; *b = 1u32; *c = 1u32; *d = 1u32; *e = 1u32; *f = 1u32; *g = 1u32; *h = 1u32; *i = 1u32; *j = 1u32; *k = 1u32; *l = 1u32; *m = 1u32; *n = 1u32; *o = 1u32; *p = 1u32; ")?;
+    var i: u32 = 0;
+    while i < 48u32 {
+        buf::buf_push_bytes(&text:ReadWrite, "while flag { ping(); } ")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "}\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 56u16)?;
+    assert(pipeline::analysis_write_visits_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 56u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+export function owner_replay_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function first(): void { ")?;
+    var i: u32 = 0;
+    while i < 32u32 {
+        buf::buf_push_bytes(&text:ReadWrite, "while true {} ")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "} function second(): void { while false { ")?;
+    i = 0;
+    while i < 33u32 {
+        buf::buf_push_bytes(&text:ReadWrite, "while true {} ")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "} }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 57u16)?;
+    assert(pipeline::analysis_owner_replays_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 57u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 对照后序表与旧递归查询，并用实际所有权合流核对诊断。
+export function owner_flow_facts(): void!AllocError {
+    let source: &[u8] = "enum E { A, B }\nfunction f(x: u32, b: bool, e: E): void { while b { if b { @drop(x); match e { E::A => { break; }, E::B => { } } return; } elseif b { continue; } else { } break; } @drop(x); }\nfunction g(b: bool, e: E): void { if b { match e { E::A => { return; }, E::B => { return; } } } else { return; } while b {} }\n";
+    let lexed: lex::LexResult = lex::lex_scan(source, 61u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 61u16)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let pool: &ast::AstPool:Read = &parsed.pool:Read;
+    let facts: owner_flow::FlowFacts = owner_flow::build_facts(pool, true)?;
+    let last: u32 = @len(pool.blocks) as u32;
+    assert(last > 9u32);
+    var block: u32 = 0;
+    while block <= last {
+        assert(owner_flow::returns_in(pool, &facts:Read, block) == owner_flow::block_returns(pool, block));
+        assert(owner_flow::falls_in(pool, &facts:Read, block) == owner_flow::slice_falls_through(pool, block));
+        block = block + 1u32;
+    }
+    var stmt: u32 = 0;
+    while stmt < @len(pool.stmts) as u32 {
+        assert(owner_flow::stmt_falls_in(pool, &facts:Read, stmt) == owner_flow::slice_stmt_falls_through(pool, pool.stmts[stmt]));
+        stmt = stmt + 1u32;
+    }
+    compare(source, 61u16, false, 6003u16)?;
+    compare("enum E { A, B }\nfunction f(e: E, s: u32[]): void { match e { E::A => { @drop(s); return; }, E::B => { return; } } @drop(s); @drop(s); }\n", 62u16, true, 0u16)?;
+    return;
+}
+
+export function place_copy_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function f(a: bool, b: bool, c: bool, d: bool, e: bool, f0: bool, g: bool, h: bool): void { @drop(a); @drop(b); @drop(c); @drop(d); @drop(e); @drop(f0); @drop(g); @drop(h); ")?;
+    var i: u32 = 0;
+    while i < 257u32 {
+        buf::buf_push_bytes(&text:ReadWrite, "while false {} ")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "}\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 63u16)?;
+    assert(pipeline::analysis_place_copy_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 63u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 文档入口只保留诊断；批处理仍收集离块、显式返回和隐式落尾的析构计划。
+export function owner_products(): void!AllocError {
+    let source: &[u8] = "function f(x: u32[], b: bool): void { if b { let y: u32[] = [1u32]; let n: u64 = @len(y); @drop(n); } else { return; } let n: u64 = @len(x); @drop(n); }\n";
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let lexed: lex::LexResult = lex::lex_scan(source, 64u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 64u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    let layouts: layout::LayoutResult = layout::layout_unit(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, &diags:ReadWrite)?;
+    @drop(layouts);
+    assert(diags.count == 0u32);
+    let batch: owner::OwnerResult = owner::check_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite)?;
+    assert(diags.count == 0u32 && batch.has_owning && @len(batch.places.items) > 2);
+    assert(@len(batch.drop_plans.items) == 1);
+    assert(@len(batch.drop_plans.items[0].defs) == 1);
+    assert(@len(batch.drop_plans.items[0].returns.items) == 1);
+    assert(@len(batch.drop_plans.items[0].returns.items[0].defs) == 1);
+    assert(@len(batch.drop_plans.items[0].returns.scopes) == 1);
+    assert(@len(batch.drop_plans.items[0].returns.scopes[0].defs) == 1);
+    let limits: owner::OwnerLimits = owner::OwnerLimits { write: 4096u32, replay: 64u32, place_copy: 4096u32, slice_merge: 4096u32, slice_copy: 1024u32, slice_scope: 1024u32, slice_assignment: 4096u32, borrow_conflict: 4096u32, place_merge: 4096u32, place_lookup: 8192u32, place_exit: 4096u32, slot_jump: 1024u32, slice_jump: 256u32, document: true };
+    let document: owner::OwnerResult = owner::check_unit_limited(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &checked:Read, &diags:ReadWrite, limits)?;
+    assert(diags.count == 0u32 && !document.has_owning);
+    assert(@len(document.drop_plans.items) == 0 && @len(document.places.items) == 0);
+    compare(source, 64u16, true, 0u16)?;
+    compare("function f(flag: bool): void!AllocError { var outer_v: u32[] = []; @push(outer_v, 1u32)?; var i: u32 = 0; outer: while i < 2 { var loop_a: u32[] = []; @push(loop_a, 2u32)?; if i == 0 { var cont_v: u32[] = []; @push(cont_v, 3u32)?; i = 1; continue outer; } inner: while flag { var inner_b: u32[] = []; @push(inner_b, 4u32)?; break outer; } } if flag { var if_v: u32[] = []; @push(if_v, 5u32)?; } return; }\n", 65u16, true, 0u16)?;
+    return;
+}
+
+// 同一超限文档在普通批处理下仍可合法合流。
+export function slice_merge_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function use(v: &[u8]): void { let n: u64 = @len(v); @drop(n); }\nfunction f(b: bool): void { let a: [u8; 1] = [1u8]; ")?;
+    var i: u8 = 0;
+    while i < 8u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "let v")?;
+        buf::buf_push_u8(&text:ReadWrite, 48u8 + i)?;
+        buf::buf_push_bytes(&text:ReadWrite, ": &[u8] = &a[0..1]:Read; ")?;
+        i = i + 1u8;
+    }
+    i = 0u8;
+    while i < 38u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "if b {} ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "use(v0); use(v1); use(v2); use(v3); use(v4); use(v5); use(v6); use(v7); }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 66u16)?;
+    assert(pipeline::analysis_slice_merge_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 66u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 同一快照复制超限源码不限制普通批处理。
+export function slice_copy_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function use(v: &[u8]): void { let n: u64 = @len(v); @drop(n); }\nfunction f(b: bool): void { let a: [u8; 1] = [1u8]; ")?;
+    var i: u8 = 0;
+    while i < 8u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "let v")?;
+        buf::buf_push_u8(&text:ReadWrite, 48u8 + i)?;
+        buf::buf_push_bytes(&text:ReadWrite, ": &[u8] = &a[0..1]:Read; ")?;
+        i = i + 1u8;
+    }
+    i = 0u8;
+    while i < 42u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "if b { return; } ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "use(v0); use(v1); use(v2); use(v3); use(v4); use(v5); use(v6); use(v7); }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function g(b: bool): void { let a: [u8; 1] = [1u8]; let v: &[u8] = &a[0..1]:Read; ")?;
+    i = 0u8;
+    while i < 5u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "if b { return; } ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "while true { break; } while true { break; } use(v); }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 67u16)?;
+    assert(pipeline::analysis_slice_copy_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 67u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 深层离块过滤超过文档配额，普通批处理仍接受同一源码。
+export function slice_scope_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function use(v: &[u8]): void { let n: u64 = @len(v); @drop(n); }\n")?;
+    var f: u8 = 0;
+    while f < 7u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "function deep")?;
+        buf::buf_push_u8(&text:ReadWrite, 48u8 + f)?;
+        buf::buf_push_bytes(&text:ReadWrite, "(b: bool): void { let a: [u8; 1] = [1u8]; let v0: &[u8] = &a[0..1]:Read; ")?;
+        var i: u8 = 0;
+        while i < 15u8 { buf::buf_push_bytes(&text:ReadWrite, "if b { ")?; i = i + 1u8; }
+        i = 0u8;
+        while i < 15u8 { buf::buf_push_bytes(&text:ReadWrite, "} ")?; i = i + 1u8; }
+        buf::buf_push_bytes(&text:ReadWrite, "use(v0); }\n")?;
+        f = f + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "function tail(b: bool): void { let a: [u8; 1] = [1u8]; let v0: &[u8] = &a[0..1]:Read; ")?;
+    var i: u8 = 0;
+    while i < 27u8 { buf::buf_push_bytes(&text:ReadWrite, "if b {} ")?; i = i + 1u8; }
+    buf::buf_push_bytes(&text:ReadWrite, "if b { if b {} } if b { if b {} } use(v0); }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 68u16)?;
+    assert(pipeline::analysis_slice_scope_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 68u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+function slice_assignment_name(text: &buf::ByteBuf:ReadWrite, index: u8): void!AllocError {
+    buf::buf_push_u8(text, 118u8)?;
+    buf::buf_push_u8(text, 65u8 + index / 26u8)?;
+    buf::buf_push_u8(text, 65u8 + index % 26u8)?;
+    return;
+}
+
+// 用声明链传播切片，既使用每个绑定，也不触发赋值目标的额外借用冲突扫描。
+function slice_assignment_source(copies: u8): buf::ByteBuf!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function wide(): void { let a: [u8; 1] = [1u8]; let vAA: &[u8] = &a[0..1]:Read; ")?;
+    var i: u8 = 0;
+    while i < copies {
+        buf::buf_push_bytes(&text:ReadWrite, "let ")?;
+        slice_assignment_name(&text:ReadWrite, i + 1u8)?;
+        buf::buf_push_bytes(&text:ReadWrite, ": &[u8] = ")?;
+        slice_assignment_name(&text:ReadWrite, i)?;
+        buf::buf_push_bytes(&text:ReadWrite, "; ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "let n: u64 = @len(")?;
+    slice_assignment_name(&text:ReadWrite, copies)?;
+    buf::buf_push_bytes(&text:ReadWrite, "); @drop(n); }\n")?;
+    return @move(text);
+}
+
+// 相邻的声明数跨过文档切片赋值配额，批处理仍接受超限文本。
+export function slice_assignment_limit(): void!AllocError {
+    let accepted: buf::ByteBuf = slice_assignment_source(51u8)?;
+    let within: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&accepted.data[0..accepted.pos]:Read, 69u16)?;
+    assert(pipeline::analysis_checked(within.status));
+    assert(within.diagnostics.count == 0u32 && !within.diagnostics.truncated);
+    let text: buf::ByteBuf = slice_assignment_source(52u8)?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 69u16)?;
+    assert(pipeline::analysis_slice_assignment_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 69u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    // 真正的借用逸出在预算内仍产生原诊断，逐项对拍两入口。
+    compare("function f(): void { let a: [u8; 1] = [1u8]; var v: &[u8] = &a[0..1]:Read; if true { let b: [u8; 1] = [2u8]; v = &b[0..1]:Read; } let n: u64 = @len(v); @drop(n); }\n", 70u16, false, 6005u16)?;
+    return;
+}
+
+// 文档超限时丢弃先前局部诊断；普通前端仍分析同一源码。
+export function borrow_conflict_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function use(v: &[u8]): void { let n: u64 = @len(v); @drop(n); }\nfunction wide(): void { let a: [u8; 1] = [1u8]; ")?;
+    var i: u8 = 0;
+    while i < 35u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "let v")?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(&text:ReadWrite, ": &[u8] = &a[0..1]:Read; ")?;
+        i = i + 1u8;
+    }
+    i = 0u8;
+    while i < 35u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "use(v")?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(&text:ReadWrite, "); ")?;
+        i = i + 1u8;
+    }
+    i = 0u8;
+    while i < 64u8 { buf::buf_push_bytes(&text:ReadWrite, "use(vAA); ")?; i = i + 1u8; }
+    buf::buf_push_bytes(&text:ReadWrite, "}\nfunction tail(): void { let a: [u8; 1] = [1u8]; let v: &[u8] = &a[0..1]:Read; use(v); use(v); use(v); }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 71u16)?;
+    assert(pipeline::analysis_borrow_conflict_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 71u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    // 同一短暂独占借用、切片共享借用仍各自报告真实冲突。
+    compare("function take(r: &u32:ReadWrite, n: u32): void { *r = n; } function f(): void { var x: u32 = 1; take(&x:ReadWrite, x); }\n", 72u16, false, 6004u16)?;
+    compare("foreign read(dst: &[u8]:ReadWrite): u32; function f(): void { var a: u8[] = [1u8]; let v: &[u8] = &a[0..1]:Read; let n: u32 = read(&a[0..1]:ReadWrite); if n as u64 == @len(v) { return; } }\n", 73u16, false, 6004u16)?;
+    return;
+}
+
+// 文档合流配额不改变批处理的合流结果。
+export function place_merge_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function wide(b: bool): void { ")?;
+    var i: u8 = 0;
+    while i < 31u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "let v")?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(&text:ReadWrite, ": u32 = 1; ")?;
+        i = i + 1u8;
+    }
+    i = 0u8;
+    while i < 21u8 { buf::buf_push_bytes(&text:ReadWrite, "if b {} ")?; i = i + 1u8; }
+    i = 0u8;
+    while i < 31u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "@drop(v")?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(&text:ReadWrite, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(&text:ReadWrite, "); ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "}\nfunction tail(b: bool): void { ")?;
+    i = 0u8;
+    while i < 7u8 { buf::buf_push_bytes(&text:ReadWrite, "if b && true {} ")?; i = i + 1u8; }
+    buf::buf_push_bytes(&text:ReadWrite, "if b && (true || (b && true)) {} }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 74u16)?;
+    assert(pipeline::analysis_place_merge_exceeded(doc.status));
+    assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 74u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    compare("function fill(x: &u32:Write): void { *x = 1; }\nfunction main(b: bool): void { out r: u32; if b { fill(out r); } }\n", 75u16, false, 6103u16)?;
+    return;
+}
+
+function lookup_drops(text: &buf::ByteBuf:ReadWrite, name: &[u8], count: u8): void!AllocError {
+    buf::buf_push_bytes(text, "function ")?;
+    buf::buf_push_bytes(text, name)?;
+    buf::buf_push_u8(text, 40u8)?;
+    var i: u8 = 0;
+    while i < count {
+        if i != 0u8 { buf::buf_push_bytes(text, ", ")?; }
+        buf::buf_push_u8(text, 97u8)?;
+        buf::buf_push_u8(text, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(text, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(text, ": bool")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(text, "): void { ")?;
+    i = 0u8;
+    while i < count {
+        buf::buf_push_bytes(text, "@drop(a")?;
+        buf::buf_push_u8(text, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(text, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(text, "); ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(text, "}\n")?;
+    return;
+}
+
+// 查找恰好用完额度时可完成；超限的同一份源码仍可由批处理检查。
+export function place_lookup_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    lookup_drops(&text:ReadWrite, "wide", 56u8)?;
+    lookup_drops(&text:ReadWrite, "narrow", 10u8)?;
+    var exact_text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&exact_text:ReadWrite, &text.data[0..text.pos]:Read)?;
+    buf::buf_push_bytes(&exact_text:ReadWrite, "function tail(x: bool): bool { return x; }\n")?;
+    let exact: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&exact_text.data[0..exact_text.pos]:Read, 76u16)?;
+    assert(pipeline::analysis_checked(exact.status) && exact.diagnostics.count == 0u32);
+    buf::buf_push_bytes(&text:ReadWrite, "function tail(x: bool): void { @drop(x); }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 76u16)?;
+    assert(pipeline::analysis_place_lookup_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 76u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+function exit_probe(text: &buf::ByteBuf:ReadWrite, name: &[u8], count: u8, repeats: u8, drop_first: bool): void!AllocError {
+    buf::buf_push_bytes(text, "function ")?;
+    buf::buf_push_bytes(text, name)?;
+    buf::buf_push_u8(text, 40u8)?;
+    var i: u8 = 0;
+    while i < count {
+        if i != 0u8 { buf::buf_push_bytes(text, ", ")?; }
+        buf::buf_push_u8(text, 97u8)?;
+        buf::buf_push_u8(text, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(text, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(text, ": bool")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(text, "): void { ")?;
+    if drop_first { buf::buf_push_bytes(text, "@drop(aAA); ")?; }
+    i = 0u8;
+    while i < repeats { buf::buf_push_bytes(text, "while false {} ")?; i = i + 1u8; }
+    i = 0u8;
+    if drop_first { i = 1u8; }
+    while i < count {
+        buf::buf_push_bytes(text, "@drop(a")?;
+        buf::buf_push_u8(text, 65u8 + i / 26u8)?;
+        buf::buf_push_u8(text, 65u8 + i % 26u8)?;
+        buf::buf_push_bytes(text, "); ")?;
+        i = i + 1u8;
+    }
+    buf::buf_push_bytes(text, "}\n")?;
+    return;
+}
+
+// 活位置为候选和两次作用域访问，已析构位置只计候选。
+export function place_exit_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    exit_probe(&text:ReadWrite, "wide", 32u8, 42u8, false)?;
+    exit_probe(&text:ReadWrite, "tail", 22u8, 1u8, true)?;
+    let exact: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&text.data[0..text.pos]:Read, 77u16)?;
+    assert(pipeline::analysis_checked(exact.status) && exact.diagnostics.count == 0u32);
+    exit_probe(&text:ReadWrite, "extra", 1u8, 1u8, true)?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 77u16)?;
+    assert(pipeline::analysis_place_exit_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 77u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 普通跳转每次 12 步，标签转交槽位 10 步，三行位置的末尾边 6 步。
+export function slot_jump_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function wide(a: bool, b: bool, c: bool, d: bool, e: bool, f: bool, g: bool, h: bool, i: bool): void { ")?;
+    var i: u32 = 0;
+    while i < 84u32 { buf::buf_push_bytes(&text:ReadWrite, "while true { break; } ")?; i = i + 1u32; }
+    buf::buf_push_bytes(&text:ReadWrite, "@drop(a); @drop(b); @drop(c); @drop(d); @drop(e); @drop(f); @drop(g); @drop(h); @drop(i); }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function fill(x: &u32:Write): void { *x = 1u32; }\nfunction labeled(): void { out r: u32; fill(out r); outer: while true { while true { break outer; } } }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function tail(a: bool, b: bool, c: bool): void { while true { break; } @drop(a); @drop(b); @drop(c); }\n")?;
+    let exact: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&text.data[0..text.pos]:Read, 78u16)?;
+    assert(pipeline::analysis_checked(exact.status) && exact.diagnostics.count == 0u32);
+    buf::buf_push_bytes(&text:ReadWrite, "function extra(): void { while true { break; } }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 78u16)?;
+    assert(pipeline::analysis_slot_jump_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 78u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 普通跳转一帧，双层转交恰好五步，单独验证文档降级不限制批处理。
+export function slice_jump_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    var f: u8 = 0;
+    while f < 3u8 {
+        buf::buf_push_bytes(&text:ReadWrite, "function plain")?;
+        buf::buf_push_u8(&text:ReadWrite, 48u8 + f)?;
+        buf::buf_push_bytes(&text:ReadWrite, "(): void { ")?;
+        var count: u8 = 84u8;
+        if f == 2u8 { count = 83u8; }
+        var i: u8 = 0;
+        while i < count { buf::buf_push_bytes(&text:ReadWrite, "while true { break; } ")?; i = i + 1u8; }
+        buf::buf_push_bytes(&text:ReadWrite, "}\n")?;
+        f = f + 1u8;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "function labeled(): void { let a: [u8; 1] = [1u8]; let v: &[u8] = &a[0..1]:Read; outer: while true { while true { break outer; } } let n: u64 = @len(v); @drop(n); }\n")?;
+    let exact: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&text.data[0..text.pos]:Read, 79u16)?;
+    assert(pipeline::analysis_checked(exact.status) && exact.diagnostics.count == 0u32);
+    buf::buf_push_bytes(&text:ReadWrite, "function extra(): void { while true { break; } }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 79u16)?;
+    assert(pipeline::analysis_slice_jump_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 79u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 签名和空作用域放大查找步数，文档限制不改变普通批处理结果。
+export function name_lookup_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function f(x: bool): void { ")?;
+    var depth: u8 = 0u8;
+    while depth < 30u8 { buf::buf_push_bytes(&text:ReadWrite, "while false { ")?; depth = depth + 1u8; }
+    var n: u8 = 0u8;
+    while n < 127u8 { buf::buf_push_bytes(&text:ReadWrite, "if x {} ")?; n = n + 1u8; }
+    while depth > 26u8 { buf::buf_push_bytes(&text:ReadWrite, "} ")?; depth = depth - 1u8; }
+    buf::buf_push_bytes(&text:ReadWrite, "if x {} ")?;
+    while depth > 0u8 { buf::buf_push_bytes(&text:ReadWrite, "} ")?; depth = depth - 1u8; }
+    var exact_text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&exact_text:ReadWrite, &text.data[0..text.pos]:Read)?;
+    buf::buf_push_bytes(&exact_text:ReadWrite, "}\n")?;
+    let exact: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&exact_text.data[0..exact_text.pos]:Read, 80u16)?;
+    assert(pipeline::analysis_checked(exact.status) && exact.diagnostics.count == 0u32);
+    buf::buf_push_bytes(&text:ReadWrite, "if x {} }\n")?;
+    let over_text: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(over_text, 80u16)?;
+    assert(pipeline::analysis_name_lookup_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(over_text, 80u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 单个枚举的 91 个成员查重耗费 4095 步；再预留一个函数名恰好用尽。
+export function reservation_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "enum E { ")?;
+    var i: u32 = 0u32;
+    while i < 91u32 {
+        if i != 0u32 { buf::buf_push_bytes(&text:ReadWrite, ", ")?; }
+        type_name(&text:ReadWrite, i)?;
+        i = i + 1u32;
+    }
+    var duplicate: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&duplicate:ReadWrite, &text.data[0..text.pos]:Read)?;
+    buf::buf_push_bytes(&text:ReadWrite, " }\nfunction f(): void {}\n")?;
+    let over_source: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(over_source, 81u16)?;
+    assert(pipeline::analysis_reservation_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(over_source, 81u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+
+    var exact: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&exact:ReadWrite, &duplicate.data[0..duplicate.pos]:Read)?;
+    buf::buf_push_bytes(&exact:ReadWrite, ", T00 }\n")?;
+    compare(&exact.data[0..exact.pos]:Read, 82u16, false, 5803u16)?;
+    buf::buf_push_bytes(&duplicate:ReadWrite, ", T00, T00 }\n")?;
+    let aborted: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&duplicate.data[0..duplicate.pos]:Read, 82u16)?;
+    assert(pipeline::analysis_reservation_exceeded(aborted.status));
+    assert(aborted.diagnostics.count == 0u32 && !aborted.diagnostics.truncated);
+    return;
+}
+
+// 31 个末行表达式和一个末行模式恰好扫完 1024 行。
+export function enum_lookup_limit(): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "enum E { ")?;
+    var i: u32 = 0u32;
+    while i < 32u32 {
+        if i != 0u32 { buf::buf_push_bytes(&text:ReadWrite, ", ")?; }
+        type_name(&text:ReadWrite, i)?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, " }\n")?;
+    i = 0u32;
+    while i < 31u32 {
+        buf::buf_push_bytes(&text:ReadWrite, "function f")?;
+        type_name(&text:ReadWrite, i)?;
+        buf::buf_push_bytes(&text:ReadWrite, "(): E { return E::T31; }\n")?;
+        i = i + 1u32;
+    }
+    buf::buf_push_bytes(&text:ReadWrite, "function g(e: E): void { match e { E::T31 => {}, _ => {} } }\n")?;
+    compare(&text.data[0..text.pos]:Read, 83u16, true, 0u16)?;
+    buf::buf_push_bytes(&text:ReadWrite, "function tail(e: E): void { match e { E::T00 => {}, _ => {} } }\n")?;
+    let source: &[u8] = &text.data[0..text.pos]:Read;
+    let over: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 84u16)?;
+    assert(pipeline::analysis_enum_lookup_exceeded(over.status));
+    assert(over.diagnostics.count == 0u32 && !over.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 84u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    compare("enum E { T00, T01 }\nfunction f(): E { return E::Missing; }\n", 85u16, false, 4002u16)?;
+    return;
+}
+
+// 单函数短条件可独立改变引用行数和索引槽数。
+function reference_output_source(names: u32, literals: u32): buf::ByteBuf!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&text:ReadWrite, "function f(x: bool): void { ")?;
+    var i: u32 = 0;
+    while i < names { buf::buf_push_bytes(&text:ReadWrite, "if x {} ")?; i = i + 1; }
+    i = 0;
+    while i < literals { buf::buf_push_bytes(&text:ReadWrite, "if true {} ")?; i = i + 1; }
+    buf::buf_push_bytes(&text:ReadWrite, "}\n")?;
+    return text;
+}
+
+export function reference_output_limit(): void!AllocError {
+    let exact: buf::ByteBuf = reference_output_source(388, 2)?;
+    compare(&exact.data[0..exact.pos]:Read, 86u16, true, 0u16)?;
+    let over: buf::ByteBuf = reference_output_source(388, 3)?;
+    let source: &[u8] = &over.data[0..over.pos]:Read;
+    let result: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 87u16)?;
+    assert(pipeline::analysis_reference_output_exceeded(result.status));
+    assert(result.diagnostics.count == 0u32 && !result.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 87u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+// 首个字段与后续字段共享预检预算，缓存命中仍属于有效节点访问。
+export function value_graph_field_steps(): void!AllocError {
+    var types: typecheck::TypeTable = typecheck::new_table();
+    let parent: u32 = typecheck::intern_local(&types:ReadWrite, 1u32)?;
+    let child: u32 = typecheck::intern_local(&types:ReadWrite, 2u32)?;
+    var fields: typecheck::FieldTable = typecheck::FieldTable { items: [] };
+    typecheck::add_field(&fields:ReadWrite, parent, 1u32, child)?;
+    typecheck::add_field(&fields:ReadWrite, parent, 2u32, child)?;
+    let enums: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    var limit: u32 = 1u32;
+    while limit <= 12u32 {
+        var work: layout::ValueGraphBudget = layout::value_graph_budget(limit);
+        let fits: bool = layout::value_depth_limited(&types:Read, &fields:Read, &enums:Read, 64u32, &work:ReadWrite)?;
+        assert(fits == (limit == 12u32) && work.exhausted == (limit < 12u32));
+        assert(work.remaining == 0u32 || limit == 1u32);
+        limit = limit + 1u32;
+    }
+    return;
+}
+
+function layout_budget_source(structs: u32, wide: bool, enums: u32, payloads: u32, bad: bool): buf::ByteBuf!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    if bad { buf::buf_push_bytes(&text:ReadWrite, "struct Bad {}\n")?; }
+    var i: u32 = 0;
+    while i < structs {
+        buf::buf_push_bytes(&text:ReadWrite, "struct ")?;
+        type_name(&text:ReadWrite, i)?;
+        buf::buf_push_bytes(&text:ReadWrite, " { a: u32, b: u32, c: u32, d: u32")?;
+        if wide { buf::buf_push_bytes(&text:ReadWrite, ", e: u32")?; }
+        buf::buf_push_bytes(&text:ReadWrite, " }\n")?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < enums {
+        buf::buf_push_bytes(&text:ReadWrite, "enum E")?;
+        type_name(&text:ReadWrite, i)?;
+        buf::buf_push_bytes(&text:ReadWrite, " { A")?;
+        if i < payloads { buf::buf_push_bytes(&text:ReadWrite, "(u32)")?; }
+        buf::buf_push_bytes(&text:ReadWrite, " }\n")?;
+        i = i + 1;
+    }
+    return text;
+}
+
+export function value_graph_limit(): void!AllocError {
+    compare("struct Bad {}\n", 90u16, false, 5502u16)?;
+    let exact: buf::ByteBuf = layout_budget_source(65u32, true, 12u32, 6u32, false)?;
+    let edge: pipeline::DocumentAnalysis = pipeline::run_document_frontend(&exact.data[0..exact.pos]:Read, 88u16)?;
+    // 恰好耗尽预检配额仍进入独立计费的正式布局。
+    assert(pipeline::analysis_layout_exceeded(edge.status));
+    assert(edge.diagnostics.count == 0u32 && !edge.diagnostics.truncated);
+    let over: buf::ByteBuf = layout_budget_source(65u32, true, 12u32, 7u32, false)?;
+    let source: &[u8] = &over.data[0..over.pos]:Read;
+    let result: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 89u16)?;
+    assert(pipeline::analysis_value_graph_exceeded(result.status));
+    assert(result.diagnostics.count == 0u32 && !result.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 89u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    return;
+}
+
+export function formal_layout_field_steps(): void!AllocError {
+    var types: typecheck::TypeTable = typecheck::new_table();
+    let parent: u32 = typecheck::intern_local(&types:ReadWrite, 1u32)?;
+    let scalar: u32 = typecheck::intern_builtin(&types:ReadWrite, 4099u16)?;
+    var fields: typecheck::FieldTable = typecheck::FieldTable { items: [] };
+    typecheck::add_field(&fields:ReadWrite, 1u32, 1u32, scalar)?;
+    typecheck::add_field(&fields:ReadWrite, 1u32, 2u32, scalar)?;
+    let enums: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    var limit: u32 = 1u32;
+    while limit <= 15u32 {
+        var work: layout::ValueGraphBudget = layout::value_graph_budget(limit);
+        var diags: diag::DiagBuffer = diag::diagbuf_new();
+        let result: layout::LayoutResult = layout::layout_unit_limited(&types:Read, &fields:Read, &enums:Read, &diags:ReadWrite, &work:ReadWrite)?;
+        assert(work.exhausted == (limit < 15u32) && diags.count == 0u32);
+        if limit == 1u32 { assert(@len(result.table.items) == 0u64 && work.remaining == 1u32); }
+        if limit == 14u32 { assert(work.remaining == 1u32); }
+        if limit == 15u32 {
+            let info: layout::LayoutInfo = result.table.items[parent - 1u32];
+            assert(work.remaining == 0u32 && info.known && info.size == 8u64 && info.align == 4u8);
+        }
+        limit = limit + 1u32;
+    }
+    return;
+}
+
+// 有序枚举行的末项命中和结构体未命中各三步；兼容路径各查七行。
+export function layout_enum_lookup_steps(): void!AllocError {
+    var types: typecheck::TypeTable = typecheck::new_table();
+    let tagged: u32 = typecheck::intern_local(&types:ReadWrite, 14u32)?;
+    let record: u32 = typecheck::intern_local(&types:ReadWrite, 15u32)?;
+    let scalar: u32 = typecheck::intern_builtin(&types:ReadWrite, 4099u16)?;
+    var fields: typecheck::FieldTable = typecheck::FieldTable { items: [] };
+    typecheck::add_field(&fields:ReadWrite, 15u32, 1u32, scalar)?;
+    var enums: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    var def: u32 = 2u32;
+    while def < 14u32 {
+        @push(enums.items, typecheck::EnumType { def: def, payloads: [] })?;
+        def = def + 2u32;
+    }
+    var payloads: u32[] = [];
+    @push(payloads, 0u32)?;
+    @push(payloads, scalar)?;
+    @push(enums.items, typecheck::EnumType { def: 14u32, payloads: @move(payloads) })?;
+    var pre: layout::ValueGraphBudget = layout::document_value_graph_budget(17u32);
+    let denied: bool = layout::value_depth_limited(&types:Read, &fields:Read, &enums:Read, 64u32, &pre:ReadWrite)?;
+    assert(!denied && pre.exhausted);
+    pre = layout::document_value_graph_budget(18u32);
+    let exact: bool = layout::value_depth_limited(&types:Read, &fields:Read, &enums:Read, 64u32, &pre:ReadWrite)?;
+    assert(exact && pre.remaining == 0u32 && !pre.exhausted);
+    pre = layout::value_graph_budget(26u32);
+    let compat: bool = layout::value_depth_limited(&types:Read, &fields:Read, &enums:Read, 64u32, &pre:ReadWrite)?;
+    assert(compat && pre.remaining == 0u32 && !pre.exhausted);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var work: layout::ValueGraphBudget = layout::document_value_graph_budget(21u32);
+    let partial: layout::LayoutResult = layout::layout_unit_limited(&types:Read, &fields:Read, &enums:Read, &diags:ReadWrite, &work:ReadWrite)?;
+    assert(work.exhausted && work.remaining == 2u32 && @len(partial.table.items) == 3u64);
+    work = layout::document_value_graph_budget(22u32);
+    let ordered: layout::LayoutResult = layout::layout_unit_limited(&types:Read, &fields:Read, &enums:Read, &diags:ReadWrite, &work:ReadWrite)?;
+    assert(!work.exhausted && work.remaining == 0u32 && diags.count == 0u32);
+    work = layout::value_graph_budget(30u32);
+    let legacy: layout::LayoutResult = layout::layout_unit_limited(&types:Read, &fields:Read, &enums:Read, &diags:ReadWrite, &work:ReadWrite)?;
+    assert(!work.exhausted && work.remaining == 0u32 && diags.count == 0u32);
+    let hit: layout::LayoutInfo = ordered.table.items[tagged - 1u32];
+    let prior: layout::LayoutInfo = legacy.table.items[tagged - 1u32];
+    assert(hit.known && prior.known && hit.size == 8u64 && hit.align == prior.align && hit.payload_off == prior.payload_off);
+    assert(ordered.table.items[record - 1u32].known && ordered.table.items[record - 1u32].size == legacy.table.items[record - 1u32].size);
+    var unordered: typecheck::EnumTable = typecheck::EnumTable { items: [] };
+    var small: u32[] = [];
+    @push(small, 0u32)?;
+    @push(unordered.items, typecheck::EnumType { def: 14u32, payloads: @move(small) })?;
+    @push(unordered.items, typecheck::EnumType { def: 2u32, payloads: [] })?;
+    var large: u32[] = [];
+    @push(large, scalar)?;
+    @push(unordered.items, typecheck::EnumType { def: 14u32, payloads: @move(large) })?;
+    let duplicate: layout::LayoutResult = layout::layout_unit(&types:Read, &fields:Read, &unordered:Read, &diags:ReadWrite)?;
+    assert(diags.count == 0u32 && duplicate.table.items[tagged - 1u32].known && duplicate.table.items[tagged - 1u32].size == 1u64);
+    return;
+}
+
+export function formal_layout_limit(): void!AllocError {
+    let exact: buf::ByteBuf = layout_budget_source(61u32, false, 14u32, 0u32, false)?;
+    compare(&exact.data[0..exact.pos]:Read, 91u16, true, 0u16)?;
+    let over: buf::ByteBuf = layout_budget_source(61u32, false, 14u32, 1u32, false)?;
+    let source: &[u8] = &over.data[0..over.pos]:Read;
+    let result: pipeline::DocumentAnalysis = pipeline::run_document_frontend(source, 92u16)?;
+    assert(pipeline::analysis_layout_exceeded(result.status));
+    assert(result.diagnostics.count == 0u32 && !result.diagnostics.truncated);
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(source, 92u16, &batch:ReadWrite)?;
+    assert(ok && batch.count == 0u32);
+    let bad: buf::ByteBuf = layout_budget_source(61u32, false, 14u32, 0u32, true)?;
+    let partial: &[u8] = &bad.data[0..bad.pos]:Read;
+    let removed: pipeline::DocumentAnalysis = pipeline::run_document_frontend(partial, 93u16)?;
+    assert(pipeline::analysis_layout_exceeded(removed.status));
+    assert(removed.diagnostics.count == 0u32 && !removed.diagnostics.truncated);
+    var real: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: bool = pipeline::run_frontend(partial, 93u16, &real:ReadWrite)?;
+    assert(!rejected && real.count == 1u32 && real.diags[0].code.raw == 5502u16);
+    return;
+}

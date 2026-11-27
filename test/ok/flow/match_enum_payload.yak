@@ -1,0 +1,23 @@
+// expected_exit: 42
+// spec: spec/lang/base.md 六、spec/lang/type/enum.md
+// 带载荷枚举的 match 臂绑定：载荷经隐式局部回传，退出码 42。
+// 注：seed 解释器拒绝 enum payload 构造，本案例只能经编译器产物验证（形态与 examples/match_payload.yak 一致）。
+foreign exit(code: u8): void;
+
+enum E { Empty, Code(u32) }
+
+function pick(x: u32): u32 {
+    var e: E = E::Empty;
+    if x != 0u32 { e = E::Code(x); }
+    var r: u32 = 0u32;
+    match e {
+        Empty => { r = 7u32; },
+        Code(v) => { r = v + 1u32; }
+    }
+    return r;
+}
+
+function main(): void {
+    exit(pick(41u32) as u8);
+    return;
+}

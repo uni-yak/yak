@@ -1,0 +1,11 @@
+// t41: 算术正确性assert（真实assert，错误即 trap）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(2 + 3 == 5);
+    assert(10 - 4 == 6);
+    assert(3 * 4 == 12);
+    assert(20 / 6 == 3);
+    assert(20 % 6 == 2);
+    return;
+}

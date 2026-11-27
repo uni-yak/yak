@@ -1,0 +1,18 @@
+// 定向回归：未定型字面量二元表达式保持未定型并由外层类型位置定型；移位位宽只取左操作数；
+// 无符号零的一元负号不改变符号性（base.md 4.7、7.x）。
+// expected_stdout: ok
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    let a: i64 = 0 - 1;
+    assert(a == -1);
+    let b: u16 = 1 << 8u8;
+    assert(b == 256u16);
+    let c: i64 = 0 - 300;
+    assert(c == -300);
+    let d: u8 = -0u8;
+    assert(d == 0u8);
+    write("ok");
+    return;
+}

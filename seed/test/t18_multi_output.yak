@@ -1,0 +1,10 @@
+// t18: 多行字符串write
+// expected_stdout: line1
+// expected_stdout: line2
+foreign write(data: &[u8]): void;
+
+function main(): void {
+    write("line1\n");
+    write("line2\n");
+    return;
+}

@@ -1,0 +1,5 @@
+// expected_trap: partial move forbidden (owner.md 2.5)
+struct Item { data: u32[] }
+function make(): Item { return Item { data: [1u32] }; }
+function replace(data: &u32[]:ReadWrite): void { *data = [2u32]; }
+function main(): void { replace(make().data); }

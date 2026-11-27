@@ -1,0 +1,4 @@
+// expected_trap: file open failed
+// output_existing: dst=fixtures/input.txt
+foreign file_write(name: &[u8], data: &[u8]): void;
+function main(): void { file_write("dst", "changed"); }

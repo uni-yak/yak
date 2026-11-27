@@ -1,0 +1,11 @@
+// expected_code: E6004
+// spec: spec/lang/base.md R-5; spec/lang/owner.md OW-2
+// 只读子租约绑定后，临时独占父租约仍阻止直接读原位置。
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var value: u32 = 7u32;
+    let shared: &u32 = &*(&value:ReadWrite);
+    assert(value == 7u32);
+    assert(*shared == 7u32);
+}

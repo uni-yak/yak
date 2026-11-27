@@ -1,0 +1,132 @@
+// 由 tools/symgen/lex_tables.py 生成；请勿手改。
+// 源摘要：40f096eb50026341498049e2407832b54c5603e4830d7d1273093d8bb949fb71
+
+// 生成源和链接产物共用同一份只读摘要。
+const SOURCE_SHA256: &[u8] = "YAK-SYMBOL-SHA256-V1:40f096eb50026341498049e2407832b54c5603e4830d7d1273093d8bb949fb71:END-YAK-SYMBOL";
+
+export function symbol_source_sha256_at(at: u32): u8 {
+    if at >= 64u32 { return 0u8; }
+    return SOURCE_SHA256[21u32 + at];
+}
+
+export function keyword(src: &[u8], off: u32, len: u32): u8 {
+    if len == 8 && matches(src, off, "function") { return 0; }
+    if len == 3 && matches(src, off, "let") { return 1; }
+    if len == 3 && matches(src, off, "var") { return 2; }
+    if len == 5 && matches(src, off, "const") { return 3; }
+    if len == 2 && matches(src, off, "if") { return 4; }
+    if len == 4 && matches(src, off, "else") { return 5; }
+    if len == 6 && matches(src, off, "elseif") { return 6; }
+    if len == 5 && matches(src, off, "while") { return 7; }
+    if len == 5 && matches(src, off, "break") { return 8; }
+    if len == 8 && matches(src, off, "continue") { return 9; }
+    if len == 6 && matches(src, off, "return") { return 10; }
+    if len == 5 && matches(src, off, "match") { return 11; }
+    if len == 4 && matches(src, off, "enum") { return 12; }
+    if len == 6 && matches(src, off, "struct") { return 13; }
+    if len == 4 && matches(src, off, "true") { return 14; }
+    if len == 5 && matches(src, off, "false") { return 15; }
+    if len == 6 && matches(src, off, "import") { return 16; }
+    if len == 6 && matches(src, off, "export") { return 17; }
+    if len == 7 && matches(src, off, "foreign") { return 18; }
+    if len == 3 && matches(src, off, "out") { return 19; }
+    if len == 2 && matches(src, off, "as") { return 20; }
+    return 255;
+}
+
+export function completion_keywords(): u8[]!AllocError {
+    let text: &[u8] = "as break const continue else elseif enum export false foreign function if import let match out return struct true var while";
+    var words: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(text) as u32 { @push(words, text[i])?; i = i + 1u32; }
+    return words;
+}
+
+export function reserved(src: &[u8], off: u32, len: u32): bool {
+    if len == 4 && matches(src, off, "loop") { return true; }
+    if len == 6 && matches(src, off, "unsafe") { return true; }
+    if len == 9 && matches(src, off, "interface") { return true; }
+    if len == 4 && matches(src, off, "impl") { return true; }
+    if len == 10 && matches(src, off, "implements") { return true; }
+    if len == 3 && matches(src, off, "for") { return true; }
+    if len == 2 && matches(src, off, "in") { return true; }
+    if len == 2 && matches(src, off, "is") { return true; }
+    if len == 4 && matches(src, off, "type") { return true; }
+    if len == 5 && matches(src, off, "never") { return true; }
+    if len == 4 && matches(src, off, "null") { return true; }
+    return false;
+}
+
+export function name_builtin(src: &[u8], off: u32, len: u32): u16 {
+    if len == 2 && matches(src, off, "u8") { return 4097; }
+    if len == 3 && matches(src, off, "u16") { return 4098; }
+    if len == 3 && matches(src, off, "u32") { return 4099; }
+    if len == 3 && matches(src, off, "u64") { return 4100; }
+    if len == 2 && matches(src, off, "i8") { return 4101; }
+    if len == 3 && matches(src, off, "i16") { return 4102; }
+    if len == 3 && matches(src, off, "i32") { return 4103; }
+    if len == 3 && matches(src, off, "i64") { return 4104; }
+    if len == 4 && matches(src, off, "bool") { return 4105; }
+    if len == 4 && matches(src, off, "char") { return 4106; }
+    if len == 4 && matches(src, off, "void") { return 4107; }
+    if len == 10 && matches(src, off, "AllocError") { return 4108; }
+    return 0;
+}
+
+export function builtin(src: &[u8], off: u32, len: u32): u16 {
+    if len == 4 && matches(src, off, "move") { return 20481; }
+    if len == 4 && matches(src, off, "copy") { return 20482; }
+    if len == 5 && matches(src, off, "clone") { return 20483; }
+    if len == 4 && matches(src, off, "drop") { return 20484; }
+    if len == 4 && matches(src, off, "push") { return 20485; }
+    if len == 3 && matches(src, off, "len") { return 20486; }
+    if len == 7 && matches(src, off, "size_of") { return 20487; }
+    if len == 8 && matches(src, off, "align_of") { return 20488; }
+    if len == 9 && matches(src, off, "offset_of") { return 20489; }
+    if len == 7 && matches(src, off, "is_null") { return 20490; }
+    if len == 5 && matches(src, off, "panic") { return 20491; }
+    if len == 10 && matches(src, off, "breakpoint") { return 20492; }
+    if len == 8 && matches(src, off, "wrap_add") { return 20493; }
+    if len == 8 && matches(src, off, "wrap_sub") { return 20494; }
+    if len == 8 && matches(src, off, "wrap_mul") { return 20495; }
+    if len == 6 && matches(src, off, "inline") { return 24577; }
+    if len == 5 && matches(src, off, "align") { return 24578; }
+    return 0;
+}
+
+export function builtin_is_base(id: u16): bool {
+    if id == 20481 { return true; }
+    if id == 20482 { return true; }
+    if id == 20483 { return true; }
+    if id == 20484 { return true; }
+    if id == 20485 { return true; }
+    if id == 20486 { return true; }
+    if id == 20493 { return true; }
+    if id == 20494 { return true; }
+    if id == 20495 { return true; }
+    return false;
+}
+
+export function builtin_variant_name(src: &[u8], off: u32, len: u32): u32 {
+    if len == 11 && matches(src, off, "OutOfMemory") { return 1; }
+    return 0;
+}
+
+export function builtin_variant_name_count(): u32 { return 1; }
+
+export function builtin_variant(host: u16, label: u32): u32 {
+    if host == 4108 && label == 1 { return 0; }
+    return 4294967295u32;
+}
+
+function matches(src: &[u8], off: u32, expected: &[u8]): bool {
+    let n: u32 = @len(src) as u32;
+    let size: u32 = @len(expected) as u32;
+    if off > n || size > n - off { return false; }
+    var i: u32 = 0;
+    while i < size {
+        if src[off + i] != expected[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}

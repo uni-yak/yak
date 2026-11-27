@@ -1,0 +1,31 @@
+// t252: @clone 嵌套载体深拷贝 —— carrier/nullable 含堆 payload 时必须深拷贝，
+// 否则 clone 后 drop 源与副本会双重释放堆（STATUS_HEAP_CORRUPTION / 0xC0000374）。
+foreign assert(cond: bool): void;
+
+struct S { opt: u32[]? }
+
+function main(): void {
+    // P1: nullable 持有 owning darray；clone 后分别 drop 触发双重释放路径
+    let s: S = S { opt: [1, 2, 3] };
+    let c: S = @clone(s)?;
+    @drop(s);
+    @drop(c);
+
+    // P2: nullable 为 null 时 clone 不分配 payload，drop 安全
+    let n: S = S { opt: null };
+    let cn: S = @clone(n)?;
+    @drop(n);
+    @drop(cn);
+
+    // P3: 多轮 clone+drop 验证堆分配器稳定性（重复触发 payload 深拷贝路径）
+    var i: u32 = 0;
+    while i < 100 {
+        let a: S = S { opt: [i, i + 1] };
+        let b: S = @clone(a)?;
+        @drop(a);
+        @drop(b);
+        i = i + 1;
+    }
+
+    return;
+}

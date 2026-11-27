@@ -1,0 +1,6 @@
+// YSM 驱动依赖链的中间单元：直接依赖叶子单元，自身再被根单元依赖。
+import chain_base;
+
+export function mid_value(x: u32): u32 {
+    return chain_base::base_value() + x;
+}

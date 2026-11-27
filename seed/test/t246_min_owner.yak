@@ -1,0 +1,839 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import owner;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// 一个测试用例同时保留前端结果与所有权结果。
+struct Case { parsed: parse::ParseResult, lexed: lex::LexResult, resolution: resolve_refs::Resolution, checked: typecheck::TypeCheckResult }
+
+function load(src: &[u8], file: u16): Case!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let lexed: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &diags:ReadWrite)?;
+    if diag::diagbuf_has_error(&diags:Read) {
+        diag::diagbuf_print_terminal(&diags:Read)?;
+        write("RESOLVE ERR\n");
+        write(src);
+    }
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    if diag::diagbuf_has_error(&diags:Read) {
+        diag::diagbuf_print_terminal(&diags:Read)?;
+        write("TYPECHECK ERR\n");
+        write(src);
+    }
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    return Case { parsed: parsed, lexed: lexed, resolution: resolution, checked: checked };
+}
+
+// 对源码执行所有权检查，返回已排序的诊断缓冲。
+function check(src: &[u8], file: u16): diag::DiagBuffer!AllocError {
+    let loaded: Case = load(src, file)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let ignored: owner::OwnerResult = owner::check_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.resolution:Read, &loaded.checked:Read, &diags:ReadWrite)?;
+    diag::diagbuf_sort(&diags:ReadWrite);
+    return diags;
+}
+
+function count_of(diags: &diag::DiagBuffer:Read, code: u16): u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(diags.diags) as u32 {
+        if diags.diags[i].code.raw == code { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 情形一：移动后继续使用必须报 R-4。
+// 结构体带拥有堆的字段才不是 Copy，移动后源失效。
+function case_use_after_move(): void!AllocError {
+    let src: &[u8] = "struct S { v: u32[] }\nfunction take(x: S): void { @drop(x); }\nfunction main(): void {\n    let s: S = S { v: [1u32] };\n    take(@move(s));\n    let t: S = s;\n    @drop(t);\n}\n";
+    let diags: diag::DiagBuffer = check(src, 1)?;
+    assert(count_of(&diags:Read, 6003) == 1);
+    return;
+}
+
+// 情形二：@drop 之后继续使用必须报 R-4。
+function case_use_after_drop(): void!AllocError {
+    let src: &[u8] = "struct S { v: u32[] }\nfunction main(): void {\n    let s: S = S { v: [1u32] };\n    @drop(s);\n    let n: u64 = @len(s.v);\n    @drop(n);\n}\n";
+    let diags: diag::DiagBuffer = check(src, 2)?;
+    assert(count_of(&diags:Read, 6003) == 1);
+    return;
+}
+
+// 情形三：@copy 只读取源，不转移所有权，后续使用合法。
+function case_copy_keeps_live(): void!AllocError {
+    let invalid: diag::DiagBuffer = check("function f(x: u32[]): void { let y: u32[] = @copy(x); @drop(y); @drop(x); }\n", 185)?;
+    assert(count_of(&invalid:Read, 6202) == 1);
+    let nested: diag::DiagBuffer = check("struct S { v: u32[] } function f(x: S): void { let y: S = @copy(x); @drop(y); @drop(x); }\n", 186)?;
+    assert(count_of(&nested:Read, 6202) == 1);
+    let expired: diag::DiagBuffer = check("function f(x: u32[]): void { @drop(x); let y: u32[] = @copy(x); @drop(y); }\n", 189)?;
+    assert(count_of(&expired:Read, 6202) == 1);
+    assert(count_of(&expired:Read, 6003) == 1);
+    let dead: diag::DiagBuffer = check("function f(x: u32[]): void { while false { let y: u32[] = @copy(x); @drop(y); } @drop(x); }\n", 190)?;
+    assert(count_of(&dead:Read, 6202) == 1);
+    assert(count_of(&dead:Read, 6003) == 0);
+    let carrier: diag::DiagBuffer = check("enum E { Bad } function make(): u32!E { return 1u32; } function f(): void { let x: u32!E = make(); let y: u32!E = @copy(x); @drop(x); @drop(y); }\n", 191)?;
+    assert(@len(carrier.diags) == 0);
+    let temporary: diag::DiagBuffer = check("function f(): void { let x: u32[] = @copy([1u32]); @drop(x); }\n", 192)?;
+    assert(count_of(&temporary:Read, 6202) == 1);
+    let view: diag::DiagBuffer = check("function f(x: &u32): void { let y: &u32 = @copy(x); let z: u32 = *y; @drop(z); }\n", 193)?;
+    assert(@len(view.diags) == 0);
+    let bad_carrier: diag::DiagBuffer = check("enum E { Bad } function make(): u32[]!E { return [1u32]; } function f(): void { let x: u32[]!E = make(); let y: u32[]!E = @copy(x); @drop(x); @drop(y); }\n", 194)?;
+    assert(count_of(&bad_carrier:Read, 6202) == 1);
+    let scalar: diag::DiagBuffer = check("function f(x: u32): void { let y: u32 = @copy(x); @drop(x); @drop(y); }\n", 187)?;
+    assert(@len(scalar.diags) == 0);
+    let src: &[u8] = "struct S { v: u32 }\nfunction main(): void {\n    let s: S = S { v: 1 };\n    let t: S = @copy(s);\n    let u: S = s;\n    @drop(t);\n    @drop(u);\n}\n";
+    let diags: diag::DiagBuffer = check(src, 3)?;
+    assert(@len(diags.diags) == 0);
+    return;
+}
+
+// 情形四：按值传参转移所有权，形参在函数内为 live。
+function case_pass_transfers(): void!AllocError {
+    let src: &[u8] = "struct S { v: u32[] }\nfunction take(x: S): void {\n    let y: S = x;\n    @drop(y);\n}\nfunction main(): void {\n    let s: S = S { v: [1u32] };\n    take(@move(s));\n}\n";
+    let diags: diag::DiagBuffer = check(src, 4)?;
+    assert(@len(diags.diags) == 0);
+    return;
+}
+
+// 情形五：Copy 类型移动后继续使用不报错。
+function case_copy_type_reusable(): void!AllocError {
+    let src: &[u8] = "function main(): void {\n    let a: u32 = 1;\n    let b: u32 = a;\n    let c: u32 = a;\n    let n: u32 = b + c;\n    @drop(n);\n}\n";
+    let diags: diag::DiagBuffer = check(src, 5)?;
+    assert(@len(diags.diags) == 0);
+    return;
+}
+
+// 情形六：借用不转移所有权，借用后可继续读取。
+function case_borrow_keeps_live(): void!AllocError {
+    let src: &[u8] = "struct S { v: u32 }\nfunction peek(x: &S): u32 { return x.v; }\nfunction main(): void {\n    let s: S = S { v: 1 };\n    let n: u32 = peek(&s);\n    let m: u32 = s.v;\n    let k: u32 = n + m;\n    @drop(k);\n    @drop(s);\n}\n";
+    let diags: diag::DiagBuffer = check(src, 6)?;
+    assert(@len(diags.diags) == 0);
+    return;
+}
+
+// 临时独占借用按求值顺序生效，完整表达式结束后释放。
+function case_temporary_write_borrow(): void!AllocError {
+    let read: diag::DiagBuffer = check("function take(r: &u32:ReadWrite, n: u32): void { *r = n; } function f(): void { var x: u32 = 1; take(&x:ReadWrite, x); }\n", 231)?;
+    assert(@len(read.diags) == 1 && count_of(&read:Read, 6004) == 1);
+    let projection: diag::DiagBuffer = check("struct S { a: u32, b: u32 } function take(r: &u32:ReadWrite, n: u32): void { *r = n; } function f(): void { var s: S = S { a: 1, b: 2 }; take(&s.a:ReadWrite, s.b); }\n", 232)?;
+    assert(@len(projection.diags) == 1 && count_of(&projection:Read, 6004) == 1);
+    let move: diag::DiagBuffer = check("function take(r: &u32[]:ReadWrite, a: u32[]): void { let n: u32 = r[0]; @drop(n); @drop(a); } function f(): void { var a: u32[] = [1]; take(&a:ReadWrite, @move(a)); }\n", 233)?;
+    assert(@len(move.diags) == 1 && count_of(&move:Read, 6004) == 1);
+    let write: diag::DiagBuffer = check("function value(r: &u32:ReadWrite): u32 { return *r; } function f(): void { var a: u32 = 1; a = value(&a:ReadWrite); }\n", 234)?;
+    assert(@len(write.diags) == 1 && count_of(&write:Read, 6004) == 1);
+    let indexed: diag::DiagBuffer = check("function index(r: &u32:ReadWrite): u64 { return (*r) as u64; } function take(r: &u32:ReadWrite, second: &u32:ReadWrite): void { *r = *second; } function f(): void { var a: u32[] = [1]; var b: u32 = 2; take(&b:ReadWrite, &a[index(&a[0]:ReadWrite)]:ReadWrite); }\n", 235)?;
+    assert(@len(indexed.diags) == 1 && count_of(&indexed:Read, 6004) == 1);
+    let nested: diag::DiagBuffer = check("function index(r: &u32:ReadWrite): u64 { return (*r) as u64; } function f(): u32 { var a: u32[][] = [[0]]; return a[index(&a[0][0]:ReadWrite)][0]; }\n", 243)?;
+    assert(@len(nested.diags) == 1 && count_of(&nested:Read, 6004) == 1);
+    let short: diag::DiagBuffer = check("function flag(r: &u32:ReadWrite): bool { return *r == 1; } function f(b: bool): bool { var a: u32 = 1; return (b && flag(&a:ReadWrite)) || a == 2; }\n", 236)?;
+    assert(@len(short.diags) == 1 && count_of(&short:Read, 6004) == 1);
+    let dead: diag::DiagBuffer = check("function flag(r: &u32:ReadWrite): bool { return *r == 1; } function f(): bool { var a: u32 = 1; return (false && (flag(&a:ReadWrite) || a == 2)) || a == 1; }\n", 237)?;
+    assert(@len(dead.diags) == 0);
+    let reverse: diag::DiagBuffer = check("function take(n: u32, r: &u32:ReadWrite): void { *r = n; } function f(): void { var a: u32 = 1; take(a, &a:ReadWrite); a = 2; }\n", 238)?;
+    assert(@len(reverse.diags) == 0);
+    let conditions: diag::DiagBuffer = check("function flag(r: &u32:ReadWrite): bool { return *r == 1; } function f(): u32 { var a: u32 = 1; if flag(&a:ReadWrite) { a = a + 1; } elseif a == 2 { a = 3; } while flag(&a:ReadWrite) { a = a + 1; } return a; }\n", 239)?;
+    assert(@len(conditions.diags) == 0);
+    let different: diag::DiagBuffer = check("function take(r: &u32:ReadWrite, n: u32): void { *r = n; } function f(): void { var a: u32 = 1; var b: u32 = 2; take(&a:ReadWrite, b); take(&b:ReadWrite, a); }\n", 240)?;
+    assert(@len(different.diags) == 0);
+    let immutable: diag::DiagBuffer = check("function take(r: &u32:ReadWrite, n: u32): void { *r = n; } function f(): void { let a: u32 = 1; take(&a:ReadWrite, a); }\n", 241)?;
+    assert(@len(immutable.diags) == 1 && count_of(&immutable:Read, 6009) == 1);
+    let duplicate: diag::DiagBuffer = check("function take(r: &u32:ReadWrite, s: &u32:ReadWrite): void { *r = *s; } function f(): void { var a: u32 = 1; take(&a:ReadWrite, &a:ReadWrite); }\n", 242)?;
+    assert(@len(duplicate.diags) == 1 && count_of(&duplicate:Read, 6004) == 1);
+    return;
+}
+
+// 非 Copy 初始化消费源，重新赋值后目标恢复可用。
+function case_binding_moves(): void!AllocError {
+    let moved: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction main(): void { let a: S = S { v: [1u32] }; let b: S = a; @drop(a); @drop(b); }\n", 7)?;
+    assert(count_of(&moved:Read, 6003) == 1);
+    let restored: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction main(): void { var a: S = S { v: [1u32] }; let b: S = a; a = S { v: [2u32] }; @drop(a); @drop(b); }\n", 8)?;
+    assert(@len(restored.diags) == 0);
+    let assigned: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction main(): void { var a: S = S { v: [1u32] }; let b: S = S { v: [2u32] }; a = b; @drop(b); @drop(a); }\n", 9)?;
+    assert(count_of(&assigned:Read, 6003) == 1);
+    let output: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1; }\nfunction main(): void { out r: u32; fill(out r); }\n", 10)?;
+    assert(@len(output.diags) == 0);
+    return;
+}
+
+// 互斥路径独立检查，合流保留可能失效的状态。
+function case_branches(): void!AllocError {
+    let both: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { @drop(s); } else { @drop(s); } }\n", 11)?;
+    assert(@len(both.diags) == 0);
+    let one: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { @drop(s); } @drop(s); }\n", 12)?;
+    assert(count_of(&one:Read, 6003) == 1);
+    let live: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { let x: u32 = 1; @drop(x); } else { let x: u32 = 2; @drop(x); } @drop(s); }\n", 13)?;
+    assert(@len(live.diags) == 0);
+    let restore: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(b: bool): void { var s: S = S { v: [1u32] }; @drop(s); if b { s = S { v: [2u32] }; } else { s = S { v: [3u32] }; } @drop(s); }\n", 14)?;
+    assert(@len(restore.diags) == 0);
+    let partial: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(b: bool): void { var s: S = S { v: [1u32] }; @drop(s); if b { s = S { v: [2u32] }; } @drop(s); }\n", 15)?;
+    assert(count_of(&partial:Read, 6003) == 1);
+    let chained: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, a: bool, b: bool): void { if a { @drop(s); } elseif b { @drop(s); } else { @drop(s); } }\n", 16)?;
+    assert(@len(chained.diags) == 0);
+    let early: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { @drop(s); return; } @drop(s); }\n", 18)?;
+    assert(@len(early.diags) == 0);
+    let nested: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, a: bool, b: bool): void { if a { if b { @drop(s); return; } else { @drop(s); return; } } @drop(s); }\n", 19)?;
+    assert(@len(nested.diags) == 0);
+    let reachable: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { return; } else { @drop(s); } @drop(s); }\n", 20)?;
+    assert(count_of(&reachable:Read, 6003) == 1);
+    let loop_exit: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { while b { if b { @drop(s); break; return; } break; } @drop(s); }\n", 21)?;
+    assert(count_of(&loop_exit:Read, 6003) == 1);
+    let match_break: diag::DiagBuffer = check("enum E { A, B } function f(x: u32, e: E, b: bool): void { while b { if b { @drop(x); match e { E::A => { break; }, E::B => { } } return; } break; } @drop(x); }\n", 138)?;
+    assert(count_of(&match_break:Read, 6003) == 1);
+    let after_if: diag::DiagBuffer = check("function f(x: u32, a: bool, b: bool): void { if a { @drop(x); if b { } return; } @drop(x); }\n", 136)?;
+    assert(@len(after_if.diags) == 0);
+    let after_match: diag::DiagBuffer = check("enum E { A, B } function f(x: u32, a: bool, e: E): void { if a { @drop(x); match e { E::A => { }, E::B => { } } return; } @drop(x); }\n", 137)?;
+    assert(@len(after_match.diags) == 0);
+    let shadow: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction f(s: S, b: bool): void { if b { let s: S = S { v: [2u32] }; @drop(s); } @drop(s); }\n", 17)?;
+    assert(@len(shadow.diags) == 0);
+    return;
+}
+
+// 匹配臂互斥，只有能到达合流点的状态影响后续读取。
+function case_match_branches(): void!AllocError {
+    let both: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { @drop(s); }, E::B => { @drop(s); } } }\n", 22)?;
+    assert(@len(both.diags) == 0);
+    let one: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { @drop(s); }, E::B => { } } @drop(s); }\n", 23)?;
+    assert(count_of(&one:Read, 6003) == 1);
+    let early: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { @drop(s); return; }, E::B => { } } @drop(s); }\n", 24)?;
+    assert(@len(early.diags) == 0);
+    let restore: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E): void { var s: S = S { v: [1u32] }; @drop(s); match e { E::A => { s = S { v: [2u32] }; }, E::B => { s = S { v: [3u32] }; } } @drop(s); }\n", 25)?;
+    assert(@len(restore.diags) == 0);
+    let partial: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E): void { var s: S = S { v: [1u32] }; @drop(s); match e { E::A => { s = S { v: [2u32] }; }, E::B => { } } @drop(s); }\n", 26)?;
+    assert(count_of(&partial:Read, 6003) == 1);
+    let shadow: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { let s: S = S { v: [2u32] }; @drop(s); }, E::B => { } } @drop(s); }\n", 27)?;
+    assert(@len(shadow.diags) == 0);
+    let unreachable: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S): void { match e { E::A => { return; }, E::B => { return; } } @drop(s); @drop(s); }\n", 28)?;
+    assert(@len(unreachable.diags) == 0);
+    let nested: diag::DiagBuffer = check("enum E { A, B } struct S { v: u32[] }\nfunction f(e: E, s: S, b: bool): void { if b { match e { E::A => { @drop(s); return; }, E::B => { @drop(s); return; } } } @drop(s); }\n", 29)?;
+    assert(@len(nested.diags) == 0);
+    return;
+}
+
+// 非 Copy 枚举在匹配时整体转移，Copy 枚举保持可用。
+function case_match_value(): void!AllocError {
+    let moved: diag::DiagBuffer = check("enum E { Some(u32[]), None }\nfunction f(e: E): void { match e { E::Some(x) => { @drop(x); }, E::None => { } } @drop(e); }\n", 30)?;
+    assert(count_of(&moved:Read, 6003) == 1);
+    let arm: diag::DiagBuffer = check("enum E { Some(u32[]), None }\nfunction f(e: E): void { match e { E::Some(x) => { @drop(x); @drop(e); }, E::None => { } } }\n", 31)?;
+    assert(count_of(&arm:Read, 6003) == 1);
+    let unbound: diag::DiagBuffer = check("enum E { Some(u32[]), None }\nfunction f(e: E): void { match e { E::Some => { }, E::None => { } } @drop(e); }\n", 32)?;
+    assert(count_of(&unbound:Read, 6003) == 1);
+    let payload: diag::DiagBuffer = check("enum E { Some(u32[]), None }\nfunction f(e: E): void { match e { E::Some(x) => { @drop(x); @drop(x); }, E::None => { } } }\n", 33)?;
+    assert(count_of(&payload:Read, 6003) == 1);
+    let copy: diag::DiagBuffer = check("enum E { Some(u32), None }\nfunction f(e: E): void { match e { E::Some(x) => { @drop(x); }, E::None => { } } match e { E::Some(x) => { @drop(x); }, E::None => { } } }\n", 34)?;
+    assert(@len(copy.diags) == 0);
+    return;
+}
+
+// Copy 字段作为实参不会消费包含 owning 字段的整个结构体。
+function case_copy_field_argument(): void!AllocError {
+    let valid: diag::DiagBuffer = check("struct S { value: u32, data: u32[] }\nfunction use(x: u32): void { @drop(x); }\nfunction f(s: S): void { use(s.value); @drop(s); }\n", 35)?;
+    assert(@len(valid.diags) == 0);
+    let invalid: diag::DiagBuffer = check("struct S { value: u32, data: u32[] }\nfunction use(x: u32): void { @drop(x); }\nfunction f(s: S): void { @drop(s); use(s.value); }\n", 36)?;
+    assert(count_of(&invalid:Read, 6003) == 1);
+    return;
+}
+
+// 复合值初始化按源码顺序转移非 Copy 值，Copy 值可重复使用。
+function case_aggregate_moves(): void!AllocError {
+    let field: diag::DiagBuffer = check("struct S { data: u32[] } struct Pair { left: S, right: S }\nfunction f(s: S): void { let p: Pair = Pair { left: s, right: s }; @drop(p); }\n", 37)?;
+    assert(count_of(&field:Read, 6003) == 1);
+    let after: diag::DiagBuffer = check("struct S { data: u32[] } struct Box { value: S }\nfunction f(s: S): void { let b: Box = Box { value: s }; @drop(s); @drop(b); }\n", 38)?;
+    assert(count_of(&after:Read, 6003) == 1);
+    let array: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { let values: S[] = [s, s]; @drop(values); }\n", 39)?;
+    assert(count_of(&array:Read, 6003) == 1);
+    let nested: diag::DiagBuffer = check("struct S { data: u32[] } struct Box { value: S } struct Pair { left: Box, right: Box }\nfunction f(s: S): void { let p: Pair = Pair { left: Box { value: s }, right: Box { value: s } }; @drop(p); }\n", 41)?;
+    assert(count_of(&nested:Read, 6003) == 1);
+    let valid: diag::DiagBuffer = check("struct S { data: u32[] } struct Box { value: S }\nfunction f(s: S): void { let b: Box = Box { value: s }; @drop(b); }\n", 42)?;
+    assert(@len(valid.diags) == 0);
+    let copy: diag::DiagBuffer = check("struct Pair { left: u32, right: u32 }\nfunction f(x: u32): void { let p: Pair = Pair { left: x, right: x }; @drop(p); }\n", 40)?;
+    assert(@len(copy.diags) == 0);
+    return;
+}
+
+// 投影写入必须检查根对象与索引，而完整绑定允许重新初始化。
+function case_assignment_targets(): void!AllocError {
+    let dropped: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; @drop(s); s.data = [2u32]; }\n", 43)?;
+    assert(count_of(&dropped:Read, 6003) == 1);
+    let moved: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; let t: S = s; s.data[0u64] = 2u32; @drop(t); }\n", 44)?;
+    assert(count_of(&moved:Read, 6003) == 1);
+    let index: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { let s: S = S { data: [1u32] }; var a: u32[] = [1u32]; @drop(s); a[@len(s.data)] = 2u32; @drop(a); }\n", 45)?;
+    assert(count_of(&index:Read, 6003) == 1);
+    let valid: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; @drop(s); s = S { data: [2u32] }; s.data[0u64] = 3u32; @drop(s); }\n", 46)?;
+    assert(@len(valid.diags) == 0);
+    return;
+}
+
+// 下标、切片边界和赋值右侧都可能使已定位的投影宿主失效。
+function case_projection_host_invalidation(): void!AllocError {
+    let index: diag::DiagBuffer = check("function take(x: u32[]): u64 { @drop(x); return 0; } function f(): u32 { var a: u32[] = [1]; return a[take(@move(a))]; }\n", 244)?;
+    assert(@len(index.diags) == 1 && count_of(&index:Read, 6003) == 1);
+    let slice: diag::DiagBuffer = check("function take(x: u32[]): u64 { @drop(x); return 0; } function f(): u64 { var a: u32[] = [1]; return @len(a[0..take(@move(a))]); }\n", 245)?;
+    assert(@len(slice.diags) == 1 && count_of(&slice:Read, 6003) == 1);
+    let nested: diag::DiagBuffer = check("struct S { data: u32[] } function take(x: S): u64 { @drop(x); return 0; } function f(): u32 { var s: S = S { data: [1] }; return s.data[take(@move(s))]; }\n", 246)?;
+    assert(@len(nested.diags) == 1 && count_of(&nested:Read, 6003) == 1);
+    let assign: diag::DiagBuffer = check("function take(x: u32[]): u32 { @drop(x); return 0; } function f(): void { var a: u32[] = [1]; a[0] = take(@move(a)); }\n", 247)?;
+    assert(@len(assign.diags) == 1 && count_of(&assign:Read, 6003) == 1);
+    let already: diag::DiagBuffer = check("function f(): void { var a: u32[] = [1]; @drop(a); a[0] = 2; }\n", 248)?;
+    assert(@len(already.diags) == 1 && count_of(&already:Read, 6003) == 1);
+    let independent: diag::DiagBuffer = check("function take(x: u32[]): u64 { @drop(x); return 0; } function f(): u32 { var a: u32[] = [1]; var b: u32[] = [2]; return a[take(@move(b))]; }\n", 249)?;
+    assert(@len(independent.diags) == 0);
+    let reinit: diag::DiagBuffer = check("function replace(x: u32[]): u32[] { @drop(x); return [2]; } function f(): u32 { var a: u32[] = [1]; a = replace(@move(a)); return a[0]; }\n", 250)?;
+    assert(@len(reinit.diags) == 0);
+    return;
+}
+
+// 循环体可能不执行，体内重新初始化不能恢复零次迭代路径。
+function case_loop_zero_iterations(): void!AllocError {
+    let moved: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(b: bool): void { var s: S = S { data: [1u32] }; @drop(s); while b { s = S { data: [2u32] }; } @drop(s); }\n", 47)?;
+    assert(count_of(&moved:Read, 6003) == 1);
+    let valid: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(b: bool): void { var s: S = S { data: [1u32] }; while b { @drop(s); s = S { data: [2u32] }; } @drop(s); }\n", 48)?;
+    assert(@len(valid.diags) == 0);
+    let returned: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S, b: bool): void { while b { @drop(s); return; } @drop(s); }\n", 49)?;
+    assert(@len(returned.diags) == 0);
+    let continued: diag::DiagBuffer = check("function f(x: u32): void { while true { @drop(x); continue; } }\n", 139)?;
+    assert(count_of(&continued:Read, 6003) == 1);
+    let labeled: diag::DiagBuffer = check("function f(x: u32): void { again: while true { @drop(x); continue again; } }\n", 140)?;
+    assert(count_of(&labeled:Read, 6003) == 1);
+    let continued_local: diag::DiagBuffer = check("function f(): void { while true { let x: u32 = 1u32; @drop(x); continue; } }\n", 141)?;
+    assert(@len(continued_local.diags) == 0);
+    let continued_restore: diag::DiagBuffer = check("function f(): void { var x: u32 = 1u32; while true { @drop(x); x = 2u32; continue; } }\n", 142)?;
+    assert(@len(continued_restore.diags) == 0);
+    let outer_continue: diag::DiagBuffer = check("function f(): void { outer: while true { let x: u32 = 1u32; inner: while true { @drop(x); continue outer; } } }\n", 143)?;
+    assert(@len(outer_continue.diags) == 0);
+    let after_continue: diag::DiagBuffer = check("function f(): void { while true { let x: u32 = 1u32; @drop(x); continue; @drop(x); } }\n", 144)?;
+    assert(@len(after_continue.diags) == 0);
+    let repeated: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { while true { @drop(s); } }\n", 50)?;
+    assert(count_of(&repeated:Read, 6003) == 1);
+    let local: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(b: bool): void { while b { let s: S = S { data: [1u32] }; @drop(s); } }\n", 51)?;
+    assert(@len(local.diags) == 0);
+    let stopped: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S, b: bool): void { while b { @drop(s); break; } }\n", 52)?;
+    assert(@len(stopped.diags) == 0);
+    let changing: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { var b: bool = true; while b { @drop(s); b = false; } }\n", 53)?;
+    assert(@len(changing.diags) == 0);
+    let local_true: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { while true { let s: S = S { data: [1u32] }; @drop(s); } }\n", 54)?;
+    assert(@len(local_true.diags) == 0);
+    let restored: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; while true { @drop(s); s = S { data: [2u32] }; } }\n", 55)?;
+    assert(@len(restored.diags) == 0);
+    let once: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { while true { @drop(s); break; } }\n", 56)?;
+    assert(@len(once.diags) == 0);
+    // 恒假循环仅保留操作数合法性诊断，不合并不可达状态。
+    let unreachable: diag::DiagBuffer = check("function f(x: u32): void { @drop(x); while false { @drop(x); @drop(x); } }\n", 149)?;
+    assert(@len(unreachable.diags) == 0);
+    let mixed: diag::DiagBuffer = check("function f(x: u32): void { @drop(x); while false { @drop(x); @drop(1u32); } }\n", 150)?;
+    assert(count_of(&mixed:Read, 6003) == 0);
+    assert(count_of(&mixed:Read, 6204) == 1);
+    let nested_false: diag::DiagBuffer = check("function f(x: u32): void { @drop(x); while false { while true { @drop(x); break; } } }\n", 151)?;
+    assert(@len(nested_false.diags) == 0);
+    let dead_move: diag::DiagBuffer = check("function f(): void { while false { let x: u32 = 1u32; @drop(x); @drop(x); let y: u32 = @move(2u32); @drop(y); } }\n", 158)?;
+    assert(count_of(&dead_move:Read, 6003) == 0);
+    assert(count_of(&dead_move:Read, 6204) == 1);
+    let nested_invalid: diag::DiagBuffer = check("function f(): void { while false { while false { @drop(1u32); } } }\n", 156)?;
+    assert(count_of(&nested_invalid:Read, 6204) == 1);
+    let outer_state: diag::DiagBuffer = check("function f(x: u32): void { while false { @drop(x); } @drop(x); }\n", 152)?;
+    assert(@len(outer_state.diags) == 0);
+    let both_sides: diag::DiagBuffer = check("function f(x: u32): void { @drop(x); @drop(x); while false { @drop(x); @drop(1u32); @drop(2u32); } @drop(x); }\n", 154)?;
+    assert(count_of(&both_sides:Read, 6003) == 2);
+    assert(count_of(&both_sides:Read, 6204) == 2);
+    let borrowed_dead: Case = load("function f(x: u32): void { while false { let r: &u32 = &x; let y: u32 = *r; @drop(y); } }\n", 155)?;
+    var borrow_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let borrow_result: owner::OwnerResult = owner::check_unit(&borrowed_dead.parsed.file:Read, &borrowed_dead.parsed.pool:Read, &borrowed_dead.resolution:Read, &borrowed_dead.checked:Read, &borrow_diags:ReadWrite)?;
+    assert(@len(borrow_result.borrows.items) == 0);
+    assert(diag::diagbuf_count(&borrow_diags:Read) == 0);
+    let borrowed_before: Case = load("function f(x: u32): void { let r: &u32 = &x; while false { let s: &u32 = &x; let n: u32 = *s; @drop(n); } let y: u32 = *r; @drop(y); }\n", 157)?;
+    var before_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let before_result: owner::OwnerResult = owner::check_unit(&borrowed_before.parsed.file:Read, &borrowed_before.parsed.pool:Read, &borrowed_before.resolution:Read, &borrowed_before.checked:Read, &before_diags:ReadWrite)?;
+    assert(@len(before_result.borrows.items) == 1);
+    assert(diag::diagbuf_count(&before_diags:Read) == 0);
+    let possible_body: diag::DiagBuffer = check("function f(x: u32, b: bool): void { @drop(x); while b { @drop(x); } }\n", 146)?;
+    assert(count_of(&possible_body:Read, 6003) == 1);
+    let false_loop: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { while false { @drop(s); } }\n", 57)?;
+    assert(@len(false_loop.diags) == 0);
+    let invalid_first: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { while true { @drop(s); @drop(s); } }\n", 58)?;
+    assert(count_of(&invalid_first:Read, 6003) == 1);
+    let skipped: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { while false { @drop(s); } @drop(s); }\n", 59)?;
+    assert(@len(skipped.diags) == 0);
+    let initialized: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(): void { var s: S = S { data: [1u32] }; @drop(s); while true { s = S { data: [2u32] }; break; } @drop(s); }\n", 60)?;
+    assert(@len(initialized.diags) == 0);
+    let consumed: diag::DiagBuffer = check("struct S { data: u32[] }\nfunction f(s: S): void { while true { @drop(s); break; } @drop(s); }\n", 61)?;
+    assert(count_of(&consumed:Read, 6003) == 1);
+    return;
+}
+
+// 短路分支只能在实际可能执行时影响后续所有权状态。
+function case_short_circuit(): void!AllocError {
+    let invalid_and: diag::DiagBuffer = check("struct S { v: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = false && take(s); @drop(b); @drop(s); }\n", 174)?;
+    assert(count_of(&invalid_and:Read, 6201) == 1);
+    assert(count_of(&invalid_and:Read, 6003) == 0);
+    let invalid_or: diag::DiagBuffer = check("function take(x: u32): bool { @drop(x); return true; } function f(): void { let b: bool = true || take(@move(1u32)); @drop(b); }\n", 175)?;
+    assert(count_of(&invalid_or:Read, 6204) == 1);
+    let dead_state: diag::DiagBuffer = check("function take(x: u32): bool { @drop(x); return true; } function f(x: u32): void { @drop(x); let b: bool = false && take(@move(x)); @drop(b); }\n", 176)?;
+    assert(count_of(&dead_state:Read, 6003) == 0);
+    let nested_invalid: diag::DiagBuffer = check("struct S { v: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S, c: bool): void { let b: bool = c && (true || take(s)); @drop(b); @drop(s); }\n", 177)?;
+    assert(count_of(&nested_invalid:Read, 6201) == 1);
+    assert(count_of(&nested_invalid:Read, 6003) == 0);
+    let skipped_and: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = false && take(@move(s)); @drop(b); @drop(s); }\n", 62)?;
+    assert(@len(skipped_and.diags) == 0);
+    let skipped_or: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = true || take(@move(s)); @drop(b); @drop(s); }\n", 63)?;
+    assert(@len(skipped_or.diags) == 0);
+    let executed: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = true && take(@move(s)); @drop(b); @drop(s); }\n", 64)?;
+    assert(count_of(&executed:Read, 6003) == 1);
+    let maybe: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S, c: bool): void { let b: bool = c || take(@move(s)); @drop(b); @drop(s); }\n", 65)?;
+    assert(count_of(&maybe:Read, 6003) == 1);
+    let executed_or: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = false || take(@move(s)); @drop(b); @drop(s); }\n", 66)?;
+    assert(count_of(&executed_or:Read, 6003) == 1);
+    let left: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S): void { let b: bool = take(@move(s)) || true; @drop(b); @drop(s); }\n", 67)?;
+    assert(count_of(&left:Read, 6003) == 1);
+    let nested: diag::DiagBuffer = check("struct S { data: u32[] } function take(s: S): bool { @drop(s); return true; } function f(s: S, c: bool): void { let b: bool = c && (false && take(@move(s))); @drop(b); @drop(s); }\n", 68)?;
+    assert(@len(nested.diags) == 0);
+    return;
+}
+
+// Copy 值显式析构后也不能读取，重新赋值则恢复可用。
+function case_copy_drop(): void!AllocError {
+    let borrowed_after: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; @drop(x); let r: &u32 = &x; let y: u32 = *r; @drop(y); }\n", 101)?;
+    assert(count_of(&borrowed_after:Read, 6003) == 1);
+    let borrowed_index: diag::DiagBuffer = check("function f(): void { let a: u32[] = [1u32]; let i: u32 = 0u32; @drop(i); let r: &u32 = &a[i]; let y: u32 = *r; @drop(y); @drop(a); }\n", 103)?;
+    assert(count_of(&borrowed_index:Read, 6003) == 1);
+    let borrowed_both: diag::DiagBuffer = check("function f(): void { let a: u32[] = [1u32]; let i: u32 = 0u32; @drop(a); @drop(i); let r: &u32 = &a[i]; let y: u32 = *r; @drop(y); }\n", 104)?;
+    assert(count_of(&borrowed_both:Read, 6003) == 2);
+    let borrowed_live: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; let r: &u32 = &x; let y: u32 = *r; @drop(y); }\n", 102)?;
+    assert(@len(borrowed_live.diags) == 0);
+    let used: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; @drop(x); let y: u32 = x; @drop(y); }\n", 69)?;
+    assert(count_of(&used:Read, 6003) == 1);
+    let twice: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; @drop(x); @drop(x); }\n", 70)?;
+    assert(count_of(&twice:Read, 6003) == 1);
+    let restored: diag::DiagBuffer = check("function f(): void { var x: u32 = 1u32; @drop(x); x = 2u32; let y: u32 = x; @drop(y); }\n", 71)?;
+    assert(@len(restored.diags) == 0);
+    let branch: diag::DiagBuffer = check("function f(x: u32, b: bool): void { if b { @drop(x); } let y: u32 = x; @drop(y); }\n", 72)?;
+    assert(count_of(&branch:Read, 6003) == 1);
+    let payload: diag::DiagBuffer = check("enum E { Some(u32), None } function f(e: E): void { match e { E::Some(x) => { @drop(x); @drop(x); }, E::None => {} } }\n", 73)?;
+    assert(count_of(&payload:Read, 6003) == 1);
+    let constant: diag::DiagBuffer = check("const A: u32 = 1u32; function f(): void { @drop(A); }\n", 76)?;
+    assert(count_of(&constant:Read, 6204) == 1);
+    let local_constant: diag::DiagBuffer = check("function f(): void { const B: u32 = 2u32; @drop(B); }\n", 78)?;
+    assert(count_of(&local_constant:Read, 6204) == 1);
+    let constant_view: diag::DiagBuffer = check("const TEXT: &[u8] = \"hi\"; function f(): void { @drop(TEXT); }\n", 79)?;
+    assert(count_of(&constant_view:Read, 6204) == 1);
+    let copied: diag::DiagBuffer = check("const A: u32 = 1u32; function f(): void { let x: u32 = A; let y: u32 = A; @drop(x); @drop(y); }\n", 77)?;
+    assert(@len(copied.diags) == 0);
+    let literal: diag::DiagBuffer = check("function f(): void { @drop(1u32); }\n", 97)?;
+    assert(count_of(&literal:Read, 6204) == 1);
+    let computed: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; @drop(x + 1u32); @drop(x); }\n", 98)?;
+    assert(count_of(&computed:Read, 6204) == 1);
+    assert(count_of(&computed:Read, 6003) == 0);
+    let unary: diag::DiagBuffer = check("function f(): void { let x: bool = true; @drop(!x); @drop(x); }\n", 100)?;
+    assert(count_of(&unary:Read, 6204) == 1);
+    assert(count_of(&unary:Read, 6003) == 0);
+    let nested: diag::DiagBuffer = check("function take(x: u32): u32 { return x; } function f(): void { let x: u32 = 1u32; @drop(take(@move(x))); @drop(x); }\n", 99)?;
+    assert(count_of(&nested:Read, 6204) == 1);
+    assert(count_of(&nested:Read, 6003) == 1);
+    let view: diag::DiagBuffer = check("function f(x: &u32): void { @drop(x); }\n", 74)?;
+    assert(count_of(&view:Read, 6204) == 1);
+    return;
+}
+
+// 显式移动 Copy 绑定也会使源失效，视图和常量不能移动。
+function case_explicit_move(): void!AllocError {
+    let value: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; let y: u32 = @move(x); @drop(x); @drop(y); }\n", 80)?;
+    assert(count_of(&value:Read, 6003) == 1);
+    let argument: diag::DiagBuffer = check("function take(x: u32): void { @drop(x); } function f(): void { let x: u32 = 1u32; take(@move(x)); @drop(x); }\n", 81)?;
+    assert(count_of(&argument:Read, 6003) == 1);
+    let view: diag::DiagBuffer = check("function f(x: &u32): void { let y: &u32 = @move(x); let z: &u32 = y; let n: u32 = *z; @drop(n); }\n", 82)?;
+    assert(count_of(&view:Read, 6204) == 1);
+    let constant: diag::DiagBuffer = check("const A: u32 = 1u32; function f(): void { let x: u32 = @move(A); @drop(x); }\n", 83)?;
+    assert(count_of(&constant:Read, 6204) == 1);
+    let valid: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; let y: u32 = @move(x); @drop(y); }\n", 84)?;
+    assert(@len(valid.diags) == 0);
+    let repeated: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; let y: u32 = @move(x); let z: u32 = @move(x); @drop(y); @drop(z); }\n", 85)?;
+    assert(count_of(&repeated:Read, 6003) == 1);
+    let restored: diag::DiagBuffer = check("function f(): void { var x: u32 = 1u32; let y: u32 = @move(x); x = 2u32; @drop(x); @drop(y); }\n", 86)?;
+    assert(@len(restored.diags) == 0);
+    let arg_constant: diag::DiagBuffer = check("const A: u32 = 1u32; function take(x: u32): void { @drop(x); } function f(): void { take(@move(A)); }\n", 87)?;
+    assert(count_of(&arg_constant:Read, 6204) == 1);
+    let arg_view: diag::DiagBuffer = check("function take(x: &u32): void { let y: u32 = *x; @drop(y); } function f(x: &u32): void { take(@move(x)); }\n", 88)?;
+    assert(count_of(&arg_view:Read, 6204) == 1);
+    let temporary: diag::DiagBuffer = check("function f(): void { let x: u32 = @move(1u32); @drop(x); }\n", 89)?;
+    assert(count_of(&temporary:Read, 6204) == 1);
+    let arg_temporary: diag::DiagBuffer = check("function take(x: u32): void { @drop(x); } function f(): void { take(@move(1u32)); }\n", 90)?;
+    assert(count_of(&arg_temporary:Read, 6204) == 1);
+    let computed: diag::DiagBuffer = check("function f(): void { let x: u32 = @move(1u32 + 2u32); @drop(x); }\n", 92)?;
+    assert(count_of(&computed:Read, 6204) == 1);
+    let negated: diag::DiagBuffer = check("function f(): void { let x: bool = true; let y: bool = @move(!x); @drop(x); @drop(y); }\n", 93)?;
+    assert(count_of(&negated:Read, 6204) == 1);
+    assert(count_of(&negated:Read, 6003) == 0);
+    let arg_negated: diag::DiagBuffer = check("function take(x: bool): void { @drop(x); } function f(): void { let x: bool = true; take(@move(!x)); @drop(x); }\n", 96)?;
+    assert(count_of(&arg_negated:Read, 6204) == 1);
+    assert(count_of(&arg_negated:Read, 6003) == 0);
+    let nested_unary: diag::DiagBuffer = check("function f(): void { let x: bool = true; let y: bool = @move(!@move(x)); @drop(x); @drop(y); }\n", 94)?;
+    assert(count_of(&nested_unary:Read, 6204) == 1);
+    assert(count_of(&nested_unary:Read, 6003) == 1);
+    let borrowed: diag::DiagBuffer = check("function f(x: u32): void { let y: &u32 = @move(&x); let n: u32 = *y; @drop(n); }\n", 95)?;
+    assert(count_of(&borrowed:Read, 6204) == 1);
+    let nested: diag::DiagBuffer = check("function take(x: u32): u32 { return x; } function f(): void { let x: u32 = 1u32; let y: u32 = @move(take(@move(x))); @drop(x); @drop(y); }\n", 91)?;
+    assert(count_of(&nested:Read, 6204) == 1);
+    assert(count_of(&nested:Read, 6003) == 1);
+    return;
+}
+
+// 可错载体由成功类型和所有错误类型共同决定是否可复制。
+function case_fallible_copy(): void!AllocError {
+    let single: Case = load("enum E { Bad } function f(): u32!E { return 1u32; }\n", 110)?;
+    let single_id: u32 = single.checked.funcs.items[0].ret;
+    assert(owner::is_copy_type(&single.checked:Read, single_id));
+    let multi: Case = load("enum A { X } enum B { Y(u32) } function f(): void!(A | B) { return; }\n", 111)?;
+    let multi_id: u32 = multi.checked.funcs.items[0].ret;
+    assert(owner::is_copy_type(&multi.checked:Read, multi_id));
+    let success: Case = load("enum E { Bad } function f(): u32[]!E { return [1u32]; }\n", 112)?;
+    let success_id: u32 = success.checked.funcs.items[0].ret;
+    assert(!owner::is_copy_type(&success.checked:Read, success_id));
+    let error: Case = load("enum A { X } enum B { Y(u32[]) } function f(): u32!(A | B) { return 1u32; }\n", 113)?;
+    let error_id: u32 = error.checked.funcs.items[0].ret;
+    assert(!owner::is_copy_type(&error.checked:Read, error_id));
+    let reused: diag::DiagBuffer = check("enum E { Bad } function make(): u32!E { return 1u32; } function f(): void { let r: u32!E = make(); let s: u32!E = r; @drop(r); @drop(s); }\n", 114)?;
+    assert(@len(reused.diags) == 0);
+    let moved: diag::DiagBuffer = check("enum E { Bad } function make(): u32[]!E { return [1u32]; } function f(): void { let r: u32[]!E = make(); let s: u32[]!E = r; @drop(r); @drop(s); }\n", 115)?;
+    assert(count_of(&moved:Read, 6003) == 1);
+    return;
+}
+
+// 返回非 Copy 绑定转移所有权，Copy 返回只读取。
+function case_return_moves(): void!AllocError {
+    let owned: Case = load("struct S { v: u32[] } function f(x: S): S { return x; }\n", 159)?;
+    var owned_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let owned_result: owner::OwnerResult = owner::check_unit(&owned.parsed.file:Read, &owned.parsed.pool:Read, &owned.resolution:Read, &owned.checked:Read, &owned_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&owned_diags:Read) == 0);
+    assert(@len(owned_result.places.items) == 1);
+    assert(owned_result.places.items[0].state == 1);
+    let copied: Case = load("function f(x: u32): u32 { return x; }\n", 160)?;
+    var copy_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let copy_result: owner::OwnerResult = owner::check_unit(&copied.parsed.file:Read, &copied.parsed.pool:Read, &copied.resolution:Read, &copied.checked:Read, &copy_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&copy_diags:Read) == 0);
+    assert(@len(copy_result.places.items) == 1);
+    assert(copy_result.places.items[0].state == 0);
+    let explicit: Case = load("struct S { v: u32[] } function f(x: S): S { return @move(x); }\n", 162)?;
+    var explicit_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let explicit_result: owner::OwnerResult = owner::check_unit(&explicit.parsed.file:Read, &explicit.parsed.pool:Read, &explicit.resolution:Read, &explicit.checked:Read, &explicit_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&explicit_diags:Read) == 0);
+    assert(explicit_result.places.items[0].state == 1);
+    let explicit_copy: Case = load("function f(x: u32): u32 { return @move(x); }\n", 165)?;
+    var explicit_copy_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let explicit_copy_result: owner::OwnerResult = owner::check_unit(&explicit_copy.parsed.file:Read, &explicit_copy.parsed.pool:Read, &explicit_copy.resolution:Read, &explicit_copy.checked:Read, &explicit_copy_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&explicit_copy_diags:Read) == 0);
+    assert(explicit_copy_result.places.items[0].state == 1);
+    let temporary: Case = load("function f(x: u32): u32 { return x + 1u32; }\n", 166)?;
+    var temporary_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let temporary_result: owner::OwnerResult = owner::check_unit(&temporary.parsed.file:Read, &temporary.parsed.pool:Read, &temporary.resolution:Read, &temporary.checked:Read, &temporary_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&temporary_diags:Read) == 0);
+    assert(temporary_result.places.items[0].state == 0);
+    let carrier: Case = load("enum E { Bad } function f(x: u32[]): u32[]!E { return x; }\n", 163)?;
+    var carrier_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let carrier_result: owner::OwnerResult = owner::check_unit(&carrier.parsed.file:Read, &carrier.parsed.pool:Read, &carrier.resolution:Read, &carrier.checked:Read, &carrier_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&carrier_diags:Read) == 0);
+    assert(carrier_result.places.items[0].state == 1);
+    let dropped: diag::DiagBuffer = check("struct S { v: u32[] } function f(x: S): S { @drop(x); return x; }\n", 161)?;
+    assert(count_of(&dropped:Read, 6003) == 1);
+    return;
+}
+
+// 本地非 Copy 按值参数必须显式移动，Copy 参数保持复制语义。
+function case_call_move_required(): void!AllocError {
+    let implicit: diag::DiagBuffer = check("struct S { v: u32[] } function take(x: S): void { @drop(x); } function f(s: S): void { take(s); }\n", 167)?;
+    assert(count_of(&implicit:Read, 6201) == 1);
+    let explicit: diag::DiagBuffer = check("struct S { v: u32[] } function take(x: S): void { @drop(x); } function f(s: S): void { take(@move(s)); }\n", 168)?;
+    assert(@len(explicit.diags) == 0);
+    let copied: diag::DiagBuffer = check("function take(x: u32): void { @drop(x); } function f(x: u32): void { take(x); @drop(x); }\n", 169)?;
+    assert(@len(copied.diags) == 0);
+    let multiple: diag::DiagBuffer = check("struct S { v: u32[] } function take(a: u32, b: S, c: S): void { @drop(a); @drop(b); @drop(c); } function f(a: u32, b: S, c: S): void { take(a, b, @move(c)); @drop(a); }\n", 170)?;
+    assert(count_of(&multiple:Read, 6201) == 1);
+    let dead: diag::DiagBuffer = check("struct S { v: u32[] } function take(x: S): void { @drop(x); } function f(s: S): void { while false { take(s); } @drop(s); }\n", 171)?;
+    assert(count_of(&dead:Read, 6201) == 1);
+    assert(count_of(&dead:Read, 6003) == 0);
+    let view: diag::DiagBuffer = check("function take(x: &u32): void { let y: u32 = *x; @drop(y); } function f(x: &u32): void { take(x); take(x); }\n", 183)?;
+    assert(@len(view.diags) == 0);
+    let dead_literal: diag::DiagBuffer = check("function take(x: u32[]): bool { @drop(x); return true; } function f(): void { let b: bool = false && take([1u32]); @drop(b); }\n", 184)?;
+    assert(count_of(&dead_literal:Read, 6201) == 1);
+    let literal: diag::DiagBuffer = check("function take(x: u32[]): void { @drop(x); } function f(): void { take([1u32]); }\n", 179)?;
+    assert(count_of(&literal:Read, 6201) == 1);
+    let returned: diag::DiagBuffer = check("function make(): u32[] { return [1u32]; } function take(x: u32[]): void { @drop(x); } function f(): void { take(make()); }\n", 180)?;
+    assert(count_of(&returned:Read, 6201) == 1);
+    let field: diag::DiagBuffer = check("struct S { v: u32[] } function take(x: u32[]): void { @drop(x); } function f(s: S): void { take(s.v); }\n", 181)?;
+    assert(count_of(&field:Read, 6201) == 1);
+    let variant: diag::DiagBuffer = check("enum E { Some(u32[]), None } function f(x: u32[]): void { let e: E = E::Some(x); @drop(e); }\n", 172)?;
+    assert(count_of(&variant:Read, 6201) == 0);
+    return;
+}
+
+// clone 不接受 Copy 值或可错载体，也不能跳过源的状态检查。
+function case_clone_domain(): void!AllocError {
+    let scalar: diag::DiagBuffer = check("function f(x: u32): void!AllocError { let y: u32 = @clone(x)?; @drop(y); @drop(x); }\n", 195)?;
+    assert(count_of(&scalar:Read, 6203) == 1);
+    let carrier: diag::DiagBuffer = check("enum E { Bad } function make(): u32[]!E { return [1u32]; } function f(): void!AllocError { let x: u32[]!E = make(); let y: u32[]!E = @clone(x)?; @drop(x); @drop(y); }\n", 196)?;
+    assert(count_of(&carrier:Read, 6203) == 1);
+    let copy_carrier: diag::DiagBuffer = check("enum E { Bad } function make(): u32!E { return 1u32; } function f(): void!AllocError { let x: u32!E = make(); let y: u32!E = @clone(x)?; @drop(x); @drop(y); }\n", 203)?;
+    assert(count_of(&copy_carrier:Read, 6203) == 1);
+    let short: diag::DiagBuffer = check("function f(x: bool): void!AllocError { let y: bool = false && @clone(x)?; @drop(y); @drop(x); }\n", 204)?;
+    assert(count_of(&short:Read, 6203) == 1);
+    assert(count_of(&short:Read, 6003) == 0);
+    let view: diag::DiagBuffer = check("function f(x: &u32): void!AllocError { let y: &u32 = @clone(x)?; let z: u32 = *y; @drop(z); }\n", 197)?;
+    assert(count_of(&view:Read, 6203) == 1);
+    let temporary: diag::DiagBuffer = check("function f(): void!AllocError { let x: u32 = @clone(1u32)?; @drop(x); }\n", 198)?;
+    assert(count_of(&temporary:Read, 6203) == 1);
+    let expired: diag::DiagBuffer = check("function f(x: u32): void!AllocError { @drop(x); let y: u32 = @clone(x)?; @drop(y); }\n", 199)?;
+    assert(count_of(&expired:Read, 6203) == 1);
+    assert(count_of(&expired:Read, 6003) == 1);
+    let dead: diag::DiagBuffer = check("function f(x: u32): void!AllocError { while false { let y: u32 = @clone(x)?; @drop(y); } @drop(x); }\n", 200)?;
+    assert(count_of(&dead:Read, 6203) == 1);
+    assert(count_of(&dead:Read, 6003) == 0);
+    let carrier_move: diag::DiagBuffer = check("function make(): u32[]!AllocError { return [1u32]; } function f(): void!AllocError { let x: u32[]!AllocError = make(); let y: u32[] = x?; @drop(y); @drop(x); }\n", 205)?;
+    assert(count_of(&carrier_move:Read, 6003) == 1);
+    let carrier_copy: diag::DiagBuffer = check("function make(): u32!AllocError { return 1u32; } function f(): void!AllocError { let x: u32!AllocError = make(); let y: u32 = x?; @drop(y); @drop(x); }\n", 206)?;
+    assert(count_of(&carrier_copy:Read, 6003) == 0);
+    let owning: diag::DiagBuffer = check("function f(x: u32[]): void!AllocError { let y: u32[] = @clone(x)?; @drop(x); @drop(y); }\n", 201)?;
+    assert(count_of(&owning:Read, 6203) == 0);
+    assert(count_of(&owning:Read, 6003) == 0);
+    return;
+}
+
+// 绑定可写性与 out 槽位状态机：let/const/out 赋值拒绝、out 传参填充与提取、合流一致性。
+function case_binding_writability(): void!AllocError {
+    let let_reassign: diag::DiagBuffer = check("function f(): void { let x: u32 = 1u32; x = 2u32; @drop(x); }\n", 207)?;
+    assert(count_of(&let_reassign:Read, 6009) == 1);
+    let const_reassign: diag::DiagBuffer = check("function f(): void { const c: u32 = 1u32; c = 2u32; @drop(c); }\n", 208)?;
+    assert(count_of(&const_reassign:Read, 2006) == 1);
+    let let_projection: diag::DiagBuffer = check("struct S { v: u32 } function f(): void { let s: S = S { v: 1 }; s.v = 2u32; @drop(s); }\n", 209)?;
+    assert(count_of(&let_projection:Read, 6009) == 1);
+    let var_ok: diag::DiagBuffer = check("function f(): void { var x: u32 = 1u32; x = 2u32; @drop(x); }\n", 210)?;
+    assert(@len(var_ok.diags) == 0);
+    let out_direct: diag::DiagBuffer = check("function f(): void { out r: u32; r = 1u32; }\n", 211)?;
+    assert(count_of(&out_direct:Read, 6102) == 1);
+    let out_fill: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1; }\nfunction main(): void { out r: u32; fill(out r); }\n", 212)?;
+    assert(@len(out_fill.diags) == 0);
+    let out_dup: diag::DiagBuffer = check("function fill(x: &u32:Write, y: &u32:Write): void { *x = 1; *y = 2; }\nfunction main(): void { out r: u32; fill(out r, out r); }\n", 213)?;
+    assert(count_of(&out_dup:Read, 6102) == 1);
+    let out_read: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1; }\nfunction main(): void { out r: u32; fill(out r); let n: u32 = r; @drop(n); }\n", 214)?;
+    assert(count_of(&out_read:Read, 6102) == 1);
+    let out_extract: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction make(x: &S:Write): void { *x = S { v: [1u32] }; }\nfunction main(): void { out s: S; make(out s); let t: S = @move(s); @drop(t); }\n", 215)?;
+    assert(@len(out_extract.diags) == 0);
+    let out_extract_unfilled: diag::DiagBuffer = check("struct S { v: u32[] }\nfunction main(): void { out s: S; let t: S = @move(s); @drop(t); }\n", 216)?;
+    assert(count_of(&out_extract_unfilled:Read, 6102) == 1);
+    let out_merge_ok: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1; }\nfunction main(b: bool): void { out r: u32; if b { fill(out r); } else { fill(out r); } }\n", 217)?;
+    assert(@len(out_merge_ok.diags) == 0);
+    let out_merge_conflict: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1; }\nfunction main(b: bool): void { out r: u32; if b { fill(out r); } }\n", 218)?;
+    assert(count_of(&out_merge_conflict:Read, 6103) == 1);
+    let out_write_read: diag::DiagBuffer = check("foreign assert(cond: bool): void;\nfunction fill(x: &u32:Write): void { *x = 1u32; assert(*x == 1u32); }\n", 219)?;
+    assert(count_of(&out_write_read:Read, 6102) == 1);
+    let out_write_copy: diag::DiagBuffer = check("function fill(x: &u32:Write): void { @copy(x); }\n", 220)?;
+    assert(count_of(&out_write_copy:Read, 6102) == 1);
+    let out_write_partial: diag::DiagBuffer = check("struct Pair { a: u32, b: u32 }\nfunction fill(x: &Pair:Write): void { (*x).a = 1u32; }\n", 221)?;
+    assert(count_of(&out_write_partial:Read, 6102) == 1);
+    let out_implicit: diag::DiagBuffer = check("struct S { v: u32[] } function fill(x: &S:Write): void { *x = S { v: [1u32] }; } function main(): void { out r: S; fill(out r); let v: S = r; @drop(v); }\n", 222)?;
+    assert(count_of(&out_implicit:Read, 6102) == 1);
+    let out_drop: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function main(): void { out r: u32; fill(out r); @drop(r); }\n", 223)?;
+    assert(count_of(&out_drop:Read, 6102) == 1);
+    let out_arg_move: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function take(v: u32): void { @drop(v); } function main(): void { out r: u32; fill(out r); take(@move(r)); }\n", 224)?;
+    assert(count_of(&out_arg_move:Read, 6102) == 1);
+    let out_nested_move: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function main(): void { out r: u32; fill(out r); let v: u32 = 1u32 + @move(r); @drop(v); }\n", 225)?;
+    assert(count_of(&out_nested_move:Read, 6102) == 1);
+    let out_carrier_saved: diag::DiagBuffer = check("function fill(x: &u32:Write): void!AllocError { *x = 1u32; return; } function main(): void!AllocError { out r: u32; let v: void!AllocError = fill(out r); v?; return; }\n", 226)?;
+    assert(count_of(&out_carrier_saved:Read, 6105) == 1);
+    let out_try_extract: diag::DiagBuffer = check("function fill(x: &u32:Write): void!AllocError { *x = 1u32; return; } function main(): void!AllocError { out r: u32; fill(out r)?; var v: u32 = @move(r); @drop(v); return; }\n", 227)?;
+    assert(@len(out_try_extract.diags) == 0);
+    let out_consumed: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function main(): void { out r: u32; fill(out r); let v: u32 = @move(r); @drop(v); fill(out r); }\n", 228)?;
+    assert(count_of(&out_consumed:Read, 6102) == 1);
+    let write_twice: diag::DiagBuffer = check("function f(x: &u32:Write): void { *x = 1u32; *x = 2u32; }\n", 230)?;
+    assert(count_of(&write_twice:Read, 6102) == 1);
+    let write_branch: diag::DiagBuffer = check("function f(b: bool, x: &u32:Write): void { if b { *x = 1u32; } *x = 2u32; }\n", 231)?;
+    assert(count_of(&write_branch:Read, 6102) == 1);
+    let write_exclusive: diag::DiagBuffer = check("function f(b: bool, x: &u32:Write, y: &u32:Write): void { if b { *x = 1u32; } else { *x = 2u32; } *y = 3u32; }\n", 232)?;
+    assert(@len(write_exclusive.diags) == 0);
+    let write_match: diag::DiagBuffer = check("enum E { A, B } function f(e: E, x: &u32:Write): void { match e { E::A => { *x = 1u32; }, E::B => { *x = 2u32; } } *x = 3u32; }\n", 233)?;
+    assert(count_of(&write_match:Read, 6102) == 1);
+    let write_back: diag::DiagBuffer = check("function f(p: bool, x: &u32:Write): void { again: while p { while true { *x = 1u32; continue again; } } }\n", 234)?;
+    assert(count_of(&write_back:Read, 6102) == 1);
+    let write_exit: diag::DiagBuffer = check("function f(p: bool, x: &u32:Write): void { again: while true { while true { if p { *x = 1u32; break again; } else { break again; } } } *x = 2u32; }\n", 235)?;
+    assert(count_of(&write_exit:Read, 6102) == 1);
+    let write_once: diag::DiagBuffer = check("function f(x: &u32:Write): void { while false { *x = 0u32; } while true { *x = 1u32; break; *x = 2u32; } }\n", 236)?;
+    assert(@len(write_once.diags) == 0);
+    let write_return: diag::DiagBuffer = check("function f(p: bool, x: &u32:Write): void { if p { *x = 1u32; return; } else { } *x = 2u32; }\n", 237)?;
+    assert(@len(write_return.diags) == 0);
+    let write_constant: diag::DiagBuffer = check("function f(x: &u32:Write): void { if false { *x = 0u32; } elseif true { *x = 1u32; } else { *x = 0u32; } }\n", 238)?;
+    assert(@len(write_constant.diags) == 0);
+    let slot_break_ok: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(b: bool): void { out r: u32; while true { if b { fill(out r); break; } else { continue; } } let v: u32 = @move(r); @drop(v); }\n", 240)?;
+    assert(@len(slot_break_ok.diags) == 0);
+    let slot_outer_break: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(b: bool): void { out r: u32; outer: while true { while true { if b { fill(out r); break outer; } else { continue outer; } } } let v: u32 = @move(r); @drop(v); }\n", 241)?;
+    assert(@len(slot_outer_break.diags) == 0);
+    let slot_back_conflict: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(b: bool): void { out r: u32; outer: while true { while true { if b { fill(out r); continue outer; } else { return; } } } }\n", 242)?;
+    assert(count_of(&slot_back_conflict:Read, 6103) == 1);
+    let slot_exit_conflict: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(b: bool): void { out r: u32; while b { fill(out r); break; } }\n", 243)?;
+    assert(count_of(&slot_exit_conflict:Read, 6103) == 1);
+    let slot_local: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(b: bool): void { while b { out r: u32; fill(out r); continue; } }\n", 244)?;
+    assert(@len(slot_local.diags) == 0);
+    let slot_match: diag::DiagBuffer = check("enum E { A, B } function fill(x: &u32:Write): void { *x = 1u32; } function f(e: E): void { out r: u32; while true { match e { E::A => { fill(out r); break; }, E::B => { continue; } } } let v: u32 = @move(r); @drop(v); }\n", 245)?;
+    assert(@len(slot_match.diags) == 0);
+    let slot_condition: diag::DiagBuffer = check("function fill(x: &u32:Write): bool { *x = 1u32; return true; } function f(): void { out r: u32; while fill(out r) { break; } let v: u32 = @move(r); @drop(v); }\n", 246)?;
+    assert(@len(slot_condition.diags) == 0);
+    let slot_condition_back: diag::DiagBuffer = check("function fill(x: &u32:Write): bool { *x = 1u32; return true; } function f(): void { out r: u32; while fill(out r) { continue; } }\n", 247)?;
+    assert(count_of(&slot_condition_back:Read, 6103) == 1);
+    let slot_fallthrough: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(b: bool): void { out r: u32; while b { fill(out r); } }\n", 248)?;
+    assert(count_of(&slot_fallthrough:Read, 6103) == 1);
+    let slot_constant: diag::DiagBuffer = check("function fill(x: &u32:Write): void { *x = 1u32; } function f(): void { out r: u32; while true { if false { fill(out r); continue; } fill(out r); break; } let v: u32 = @move(r); @drop(v); }\n", 249)?;
+    assert(@len(slot_constant.diags) == 0);
+    return;
+}
+
+// 情形：owning 聚合的投影移动一律拒绝（OW-10 / E6205，owner.md 2.5）。
+function case_partial_move(): void!AllocError {
+    let field: diag::DiagBuffer = check("struct Wrap { data: u32[], count: u32 }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32], count: 1u32 }; let x: u32[] = w.data; @drop(x); }\n", 260)?;
+    assert(count_of(&field:Read, 6205) == 1);
+    let move_field: diag::DiagBuffer = check("struct Wrap { data: u32[] }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32] }; let x: u32[] = @move(w.data); @drop(x); }\n", 261)?;
+    assert(count_of(&move_field:Read, 6205) == 1);
+    let element: diag::DiagBuffer = check("function main(): void { let items: [u32[]; 2] = [[1u32], [2u32]]; let x: u32[] = items[0u32]; @drop(x); }\n", 262)?;
+    assert(count_of(&element:Read, 6205) == 1);
+    let moved_arg: diag::DiagBuffer = check("struct Wrap { data: u32[] }\nfunction take(x: u32[]): void { @drop(x); }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32] }; take(@move(w.data)); }\n", 263)?;
+    assert(count_of(&moved_arg:Read, 6205) == 1);
+    let returned: diag::DiagBuffer = check("struct Wrap { data: u32[] }\nfunction take(w: Wrap): u32[] { return w.data; }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32] }; let x: u32[] = take(@move(w)); @drop(x); }\n", 264)?;
+    assert(count_of(&returned:Read, 6205) == 1);
+    // 正面：整天移动与 Copy 字段读取仍合法。
+    let whole: diag::DiagBuffer = check("struct Wrap { data: u32[], count: u32 }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32], count: 1u32 }; let n: u32 = w.count; let x: Wrap = @move(w); @drop(n); @drop(x); }\n", 265)?;
+    assert(@len(whole.diags) == 0);
+    // @drop 只接受整 place：成员、索引与切片投影一律拒绝（OW-11 / E6206）。
+    let drop_field: diag::DiagBuffer = check("struct Wrap { data: u32[], count: u32 }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32], count: 1u32 }; @drop(w.data); }\n", 266)?;
+    assert(count_of(&drop_field:Read, 6206) == 1);
+    let drop_copy_field: diag::DiagBuffer = check("struct Wrap { data: u32[], count: u32 }\nfunction main(): void { let w: Wrap = Wrap { data: [1u32], count: 1u32 }; @drop(w.count); }\n", 267)?;
+    assert(count_of(&drop_copy_field:Read, 6206) == 1);
+    let drop_element: diag::DiagBuffer = check("function main(): void { let items: [u32[]; 2] = [[1u32], [2u32]]; @drop(items[0u32]); }\n", 268)?;
+    assert(count_of(&drop_element:Read, 6206) == 1);
+    return;
+}
+
+// 标量引用以绑定所在块为借用期；经引用访问和跳出后的原位置访问仍然合法。
+function case_block_scalar_borrows(): void!AllocError {
+    let exclusive_write: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 0u32; let r: &u32:ReadWrite = &x:ReadWrite; x = 1u32; assert(*r == 1u32); }\n", 300)?;
+    assert(@len(exclusive_write.diags) == 1 && count_of(&exclusive_write:Read, 6004) == 1);
+    let exclusive_read: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 0u32; let r: &u32:ReadWrite = &x:ReadWrite; assert(x == 0u32); assert(*r == 0u32); }\n", 301)?;
+    assert(@len(exclusive_read.diags) == 1 && count_of(&exclusive_read:Read, 6004) == 1);
+    let shared_write: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 0u32; let r: &u32 = &x:Read; x = 1u32; assert(*r == 1u32); }\n", 302)?;
+    assert(@len(shared_write.diags) == 1 && count_of(&shared_write:Read, 6004) == 1);
+    let shared_read: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 0u32; let r: &u32 = &x:Read; let s: &u32 = &x:Read; assert(x == *r && *r == *s); }\n", 303)?;
+    assert(@len(shared_read.diags) == 0);
+    let reborrow_exit: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; if true { let r: &u32:ReadWrite = &x:ReadWrite; if true { let q: &u32 = &*r; assert(*q == 7u32); } *r = 9u32; } assert(x == 9u32); }\n", 304)?;
+    assert(@len(reborrow_exit.diags) == 0);
+    let reborrow_write: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; let r: &u32:ReadWrite = &x:ReadWrite; if true { let q: &u32 = &*r; *r = 9u32; assert(*q == 9u32); } }\n", 305)?;
+    assert(@len(reborrow_write.diags) == 1 && count_of(&reborrow_write:Read, 6004) == 1);
+    let labeled_exit: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 0u32; outer: while true { while true { let r: &u32:ReadWrite = &x:ReadWrite; *r = 1u32; break outer; } } x = 2u32; assert(x == 2u32); }\n", 306)?;
+    assert(@len(labeled_exit.diags) == 0);
+    let copy_suspended: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; let r: &u32:ReadWrite = &x:ReadWrite; let s: &u32:ReadWrite = @copy(r); if true { let q: &u32 = &*s; assert(*r == 7u32); assert(*q == 7u32); } }\n", 307)?;
+    assert(@len(copy_suspended.diags) == 1 && count_of(&copy_suspended:Read, 6004) == 1);
+    let rebind_old: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; var y: u32 = 8u32; var r: &u32:ReadWrite = &x:ReadWrite; r = &y:ReadWrite; x = 9u32; *r = 10u32; }\n", 308)?;
+    assert(@len(rebind_old.diags) == 1 && count_of(&rebind_old:Read, 6004) == 1);
+    let parameter: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(r: &u32:ReadWrite): void { if true { let q: &u32 = &*r; *r = 9u32; assert(*q == 9u32); } *r = 11u32; }\n", 309)?;
+    assert(@len(parameter.diags) == 1 && count_of(&parameter:Read, 6004) == 1);
+    let shared_children: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; let r: &u32:ReadWrite = &x:ReadWrite; if true { let a: &u32 = &*r; let b: &u32 = &*r; let c: &u32 = &*a; assert(*a == *b && *b == *c); } *r = 11u32; }\n", 310)?;
+    assert(@len(shared_children.diags) == 0);
+    let narrowed: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; let r: &u32:ReadWrite = &x:ReadWrite; let read: &u32 = r; assert(*read == 7u32); assert(x == 7u32); }\n", 311)?;
+    assert(@len(narrowed.diags) == 1 && count_of(&narrowed:Read, 6004) == 1);
+    let escaping: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; var r: &u32:ReadWrite = &x:ReadWrite; if true { var y: u32 = 8u32; r = &y:ReadWrite; } assert(*r == 7u32); }\n", 312)?;
+    assert(@len(escaping.diags) == 1 && count_of(&escaping:Read, 6005) == 1);
+    let labeled_continue: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 0u32; outer: while x < 2u32 { while true { let r: &u32:ReadWrite = &x:ReadWrite; *r = *r + 1u32; continue outer; } } assert(x == 2u32); }\n", 313)?;
+    assert(@len(labeled_continue.diags) == 0);
+    let nested_temp: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; let q: &u32 = &*(&x:ReadWrite); assert(x == 7u32); assert(*q == 7u32); }\n", 314)?;
+    assert(@len(nested_temp.diags) == 1 && count_of(&nested_temp:Read, 6004) == 1);
+    let nested_temp_end: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(): void { var x: u32 = 7u32; if true { let q: &u32 = &*(&x:ReadWrite); assert(*q == 7u32); } x = 9u32; assert(x == 9u32); }\n", 315)?;
+    assert(@len(nested_temp_end.diags) == 0);
+    let overlap_fields: diag::DiagBuffer = check("struct Pair { left: u32, right: u32 } foreign assert(cond: bool): void; function f(): void { var p: Pair = Pair { left: 1u32, right: 2u32 }; let r: &u32 = &p.left; p.right = 3u32; assert(*r == 1u32); }\n", 316)?;
+    assert(@len(overlap_fields.diags) == 1 && count_of(&overlap_fields:Read, 6004) == 1);
+    let implicit_member: diag::DiagBuffer = check("struct Pair { left: u32, right: u32 } foreign assert(cond: bool): void; function f(): void { var p: Pair = Pair { left: 1u32, right: 2u32 }; let r: &Pair:ReadWrite = &p:ReadWrite; if true { let q: &u32 = &r.left; assert(*q == 1u32); } r.right = 3u32; assert(r.right == 3u32); }\n", 317)?;
+    if diag::diagbuf_has_error(&implicit_member:Read) { diag::diagbuf_print_terminal(&implicit_member:Read)?; }
+    assert(@len(implicit_member.diags) == 0);
+    let read_member: diag::DiagBuffer = check("struct Pair { left: u32, right: u32 } function f(): void { var p: Pair = Pair { left: 1u32, right: 2u32 }; var r: &Pair = &p; r.right = 3u32; }\n", 319)?;
+    assert(@len(read_member.diags) == 1 && count_of(&read_member:Read, 6008) == 1);
+    let branch_rebind: diag::DiagBuffer = check("foreign assert(cond: bool): void; function f(flag: bool): void { var x: u32 = 7u32; var y: u32 = 8u32; var r: &u32:ReadWrite = &x:ReadWrite; let s: &u32:ReadWrite = &y:ReadWrite; if flag { r = @copy(s); } x = 9u32; *r = 10u32; }\n", 318)?;
+    assert(@len(branch_rebind.diags) == 1 && count_of(&branch_rebind:Read, 6004) == 1);
+    return;
+}
+
+function main(): void {
+    // 显式可写切片的临时借用在调用后结束，绑定则须保持独占直至离块。
+    let slice_ok: diag::DiagBuffer = check("foreign read(dst: &[u8]:ReadWrite): u32; function f(): void { var a: u8[] = [1u8]; let n: u32 = read(&a[0..1]:ReadWrite); if n == 0 { @drop(a); return; } @drop(a); }\n", 269)?;
+    assert(@len(slice_ok.diags) == 0);
+    let slice_let: diag::DiagBuffer = check("foreign read(dst: &[u8]:ReadWrite): u32; function f(): void { let a: [u8; 1] = [1u8]; let n: u32 = read(&a[0..1]:ReadWrite); if n == 0 { return; } }\n", 270)?;
+    assert(@len(slice_let.diags) == 1 && count_of(&slice_let:Read, 6009) == 1);
+    let slice_exclusive: diag::DiagBuffer = check("function f(): void { var a: [u8; 2] = [1u8, 2u8]; let v: &[u8]:ReadWrite = &a[0..1]:ReadWrite; let n: u8 = a[1]; if n == v[0] { return; } }\n", 271)?;
+    assert(@len(slice_exclusive.diags) == 1 && count_of(&slice_exclusive:Read, 6004) == 1);
+    let slice_shared: diag::DiagBuffer = check("foreign read(dst: &[u8]:ReadWrite): u32; function f(): void { var a: u8[] = [1u8]; let v: &[u8] = &a[0..1]:Read; let n: u32 = read(&a[0..1]:ReadWrite); if n as u64 == @len(v) { return; } }\n", 272)?;
+    assert(@len(slice_shared.diags) == 1 && count_of(&slice_shared:Read, 6004) == 1);
+    case_block_scalar_borrows()?;
+    case_binding_writability()?;
+    case_clone_domain()?;
+    case_call_move_required()?;
+    case_return_moves()?;
+    case_fallible_copy()?;
+    case_explicit_move()?;
+    case_copy_drop()?;
+    case_short_circuit()?;
+    case_loop_zero_iterations()?;
+    case_assignment_targets()?;
+    case_projection_host_invalidation()?;
+    case_aggregate_moves()?;
+    case_copy_field_argument()?;
+    case_match_value()?;
+    case_match_branches()?;
+    case_branches()?;
+    case_binding_moves()?;
+    case_use_after_move()?;
+    case_use_after_drop()?;
+    case_copy_keeps_live()?;
+    case_pass_transfers()?;
+    case_copy_type_reusable()?;
+    case_borrow_keeps_live()?;
+    case_temporary_write_borrow()?;
+    case_partial_move()?;
+    return;
+}

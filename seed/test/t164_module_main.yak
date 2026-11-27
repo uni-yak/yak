@@ -1,0 +1,3 @@
+// expected_trap: dependency cannot define main
+// module: bad=fixtures/bad_main.yak
+import bad; function main(): void {}

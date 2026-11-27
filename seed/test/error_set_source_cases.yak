@@ -1,0 +1,103 @@
+// 从 Yak 源码生成错误集并复验规范顺序和布局边界。
+import buf;
+import lex;
+import parse;
+import diag;
+import types;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import layout;
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+foreign exit(status: u8): void;
+
+function error_name(source: &buf::ByteBuf:ReadWrite, ordinal: u32): void!AllocError {
+    buf::buf_push_u8(source, 69u8)?;
+    var place: u32 = 10000;
+    while place != 0 {
+        buf::buf_push_u8(source, 48u8 + ((ordinal / place) % 10u32) as u8)?;
+        place = place / 10u32;
+    }
+    return;
+}
+
+function check_members(count: u32, expected_set_size: u64, expected_carrier_size: u64): void!AllocError {
+    var source: buf::ByteBuf = buf::buf_new();
+    // 声明和首次驻留顺序均与规范序相反，且数量越过大集合排序分支。
+    var ordinal: u32 = count;
+    while ordinal != 0 {
+        ordinal = ordinal - 1;
+        buf::buf_push_bytes(&source:ReadWrite, "enum ")?;
+        error_name(&source:ReadWrite, ordinal)?;
+        buf::buf_push_bytes(&source:ReadWrite, " { Failed }\n")?;
+    }
+    buf::buf_push_bytes(&source:ReadWrite, "function leaf(): void!(")?;
+    ordinal = count;
+    while ordinal != 0 {
+        ordinal = ordinal - 1;
+        error_name(&source:ReadWrite, ordinal)?;
+        buf::buf_push_bytes(&source:ReadWrite, " | ")?;
+    }
+    buf::buf_push_bytes(&source:ReadWrite, "E00012 | E00034 | E00000) { return E00012::Failed; }\n")?;
+    check_source(&source.data[0..source.pos]:Read, count, expected_set_size, expected_carrier_size)?;
+    return;
+}
+
+function check_source(source: &[u8], count: u32, expected_set_size: u64, expected_carrier_size: u64): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(source, 1u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 1u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit_for_check(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, 0, "source", &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &diags:ReadWrite)?;
+    assert(!diag::diagbuf_has_error(&diags:Read));
+    let ret: u32 = checked.funcs.items[0].ret;
+    let set: u32 = checked.types.entries[ret - 1].elem;
+    let entry: typecheck::TypeEntry = checked.types.entries[set - 1];
+    assert(entry.members_count == count);
+    var ordinal: u32 = 0;
+    while ordinal < entry.members_count {
+        let member: u32 = checked.types.members[entry.members_start + ordinal];
+        // 反向声明使最小标签名称对应最大 DefId。
+        assert(checked.types.entries[member - 1].def == count - ordinal);
+        ordinal = ordinal + 1;
+    }
+    let layouts: layout::LayoutResult = layout::layout_unit(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, &diags:ReadWrite)?;
+    if expected_set_size == 0 {
+        assert(diag::diagbuf_count(&diags:Read) == 1);
+        let diagnostic: diag::Diag = diags.diags[0];
+        let code: types::ErrorCode = diagnostic.code;
+        assert(code.raw == 5503u16);
+        assert(!layouts.table.items[set - 1].known && !layouts.table.items[ret - 1].known);
+    } else {
+        assert(!diag::diagbuf_has_error(&diags:Read));
+        assert(layouts.table.items[set - 1].known && layouts.table.items[set - 1].size == expected_set_size);
+        assert(layouts.table.items[ret - 1].known && layouts.table.items[ret - 1].size == expected_carrier_size);
+    }
+    return;
+}
+
+export function check_oversized_source(source: &[u8]): void!AllocError {
+    check_source(source, 65537u32, 0u64, 0u64)?;
+    write("常驻源码只发 E5503\n");
+    exit(0);
+    return;
+}
+
+export function verify_source_boundaries(full: bool): void!AllocError {
+    check_members(35, 2, 3)?;
+    check_members(257, 4, 6)?;
+    // 原生入口检查源级上限；普通解释回归只跑小集合。
+    if full {
+        check_members(65536, 4, 6)?;
+        write("65536 个唯一成员通过\n");
+        check_members(65537, 0, 0)?;
+        write("65537 个唯一成员只发 E5503\n");
+    }
+    exit(0);
+    return;
+}

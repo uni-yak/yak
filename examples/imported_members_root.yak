@@ -1,0 +1,15 @@
+// 消费方通过接口取得跨模块参数与结构体字段的实际类型和布局。
+import imported_struct_dep;
+import imported_members_mid;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function main(): void {
+    let p: imported_struct_dep::Pair = imported_struct_dep::make(13u32);
+    let first: u32 = imported_members_mid::read_pair(p);
+    let q: imported_struct_dep::Pair = imported_struct_dep::make(first);
+    let b: imported_members_mid::Box = imported_members_mid::Box { pair: q };
+    assert(b.pair.a == 13u32 && b.pair.b == 14u32 && b.pair.c == 15u32);
+    exit((b.pair.a + b.pair.b + b.pair.c) as u8);
+    return;
+}

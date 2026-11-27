@@ -1,0 +1,2 @@
+// expected_trap: literal overflow
+function main(): void { let x: u64 = 18446744073709551616; }

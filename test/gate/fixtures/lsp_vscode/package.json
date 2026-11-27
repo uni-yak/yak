@@ -1,0 +1,37 @@
+{
+  "name": "yak-lsp-vscode-gate",
+  "displayName": "Yak LSP VS Code Gate",
+  "version": "0.0.1",
+  "private": true,
+  "publisher": "yak-gate",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "main": "./check.cjs",
+  "contributes": {
+    "languages": [
+      {
+        "id": "yak",
+        "extensions": [
+          ".yak"
+        ]
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "yak.trace.server": {
+          "type": "string",
+          "default": "verbose",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ]
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  }
+}

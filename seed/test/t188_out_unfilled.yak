@@ -1,0 +1,3 @@
+// expected_trap: out slot not filled on success
+function f(out x: u32): void {}
+function main(): void { out x: u32; f(out x); }

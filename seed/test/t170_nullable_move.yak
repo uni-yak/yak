@@ -1,0 +1,3 @@
+// expected_trap: moved/dropped
+struct S { data: u8[], }
+function main(): void { let a: S? = S { data: [1] }; let b: S? = a; a.unwrap(); }

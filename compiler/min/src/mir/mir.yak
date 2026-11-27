@@ -1,0 +1,590 @@
+// 检查后的标量中间表示与确定性控制流构造。
+import types;
+import typecheck;
+import layout;
+
+const NONE: u32 = 4294967295u32;
+
+export struct MirLocal { id: u32, value_type_id: u32, kind: u8, state: u8 }
+
+export struct MirInst {
+    op: u8, a: u32, b: u32, c: u32, value: u64, value_type_id: u32,
+    args_start: u32, args_count: u32,
+    // 私有陷阱清理块号加一；零表示没有私有清理。
+    trap: u32,
+    // 指令后结束的词法视图使用链，仅供内存中的 MIR 验证。
+    view_ends: u32, opens_view_slot: bool,
+}
+
+export struct DomPredecessor { origin: u32, next: u32 }
+
+export function dominates(dominators: &[u32], origin: u32, target: u32): bool {
+    var walk: u32 = target;
+    while walk != origin {
+        let parent: u32 = dominators[walk];
+        if parent == NONE || parent == walk { return false; }
+        walk = parent;
+    }
+    return true;
+}
+
+export function reads_first(op: u8): bool {
+    if op >= 80 && op <= 83 { return true; }
+    if op < 80 {
+        return (op >= 16 && op <= 24) || (op >= 32 && op <= 36) || (op >= 48 && op <= 53) || op == 64;
+    }
+    if op >= 112 && op <= 130 { return op <= 115 || op >= 128; }
+    return op == 148 || op == 152 || op == 160 || op == 161 || op == 178 || op == 209 || op == 210;
+}
+
+export function reads_second(op: u8): bool {
+    if op >= 80 {
+        return op == 81 || op == 83 || op == 115 || op == 130 || op == 178 || op == 209;
+    }
+    return ((op >= 16 && op <= 24) && op != 21) || (op >= 32 && op <= 36) || (op >= 48 && op <= 53);
+}
+
+// 仅包含能在当前栈帧内跳到陷阱清理块的指令。
+export function has_trap_edge(op: u8): bool {
+    return (op >= 16 && op <= 21) || op == 35 || op == 36 || op == 83 || op == 130 || (op >= 149 && op <= 152);
+}
+
+export function is_foreign_call(op: u8): bool { return op == 147 || op == 149; }
+
+// 返回整值交接的单个来源；Copy 值只在显式 move/drop 时失效。
+export function handoff_source(inst: MirInst): u32 {
+    let op: u8 = inst.op;
+    if op == 112 || op == 115 || op == 160 || op == 161 { return inst.b; }
+    if op == 81 || op == 178 || op == 209 { return inst.c; }
+    if op == 176 { return inst.value as u32; }
+    return 0;
+}
+
+// 构造与调用按参数池交接整值；窥读原语与切片参数不转移所有权。
+export function hands_off_args(op: u8): bool {
+    return op == 96 || op == 97 || is_slot_call(op) || is_foreign_call(op);
+}
+
+export function terminates_process(op: u8): bool { return op == 195 || op == 197; }
+
+export struct MirTerminator { op: u8, a: u32, b: u32, c: u32 }
+
+// 多路分派臂表项：base 期用于 enum_dispatch（variant 为声明序 VariantId，block 为目标块）；
+// 该 (tag_index: u16, block: u16) 形态保持通用，供 full 层按规范成员序分派 PlainUnion 与多成员 .catch 复用。
+// base 期臂表按 variant 升序且覆盖全部变体；通配臂在降级时已展开，不保留 default。
+export struct MirArm { variant: u16, block: u16 }
+
+export struct MirViewEnd { local: u32, next: u32 }
+
+export struct MirBlock {
+    id: u16, inst_start: u32, inst_count: u32,
+    terminator: MirTerminator, payload: u32, entry_view_ends: u32,
+}
+
+export struct MirFunction {
+    def: u32, signature: u32, declared_no_alloc: bool, no_alloc: bool,
+    locals: MirLocal[], blocks: MirBlock[], insts: MirInst[], args: u32[], params: u32[],
+    arms: MirArm[], view_ends: MirViewEnd[],
+    entry: u16, has_trap_target: bool, trap_target: u16,
+}
+
+// 静态池条目：type 承载条目实型——字符串字面量条目是 &[u8] 视图类型，
+// 聚合常量条目是常量自身的类型（kind7 定长数组 / kind2 名义枚举）；
+// offset/length 指向模块级只读静态字节池，length 即条目布局字节数。
+export struct MirStatic { value_type_id: u32, offset: u32, length: u32 }
+
+// 导入签名来自接口，而不是调用指令本身；形参类型位于模块参数池。
+export struct MirImport { dep: u16, export_id: u32, param_count: u16, param_start: u32, ret: u32 }
+
+export struct MirModule {
+    functions: MirFunction[], types: typecheck::TypeTable, signatures: typecheck::FuncTable, imports: MirImport[], import_params: u32[],
+    fields: typecheck::FieldTable, enums: typecheck::EnumTable,
+    statics: MirStatic[], static_bytes: u8[],
+    // 所选依赖的布局摘要、导入结构体字段偏移与导入枚举变体；缺失即按未知拒绝。
+    imported_layouts: layout::ImportedLayoutTable, imported_fields: layout::ImportedFieldLayoutTable,
+    // 接口字段签名独立于布局表保存，复验不从待核对的布局表回读类型。
+    imported_field_types: typecheck::ImportedFieldTable,
+    imported_enums: typecheck::ImportedEnumTable,
+    // 变体身份和载荷签名独立于构造及分派使用的变体表。
+    imported_enum_signatures: typecheck::ImportedEnumTable,
+}
+
+export struct MirRejection { kind: u8, span: types::Span }
+
+export struct MirResult { accepted: bool, module: MirModule, rejection: MirRejection }
+
+export function func_sig(funcs: &typecheck::FuncTable:Read, def: u32): u32 {
+    return typecheck::func_sig(funcs, def);
+}
+
+// 缺少签名与非服务外部函数均不能证明无分配。
+export function foreign_service(module: &MirModule:Read, def: u32): u8 {
+    let sig: u32 = func_sig(&module.signatures:Read, def);
+    if sig == 0 { return 0; }
+    return module.signatures.items[sig - 1].service;
+}
+
+export function valid_type(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    return id > 0 && id <= @len(tt.entries) as u32;
+}
+
+export function is_void(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    return tt.entries[id - 1].kind == 0;
+}
+
+export function is_scalar(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    return entry.kind == 1 && entry.builtin >= 4097 && entry.builtin <= 4106;
+}
+
+export function is_bool(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    return tt.entries[id - 1].kind == 1 && tt.entries[id - 1].builtin == 4105;
+}
+
+// 地址局部的类型：内建 u64（4100）承载指针，由 field_addr / index_addr 产生。
+export function is_pointer(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    return tt.entries[id - 1].kind == 1 && tt.entries[id - 1].builtin == 4100;
+}
+
+export function enum_index(tc: &typecheck::TypeCheckResult:Read, id: u32): u32 {
+    if !valid_type(&tc.types:Read, id) { return 0; }
+    if tc.types.entries[id - 1].kind != 2 { return 0; }
+    var i: u32 = 0;
+    while i < @len(tc.enums.items) as u32 {
+        if tc.enums.items[i].def == tc.types.entries[id - 1].def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 导入枚举变体组是否完整：存在且每条变体签名均已解码。
+export function imported_enum_known(imported: &typecheck::ImportedEnumTable:Read, dep: u16, export_id: u32): bool {
+    var count: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(imported.items) as u32 {
+        if imported.items[i].dep == dep && imported.items[i].export_id == export_id {
+            count = count + 1;
+            if !imported.items[i].known { return false; }
+        }
+        i = i + 1;
+    }
+    return count != 0;
+}
+
+// 合法切片视图（Read / ReadWrite）共享胖指针表示，元素可为标量或已知布局聚合。
+export function is_slice_view(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    return entry.kind == 5 && entry.cap <= 1 && valid_type(tt, entry.elem);
+}
+
+// 字符串常量始终是只读字节切片。
+export function is_u8_slice(tt: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    if entry.kind != 5 || entry.cap != 0 { return false; }
+    if !valid_type(tt, entry.elem) { return false; }
+    let elem: typecheck::TypeEntry = tt.entries[entry.elem - 1];
+    return elem.kind == 1 && elem.builtin == 4097;
+}
+
+// 实参与绑定类型兼容：同类型，或允许 &T:ReadWrite → &T:Read / &[T]:ReadWrite → &[T]:Read 收窄（base.md 7.4）。
+export function arg_type_compatible(types: &typecheck::TypeTable:Read, actual: u32, formal: u32): bool {
+    if actual == formal { return true; }
+    if !valid_type(types, actual) || !valid_type(types, formal) { return false; }
+    let a: typecheck::TypeEntry = types.entries[actual - 1];
+    let f: typecheck::TypeEntry = types.entries[formal - 1];
+    return (a.kind == 4 || a.kind == 5) && a.kind == f.kind && a.cap == 1 && f.cap == 0 && a.elem == f.elem;
+}
+
+export function error_member(tt: &typecheck::TypeTable:Read, set: u32, member: u32): bool {
+    if set == member { return true; }
+    if !valid_type(tt, set) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[set - 1];
+    if entry.kind != 11 { return false; }
+    if entry.members_start > @len(tt.members) as u32 || entry.members_count > @len(tt.members) as u32 - entry.members_start { return false; }
+    var i: u32 = 0;
+    while i < entry.members_count {
+        if tt.members[entry.members_start + i] == member { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+export function error_subset(tt: &typecheck::TypeTable:Read, src: u32, dst: u32): bool {
+    if src == dst || error_member(tt, dst, src) { return true; }
+    if !valid_type(tt, src) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[src - 1];
+    if entry.kind != 11 { return false; }
+    if entry.members_start > @len(tt.members) as u32 || entry.members_count > @len(tt.members) as u32 - entry.members_start { return false; }
+    var i: u32 = 0;
+    while i < entry.members_count {
+        if !error_member(tt, dst, tt.members[entry.members_start + i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function local_type(ctx: &MirFunction:Read, id: u32): u32 {
+    if id == 0 || id > @len(ctx.locals) as u32 { return 0; }
+    return ctx.locals[id - 1].value_type_id;
+}
+
+// base 的槽位保存具体的非载体值。布局和参数检查分别验证可存储性与 ABI。
+export function out_payload_supported(types: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(types, id) { return false; }
+    let entry: typecheck::TypeEntry = types.entries[id - 1];
+    if is_scalar(types, id) || (entry.kind == 1 && entry.builtin == 4108) { return true; }
+    return entry.kind == 2 || entry.kind == 3 || entry.kind == 6 || entry.kind == 7;
+}
+
+function out_plain_return(types: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(types, id) { return false; }
+    let kind: u8 = types.entries[id - 1].kind;
+    return kind == 0 || kind == 8 || out_payload_supported(types, id);
+}
+
+export function out_return_supported(types: &typecheck::TypeTable:Read, id: u32): bool {
+    if !valid_type(types, id) { return false; }
+    let entry: typecheck::TypeEntry = types.entries[id - 1];
+    if entry.kind == 9 { return out_plain_return(types, entry.success); }
+    return out_plain_return(types, id);
+}
+
+// 从已计算的布局表按 TypeId 查字节尺寸；未知类型返回 0。
+export function layout_size(table: &layout::LayoutTable:Read, id: u32): u64 {
+    if id == 0 || id > @len(table.items) as u32 { return 0; }
+    let info: layout::LayoutInfo = table.items[id - 1];
+    if !info.known { return 0; }
+    return info.size;
+}
+
+// 聚合静态条目的类型域：kind7 定长数组，或 kind2 且 DefId 命中枚举表的名义枚举。
+// struct（kind2 非枚举 Def）不在域内：语言层的常量表达式不存在 struct 构造，
+// 这里防御性排除，op4 的条目类型只能是可物化聚合（&[u8] 视图仍由 op3 承载）。
+export function aggregate_static_type(tt: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, id: u32): bool {
+    if !valid_type(tt, id) { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    if entry.kind == 7 { return true; }
+    if entry.kind != 2 { return false; }
+    var i: u32 = 0;
+    while i < @len(enums.items) as u32 {
+        if enums.items[i].def == entry.def { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+export function copy_imported_fields(src: &layout::ImportedFieldLayoutTable:Read): layout::ImportedFieldLayoutTable!AllocError {
+    var dst: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    var i: u32 = 0;
+    while i < @len(src.items) as u32 { @push(dst.items, src.items[i])?; i = i + 1; }
+    return dst;
+}
+
+export function copy_imported_enums(src: &typecheck::ImportedEnumTable:Read): typecheck::ImportedEnumTable!AllocError {
+    var dst: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    var i: u32 = 0;
+    while i < @len(src.items) as u32 { @push(dst.items, src.items[i])?; i = i + 1; }
+    return dst;
+}
+
+// 字段地址立即值高 32 位为声明序，低 32 位为间接基址类型；
+// 索引地址高 32 位为间接基址类型，低 32 位为布局步长。
+export function projection_base(inst: MirInst): u32 {
+    if inst.op == 82 { return inst.value as u32; }
+    return (inst.value >> 32u64) as u32;
+}
+
+export function projection_stride(inst: MirInst): u32 { return inst.value as u32; }
+
+export function projection_field(inst: MirInst): u32 { return (inst.value >> 32u64) as u32; }
+
+// 内建只读字段沿用字段投影。动态数组和切片的 len 为第 0 字段，动态数组的 cap 为第 1 字段。
+export function array_field_offset(kind: u8, field: u32): u32 {
+    if field == 0 && (kind == 5 || kind == 6) { return 8; }
+    if field == 1 && kind == 6 { return 16; }
+    return 0;
+}
+
+// 使用已计算的布局表取投影指向的类型，避免按指令重复全表求布局。
+export function projection_pointee_with_layout(module: &MirModule:Read, layouts: &layout::LayoutTable:Read, base: u32, inst: MirInst): u32 {
+    return projection_pointee_indexed(module, layouts, base, inst, false);
+}
+
+export function projection_pointee_indexed(module: &MirModule:Read, layouts: &layout::LayoutTable:Read, base: u32, inst: MirInst, ordered: bool): u32 {
+    if !valid_type(&module.types:Read, base) { return 0; }
+    let entry: typecheck::TypeEntry = module.types.entries[base - 1];
+    if inst.op == 83 { return entry.elem; }
+    if inst.op != 82 { return 0; }
+    let field: u32 = projection_field(inst);
+    if field > 65535 { return 0; }
+    if entry.kind == 5 || entry.kind == 6 {
+        let offset: u32 = array_field_offset(entry.kind, field);
+        if offset != 0 && offset == inst.c && is_pointer(&module.types:Read, inst.value_type_id) { return inst.value_type_id; }
+        return 0;
+    }
+    var i: u32 = 0;
+    if entry.kind == 2 && entry.def != 0 {
+        let offset: u64 = layout::field_byte_offset_from_table(layouts, &module.fields:Read, entry.def, field);
+        if offset >= 4294967295u64 || offset != inst.c as u64 { return 0; }
+        var ordinal: u32 = 0;
+        while i < @len(module.fields.items) as u32 {
+            if module.fields.items[i].def == entry.def {
+                if ordinal == field { return module.fields.items[i].type_id; }
+                ordinal = ordinal + 1;
+            }
+            i = i + 1;
+        }
+    } elseif entry.kind == 3 {
+        i = layout::imported_fields_start(&module.imported_fields:Read, entry.dep, entry.export_id, ordered);
+        let total: u32 = @len(module.imported_fields.items) as u32;
+        while i < total {
+            let item: layout::ImportedFieldLayout = module.imported_fields.items[i];
+            if item.dep == entry.dep && item.export_id == entry.export_id {
+                if item.field == field + 1 {
+                    if item.known && item.offset == inst.c as u64 { return item.value_type_id; }
+                    return 0;
+                }
+            } elseif ordered { break; }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// 取投影指向的类型。字段按声明序查询，并核对原生地址的字节偏移。
+export function projection_pointee(module: &MirModule:Read, base: u32, inst: MirInst): u32!AllocError {
+    if !valid_type(&module.types:Read, base) { return 0; }
+    let entry: typecheck::TypeEntry = module.types.entries[base - 1];
+    if inst.op == 83 { return entry.elem; }
+    if inst.op != 82 { return 0; }
+    let field: u32 = projection_field(inst);
+    if field > 65535 { return 0; }
+    if entry.kind == 5 || entry.kind == 6 {
+        let offset: u32 = array_field_offset(entry.kind, field);
+        if offset != 0 && offset == inst.c && is_pointer(&module.types:Read, inst.value_type_id) { return inst.value_type_id; }
+        return 0;
+    }
+    var i: u32 = 0;
+    if entry.kind == 2 && entry.def != 0 {
+        let offset: u64 = layout::field_byte_offset_with_imports(&module.types:Read, &module.fields:Read, &module.enums:Read, &module.imported_layouts:Read, &module.imported_enums:Read, entry.def, field)?;
+        if offset >= 4294967295u64 || offset != inst.c as u64 { return 0; }
+        var ordinal: u32 = 0;
+        while i < @len(module.fields.items) as u32 {
+            if module.fields.items[i].def == entry.def {
+                if ordinal == field { return module.fields.items[i].type_id; }
+                ordinal = ordinal + 1;
+            }
+            i = i + 1;
+        }
+    } elseif entry.kind == 3 {
+        while i < @len(module.imported_fields.items) as u32 {
+            let item: layout::ImportedFieldLayout = module.imported_fields.items[i];
+            if item.dep == entry.dep && item.export_id == entry.export_id && item.field == field + 1 {
+                if item.known && item.offset == inst.c as u64 { return item.value_type_id; }
+                return 0;
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// 枚举身份：kind 0=非枚举，1=本地 DefId，2=内置 AllocError，3=导入 (dep, export_id)。
+export struct EnumIdentity { kind: u8, def: u32, dep: u16, export_id: u32 }
+
+export function enum_identity_of(types: &typecheck::TypeTable:Read, value_type_id: u32): EnumIdentity {
+    let none: EnumIdentity = EnumIdentity { kind: 0, def: 0, dep: 0, export_id: 0 };
+    if value_type_id == 0 || value_type_id > @len(types.entries) as u32 { return none; }
+    let entry: typecheck::TypeEntry = types.entries[value_type_id - 1];
+    if entry.kind == 2 { return EnumIdentity { kind: 1, def: entry.def, dep: 0, export_id: 0 }; }
+    if entry.kind == 1 && entry.builtin == 4108 { return EnumIdentity { kind: 2, def: 4108, dep: 0, export_id: 0 }; }
+    if entry.kind == 3 { return EnumIdentity { kind: 3, def: 0, dep: entry.dep, export_id: entry.export_id }; }
+    return none;
+}
+
+// 取 enum 的变体总数；导入枚举要求变体表完整（缺签名返回 0，由调用方拒绝）。
+export function enum_count_of(types: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, imported: &typecheck::ImportedEnumTable:Read, value_type_id: u32): u32 {
+    let identity: EnumIdentity = enum_identity_of(types, value_type_id);
+    if identity.kind == 2 { return 1; }
+    if identity.kind == 1 {
+        var i: u32 = 0;
+        while i < @len(enums.items) as u32 {
+            if enums.items[i].def == identity.def { return @len(enums.items[i].payloads) as u32; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if identity.kind == 3 {
+        if !imported_enum_known(imported, identity.dep, identity.export_id) { return 0; }
+        var count: u32 = 0;
+        var i: u32 = 0;
+        while i < @len(imported.items) as u32 {
+            if imported.items[i].dep == identity.dep && imported.items[i].export_id == identity.export_id { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+    return 0;
+}
+
+// 导入枚举变体载荷：返回消费方类型编号（0 表示无载荷），未知或未找到返回 NONE。
+export function imported_payload_of(imported: &typecheck::ImportedEnumTable:Read, dep: u16, export_id: u32, variant: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(imported.items) as u32 {
+        if imported.items[i].dep == dep && imported.items[i].export_id == export_id && imported.items[i].variant == variant {
+            if !imported.items[i].known { return NONE; }
+            return imported.items[i].payload;
+        }
+        i = i + 1;
+    }
+    return NONE;
+}
+
+// 无载荷返回 0；不存在的变体或缺少签名返回 NONE。
+export function variant_payload(enums: &typecheck::EnumTable:Read, imported: &typecheck::ImportedEnumTable:Read, identity: EnumIdentity, variant: u32): u32 {
+    if identity.kind == 2 && variant == 0 { return 0; }
+    if identity.kind == 3 { return imported_payload_of(imported, identity.dep, identity.export_id, variant); }
+    if identity.kind == 1 {
+        var i: u32 = 0;
+        while i < @len(enums.items) as u32 {
+            if enums.items[i].def == identity.def {
+                if variant >= @len(enums.items[i].payloads) as u32 { return NONE; }
+                return enums.items[i].payloads[variant];
+            }
+            i = i + 1;
+        }
+    }
+    return NONE;
+}
+
+export function supports_equality(types: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, imported: &typecheck::ImportedEnumTable:Read, id: u32, depth: u32): bool {
+    if depth > 16 || !valid_type(types, id) { return false; }
+    if is_scalar(types, id) || types.entries[id - 1].kind == 8 { return true; }
+    let count: u32 = enum_count_of(types, enums, imported, id);
+    if count == 0 { return false; }
+    let identity: EnumIdentity = enum_identity_of(types, id);
+    var i: u32 = 0;
+    while i < count {
+        let payload: u32 = variant_payload(enums, imported, identity, i);
+        if payload != 0 && !supports_equality(types, enums, imported, payload, depth + 1) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 按值存储形态：0 为未证明，1 为 Copy，2 为递归拥有堆资源。
+// 枚举必须验证全部变体，实际克隆和析构只访问活跃载荷。
+function storage_shape_ordered(tt: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, id: u32, depth: u32, ordered_fields: bool): u8 {
+    if depth > 16 || !valid_type(tt, id) { return 0; }
+    let e: typecheck::TypeEntry = tt.entries[id - 1];
+    if is_scalar(tt, id) || e.kind == 8 { return 1; }
+    if e.kind == 6 || e.kind == 7 {
+        let element: u8 = storage_shape_ordered(tt, fields, enums, imported, imported_enums, e.elem, depth + 1, ordered_fields);
+        if element == 0 { return 0; }
+        if e.kind == 6 { return 2; }
+        return element;
+    }
+    let count: u32 = enum_count_of(tt, enums, imported_enums, id);
+    var shape: u8 = 1;
+    var i: u32 = 0;
+    if count != 0 {
+        let identity: EnumIdentity = enum_identity_of(tt, id);
+        while i < count {
+            let payload: u32 = variant_payload(enums, imported_enums, identity, i);
+            if payload != 0 {
+                let child: u8 = storage_shape_ordered(tt, fields, enums, imported, imported_enums, payload, depth + 1, ordered_fields);
+                if child == 0 { return 0; }
+                if child == 2 { shape = 2; }
+            }
+            i = i + 1;
+        }
+        return shape;
+    }
+    var found: bool = false;
+    if e.kind == 2 {
+        while i < @len(fields.items) as u32 {
+            if fields.items[i].def == e.def {
+                found = true;
+                let child: u8 = storage_shape_ordered(tt, fields, enums, imported, imported_enums, fields.items[i].type_id, depth + 1, ordered_fields);
+                if child == 0 { return 0; }
+                if child == 2 { shape = 2; }
+            }
+            i = i + 1;
+        }
+    } elseif e.kind == 3 {
+        i = layout::imported_fields_start(imported, e.dep, e.export_id, ordered_fields);
+        let total: u32 = @len(imported.items) as u32;
+        while i < total {
+            let field: layout::ImportedFieldLayout = imported.items[i];
+            if field.dep == e.dep && field.export_id == e.export_id {
+                if !field.known { return 0; }
+                found = true;
+                let child: u8 = storage_shape_ordered(tt, fields, enums, imported, imported_enums, field.value_type_id, depth + 1, ordered_fields);
+                if child == 0 { return 0; }
+                if child == 2 { shape = 2; }
+            } elseif ordered_fields { break; }
+            i = i + 1;
+        }
+    }
+    if found { return shape; }
+    return 0;
+}
+
+export function storage_shape(tt: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, id: u32, depth: u32): u8 {
+    let ordered: bool = layout::imported_fields_ordered(imported);
+    return storage_shape_ordered(tt, fields, enums, imported, imported_enums, id, depth, ordered);
+}
+
+export function function_index(module: &MirModule:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(module.functions) as u32 {
+        if module.functions[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Yak 被调方负责槽位初始化及本帧回滚，三种调用目标共用这条规则。
+export function is_local_call(op: u8): bool { return op == 144 || op == 150; }
+export function is_far_call(op: u8): bool { return op == 145 || op == 151; }
+export function is_indirect_call(op: u8): bool { return op == 148 || op == 152; }
+export function is_slot_call(op: u8): bool { return op == 144 || op == 145 || op == 148 || (op >= 150 && op <= 152); }
+export function is_checked_call(op: u8): bool { return op >= 150 && op <= 152; }
+
+export function trap_reason(op: u8): u32 {
+    if op == 149 { return 1; }
+    if is_checked_call(op) { return 2; }
+    return 0;
+}
+
+export function import_index(module: &MirModule:Read, dep: u32, export_id: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(module.imports) as u32 {
+        if module.imports[i].dep as u32 == dep && module.imports[i].export_id == export_id { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+export function function_ref_matches(types: &typecheck::TypeTable:Read, id: u32, params: &[u32], result: u32): bool {
+    if !valid_type(types, id) || !valid_type(types, result) { return false; }
+    let ty: typecheck::TypeEntry = types.entries[id - 1];
+    let total: u32 = @len(types.members) as u32;
+    if ty.kind != 8 || ty.elem != result || ty.members_count != @len(params) as u32 ||
+        ty.members_start > total || ty.members_count > total - ty.members_start { return false; }
+    var i: u32 = 0;
+    while i < ty.members_count {
+        let formal: u32 = params[i];
+        if !valid_type(types, formal) || types.members[ty.members_start + i] != formal { return false; }
+        let kind: u8 = types.entries[formal - 1].kind;
+        if kind != 4 && kind != 5 && kind != 8 { return false; }
+        i = i + 1;
+    }
+    return true;
+}

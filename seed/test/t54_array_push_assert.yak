@@ -1,0 +1,14 @@
+// t54: @push 后 @len assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var arr: u8[] = [];
+    @push(arr, 65);
+    @push(arr, 66);
+    @push(arr, 67);
+    let n: u32 = @len(arr) as u32;
+    assert(n == 3);
+    assert(arr[0] == 65);
+    assert(arr[2] == 67);
+    return;
+}

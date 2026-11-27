@@ -1,0 +1,125 @@
+// 绑定 System V 发射结果与 ELF64 对象容器。函数体、数据池与调用目标均来自已验证的 MIR。
+import buf;
+import coff;
+import coff_state;
+import coff_symbols;
+import elf;
+import mir;
+
+function rejected(code: u16): elf::ObjectResult {
+    return elf::ObjectResult { code: code, bytes: buf::buf_new() };
+}
+
+function layout_error(kind: u8): u16 {
+    if kind == 5 { return coff::e_em5(); }
+    if kind == 6 { return coff::e_em6(); }
+    let diagnostic: u16 = coff_state::win64_reject_code(kind);
+    if diagnostic != 0 { return diagnostic; }
+    return coff::e_em4();
+}
+
+// 先按生产链接键排序，再按 ELF 规则把局部符号放在全局符号前。
+// LinkId 是目标绑定号，连续分配给最终表中的每个条目，零号留给 ELF。
+function append_symbols(input: &elf::ObjectInput:ReadWrite, keys: &u64[]:ReadWrite,
+    layout: &coff_state::ObjectLayout:Read, ordered: &[coff_symbols::OutSymbol]:Read, public: bool): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(ordered) as u32 {
+        let item: &coff_symbols::OutSymbol:Read = &ordered[i]:Read;
+        let external: bool = item.storage == coff_symbols::sym_class_external();
+        if external == public {
+            let link: u32 = (@len(input.symbols) as u32) + 1;
+            let position: u64 = item.value as u64;
+            var length: u64 = 0;
+            if item.section != 0 {
+                let index: u32 = coff_symbols::function_index(layout, item.def);
+                length = layout.functions[index].code_size as u64;
+            }
+            let name: u8[] = @clone(item.name)?;
+            @push(input.symbols, elf::Symbol { link: link, name: @move(name), section: item.section as u16,
+                kind: 2, public: public, value: position, size: length })?;
+            @push(*keys, item.def)?;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+function lookup(keys: &[u64]:Read, key: u64): u32 {
+    var i: u32 = 0;
+    while i < @len(keys) as u32 {
+        if keys[i] == key { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 已按函数和指令顺序生成两个引用流，按实际位移站点归并为 ELF 的 RELA 顺序。
+function append_relocations(input: &elf::ObjectInput:ReadWrite, layout: &coff_state::ObjectLayout:Read,
+    keys: &[u64]:Read, pool: u32): u16!AllocError {
+    var i: u32 = 0;
+    while i < @len(layout.functions) as u32 {
+        let func: &coff_state::FunctionLayout:Read = &layout.functions[i]:Read;
+        var c: u32 = 0;
+        var d: u32 = 0;
+        let calls: u32 = @len(func.calls) as u32;
+        let data: u32 = @len(func.data_refs) as u32;
+        while c < calls || d < data {
+            if c < calls && (d == data || func.calls[c].at < func.data_refs[d].at) {
+                let site: coff_state::CallSite = func.calls[c];
+                let symbol: u32 = lookup(keys, site.symbol);
+                if symbol == 0 { return coff_symbols::e_em1(); }
+                let address: u64 = (func.text_offset as u64) + (site.at as u64);
+                var kind: u32 = 2;
+                // 静态函数引用是 LEA 地址计算。只有未定义目标的直接调用使用 PLT32。
+                if site.kind != 5 && input.symbols[symbol - 1].section == 0 { kind = 4; }
+                @push(input.relocations, elf::Relocation { section: 1, offset: address, target: symbol, kind: kind, width: 4, addend: -4 })?;
+                c = c + 1;
+            } else {
+                let site: coff_state::DataRef = func.data_refs[d];
+                if pool == 0 || site.index >= @len(layout.static_offsets) as u32 { return coff::e_em3(); }
+                let offset: u32 = layout.static_offsets[site.index];
+                if (offset as u64) > @len(layout.rdata) { return coff::e_em3(); }
+                let address: u64 = (func.text_offset as u64) + (site.at as u64);
+                @push(input.relocations, elf::Relocation { section: 1, offset: address, target: pool, kind: 2,
+                    width: 4, addend: (offset as i64) - 4i64 })?;
+                d = d + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+export function emit_object(module: &mir::MirModule:Read, table: &coff_state::LinkTable:Read): elf::ObjectResult!AllocError {
+    let invalid: u16 = coff_symbols::validate_target_links(table, true)?;
+    if invalid != 0 { return rejected(invalid); }
+    let layout: coff_state::ObjectLayout = coff::build_sysv_layout(module)?;
+    if layout.rejected != 0 { return rejected(layout_error(layout.reject_kind)); }
+    let links: coff_state::LinkTable = coff::augment_runtime_symbols(module, table, &layout:Read)?;
+    let bad_symbols: u16 = coff_symbols::validate_symbols(&links:Read, &layout:Read)?;
+    if bad_symbols != 0 { return rejected(bad_symbols); }
+    let bad_sites: u16 = coff::validate_stream_reloc_sites(&layout:Read);
+    if bad_sites != 0 { return rejected(bad_sites); }
+    let raw: coff_symbols::OutSymbol[] = coff_symbols::build_target_symbols(&links:Read, &layout:Read, false)?;
+    let symbols: coff_symbols::OutSymbol[] = coff_symbols::sorted_symbols(&raw[0..@len(raw)]:Read, &links:Read)?;
+    var input: elf::ObjectInput = elf::ObjectInput { sections: [], symbols: [], relocations: [], small_mode: false };
+    @push(input.sections, elf::Section { index: 1, flags: 6, bytes: @clone(layout.text)? })?;
+    @push(input.sections, elf::Section { index: 2, flags: 2, bytes: @clone(layout.rdata)? })?;
+    @push(input.sections, elf::Section { index: 3, flags: 3, bytes: @clone(layout.data)? })?;
+    var keys: u64[] = [];
+    let order: &[coff_symbols::OutSymbol]:Read = &symbols[0..@len(symbols)]:Read;
+    append_symbols(&input:ReadWrite, &keys:ReadWrite, &layout:Read, order, false)?;
+    var pool: u32 = 0;
+    // 空字面量也允许引用只读节基址；是否需要锚点由静态条目表决定。
+    if @len(layout.static_offsets) != 0 {
+        pool = (@len(input.symbols) as u32) + 1;
+        let anchor: u8[] = [46, 76, 121, 97, 107, 95, 114, 111, 100, 97, 116, 97];
+        @push(input.symbols, elf::Symbol { link: pool, name: @move(anchor), section: 2,
+            kind: 0, public: false, value: 0, size: 0 })?;
+        @push(keys, 0u64)?;
+    }
+    append_symbols(&input:ReadWrite, &keys:ReadWrite, &layout:Read, order, true)?;
+    let reloc_status: u16 = append_relocations(&input:ReadWrite, &layout:Read, &keys[0..@len(keys)]:Read, pool)?;
+    if reloc_status != 0 { return rejected(reloc_status); }
+    return elf::emit_object(&input:Read)?;
+}

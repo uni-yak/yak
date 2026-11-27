@@ -1,0 +1,20 @@
+// mem_limit: 150000
+foreign assert(cond: bool): void;
+enum Fail { Stop }
+struct Item { data: u32[] }
+function make(): Item[] { return [Item { data: [1u32] }]; }
+function stop(): u32!Fail { return Fail::Stop; }
+function called(data: &u32[], next: u32): u32 { assert(false); return data[0u32] + next; }
+function run(early: bool): u32!Fail {
+    if early { return called(make()[stop()?].data, 0u32); }
+    return called(make()[0u32].data, stop()?);
+}
+function recover(failure: &Fail): u32 { return 9u32; }
+function main(): void {
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(run(true).catch(&recover) == 9u32);
+        assert(run(false).catch(&recover) == 9u32);
+        i = i + 1u32;
+    }
+}

@@ -1,0 +1,28 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+enum Failure { Bad }
+function first(state: &u32:ReadWrite): Item {
+    *state = 1u32;
+    return Item { data: [7u32, 8u32] };
+}
+function fail(state: &u32:ReadWrite): u32!Failure {
+    assert(*state == 1u32);
+    *state = 2u32;
+    return Failure::Bad;
+}
+function later(state: &u32:ReadWrite): u32 { *state = 3u32; return 0u32; }
+function invoke(item: &Item, feed: &u32, last: &u32): u32 { assert(false); return 0u32; }
+function attempt(state: &u32:ReadWrite): u32!Failure {
+    return invoke(first(state), fail(state)?, later(state));
+}
+function recover(e: &Failure): u32 { return 9u32; }
+function main(): void {
+    var state: u32 = 0u32;
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(attempt(&state:ReadWrite).catch(&recover) == 9u32);
+        assert(state == 2u32);
+        i = i + 1u32;
+    }
+}

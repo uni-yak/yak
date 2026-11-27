@@ -1,0 +1,1 @@
+export function value(): u32 { return 1; }

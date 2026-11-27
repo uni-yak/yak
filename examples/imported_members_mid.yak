@@ -1,0 +1,12 @@
+// 公开签名与两个名义成员位置均直接引用依赖的 Pair。
+import imported_struct_dep;
+export struct Box { pair: imported_struct_dep::Pair }
+export enum Packet { Value(imported_struct_dep::Pair) }
+
+export function make_pair(x: u32): imported_struct_dep::Pair {
+    return imported_struct_dep::make(x);
+}
+
+export function read_pair(x: imported_struct_dep::Pair): u32 {
+    return x.a;
+}

@@ -1,0 +1,7 @@
+export struct Batch { stamp: u8, rows: [u8[][]; 2], tail: u8[] }
+export enum Choice { Empty, Bundle(Batch), Spare(u8[]) }
+
+export function build(): Choice {
+    let batch: Batch = Batch { stamp: 42u8, rows: [[[11u8], [12u8]], [[13u8]]], tail: [14u8] };
+    return Choice::Bundle(batch);
+}

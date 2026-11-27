@@ -1,0 +1,7 @@
+// expected_code: E1007
+// spec: spec/lang/lex.md L-7
+// 触发：base 期书写浮点字面量（f32 类型）。
+function main(): void {
+    let x: f32 = 1.5;
+    return;
+}

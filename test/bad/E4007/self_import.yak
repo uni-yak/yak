@@ -1,0 +1,6 @@
+// expected_code: E4007
+// module_graph: scan
+// spec: spec/lang/module.md#N-7、spec/lang/name.md#N-7
+// 触发：根模块直接导入自身。
+import self_import;
+function main(): void { return; }

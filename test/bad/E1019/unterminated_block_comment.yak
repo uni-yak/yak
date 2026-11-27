@@ -1,0 +1,5 @@
+// expected_code: E1019
+// spec: spec/lang/lex.md L-19
+// 触发：块注释直到文件末尾都没有结束界定符。
+function main(): void { return; }
+/* 未闭合

@@ -1,0 +1,2 @@
+// expected_trap: unknown or mismatched type
+function main(): void { let value: i99 = 1; }

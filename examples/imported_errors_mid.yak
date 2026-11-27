@@ -1,0 +1,10 @@
+// 公开签名保留底层模块的两个错误枚举，不重新声明其身份。
+import imported_errors_dep;
+
+export function relay(x: u32): u32!(imported_errors_dep::Widthy | imported_errors_dep::Z) {
+    let v: u32 = imported_errors_dep::value(x)?;
+    return v;
+}
+
+// 与底层模块同名、同布局，但声明身份独立。
+export enum Z { Bad(u8) }

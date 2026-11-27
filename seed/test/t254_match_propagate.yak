@@ -1,0 +1,28 @@
+foreign assert(cond: bool): void;
+enum Choice { Left, Right, }
+enum Failure { Bad, }
+enum OtherFailure { Bad, }
+
+function choose(n: &u32): Choice!(Failure | OtherFailure) {
+    if *n == 0 { return Failure::Bad; }
+    if *n == 3 { return OtherFailure::Bad; }
+    if *n == 1 { return Choice::Left; }
+    return Choice::Right;
+}
+
+function run(n: u32): u32!(Failure | OtherFailure) {
+    match choose(&n)? {
+        Left => { return 11; },
+        Right => { return 22; },
+    }
+    return 99;
+}
+
+function recover(e: &Failure): u32 { return 33; }
+function recover_other(e: &OtherFailure): u32 { return 44; }
+function main(): void {
+    assert(run(0).catch(Failure => &recover, OtherFailure => &recover_other) == 33);
+    assert(run(1).catch(Failure => &recover, OtherFailure => &recover_other) == 11);
+    assert(run(2).catch(Failure => &recover, OtherFailure => &recover_other) == 22);
+    assert(run(3).catch(Failure => &recover, OtherFailure => &recover_other) == 44);
+}

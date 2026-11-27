@@ -1,0 +1,16 @@
+// t98: ? 传播链（g 调 f()? 再向上传播，成功路径）
+foreign assert(cond: bool): void;
+enum E { Bad }
+function f(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function g(x: u32): u32!E {
+    let v: u32 = f(x)?;
+    return v + 1;
+}
+function main(): void {
+    let v: u32 = g(5)?;
+    assert(v == 6);
+    return;
+}

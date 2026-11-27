@@ -1,0 +1,738 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+import ast;
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import layout;
+import iface;
+import iface_write;
+import iface_load;
+import hash;
+foreign assert(cond: bool): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    return Loaded { parsed: p, lexed: r };
+}
+function find_export(li: &iface::LoadedInterface:Read, kind: u8, ordinal: u32): u32 {
+    var seen: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(li.exports) as u32 {
+        if li.exports[i].kind == kind {
+            if seen == ordinal { return i + 1; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+function find_summary(li: &iface::LoadedInterface:Read, export_id: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(li.summaries) as u32 {
+        if li.summaries[i].type_export_id == export_id { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function find_enum_desc(li: &iface::LoadedInterface:Read, export_id: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(li.enum_descriptors) as u32 {
+        if li.enum_descriptors[i].export_id == export_id { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function has_code(diags: &diag::DiagBuffer:Read, code: u16): bool {
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(diags) {
+        if diags.diags[i].code.raw == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function find_struct_desc(li: &iface::LoadedInterface:Read, export_id: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(li.struct_descriptors) as u32 {
+        if li.struct_descriptors[i].export_id == export_id { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function reject_record_flag(original: &[u8], offset: u32, value: u8): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    bytes[offset] = value;
+    i = 24;
+    while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0;
+    while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    assert(has_code(&diags:Read, 7012) && @len(rejected.exports) == 0);
+    return;
+}
+function accept_record_flag(original: &[u8], offset: u32, value: u8): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    bytes[offset] = value;
+    i = 24; while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0; while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0 && @len(loaded.exports) == 3);
+    return;
+}
+// 同时重算名称哈希和接口摘要，避免其他检查掩盖非法名称。
+function check_interface_name(original: &[u8], hash_offset: u32, name_offset: u32, value: u8, valid: bool): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    bytes[name_offset] = value;
+    let hash_value: u64 = hash::fnv1a(&bytes[name_offset..name_offset + 1]:Read);
+    i = 0; while i < 8 { bytes[hash_offset + i] = ((hash_value >> ((i as u64) * 8)) & 255) as u8; i = i + 1; }
+    i = 24; while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0; while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    if valid {
+        assert(!diags.has_error && @len(rejected.exports) == 3);
+    } else {
+        assert(has_code(&diags:Read, 7012) && @len(rejected.exports) == 0);
+    }
+    return;
+}
+function reject_reversed_index(original: &[u8], offset: u32): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    i = 0;
+    while i < 8 {
+        let value: u8 = bytes[offset + i];
+        bytes[offset + i] = bytes[offset + 8 + i];
+        bytes[offset + 8 + i] = value;
+        i = i + 1;
+    }
+    i = 24;
+    while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0;
+    while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let rejected: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    assert(has_code(&diags:Read, 7012) && @len(rejected.exports) == 0);
+    return;
+}
+function section_offset(bytes: &[u8], section: u32): u32 {
+    let p: u32 = 60 + section * 16;
+    return bytes[p] as u32 | (bytes[p + 1] as u32 << 8) | (bytes[p + 2] as u32 << 16) | (bytes[p + 3] as u32 << 24);
+}
+// 重定位签名节并重新计算摘要，确保只改变待测成员的类型。
+function check_member_layout(original: &[u8], sig: &[u8], record: u32, summary_index: u32, member: &[u8], size: u32, align: u8, code: u16): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    let new_offset: u32 = @len(bytes) as u32;
+    i = 0;
+    while i < @len(sig) as u32 { @push(bytes, sig[i])?; i = i + 1; }
+    let member_offset: u32 = @len(sig) as u32;
+    i = 0;
+    while i < @len(member) as u32 { @push(bytes, member[i])?; i = i + 1; }
+    let sig_len: u32 = member_offset + @len(member) as u32;
+    let total: u32 = @len(bytes) as u32;
+    set_test_u32(&bytes:ReadWrite, 20, total);
+    set_test_u32(&bytes:ReadWrite, 60 + 4 * 16, new_offset);
+    set_test_u32(&bytes:ReadWrite, 64 + 4 * 16, sig_len);
+    set_test_u32(&bytes:ReadWrite, 68 + 4 * 16, sig_len);
+    set_test_u32(&bytes:ReadWrite, record + 16, member_offset);
+    set_test_u32(&bytes:ReadWrite, record + 20, @len(member) as u32);
+    let summary: u32 = section_offset(original, 5) + summary_index * 16;
+    set_test_u32(&bytes:ReadWrite, summary + 4, size);
+    set_test_u32(&bytes:ReadWrite, summary + 8, 0);
+    bytes[summary + 12] = align;
+    i = 24; while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0; while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    if code == 0 { assert(diag::diagbuf_count(&diags:Read) == 0 && @len(result.exports) == 3); }
+    else { assert(diag::diagbuf_count(&diags:Read) == 1 && has_code(&diags:Read, code) && @len(result.exports) == 0); }
+    return;
+}
+function check_depth_interface(original: &[u8], sig: &[u8], record: u32, summary_index: u32, layers: u32): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < layers { @push(bytes, 6)?; i = i + 1; }
+    @push(bytes, 1)?; @push(bytes, 1)?; @push(bytes, 16)?; @push(bytes, 0)?; @push(bytes, 0)?;
+    // 动态数组字段加另一字段，或枚举标签加动态数组载荷，布局均为 32/8。
+    var code: u16 = 0;
+    if layers == 64 { code = 9001; }
+    check_member_layout(original, sig, record, summary_index, &bytes[0..@len(bytes)]:Read, 32, 8, code)?;
+    return;
+}
+function check_layout_graph(original: &[u8], sig: &[u8], field: u32, summary: u32, struct_id: u32, enum_id: u32): void!AllocError {
+    // P 的首字段改为 E，随后仍为 u32；P 的真实布局为 12/4。
+    let nominal: u8[] = [2, enum_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &nominal[0..7]:Read, 12, 4, 0)?;
+    check_member_layout(original, sig, field, summary, &nominal[0..7]:Read, 8, 4, 7012)?;
+    let nullable: u8[] = [11, 2, enum_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &nullable[0..8]:Read, 16, 4, 0)?;
+    let fixed: u8[] = [5, 2, 0, 0, 0, 0, 0, 0, 0, 2, enum_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &fixed[0..16]:Read, 20, 4, 0)?;
+    let overflow: u8[] = [5, 255, 255, 255, 255, 255, 255, 255, 255, 2, enum_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &overflow[0..16]:Read, 20, 4, 7012)?;
+    let cycle: u8[] = [11, 2, struct_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &cycle[0..8]:Read, 8, 4, 7012)?;
+    let dynamic: u8[] = [6, 2, struct_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &dynamic[0..8]:Read, 32, 8, 0)?;
+    // 数组头布局正确，但元素以 P 的最终尺寸计算时会溢出。
+    let dynamic_overflow: u8[] = [6, 5, 255, 255, 255, 255, 255, 255, 255, 255, 2, struct_id as u8, 0, 0, 0, 0, 0];
+    check_member_layout(original, sig, field, summary, &dynamic_overflow[0..17]:Read, 32, 8, 7012)?;
+    // 回调本体仍是 8/8，但返回的动态数组不能使用溢出的本地元素布局。
+    var callback: u8[] = [9, 0, 0, 6, 5, 1, 0, 0, 0, 0, 0, 0, 0, 1, 2, 16, 0, 0];
+    check_member_layout(original, sig, field, summary, &callback[0..18]:Read, 16, 8, 0)?;
+    var length_byte: u32 = 5;
+    while length_byte < 13 { callback[length_byte] = 255; length_byte = length_byte + 1; }
+    check_member_layout(original, sig, field, summary, &callback[0..18]:Read, 16, 8, 7012)?;
+    return;
+}
+// 重签名无载荷枚举，并分别验证标签布局和伪造摘要。
+function check_empty_enum(original: &[u8], li: &iface::LoadedInterface:Read, export_id: u32, requested: u8, size: u8, align: u8, valid: bool): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    let member: u32 = section_offset(original, 7) + 32;
+    bytes[member + 12] = 0;
+    set_test_u32(&bytes:ReadWrite, member + 16, 0);
+    set_test_u32(&bytes:ReadWrite, member + 20, 0);
+    let desc: u32 = section_offset(original, 6) + li.exports[export_id - 1].aux_off;
+    bytes[desc + 10] = requested;
+    let summary: u32 = section_offset(original, 5) + (find_summary(li, export_id) - 1) * 16;
+    bytes[summary + 4] = size;
+    bytes[summary + 12] = align;
+    i = 24; while i < 56 { bytes[i] = 0; i = i + 1; }
+    let digest: u8[] = iface::sha256(&bytes[0..@len(bytes)]:Read)?;
+    i = 0; while i < 32 { bytes[24 + i] = digest[i]; i = i + 1; }
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: iface::LoadedInterface = iface_load::load_interface(&bytes[0..@len(bytes)]:Read, &diags:ReadWrite)?;
+    if valid { assert(!diags.has_error && @len(loaded.exports) == 3); }
+    else { assert(has_code(&diags:Read, 7012) && @len(loaded.exports) == 0); }
+    return;
+}
+function check_empty_enums(original: &[u8], li: &iface::LoadedInterface:Read, export_id: u32): void!AllocError {
+    check_empty_enum(original, li, export_id, 0, 1, 1, true)?;
+    check_empty_enum(original, li, export_id, 4, 4, 4, true)?;
+    check_empty_enum(original, li, export_id, 0, 4, 1, false)?;
+    check_empty_enum(original, li, export_id, 0, 4, 4, false)?;
+    check_empty_enum(original, li, export_id, 4, 8, 4, false)?;
+    return;
+}
+function set_test_u32(bytes: &u8[]:ReadWrite, offset: u32, value: u32): void {
+    var i: u32 = 0;
+    while i < 4 { (*bytes)[offset + i] = ((value >> (i * 8)) & 255) as u8; i = i + 1; }
+    return;
+}
+function check_analyzed(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read): void!AllocError {
+    // 严格入口必须为每个导出函数取得分析结果。
+    var fact_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var facts: u8[] = [];
+    let absent: iface::InterfaceResult = iface_write::write_interface_analyzed(file, pool, resolution, names, tc, layouts, &facts[0..@len(facts)]:Read, "desc", &fact_diags:ReadWrite)?;
+    assert(fact_diags.has_error && @len(absent.data.bytes) == 0 && @len(absent.digest) == 0 && absent.export_count == 0);
+    var fi: u32 = 0;
+    while fi < @len(resolution.result.tables.defs) as u32 { @push(facts, 0u8)?; fi = fi + 1; }
+    fi = 0; while fi < @len(tc.funcs.items) as u32 { facts[tc.funcs.items[fi].def - 1] = 2; fi = fi + 1; }
+    var analyzed_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let analyzed: iface::InterfaceResult = iface_write::write_interface_analyzed(file, pool, resolution, names, tc, layouts, &facts[0..@len(facts)]:Read, "desc", &analyzed_diags:ReadWrite)?;
+    let analyzed_loaded: iface::LoadedInterface = iface_load::load_interface(&analyzed.data.bytes[0..@len(analyzed.data.bytes)]:Read, &analyzed_diags:ReadWrite)?;
+    assert(!analyzed_diags.has_error && analyzed_loaded.exports[find_export(&analyzed_loaded:Read, 1, 0) - 1].flags == 1);
+    facts[tc.funcs.items[0].def - 1] = 1;
+    let conservative: iface::InterfaceResult = iface_write::write_interface_analyzed(file, pool, resolution, names, tc, layouts, &facts[0..@len(facts)]:Read, "desc", &analyzed_diags:ReadWrite)?;
+    let conservative_loaded: iface::LoadedInterface = iface_load::load_interface(&conservative.data.bytes[0..@len(conservative.data.bytes)]:Read, &analyzed_diags:ReadWrite)?;
+    assert(!analyzed_diags.has_error && conservative_loaded.exports[find_export(&conservative_loaded:Read, 1, 0) - 1].flags == 0);
+    facts[tc.funcs.items[0].def - 1] = 3;
+    var invalid_fact_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let invalid_fact: iface::InterfaceResult = iface_write::write_interface_analyzed(file, pool, resolution, names, tc, layouts, &facts[0..@len(facts)]:Read, "desc", &invalid_fact_diags:ReadWrite)?;
+    assert(invalid_fact_diags.has_error && @len(invalid_fact.data.bytes) == 0);
+    return;
+}
+// 不依赖导入绑定，直接验证已签名容器中的函数签名。
+function reject_function_signature(original: &[u8], li: &iface::LoadedInterface:Read, function_index: u32): void!AllocError {
+    let function_record: u32 = section_offset(original, 3) + (function_index - 1) * 32;
+    let function_sig: u32 = section_offset(original, 4) + li.exports[function_index - 1].sig_off;
+    reject_record_flag(original, function_sig + 4, 255)?;
+    reject_record_flag(original, function_sig + 2, 0)?;
+    reject_record_flag(original, function_record + 24, 4)?;
+    return;
+}
+// 只改错误位中的 ExportId，再重新签名，避免容器摘要错误掩盖签名语义。
+function reject_error_ids(original: &[u8], offset: u32, first: u32, second: u32): void!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(original) as u32 { @push(bytes, original[i])?; i = i + 1; }
+    set_test_u32(&bytes:ReadWrite, offset + 1, first);
+    set_test_u32(&bytes:ReadWrite, offset + 8, second);
+    reject_record_flag(&bytes[0..@len(bytes)]:Read, offset, 2)?;
+    return;
+}
+function check_error_order_at(original: &[u8], li: &iface::LoadedInterface:Read, start: u32): void!AllocError {
+    let signatures: &[u8] = &li.sig_bytes[0..@len(li.sig_bytes)]:Read;
+    // fallible 头：操作码、u32 成功位、成员数；之后是固有成员与三个名义成员。
+    assert(signatures[start] == 10 && signatures[start + 6] == 4);
+    let builtin: u32 = start + 10;
+    assert(signatures[builtin] == 1 && signatures[builtin + 1] == 12 && signatures[builtin + 2] == 16);
+    let first: u32 = builtin + 5;
+    let offset: u32 = section_offset(original, 4) + first;
+    var ids: u32[] = [];
+    var i: u32 = 0;
+    while i < 3 {
+        let member: u32 = first + i * 7;
+        let id: u32 = signatures[member + 1] as u32;
+        assert(signatures[member] == 2 && id > 0 && id <= @len(li.exports) as u32);
+        let entry: iface::LoadedExport = li.exports[id - 1];
+        let name: u8 = li.name_bytes[entry.name_off];
+        if i == 0 { assert(entry.name_len == 1 && name == 66); }
+        elseif i == 1 { assert(entry.name_len == 2 && name == 65); }
+        else { assert(entry.name_len == 2 && name == 90); }
+        @push(ids, id)?;
+        i = i + 1;
+    }
+    reject_error_ids(original, offset, ids[1], ids[0])?;
+    reject_error_ids(original, offset + 7, ids[1], ids[0])?;
+    return;
+}
+function check_error_order(): void!AllocError {
+    // 0x0100 的长度先写 0x00，必须排在先写 0xFF 的 0x00FF 前。
+    var long: u8[] = [];
+    var n: u32 = 0;
+    while n < 256 { @push(long, 65u8)?; n = n + 1; }
+    assert(resolve_refs::enum_name_less(&long[0..256]:Read, &long[0..255]:Read));
+    assert(!resolve_refs::enum_name_less(&long[0..255]:Read, &long[0..256]:Read));
+    let loaded: Loaded = load("export enum ZZ { X }\nexport enum AA { Y }\nexport enum B { Z }\nexport struct Holder { cb: &function(): u32!(ZZ | AA | AllocError | B) }\nexport function f(): u32!(ZZ | AA | AllocError | B) { return 1; }\n", 1001)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolved: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "errors", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolved:Read, &diags:ReadWrite)?;
+    let ly: layout::LayoutResult = layout::layout_unit(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, &diags:ReadWrite)?;
+    var data: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    var i: u32 = 0;
+    while i < @len(ly.table.items) as u32 {
+        @push(data.sizes, ly.table.items[i].size)?;
+        @push(data.aligns, ly.table.items[i].align)?;
+        @push(data.known, ly.table.items[i].known)?;
+        i = i + 1;
+    }
+    assert(!diags.has_error);
+    let built: iface::InterfaceResult = iface_write::write_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolved:Read, &loaded.lexed.names:Read, &tc:Read, &data:Read, "errors", &diags:ReadWrite)?;
+    let original: &[u8] = &built.data.bytes[0..@len(built.data.bytes)]:Read;
+    let li: iface::LoadedInterface = iface_load::load_interface(original, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(li.exports) == 5);
+    let f: u32 = find_export(&li:Read, 1, 0);
+    check_error_order_at(original, &li:Read, li.exports[f - 1].sig_off + 4)?;
+    check_error_order_at(original, &li:Read, li.struct_fields[0].type_sig_off + 3)?;
+    return;
+}
+// 从合法声明取得接口布局，再在类型事实中注入解析器挡住的视图位置。
+function check_view_positions(): void!AllocError {
+    let loaded: Loaded = load("export struct Record { callback: &function(&u8, &[u8]): u8 }\nexport function first(value: &u8, bytes: &[u8]): u8 { value; bytes; return 1u8; }\n", 1000)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var good_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &good_diags:ReadWrite)?;
+    var tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &good_diags:ReadWrite)?;
+    let ly: layout::LayoutResult = layout::layout_unit(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, &good_diags:ReadWrite)?;
+    var layout_data: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    var i: u32 = 0;
+    while i < @len(ly.table.items) as u32 {
+        @push(layout_data.sizes, ly.table.items[i].size)?;
+        @push(layout_data.aligns, ly.table.items[i].align)?;
+        @push(layout_data.known, ly.table.items[i].known)?;
+        i = i + 1;
+    }
+    assert(diag::diagbuf_count(&good_diags:Read) == 0);
+    assert(@len(tc.fields.items) == 1);
+    assert(@len(tc.funcs.items) == 1);
+    let good: iface::InterfaceResult = iface_write::write_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, &layout_data:Read, "views", &good_diags:ReadWrite)?;
+    let roundtrip: iface::LoadedInterface = iface_load::load_interface(&good.data.bytes[0..@len(good.data.bytes)]:Read, &good_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&good_diags:Read) == 0 && @len(roundtrip.exports) == 2);
+
+    let ref_type: u32 = tc.funcs.items[0].params[0];
+    let slice_type: u32 = tc.funcs.items[0].params[1];
+    let field_type: u32 = tc.fields.items[0].type_id;
+    let return_type: u32 = tc.funcs.items[0].ret;
+    let array_of_views: u32 = typecheck::intern_fixed_array(&tc.types:ReadWrite, slice_type, 1)?;
+    let callback_params: u32[] = [ref_type];
+    let invalid_callback: u32 = typecheck::intern_fn_ref(&tc.types:ReadWrite, @move(callback_params), slice_type)?;
+    i = 0;
+    while i < 5 {
+        tc.fields.items[0].type_id = field_type;
+        tc.funcs.items[0].ret = return_type;
+        if i == 0 { tc.funcs.items[0].ret = ref_type; }
+        elseif i == 1 { tc.funcs.items[0].ret = slice_type; }
+        elseif i == 2 { tc.fields.items[0].type_id = ref_type; }
+        elseif i == 3 { tc.fields.items[0].type_id = array_of_views; }
+        else { tc.fields.items[0].type_id = invalid_callback; }
+        var diags: diag::DiagBuffer = diag::diagbuf_new();
+        let rejected: iface::InterfaceResult = iface_write::write_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, &layout_data:Read, "views", &diags:ReadWrite)?;
+        // rejection_spec: E7011 spec/lang/symbol.md#S-11
+        assert(diag::diagbuf_count(&diags:Read) == 1 && diags.diags[0].code.raw == 7011 && @len(rejected.data.bytes) == 0 && @len(rejected.digest) == 0 && rejected.export_count == 0);
+        i = i + 1;
+    }
+    return;
+}
+function main(): void {
+    check_view_positions()?;
+    check_error_order()?;
+    let loaded: Loaded = load("export struct P { a: u8, b: u32 }\nexport enum E { A, B(u32) }\nexport function f(p: P): u32 { return p.b; }\n", 1000)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var build_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &build_diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &build_diags:ReadWrite)?;
+    let ly: layout::LayoutResult = layout::layout_unit(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, &build_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&build_diags:Read) == 0);
+    var layout_sizes: u64[] = [];
+    var layout_aligns: u8[] = [];
+    var layout_known: bool[] = [];
+    var layout_index: u32 = 0;
+    while layout_index < @len(tc.types.entries) as u32 {
+        @push(layout_sizes, ly.table.items[layout_index].size)?;
+        @push(layout_aligns, ly.table.items[layout_index].align)?;
+        @push(layout_known, ly.table.items[layout_index].known)?;
+        layout_index = layout_index + 1;
+    }
+    let layout_data: iface::LayoutData = iface::LayoutData { sizes: layout_sizes, aligns: layout_aligns, known: layout_known };
+    // 布局缺失或已有错误时不能返回可误用的接口容器。
+    let missing_layout: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    var missing_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let missing_result: iface::InterfaceResult = iface_write::write_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, &missing_layout:Read, "desc", &missing_diags:ReadWrite)?;
+    assert(missing_diags.has_error);
+    assert(@len(missing_result.data.bytes) == 0 && @len(missing_result.digest) == 0 && missing_result.export_count == 0);
+    let blocked_result: iface::InterfaceResult = iface_write::write_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, &layout_data:Read, "desc", &missing_diags:ReadWrite)?;
+    assert(@len(blocked_result.data.bytes) == 0 && @len(blocked_result.digest) == 0 && blocked_result.export_count == 0);
+    check_analyzed(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, &layout_data:Read)?;
+    let result: iface::InterfaceResult = iface_write::write_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, &layout_data:Read, "desc", &build_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&build_diags:Read) == 0);
+    var load_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let li: iface::LoadedInterface = iface_load::load_interface(&result.data.bytes[0..@len(result.data.bytes)]:Read, &load_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&load_diags:Read) == 0);
+    assert(@len(li.exports) == 3);
+    // struct P：size=8、align=4、2 个字段、name index 2 条。
+    let struct_export: u32 = li.exports[find_export(&li:Read, 3, 0) - 1].export_id;
+    let struct_summary_index: u32 = find_summary(&li:Read, struct_export);
+    assert(struct_summary_index != 0);
+    assert(li.summaries[struct_summary_index - 1].size == 8);
+    assert(li.summaries[struct_summary_index - 1].align == 4);
+    let struct_desc_index: u32 = find_struct_desc(&li:Read, struct_export);
+    assert(struct_desc_index != 0);
+    assert(li.struct_descriptors[struct_desc_index - 1].member_count == 2);
+    assert(@len(li.struct_fields) == 2);
+    assert(li.struct_fields[0].field_id == 0);
+    assert(li.struct_fields[1].field_id == 1);
+    assert(li.struct_fields[0].type_sig_len > 0);
+    assert(li.struct_fields[1].type_sig_len > 0);
+    assert(@len(li.struct_field_name_index) == 2);
+    // enum E：size=8、align=4、2 个标签，B 有 payload。
+    let enum_export: u32 = li.exports[find_export(&li:Read, 2, 0) - 1].export_id;
+    let enum_summary_index: u32 = find_summary(&li:Read, enum_export);
+    assert(enum_summary_index != 0);
+    assert(li.summaries[enum_summary_index - 1].size == 8);
+    assert(li.summaries[enum_summary_index - 1].align == 4);
+    let enum_desc_index: u32 = find_enum_desc(&li:Read, enum_export);
+    assert(enum_desc_index != 0);
+    assert(li.enum_descriptors[enum_desc_index - 1].member_count == 2);
+    assert(@len(li.enum_members) == 2);
+    assert(li.enum_members[0].variant_id == 0);
+    assert(li.enum_members[1].variant_id == 1);
+    assert(li.enum_members[0].flags == 0);
+    assert(li.enum_members[1].flags == 1);
+    assert(li.enum_members[1].payload_sig_len > 0);
+    assert(@len(li.enum_name_index) == 2);
+    // 函数导出：sig_off/sig_len 有效，aux_off=0。
+    let function_index: u32 = find_export(&li:Read, 1, 0);
+    assert(function_index != 0);
+    assert(li.exports[function_index - 1].sig_len > 0);
+    assert(li.exports[function_index - 1].aux_off == 0);
+    // 摘要篡改仍拒绝。
+    var tampered: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(result.data.bytes) as u32 { @push(tampered, result.data.bytes[i])?; i = i + 1; }
+    tampered[24] = tampered[24] ^ 1;
+    var tamper_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let ignored: iface::LoadedInterface = iface_load::load_interface(&tampered[0..@len(tampered)]:Read, &tamper_diags:ReadWrite)?;
+    assert(has_code(&tamper_diags:Read, 7012));
+    assert(@len(ignored.exports) == 0);
+    // 合法函数标志必须经载入和依赖适配保留；非函数标志仍为零。
+    let original: &[u8]:Read = &result.data.bytes[0..@len(result.data.bytes)]:Read;
+    assert(li.exports[function_index - 1].flags == 0);
+    let function_flag: u32 = section_offset(original, 3) + (function_index - 1) * 32 + 7;
+    var flagged: u8[] = [];
+    i = 0; while i < @len(original) as u32 { @push(flagged, original[i])?; i = i + 1; }
+    flagged[function_flag] = 1;
+    i = 24; while i < 56 { flagged[i] = 0; i = i + 1; }
+    let flagged_digest: u8[] = iface::sha256(&flagged[0..@len(flagged)]:Read)?;
+    i = 0; while i < 32 { flagged[24 + i] = flagged_digest[i]; i = i + 1; }
+    var flagged_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let flagged_iface: iface::LoadedInterface = iface_load::load_interface(&flagged[0..@len(flagged)]:Read, &flagged_diags:ReadWrite)?;
+    assert(!flagged_diags.has_error && flagged_iface.exports[function_index - 1].flags == 1);
+    assert(flagged_iface.exports[struct_export - 1].flags == 0 && flagged_iface.exports[enum_export - 1].flags == 0);
+    var flagged_deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    iface_load::add_binary_dependency(&flagged_deps:ReadWrite, &flagged_iface:Read)?;
+    assert(flagged_deps.ifaces[0].exports[function_index - 1].flags == 1);
+    let caller: Loaded = load("import desc; function f(): u32 { return desc::f(1); } function g(): desc::P { return desc::P { a: 1, b: 2 }; }\n", 1002)?;
+    let flagged_resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&caller.parsed.file:Read, &caller.parsed.pool:Read, &caller.lexed.names:Read, &flagged_deps:Read, "caller", &flagged_diags:ReadWrite)?;
+    assert(!flagged_diags.has_error && @len(flagged_resolution.bridges.items) == 2);
+    var saw_function: bool = false;
+    i = 0; while i < @len(flagged_resolution.bridges.items) as u32 {
+        let bridge: resolve_refs::BridgeRecord = flagged_resolution.bridges.items[i];
+        if bridge.export_id == function_index { assert(bridge.flags == 1); saw_function = true; }
+        else { assert(bridge.flags == 0); }
+        i = i + 1;
+    }
+    assert(saw_function);
+    reject_record_flag(original, function_flag, 2)?;
+    reject_function_signature(original, &li:Read, function_index)?;
+    // 首条成员不能引用零编号；同组后续成员也必须逐条验证编号。
+    let fields_at: u32 = section_offset(original, 12);
+    assert(original[fields_at] == struct_export as u8 && original[fields_at + 32 + 10] == 1);
+    reject_record_flag(original, fields_at, 0)?;
+    reject_record_flag(original, fields_at + 32 + 10, 0)?;
+    // 成员名称及类型签名越界即使摘要有效也必须拒绝。
+    var section: u32 = 7;
+    while section <= 12 {
+        let entry: u32 = 56 + section * 16;
+        let record: u32 = original[entry + 4] as u32 | (original[entry + 5] as u32 << 8) | (original[entry + 6] as u32 << 16) | (original[entry + 7] as u32 << 24);
+        var field: u32 = 7;
+        while field <= 19 {
+            var corrupt: u8[] = [];
+            i = 0;
+            while i < @len(original) as u32 { @push(corrupt, original[i])?; i = i + 1; }
+            corrupt[record + field] = 255;
+            i = 24;
+            while i < 56 { corrupt[i] = 0; i = i + 1; }
+            let digest: u8[] = iface::sha256(&corrupt[0..@len(corrupt)]:Read)?;
+            i = 0;
+            while i < 32 { corrupt[24 + i] = digest[i]; i = i + 1; }
+            var invalid_diags: diag::DiagBuffer = diag::diagbuf_new();
+            let invalid: iface::LoadedInterface = iface_load::load_interface(&corrupt[0..@len(corrupt)]:Read, &invalid_diags:ReadWrite)?;
+            assert(has_code(&invalid_diags:Read, 7012));
+            assert(@len(invalid.exports) == 0);
+            field = field + 12;
+        }
+        section = section + 5;
+    }
+    // 签名内容无效时，即使记录范围和摘要正确也必须拒绝。
+    let sig_base: u32 = section_offset(original, 4);
+    reject_record_flag(original, sig_base + li.struct_fields[0].type_sig_off, 255)?;
+    reject_record_flag(original, sig_base + li.enum_members[1].payload_sig_off, 255)?;
+    reject_record_flag(original, sig_base + li.struct_fields[0].type_sig_off, 7)?;
+    reject_record_flag(original, section_offset(original, 12) + 20, 1)?;
+    reject_record_flag(original, section_offset(original, 7) + 32 + 20, 1)?;
+    reject_record_flag(original, section_offset(original, 12) + 20, (li.struct_fields[0].type_sig_len + 1) as u8)?;
+    // 固有分配错误只允许作为错误成员，不得占据普通存储位置。
+    let field_type: u32 = sig_base + li.struct_fields[0].type_sig_off;
+    let payload_type: u32 = sig_base + li.enum_members[1].payload_sig_off;
+    assert(original[field_type] == 1 && original[field_type + 2] == 16);
+    assert(original[payload_type] == 1 && original[payload_type + 2] == 16);
+    reject_record_flag(original, field_type + 1, 12)?;
+    reject_record_flag(original, payload_type + 1, 12)?;
+    // full 类型编号虽已冻结，当前阶段不能通过成员签名激活。
+    reject_record_flag(original, field_type + 1, 13)?;
+    reject_record_flag(original, payload_type + 1, 14)?;
+    let full_array: u8[] = [6, 1, 15, 16, 0, 0];
+    let full_exports: resolve_refs::IfaceExport[] = [];
+    var full_diags: diag::DiagBuffer = diag::diagbuf_new();
+    assert(!resolve_refs::valid_member_signature(&full_array[0..@len(full_array)]:Read, &full_exports[0..@len(full_exports)]:Read, &full_diags:ReadWrite)?);
+    assert(has_code(&full_diags:Read, 7012));
+    let alloc_field: u8[] = [1, 12, 16, 0, 0];
+    let alloc_array: u8[] = [6, 1, 12, 16, 0, 0];
+    let alloc_result: u8[] = [9, 0, 0, 10, 1, 11, 16, 0, 0, 1, 0, 0, 0, 1, 12, 16, 0, 0];
+    let alloc_exports: resolve_refs::IfaceExport[] = [];
+    var alloc_diags: diag::DiagBuffer = diag::diagbuf_new();
+    assert(!resolve_refs::valid_member_signature(&alloc_field[0..@len(alloc_field)]:Read, &alloc_exports[0..@len(alloc_exports)]:Read, &alloc_diags:ReadWrite)?);
+    assert(!resolve_refs::valid_member_signature(&alloc_array[0..@len(alloc_array)]:Read, &alloc_exports[0..@len(alloc_exports)]:Read, &alloc_diags:ReadWrite)?);
+    var valid_alloc_diags: diag::DiagBuffer = diag::diagbuf_new();
+    assert(resolve_refs::valid_member_signature(&alloc_result[0..@len(alloc_result)]:Read, &alloc_exports[0..@len(alloc_exports)]:Read, &valid_alloc_diags:ReadWrite)?);
+    assert(diag::diagbuf_count(&valid_alloc_diags:Read) == 0);
+    // 合法容器中的字段和载荷分别验证读取深度边界。
+    let signature: &[u8]:Read = &li.sig_bytes[0..@len(li.sig_bytes)]:Read;
+    let field_record: u32 = section_offset(original, 12);
+    let payload_record: u32 = section_offset(original, 7) + 32;
+    check_depth_interface(original, signature, field_record, struct_summary_index - 1, 63)?;
+    check_depth_interface(original, signature, field_record, struct_summary_index - 1, 64)?;
+    check_depth_interface(original, signature, payload_record, enum_summary_index - 1, 63)?;
+    check_depth_interface(original, signature, payload_record, enum_summary_index - 1, 64)?;
+    check_layout_graph(original, signature, field_record, struct_summary_index - 1, struct_export, enum_export)?;
+    // 每个类型签名的嵌套节点数有独立上限，超限必须给出资源诊断。
+    var nested: u8[] = [];
+    var depth: u32 = 0;
+    while depth < 63 { @push(nested, 6)?; depth = depth + 1; }
+    @push(nested, 1)?; @push(nested, 1)?; @push(nested, 16)?; @push(nested, 0)?; @push(nested, 0)?;
+    var nested_diags: diag::DiagBuffer = diag::diagbuf_new();
+    assert(resolve_refs::valid_member_signature(&nested[0..@len(nested)]:Read, &alloc_exports[0..@len(alloc_exports)]:Read, &nested_diags:ReadWrite)?);
+    assert(diag::diagbuf_count(&nested_diags:Read) == 0);
+    var deep: u8[] = [];
+    depth = 0;
+    while depth < 64 { @push(deep, 6)?; depth = depth + 1; }
+    @push(deep, 1)?; @push(deep, 1)?; @push(deep, 16)?; @push(deep, 0)?; @push(deep, 0)?;
+    var deep_diags: diag::DiagBuffer = diag::diagbuf_new();
+    assert(!resolve_refs::valid_member_signature(&deep[0..@len(deep)]:Read, &alloc_exports[0..@len(alloc_exports)]:Read, &deep_diags:ReadWrite)?);
+    assert(has_code(&deep_diags:Read, 9001));
+    var huge: u8[] = [];
+    depth = 0;
+    while depth < 2048 { @push(huge, 6)?; depth = depth + 1; }
+    @push(huge, 1)?; @push(huge, 1)?; @push(huge, 16)?; @push(huge, 0)?; @push(huge, 0)?;
+    var huge_diags: diag::DiagBuffer = diag::diagbuf_new();
+    assert(!resolve_refs::valid_member_signature(&huge[0..@len(huge)]:Read, &alloc_exports[0..@len(alloc_exports)]:Read, &huge_diags:ReadWrite)?);
+    assert(has_code(&huge_diags:Read, 9001));
+    check_descriptor_records(original, &li:Read, struct_export, enum_export, function_index, struct_summary_index, enum_summary_index)?;
+    return;
+}
+
+function check_descriptor_records(original: &[u8], li: &iface::LoadedInterface:Read, struct_export: u32, enum_export: u32, function_index: u32, struct_summary_index: u32, enum_summary_index: u32): void!AllocError {
+    // 名称哈希和摘要正确时，仍要拒绝不是标识符的公开名称。
+    let name_base: u32 = section_offset(original, 0);
+    let export_record: u32 = section_offset(original, 3) + (struct_export - 1) * 32;
+    check_interface_name(original, export_record + 8, name_base + li.exports[struct_export - 1].name_off, 80, true)?;
+    check_interface_name(original, export_record + 8, name_base + li.exports[struct_export - 1].name_off, 95, false)?;
+    check_interface_name(original, section_offset(original, 12) + 24, name_base + li.struct_fields[0].name_off, 97, true)?;
+    check_interface_name(original, section_offset(original, 7) + 24, name_base + li.enum_members[0].name_off, 65, true)?;
+    check_interface_name(original, section_offset(original, 12) + 24, name_base + li.struct_fields[0].name_off, 48, false)?;
+    check_interface_name(original, section_offset(original, 7) + 24, name_base + li.enum_members[0].name_off, 48, false)?;
+    // 成员名称不变而哈希被篡改时，摘要有效也必须拒绝。
+    let enum_hash: u32 = section_offset(original, 7) + 24;
+    let field_hash: u32 = section_offset(original, 12) + 24;
+    reject_record_flag(original, enum_hash, original[enum_hash] ^ 1)?;
+    reject_record_flag(original, field_hash, original[field_hash] ^ 1)?;
+    // 布局摘要必须引用有序的名义类型，尺寸与对齐也必须有效。
+    let summary: u32 = section_offset(original, 5);
+    reject_record_flag(original, summary, 0)?;
+    reject_record_flag(original, summary, function_index as u8)?;
+    reject_record_flag(original, summary + 16, original[summary])?;
+    reject_record_flag(original, summary + 4, 0)?;
+    reject_record_flag(original, summary + 4, 7)?;
+    reject_record_flag(original, summary + 12, 3)?;
+    // 伪造值满足摘要记录的格式，但与成员布局不一致。
+    reject_record_flag(original, summary + (struct_summary_index - 1) * 16 + 4, 12)?;
+    reject_record_flag(original, summary + (enum_summary_index - 1) * 16 + 12, 2)?;
+    // 无载荷枚举必须使用标签宽度和请求对齐推导的精确布局。
+    check_empty_enums(original, li, enum_export)?;
+    // 描述符不得指向无效导出、成员范围或其他类型的摘要。
+    let enum_desc: u32 = section_offset(original, 6);
+    let struct_desc: u32 = section_offset(original, 11);
+    reject_record_flag(original, enum_desc + 12, 255)?;
+    reject_record_flag(original, struct_desc + 12, 255)?;
+    reject_record_flag(original, enum_desc + 12, original[struct_desc + 12])?;
+    reject_record_flag(original, struct_desc + 12, original[enum_desc + 12])?;
+    reject_record_flag(original, enum_desc + 10, 3)?;
+    reject_record_flag(original, struct_desc + 10, 3)?;
+    // 摘要对齐为 4；请求 8 与摘要不一致，请求 4 则仍然合法。
+    reject_record_flag(original, enum_desc + 10, 8)?;
+    reject_record_flag(original, struct_desc + 10, 8)?;
+    reject_record_flag(original, enum_desc + 10, 2)?;
+    reject_record_flag(original, struct_desc + 10, 2)?;
+    accept_record_flag(original, enum_desc + 10, 4)?;
+    accept_record_flag(original, struct_desc + 10, 4)?;
+    reject_record_flag(original, enum_desc + 4, 0)?;
+    reject_record_flag(original, struct_desc + 4, 0)?;
+    reject_record_flag(original, enum_desc, 255)?;
+    reject_record_flag(original, struct_desc, 255)?;
+    reject_record_flag(original, enum_desc + 8, 1)?;
+    reject_record_flag(original, struct_desc + 8, 1)?;
+    reject_record_flag(original, section_offset(original, 3) + (enum_export - 1) * 32 + 28, 1)?;
+    reject_record_flag(original, section_offset(original, 3) + (struct_export - 1) * 32 + 28, 16)?;
+    // 成员必须属于相应导出，编号连续且覆盖描述符声明的区间。
+    let enum_member: u32 = section_offset(original, 7);
+    let struct_field: u32 = section_offset(original, 12);
+    reject_record_flag(original, enum_member, 0)?;
+    reject_record_flag(original, enum_member, struct_export as u8)?;
+    reject_record_flag(original, enum_member + 10, 1)?;
+    reject_record_flag(original, enum_member + 32 + 10, 0)?;
+    reject_record_flag(original, struct_field, 0)?;
+    reject_record_flag(original, struct_field, enum_export as u8)?;
+    reject_record_flag(original, struct_field + 10, 1)?;
+    reject_record_flag(original, struct_field + 32 + 10, 0)?;
+    reject_record_flag(original, enum_desc + 4, 1)?;
+    reject_record_flag(original, struct_desc + 4, 1)?;
+    reject_record_flag(original, enum_member + 16, 1)?;
+    // 名称索引必须指向宿主成员，且按名称排序并完整覆盖。
+    let enum_index: u32 = section_offset(original, 8);
+    let struct_index: u32 = section_offset(original, 13);
+    reject_record_flag(original, enum_index, function_index as u8)?;
+    reject_record_flag(original, enum_index + 4, 255)?;
+    reject_record_flag(original, enum_index + 4, original[enum_index + 8 + 4])?;
+    reject_record_flag(original, struct_index, function_index as u8)?;
+    reject_record_flag(original, struct_index + 4, 255)?;
+    reject_record_flag(original, struct_index + 4, original[struct_index + 8 + 4])?;
+    reject_reversed_index(original, enum_index)?;
+    reject_reversed_index(original, struct_index)?;
+    reject_record_flag(original, enum_member + 32 + 20, 0)?;
+    // 字段类型签名不能为空，即使偏移仍位于签名节内。
+    reject_record_flag(original, struct_field + 20, 0)?;
+    // 对各记录设置非法标志或非零保留位，摘要仍保持有效。
+    reject_record_flag(original, section_offset(original, 3) + (struct_export - 1) * 32 + 7, 1)?;
+    reject_record_flag(original, section_offset(original, 3) + (enum_export - 1) * 32 + 7, 1)?;
+    reject_record_flag(original, section_offset(original, 5) + 13, 1)?;
+    reject_record_flag(original, section_offset(original, 5) + 14, 1)?;
+    reject_record_flag(original, section_offset(original, 6) + 11, 1)?;
+    reject_record_flag(original, section_offset(original, 7) + 12, 2)?;
+    reject_record_flag(original, section_offset(original, 7) + 14, 1)?;
+    reject_record_flag(original, section_offset(original, 8) + 6, 1)?;
+    reject_record_flag(original, section_offset(original, 11) + 11, 1)?;
+    reject_record_flag(original, section_offset(original, 12) + 12, 1)?;
+    reject_record_flag(original, section_offset(original, 12) + 14, 1)?;
+    reject_record_flag(original, section_offset(original, 13) + 6, 1)?;
+    // 函数签名引用未导出本地 nominal 类型 → N-8（4008），不是 7012。
+    let hidden: Loaded = load("struct Hidden { x: u32 }\nexport function bad(h: Hidden): u32 { return h.x; }\n", 1001)?;
+    let hidden_deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var hidden_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let hidden_resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&hidden.parsed.file:Read, &hidden.parsed.pool:Read, &hidden.lexed.names:Read, &hidden_deps:Read, "", &hidden_diags:ReadWrite)?;
+    let hidden_tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&hidden.parsed.file:Read, &hidden.parsed.pool:Read, &hidden_resolution:Read, &hidden_diags:ReadWrite)?;
+    let hidden_ly: layout::LayoutResult = layout::layout_unit(&hidden_tc.types:Read, &hidden_tc.fields:Read, &hidden_tc.enums:Read, &hidden_diags:ReadWrite)?;
+    let empty_layout: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    let ignored_result: iface::InterfaceResult = iface_write::write_interface(&hidden.parsed.file:Read, &hidden.parsed.pool:Read, &hidden_resolution:Read, &hidden.lexed.names:Read, &hidden_tc:Read, &empty_layout:Read, "hidden", &hidden_diags:ReadWrite)?;
+    assert(has_code(&hidden_diags:Read, 4008));
+    assert(@len(ignored_result.data.bytes) == 0 && @len(ignored_result.digest) == 0 && ignored_result.export_count == 0);
+    return;
+}

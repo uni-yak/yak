@@ -1,0 +1,9 @@
+// 根模块同时调用两条直接依赖，期望退出码 17（(3 + 4) * 2 + 3）。
+import upper::value;
+import lower::value;
+
+foreign exit(code: u8): void;
+
+function main(): void {
+    exit((upper::value::top_value() + lower::value::leaf_value()) as u8);
+}

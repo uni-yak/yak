@@ -1,0 +1,10 @@
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+function inspect(data: &u32[], first: &u32): u32 { return data[0u32] + *first; }
+function main(): void {
+    var item: Item = Item { data: [2u32] };
+    let ref: &Item:ReadWrite = &item:ReadWrite;
+    assert(inspect(@copy(ref).data, @copy(ref).data[0u32]) == 4u32);
+    ref.data[0u32] = 5u32;
+    assert(ref.data[0u32] == 5u32);
+}

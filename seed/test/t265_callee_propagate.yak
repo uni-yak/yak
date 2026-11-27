@@ -1,0 +1,13 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+function index(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 0u32; }
+function target(value: &u32): u32 { return *value + 1u32; }
+function invoke(ok: bool): u32!Failure {
+    let callbacks: [&function(&u32): u32; 1] = [&target];
+    return callbacks[index(ok)?](41u32);
+}
+function recover(e: &Failure): u32 { return 99u32; }
+function main(): void {
+    assert(invoke(false).catch(&recover) == 99u32);
+    assert(invoke(true).catch(&recover) == 42u32);
+}

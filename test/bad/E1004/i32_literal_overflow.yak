@@ -1,0 +1,7 @@
+// expected_code: E1004
+// spec: spec/lang/type/i32.md L-4
+// 触发：带类型后缀的数值 2147483649 超出 i32 的正值上界。
+function main(): void {
+    @drop(2147483649i32);
+    return;
+}

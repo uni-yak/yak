@@ -1,0 +1,297 @@
+// 按局部和接口类型描述判定 Copy，保留可复用的分类结果与工作预算。
+import typecheck;
+
+const TK_BUILTIN: u8 = 1;
+const TK_ERROR_SET: u8 = 11;
+const TK_PLAIN_UNION: u8 = 12;
+const TK_TEXT_VIEW: u8 = 14;
+const TK_FALLIBLE: u8 = 9;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FN_REF: u8 = 8;
+const TK_IMPORTED: u8 = 3;
+const TK_LOCAL: u8 = 2;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_VOID: u8 = 0;
+
+function copy_import_key(dep: u16, export_id: u32): u64 {
+    return ((dep as u64) << 32) | (export_id as u64);
+}
+
+function copy_enum_ordered(table: &typecheck::ImportedEnumTable:Read): bool {
+    var previous: u64 = 0;
+    var i: u32 = 0;
+    while i < @len(table.items) as u32 {
+        let item: typecheck::ImportedEnumVariant = table.items[i];
+        let key: u64 = copy_import_key(item.dep, item.export_id);
+        if key < previous { return false; }
+        previous = key;
+        i = i + 1;
+    }
+    return true;
+}
+
+function copy_enum_start(table: &typecheck::ImportedEnumTable:Read, key: u64): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = @len(table.items) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2;
+        let item: typecheck::ImportedEnumVariant = table.items[mid];
+        if copy_import_key(item.dep, item.export_id) < key { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return lo;
+}
+
+function copy_field_ordered(table: &typecheck::ImportedFieldTable:Read): bool {
+    var previous: u64 = 0;
+    var i: u32 = 0;
+    while i < @len(table.items) as u32 {
+        let item: typecheck::ImportedFieldType = table.items[i];
+        let key: u64 = copy_import_key(item.dep, item.export_id);
+        if key < previous { return false; }
+        previous = key;
+        i = i + 1;
+    }
+    return true;
+}
+
+function copy_field_start(table: &typecheck::ImportedFieldTable:Read, key: u64): u32 {
+    var lo: u32 = 0;
+    var hi: u32 = @len(table.items) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2;
+        let item: typecheck::ImportedFieldType = table.items[mid];
+        if copy_import_key(item.dep, item.export_id) < key { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return lo;
+}
+
+// 各表独立核验分组顺序，成员声明序仍由 Copy 判定核验。
+export function imported_copy_order(checked: &typecheck::TypeCheckResult:Read): u8 {
+    return imported_table_order(&checked.imported_enums:Read, &checked.imported_fields:Read);
+}
+
+export function imported_table_order(enums: &typecheck::ImportedEnumTable:Read, fields: &typecheck::ImportedFieldTable:Read): u8 {
+    var order: u8 = 0;
+    if copy_enum_ordered(enums) { order = 1; }
+    if copy_field_ordered(fields) { order = order | 2; }
+    return order;
+}
+
+// 调用方先核验按值布局无环；导入记录按模块和导出身份匹配，未知成员不能证明 Copy。
+export function is_copy_value(checked: &typecheck::TypeCheckResult:Read, id: u32): bool {
+    return is_copy_value_ordered(checked, id, 0);
+}
+
+// 顺序必须由同一只读结果计算；未验证的表完整遍历。
+export function is_copy_value_ordered(checked: &typecheck::TypeCheckResult:Read, id: u32, order: u8): bool {
+    return copy_value(checked, id, order, false, &checked.copy_facts:Read);
+}
+
+// 本地字段按定义分组，枚举每个定义只有一行；兼容路径不要求这些不变量。
+function copy_local_field_start(fields: &typecheck::FieldTable:Read, def: u32, ordered: bool): u32 {
+    if !ordered { return 0; }
+    var left: u32 = 0;
+    var right: u32 = @len(fields.items) as u32;
+    while left < right {
+        let mid: u32 = left + (right - left) / 2u32;
+        if fields.items[mid].def < def { left = mid + 1u32; } else { right = mid; }
+    }
+    return left;
+}
+
+function copy_local_enum_start(enums: &typecheck::EnumTable:Read, def: u32, ordered: bool): u32 {
+    if !ordered { return 0; }
+    let row: u32 = typecheck::enum_row(enums, def, true);
+    if row == 0 { return @len(enums.items) as u32; }
+    return row - 1u32;
+}
+
+function copy_value(checked: &typecheck::TypeCheckResult:Read, id: u32, order: u8, local_ordered: bool, facts: &typecheck::CopyFacts:Read): bool {
+    return copy_from_tables(&checked.types:Read, &checked.fields:Read, &checked.enums:Read, &checked.imported_fields:Read,
+        &checked.imported_enums:Read, id, order, local_ordered, facts, @len(checked.types.entries) as u32);
+}
+
+// 已验证的 MIR 和源码检查共用同一套类型判定；深度上界只排除循环的按值类型图。
+export function copy_from_tables(types: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported_fields: &typecheck::ImportedFieldTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, id: u32, order: u8, local_ordered: bool, facts: &typecheck::CopyFacts:Read, remaining: u32): bool {
+    if id == 0 || id > @len(types.entries) as u32 || remaining == 0 { return false; }
+    if id <= @len(facts.items) as u32 && facts.items[id - 1u32] != 0u8 { return facts.items[id - 1u32] == 1u8; }
+    let entry: typecheck::TypeEntry = types.entries[id - 1];
+    let kind: u8 = entry.kind;
+    let next: u32 = remaining - 1;
+    if kind == TK_VOID || kind == TK_BUILTIN || kind == TK_REF || kind == TK_SLICE || kind == TK_FN_REF || kind == TK_TEXT_VIEW { return true; }
+    if kind == TK_FIXED_ARRAY { return copy_from_tables(types, fields, enums, imported_fields, imported_enums, entry.elem, order, local_ordered, facts, next); }
+    if kind == TK_FALLIBLE {
+        return copy_from_tables(types, fields, enums, imported_fields, imported_enums, entry.success, order, local_ordered, facts, next)
+            && copy_from_tables(types, fields, enums, imported_fields, imported_enums, entry.elem, order, local_ordered, facts, next);
+    }
+    if kind == TK_ERROR_SET || kind == TK_PLAIN_UNION {
+        let total: u32 = @len(types.members) as u32;
+        if entry.members_start > total || entry.members_count > total - entry.members_start { return false; }
+        var i: u32 = 0;
+        while i < entry.members_count {
+            if !copy_from_tables(types, fields, enums, imported_fields, imported_enums, types.members[entry.members_start + i], order, local_ordered, facts, next) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if kind == TK_LOCAL {
+        var i: u32 = copy_local_field_start(fields, entry.def, local_ordered);
+        while i < @len(fields.items) as u32 {
+            if local_ordered && fields.items[i].def != entry.def { break; }
+            if fields.items[i].def == entry.def && !copy_from_tables(types, fields, enums, imported_fields, imported_enums, fields.items[i].type_id, order, local_ordered, facts, next) { return false; }
+            i = i + 1;
+        }
+        i = copy_local_enum_start(enums, entry.def, local_ordered);
+        while i < @len(enums.items) as u32 {
+            if enums.items[i].def == entry.def {
+                var p: u32 = 0;
+                while p < @len(enums.items[i].payloads) as u32 {
+                    let payload: u32 = enums.items[i].payloads[p];
+                    if payload != 0 && !copy_from_tables(types, fields, enums, imported_fields, imported_enums, payload, order, local_ordered, facts, next) { return false; }
+                    p = p + 1;
+                }
+            }
+            if local_ordered { break; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if kind == TK_IMPORTED {
+        let key: u64 = copy_import_key(entry.dep, entry.export_id);
+        var count: u32 = 0;
+        var i: u32 = 0;
+        let enum_ordered: bool = (order & 1) != 0;
+        if enum_ordered { i = copy_enum_start(imported_enums, key); }
+        while i < @len(imported_enums.items) as u32 {
+            let v: typecheck::ImportedEnumVariant = imported_enums.items[i];
+            if enum_ordered && (v.dep != entry.dep || v.export_id != entry.export_id) { break; }
+            if v.dep == entry.dep && v.export_id == entry.export_id {
+                if !v.known || v.variant != count || (v.payload != 0 && !copy_from_tables(types, fields, enums, imported_fields, imported_enums, v.payload, order, local_ordered, facts, next)) { return false; }
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        if count != 0 { return true; }
+        i = 0;
+        let field_ordered: bool = (order & 2) != 0;
+        if field_ordered { i = copy_field_start(imported_fields, key); }
+        while i < @len(imported_fields.items) as u32 {
+            let f: typecheck::ImportedFieldType = imported_fields.items[i];
+            if field_ordered && (f.dep != entry.dep || f.export_id != entry.export_id) { break; }
+            if f.dep == entry.dep && f.export_id == entry.export_id {
+                if f.field != count + 1 || !copy_from_tables(types, fields, enums, imported_fields, imported_enums, f.value_type_id, order, local_ordered, facts, next) { return false; }
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return count != 0;
+    }
+    // 动态数组、未接通的可空与未知类型不提供 Copy 证明。
+    return false;
+}
+
+// 文档前端的保守估算：按每条 Copy 递归边计入子图，不依赖实际的布尔短路。
+// 仅在类型布局成功后使用；导入成员的实际候选行也计入成本，间接容器不递归。
+function copy_walk_cost(checked: &typecheck::TypeCheckResult:Read, costs: &u64[]:ReadWrite, facts: &typecheck::CopyFacts:ReadWrite, id: u32, limit: u64, local_ordered: bool, remaining_depth: u32): u64 {
+    if id == 0u32 || id > @len(checked.types.entries) as u32 { return 1u64; }
+    let index: u32 = id - 1u32;
+    if costs[index] != 0u64 { return costs[index]; }
+    let exceeded: u64 = limit + 1u64;
+    if remaining_depth == 0u32 { return exceeded; }
+    let next_depth: u32 = remaining_depth - 1u32;
+    costs[index] = exceeded;
+    let entry: typecheck::TypeEntry = checked.types.entries[index];
+    var cost: u64 = 1;
+    if entry.kind == TK_FIXED_ARRAY {
+        cost = cost + copy_walk_cost(checked, costs, facts, entry.elem, limit, local_ordered, next_depth);
+    } elseif entry.kind == TK_FALLIBLE {
+        cost = cost + copy_walk_cost(checked, costs, facts, entry.success, limit, local_ordered, next_depth);
+        if cost <= limit { cost = cost + copy_walk_cost(checked, costs, facts, entry.elem, limit, local_ordered, next_depth); }
+    } elseif entry.kind == TK_ERROR_SET || entry.kind == TK_PLAIN_UNION {
+        var i: u32 = 0;
+        while i < entry.members_count && cost <= limit {
+            cost = cost + copy_walk_cost(checked, costs, facts, checked.types.members[entry.members_start + i], limit, local_ordered, next_depth);
+            i = i + 1u32;
+        }
+    } elseif entry.kind == TK_LOCAL {
+        var i: u32 = copy_local_field_start(&checked.fields:Read, entry.def, local_ordered);
+        while i < @len(checked.fields.items) as u32 && cost <= limit {
+            let field: typecheck::FieldType = checked.fields.items[i];
+            if local_ordered && field.def != entry.def { break; }
+            if field.def == entry.def { cost = cost + copy_walk_cost(checked, costs, facts, field.type_id, limit, local_ordered, next_depth); }
+            i = i + 1u32;
+        }
+        i = copy_local_enum_start(&checked.enums:Read, entry.def, local_ordered);
+        while i < @len(checked.enums.items) as u32 && cost <= limit {
+            if checked.enums.items[i].def == entry.def {
+                var p: u32 = 0;
+                while p < @len(checked.enums.items[i].payloads) as u32 && cost <= limit {
+                    let payload: u32 = checked.enums.items[i].payloads[p];
+                    if payload != 0u32 { cost = cost + copy_walk_cost(checked, costs, facts, payload, limit, local_ordered, next_depth); }
+                    p = p + 1u32;
+                }
+            }
+            if local_ordered { break; }
+            i = i + 1u32;
+        }
+    } elseif entry.kind == TK_IMPORTED {
+        var count: u32 = 0;
+        var i: u32 = 0;
+        while i < @len(checked.imported_enums.items) as u32 && cost <= limit {
+            cost = cost + 1u64;
+            if cost > limit { return exceeded; }
+            let variant: typecheck::ImportedEnumVariant = checked.imported_enums.items[i];
+            if variant.dep == entry.dep && variant.export_id == entry.export_id {
+                // 缺口或未知载荷使正式判定直接返回非 Copy，不再递归。
+                if !variant.known || variant.variant != count { break; }
+                count = count + 1u32;
+                if variant.payload != 0u32 { cost = cost + copy_walk_cost(checked, costs, facts, variant.payload, limit, local_ordered, next_depth); }
+            }
+            i = i + 1u32;
+        }
+        if i == @len(checked.imported_enums.items) as u32 && count == 0u32 {
+            i = 0u32;
+            while i < @len(checked.imported_fields.items) as u32 && cost <= limit {
+                cost = cost + 1u64;
+                if cost > limit { return exceeded; }
+                let field: typecheck::ImportedFieldType = checked.imported_fields.items[i];
+                if field.dep == entry.dep && field.export_id == entry.export_id {
+                    if field.field != count + 1u32 { break; }
+                    count = count + 1u32;
+                    cost = cost + copy_walk_cost(checked, costs, facts, field.value_type_id, limit, local_ordered, next_depth);
+                }
+                i = i + 1u32;
+            }
+        }
+    }
+    if cost > limit { return exceeded; }
+    let yes: bool = copy_value(checked, id, 0u8, local_ordered, &*facts:Read);
+    facts.items[index] = 2u8;
+    if yes { facts.items[index] = 1u8; }
+    costs[index] = cost;
+    return cost;
+}
+
+// 有序入口仅适用于按递增定义编号收集字段和唯一枚举行的本地声明。
+// 完整成功才提交缓存；不在批处理入口调用，也不保留跨文档版本的类型编号。
+export function prepare_local_copy(checked: &typecheck::TypeCheckResult:ReadWrite, limit: u32, local_ordered: bool): bool!AllocError {
+    var costs: u64[] = [];
+    var facts: typecheck::CopyFacts = typecheck::CopyFacts { items: [] };
+    let count: u32 = @len(checked.types.entries) as u32;
+    var i: u32 = 0;
+    while i < count {
+        @push(costs, 0u64)?;
+        @push(facts.items, 0u8)?;
+        i = i + 1u32;
+    }
+    i = 0;
+    while i < count {
+        if copy_walk_cost(&*checked:Read, &costs:ReadWrite, &facts:ReadWrite, i + 1u32, limit as u64, local_ordered, 64u32) > limit as u64 { return false; }
+        i = i + 1u32;
+    }
+    checked.copy_facts = @move(facts);
+    return true;
+}

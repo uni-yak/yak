@@ -1,0 +1,78 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+// module: iface_read_members=../../compiler/min/src/check/iface_read_members.yak
+// module: iface_read=../../compiler/min/src/check/iface_read.yak
+// module: iface_load=../../compiler/min/src/check/iface_load.yak
+// module: iface_layout_check=../../compiler/min/src/check/iface_layout_check.yak
+import ast;
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import layout;
+import iface;
+import iface_write;
+import iface_load;
+import hash;
+foreign assert(cond: bool): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    return Loaded { parsed: p, lexed: r };
+}
+function check_mixed_facts(): void!AllocError {
+    // 声明顺序为 alpha、beta，接口哈希排序则为 beta、alpha。
+    let unit: Loaded = load("export function alpha(): u32 { return 1u32; } export function beta(): u32 { return 2u32; }\n", 1002)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let refs: resolve_refs::Resolution = resolve_unit::resolve_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &unit.lexed.names:Read, &deps:Read, "mixed", &diags:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(tc.funcs.items) == 2);
+    var facts: u8[] = []; var i: u32 = 0;
+    while i < @len(refs.result.tables.defs) as u32 { @push(facts, 0u8)?; i = i + 1; }
+    facts[tc.funcs.items[0].def - 1] = 2;
+    facts[tc.funcs.items[1].def - 1] = 1;
+    let layouts: iface::LayoutData = iface::LayoutData { sizes: [], aligns: [], known: [] };
+    let written: iface::InterfaceResult = iface_write::write_interface_analyzed(&unit.parsed.file:Read, &unit.parsed.pool:Read, &refs:Read, &unit.lexed.names:Read, &tc:Read, &layouts:Read, &facts[0..@len(facts)]:Read, "mixed", &diags:ReadWrite)?;
+    let result: iface::LoadedInterface = iface_load::load_interface(&written.data.bytes[0..@len(written.data.bytes)]:Read, &diags:ReadWrite)?;
+    assert(!diags.has_error && @len(result.exports) == 2);
+    assert(result.exports[0].name_hash == hash::fnv1a("beta") && result.exports[0].flags == 0);
+    assert(result.exports[1].name_hash == hash::fnv1a("alpha") && result.exports[1].flags == 1);
+    return;
+}
+
+function main(): void { check_mixed_facts()?; }

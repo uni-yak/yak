@@ -1,0 +1,28 @@
+// 宿主内部参数表，每项以 NUL 结束，允许空项；参数字节不解释为路径。
+foreign assert(cond: bool): void;
+
+export function count(args: &[u8]): u32 {
+    var n: u32 = 0;
+    var i: u64 = 0;
+    while i < @len(args) {
+        if args[i] == 0u8 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+export function get(args: &[u8], index: u32): u8[]!AllocError {
+    var cursor: u64 = 0;
+    var n: u32 = 0;
+    while n < index && cursor < @len(args) {
+        if args[cursor] == 0u8 { n = n + 1; }
+        cursor = cursor + 1;
+    }
+    var bytes: u8[] = [];
+    while cursor < @len(args) && args[cursor] != 0u8 {
+        @push(bytes, args[cursor])?;
+        cursor = cursor + 1;
+    }
+    assert(cursor < @len(args));
+    return bytes;
+}

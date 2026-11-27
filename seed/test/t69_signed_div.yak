@@ -1,0 +1,12 @@
+// t69: 有符号除法与取模assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let a: i32 = -17;
+    let b: i32 = 5;
+    assert(a / b == -3);
+    assert(a % b == -2);
+    let c: i32 = 17;
+    assert(c / b == 3);
+    return;
+}

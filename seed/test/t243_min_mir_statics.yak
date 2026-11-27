@@ -1,0 +1,327 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: ysm=../../compiler/min/src/ysm/ysm.yak
+// module: ysm_validate=../../compiler/min/src/ysm/ysm_validate.yak
+// module: ysm_write=../../compiler/min/src/ysm/ysm_write.yak
+// module: ysm_write_sig=../../compiler/min/src/ysm/ysm_write_sig.yak
+// 静态字节池与 &[u8] 字面量的定向用例：覆盖 MIR 构建、校验拒绝与 YSM 往返。
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import iface;
+import mir;
+import mir_lower;
+import mir_verify;
+import ysm;
+import ysm_write;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// 单字面量：foreign 形参为 &[u8]，MIR 只记录实参 LocalId，切片展开留给发射阶段。
+const ONE_SOURCE: &[u8] = "foreign write(data: &[u8]): void; function main(): void { let s: &[u8] = \"hi\"; write(s); }\n";
+// 两条不同字面量：静态池按源码出现顺序累积，字节内容必须精确。
+const TWO_SOURCE: &[u8] = "foreign write(data: &[u8]): void; function main(): void { let a: &[u8] = \"hi\"; write(a); let b: &[u8] = \"yo\"; write(b); }\n";
+
+// 走带静态池的解析入口，其余阶段与会话内测试运行器保持一致。
+function compile(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", diags)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, diags)?;
+    return mir_lower::build_mir(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &tc:Read, diags)?;
+}
+// 返回函数内第一条 const_bytes 指令的位置（1 基），没有则返回 0。
+function const_bytes_at(f: &mir::MirFunction:Read): u32 {
+    var i: u32 = 0;
+    while i < @len(f.insts) as u32 {
+        if f.insts[i].op == 3 { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 返回位置 after 之后的下一条 const_bytes 指令位置（1 基），没有则返回 0。
+function next_const_after(f: &mir::MirFunction:Read, after: u32): u32 {
+    var i: u32 = after;
+    while i < @len(f.insts) as u32 {
+        if f.insts[i].op == 3 { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 返回函数内第一条外部服务调用（op 147）的位置（1 基），没有则返回 0。
+function foreign_call_at(f: &mir::MirFunction:Read): u32 {
+    var i: u32 = 0;
+    while i < @len(f.insts) as u32 {
+        if mir::is_foreign_call(f.insts[i].op) { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 在类型表里按内建 id 找类型条目编号，没有则返回 0。
+function find_builtin(m: &mir::MirModule:Read, builtin: u16): u32 {
+    var i: u32 = 0;
+    while i < @len(m.types.entries) as u32 {
+        if m.types.entries[i].kind == 1 && m.types.entries[i].builtin == builtin { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 单字面量：模块必须被接受，静态池一条，const_bytes 的索引与结果类型正确。
+function single_literal(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(ONE_SOURCE, 1250, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0);
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    assert(@len(result.module.statics) == 1);
+    assert(result.module.statics[0].offset == 0 && result.module.statics[0].length == 2);
+    assert(@len(result.module.static_bytes) == 2);
+    assert(result.module.static_bytes[0] == 104 && result.module.static_bytes[1] == 105);
+    let f: &mir::MirFunction:Read = &result.module.functions[0]:Read;
+    let at: u32 = const_bytes_at(f);
+    assert(at != 0);
+    let instruction: mir::MirInst = f.insts[at - 1];
+    assert(instruction.b == 0);
+    assert(instruction.value_type_id == result.module.statics[0].value_type_id);
+    assert(f.locals[instruction.a - 1].value_type_id == instruction.value_type_id);
+    assert(f.locals[instruction.a - 1].kind == 1);
+    // 外部调用的实参直接引用切片 Local，宽度与展开由发射阶段决定。
+    let call: u32 = foreign_call_at(f);
+    assert(call != 0);
+    assert(f.insts[call - 1].args_count == 1);
+    let argument: u32 = f.args[f.insts[call - 1].args_start];
+    assert(f.locals[argument - 1].value_type_id == instruction.value_type_id);
+    return;
+}
+// 两条不同字面量：两个静态条目、字节精确、const_bytes 索引分别为 0 与 1。
+function two_literals(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(TWO_SOURCE, 1251, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0);
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    assert(@len(result.module.statics) == 2);
+    assert(result.module.statics[0].offset == 0 && result.module.statics[0].length == 2);
+    assert(result.module.statics[1].offset == 2 && result.module.statics[1].length == 2);
+    assert(@len(result.module.static_bytes) == 4);
+    assert(result.module.static_bytes[0] == 104 && result.module.static_bytes[1] == 105);
+    assert(result.module.static_bytes[2] == 121 && result.module.static_bytes[3] == 111);
+    let f: &mir::MirFunction:Read = &result.module.functions[0]:Read;
+    let first: u32 = const_bytes_at(f);
+    assert(first != 0);
+    let second: u32 = next_const_after(f, first);
+    assert(second != 0);
+    assert(next_const_after(f, second) == 0);
+    let i1: mir::MirInst = f.insts[first - 1];
+    let i2: mir::MirInst = f.insts[second - 1];
+    assert(i1.b == 0 && i2.b == 1);
+    assert(i1.value_type_id == result.module.statics[0].value_type_id && i2.value_type_id == result.module.statics[1].value_type_id);
+    assert(i1.value_type_id == i2.value_type_id);
+    return;
+}
+// 三类非法形态必须被 verify_module 拒绝：越界索引、标量结果类型、非法静态条目类型。
+function rejections(): void!AllocError {
+    // 越界静态索引。
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    var out_of_range: mir::MirResult = compile(TWO_SOURCE, 1252, &d1:ReadWrite)?;
+    assert(out_of_range.accepted);
+    let at1: u32 = const_bytes_at(&out_of_range.module.functions[0]:Read);
+    assert(at1 != 0);
+    out_of_range.module.functions[0].insts[at1 - 1].b = 2;
+    assert(!mir_verify::verify_module(&out_of_range.module:Read)?);
+    // 标量结果类型：指令与结果 Local 同时改成 u8，切片视图校验必须拒绝。
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    var wrong_type: mir::MirResult = compile(TWO_SOURCE, 1253, &d2:ReadWrite)?;
+    assert(wrong_type.accepted);
+    let at2: u32 = const_bytes_at(&wrong_type.module.functions[0]:Read);
+    assert(at2 != 0);
+    let u8_type: u32 = find_builtin(&wrong_type.module:Read, 4097);
+    assert(u8_type != 0);
+    let produced: u32 = wrong_type.module.functions[0].insts[at2 - 1].a;
+    wrong_type.module.functions[0].insts[at2 - 1].value_type_id = u8_type;
+    wrong_type.module.functions[0].locals[produced - 1].value_type_id = u8_type;
+    assert(!mir_verify::verify_module(&wrong_type.module:Read)?);
+    // 静态条目类型不是 &[u8]。
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    var wrong_static: mir::MirResult = compile(ONE_SOURCE, 1254, &d3:ReadWrite)?;
+    assert(wrong_static.accepted);
+    let u8_again: u32 = find_builtin(&wrong_static.module:Read, 4097);
+    assert(u8_again != 0);
+    wrong_static.module.statics[0].value_type_id = u8_again;
+    assert(!mir_verify::verify_module(&wrong_static.module:Read)?);
+    return;
+}
+// 构造空事实表：本用例的静态池全部来自 MIR 模块，调用方不再追加。
+function make_facts(): ysm::YsmFacts {
+    var statics: ysm::YsmStatic[] = [];
+    var dependencies: ysm::YsmDependency[] = [];
+    return ysm::YsmFacts {
+        target_profile: 7,
+        statics: @move(statics),
+        dependencies: @move(dependencies),
+        candidate_digests: [],
+        exports: iface::ExportMap { defs: [], exports: [] },
+    };
+}
+// YSM 往返：statics 记录与 static_bytes 来自 MIR 模块，两次写出逐字节一致，读回逐项还原。
+function ysm_roundtrip(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(TWO_SOURCE, 1255, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let facts: ysm::YsmFacts = make_facts();
+    var first_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let first: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &first_diags:ReadWrite)?;
+    assert(first.accepted && @len(first.data) != 0);
+    var second_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let second: ysm::YsmResult = ysm_write::write_module(&result.module:Read, &facts:Read, &second_diags:ReadWrite)?;
+    assert(second.accepted);
+    assert(@len(first.data) == @len(second.data));
+    var i: u32 = 0;
+    while i < @len(first.data) as u32 {
+        assert(first.data[i] == second.data[i]);
+        i = i + 1;
+    }
+    var read_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let loaded: ysm::YsmLoadResult = ysm::read_module(&first.data[0..@len(first.data) as u32]:Read, &read_diags:ReadWrite)?;
+    assert(loaded.accepted);
+    assert(loaded.file.header.static_count == 2);
+    assert(@len(loaded.file.statics) == 2);
+    assert(@len(loaded.file.static_bytes) == 4);
+    assert(loaded.file.statics[0].static_index == 0 && loaded.file.statics[1].static_index == 1);
+    assert(loaded.file.statics[0].byte_off == 0 && loaded.file.statics[0].byte_len == 2);
+    assert(loaded.file.statics[1].byte_off == 2 && loaded.file.statics[1].byte_len == 2);
+    assert(loaded.file.static_bytes[0] == 104 && loaded.file.static_bytes[1] == 105);
+    assert(loaded.file.static_bytes[2] == 121 && loaded.file.static_bytes[3] == 111);
+    // 类型签名偏移必须落在 type_sigs 节内，且该签名是切片编码（操作码 8）。
+    assert(loaded.file.statics[0].type_sig_off < @len(loaded.file.type_sigs) as u32);
+    assert(loaded.file.type_sigs[loaded.file.statics[0].type_sig_off] == 8);
+    return;
+}
+// 顶层常量视图：常量在前端求值，引用点必须落成 const_bytes，且类型与静态池一致。
+// 这是模块常量接入 MIR 的定向证据，与字符串字面量共用同一条静态池通路。
+const GLOBAL_SOURCE: &[u8] = "foreign write(data: &[u8]): void; const BANNER: &[u8] = \"hi\"; function main(): void { write(BANNER); }\n";
+// 标量常量：引用点必须落成 const_int，值与声明类型一致。
+const SCALAR_SOURCE: &[u8] = "const LIMIT: u32 = 7; function f(): u32 { return LIMIT; }\n";
+function global_const(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(GLOBAL_SOURCE, 1260, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0);
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    // 常量声明的字符串字面量进入静态池；常量引用复用同一份字节。
+    assert(@len(result.module.statics) == 1);
+    assert(result.module.static_bytes[0] == 104 && result.module.static_bytes[1] == 105);
+    let f: &mir::MirFunction:Read = &result.module.functions[0]:Read;
+    let at: u32 = const_bytes_at(f);
+    assert(at != 0);
+    let instruction: mir::MirInst = f.insts[at - 1];
+    assert(instruction.b == 0);
+    assert(instruction.value_type_id == result.module.statics[0].value_type_id);
+    return;
+}
+function scalar_const(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(SCALAR_SOURCE, 1261, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0);
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    let f: &mir::MirFunction:Read = &result.module.functions[0]:Read;
+    var found: bool = false;
+    var i: u32 = 0;
+    while i < @len(f.insts) as u32 {
+        if f.insts[i].op == 1 && f.insts[i].value == 7u64 { found = true; }
+        i = i + 1;
+    }
+    assert(found);
+    return;
+}
+// 静态条目的类型化：`MirStatic.type` 承载条目实型而不是统一的视图类型。
+// 字符串条目仍是 &[u8] 视图（`const_bytes` 语义不变），聚合常量条目带自己的类型，
+// 且聚合条目追加在字符串条目之后——字符串条目索引保持不变（视图回归）。
+const TYPED_SOURCE: &[u8] = "foreign write(data: &[u8]): void; const T: [u32; 2] = [1u32, 2u32]; function main(): u32 { let a: [u32; 2] = T; write(\"hi\"); return a[1u32]; }\n";
+function typed_static_entries(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(TYPED_SOURCE, 1262, &diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&diags:Read) == 0);
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    assert(@len(result.module.statics) == 2);
+    // 第 0 条仍是字符串字面量：视图类型（切片 kind5）与索引都未变。
+    let string_type: u32 = result.module.statics[0].value_type_id;
+    assert(result.module.types.entries[string_type - 1].kind == 5);
+    assert(result.module.statics[0].offset == 0 && result.module.statics[0].length == 2);
+    // 第 1 条是聚合镜像：条目类型是定长数组（kind7），不是视图类型。
+    let agg_type: u32 = result.module.statics[1].value_type_id;
+    assert(result.module.types.entries[agg_type - 1].kind == 7);
+    assert(agg_type != string_type);
+    assert(result.module.statics[1].offset == 2 && result.module.statics[1].length == 8);
+    assert(@len(result.module.static_bytes) == 10);
+    let f: &mir::MirFunction:Read = &result.module.functions[0]:Read;
+    // 视图回归：常量字节指令仍指向字符串条目，结果类型保持 &[u8] 视图。
+    let at: u32 = const_bytes_at(f);
+    assert(at != 0);
+    assert(f.insts[at - 1].b == 0);
+    assert(f.insts[at - 1].value_type_id == string_type);
+    assert(f.locals[f.insts[at - 1].a - 1].value_type_id == string_type);
+    return;
+}
+function main(): void {
+    single_literal()?;
+    two_literals()?;
+    rejections()?;
+    ysm_roundtrip()?;
+    global_const()?;
+    scalar_const()?;
+    typed_static_entries()?;
+    return;
+}

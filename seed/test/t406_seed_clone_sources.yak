@@ -1,0 +1,30 @@
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+enum Fault { Failed }
+
+function samples(succeeds: bool): u8[]!Fault {
+    if !succeeds { return Fault::Failed; }
+    return [7u8];
+}
+
+function copied(works: bool): u8[]!(Fault | AllocError) {
+    return @clone(samples(works)?)?;
+}
+
+function run(): void!(Fault | AllocError) {
+    let source: [u8[]; 2] = [[1u8], [2u8]];
+    var from_projection: u8[] = @clone(source[1])?;
+    @push(from_projection, 9u8)?;
+    assert(from_projection[1] == 9u8 && source[1].len == 1u64);
+    let from_temporary: u8[] = copied(true)?;
+    assert(from_temporary.len == 1u64 && from_temporary[0] == 7u8);
+    let failed: u8[]!(Fault | AllocError) = copied(false);
+    @drop(failed);
+    exit(0u8);
+}
+
+function main(): void {
+    run();
+    exit(1u8);
+}

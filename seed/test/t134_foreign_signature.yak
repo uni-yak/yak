@@ -1,0 +1,2 @@
+// expected_trap: invalid service signature
+foreign write(): void; function main(): void { write(); }

@@ -1,0 +1,9 @@
+foreign assert(cond: bool): void;
+function main(): void {
+    let a: i8 = 128u8 as i8; let b: i8 = 255u8 as i8;
+    let c: i16 = 32768u16 as i16; let d: i16 = 65535u16 as i16;
+    let e: i32 = 2147483648u32 as i32; let f: i32 = 4294967295u32 as i32;
+    let g: i64 = 9223372036854775808u64 as i64; let h: i64 = 18446744073709551615u64 as i64;
+    assert(a % b == 0i8); assert(c % d == 0i16);
+    assert(e % f == 0i32); assert(g % h == 0i64);
+}

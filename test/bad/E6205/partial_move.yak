@@ -1,0 +1,11 @@
+// expected_code: E6205
+// spec: spec/lang/owner.md OW-10
+// 触发：从 owning 聚合仅移动其动态数组字段。
+struct Wrap { data: u32[] }
+
+function main(): void {
+    let w: Wrap = Wrap { data: [1u32] };
+    let x: u32[] = @move(w.data);
+    @drop(x);
+    return;
+}

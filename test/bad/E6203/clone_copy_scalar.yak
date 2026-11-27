@@ -1,0 +1,10 @@
+// expected_code: E6203
+// spec: spec/lang/base.md R-21
+// 触发：尝试克隆本应复制的整数。
+function reject(value: u32): void!AllocError {
+    let cloned: u32 = @clone(value)?;
+    @drop(cloned);
+    @drop(value);
+    return;
+}
+function main(): void { return; }

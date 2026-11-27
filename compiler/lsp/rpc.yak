@@ -1,0 +1,179 @@
+// 封包路由不读写宿主、不复制请求 ID；状态只由调用方在成功处理后提交。
+import json;
+import json_string;
+
+// kind：0 丢弃，1 错误，2 初始化，3 已初始化通知，4 关闭，5 退出。
+// 6 打开文档，7 变更（增量/全量），8 关闭文档（均无响应）；
+// 9 定义，10 悬停，11 补全，12 完整语义记号，13 文档符号，14 折叠，15 工作区符号，
+// 16 $/cancelRequest 通知，17 yak/workspaceFiles 通知，
+// 18 格式化，19 prepareRename，20 rename，21 codeAction。
+// phase：0 等待初始化，1 等通知，2 运行，3 已关闭。id_end 为零则响应使用 null。
+export struct Route {
+    kind: u8,
+    phase: u8,
+    code: i32,
+    id_start: u32,
+    id_end: u32,
+    params_id: u32,
+    exit_code: u8
+}
+
+function result(kind: u8, phase: u8): Route {
+    return Route { kind: kind, phase: phase, code: 0, id_start: 0, id_end: 0, params_id: 0, exit_code: 0 };
+}
+
+function reject(phase: u8, code: i32): Route {
+    var route: Route = result(1, phase);
+    route.code = code;
+    return route;
+}
+
+function valid_id(src: &[u8], item: json::Node): bool {
+    if item.end - item.start > 4096u32 { return false; }
+    if json::is_string(item.kind) { return true; }
+    if !json::is_number(item.kind) { return false; }
+    var i: u32 = item.start;
+    var limit: u32 = 2147483647;
+    if src[i] == 45u8 { i = i + 1; limit = 2147483648; }
+    var value: u32 = 0;
+    while i < item.end {
+        let b: u8 = src[i];
+        if b < 48u8 || b > 57u8 { return false; }
+        let digit: u32 = (b - 48u8) as u32;
+        if value > (limit - digit) / 10 { return false; }
+        value = value * 10 + digit;
+        i = i + 1;
+    }
+    return true;
+}
+
+function named(src: &[u8], item: json::Node, name: &[u8]): bool {
+    return json::is_string(item.kind) && json_string::equals(src, item.start, item.end, name);
+}
+
+// 返回文档存储的操作编号；零表示不是文档通知。
+export function document_method(kind: u8): u8 {
+    if kind >= 6u8 && kind <= 8u8 { return kind - 5u8; }
+    return 0;
+}
+
+function notice_kind(src: &[u8], name: json::Node): u8 {
+    if named(src, name, "textDocument/didOpen") { return 6; }
+    if named(src, name, "textDocument/didChange") { return 7; }
+    if named(src, name, "textDocument/didClose") { return 8; }
+    if named(src, name, "$/cancelRequest") { return 16; }
+    if named(src, name, "yak/workspaceFiles") { return 17; }
+    return 0;
+}
+
+// 只接收由同一份 src 解析的节点表。顶层参数下标为零表示缺失。
+export function classify(doc: &json::Document:Read, src: &[u8], phase: u8): Route {
+    return classify_configured(doc, src, phase, false);
+}
+
+export function classify_configured(doc: &json::Document:Read, src: &[u8], phase: u8, definitions: bool): Route {
+    return classify_workspace(doc, src, phase, definitions, false);
+}
+
+export function classify_workspace(doc: &json::Document:Read, src: &[u8], phase: u8, definitions: bool, workspace_symbols: bool): Route {
+    if doc.status == 1u8 { return reject(phase, -32700i32); }
+    if doc.status != 0u8 || @len(doc.nodes) == 0 || !json::is_object(doc.nodes[0].kind) {
+        return reject(phase, -32600i32);
+    }
+    let method: json::Member = json::member(doc, src, 0, "method");
+    if method.status == 0u8 {
+        if json::member(doc, src, 0, "result").status != 0u8 || json::member(doc, src, 0, "error").status != 0u8 {
+            return result(0, phase);
+        }
+    }
+    let version: json::Member = json::member(doc, src, 0, "jsonrpc");
+    if version.status != 1u8 || !named(src, doc.nodes[version.id], "2.0") || method.status != 1u8 {
+        return reject(phase, -32600i32);
+    }
+    let name: json::Node = doc.nodes[method.id];
+    if !json::is_string(name.kind) || name.end - name.start <= 2u32 { return reject(phase, -32600i32); }
+    let id: json::Member = json::member(doc, src, 0, "id");
+    let params: json::Member = json::member(doc, src, 0, "params");
+    if id.status == 2u8 || params.status == 2u8 { return reject(phase, -32600i32); }
+    let empty: bool = params.status == 0u8 || json::is_null(doc.nodes[params.id].kind);
+    if id.status == 0u8 {
+        if empty && named(src, name, "exit") {
+            var route: Route = result(5, phase);
+            if phase != 3u8 { route.exit_code = 1; }
+            return route;
+        }
+        let empty_object: bool = params.status == 1u8 && json::is_object(doc.nodes[params.id].kind)
+            && doc.nodes[params.id].next == params.id + 1;
+        if phase == 1u8 && (empty || empty_object) && named(src, name, "initialized") { return result(3, 2); }
+        if phase == 2u8 && params.status == 1u8 && json::is_object(doc.nodes[params.id].kind) {
+            let kind: u8 = notice_kind(src, name);
+            if kind != 0u8 {
+                var notice: Route = result(kind, phase);
+                notice.params_id = params.id;
+                return notice;
+            }
+        }
+        return result(0, phase);
+    }
+    let raw: json::Node = doc.nodes[id.id];
+    if !valid_id(src, raw) { return reject(phase, -32600i32); }
+    var route: Route = result(1, phase);
+    route.id_start = raw.start;
+    route.id_end = raw.end;
+    route.params_id = params.id;
+    if phase == 3u8 || (phase != 0u8 && named(src, name, "initialize")) { route.code = -32600i32; }
+    elseif phase == 0u8 && named(src, name, "initialize") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 2; route.phase = 1; }
+    }
+    elseif phase != 2u8 { route.code = -32002i32; }
+    elseif named(src, name, "shutdown") {
+        if empty { route.kind = 4; route.phase = 3; }
+        else { route.code = -32602i32; }
+    }
+    elseif definitions && named(src, name, "textDocument/definition") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 9u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/hover") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 10u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/completion") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 11u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/semanticTokens/full") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 12u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/documentSymbol") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 13u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/foldingRange") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 14u8; }
+    }
+    elseif (workspace_symbols || definitions) && named(src, name, "workspace/symbol") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 15u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/formatting") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 18u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/prepareRename") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 19u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/rename") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 20u8; }
+    }
+    elseif definitions && named(src, name, "textDocument/codeAction") {
+        if params.status != 1u8 || !json::is_object(doc.nodes[params.id].kind) { route.code = -32602i32; }
+        else { route.kind = 21u8; }
+    } else { route.code = -32601i32; }
+    return route;
+}

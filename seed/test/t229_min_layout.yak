@@ -1,0 +1,298 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import layout;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_ERROR_SET: u8 = 11;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FALLIBLE: u8 = 9;
+const LY_2: u16 = 5502;
+const LY_4: u16 = 5504;
+const LY_9: u16 = 5509;
+foreign assert(cond: bool): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+struct Bundle { tc: typecheck::TypeCheckResult, ly: layout::LayoutResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    return Loaded { parsed: parsed, lexed: r };
+}
+function run(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): Bundle!AllocError {
+    let loaded: Loaded = load(src, file)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", diags)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, diags)?;
+    let ly: layout::LayoutResult = layout::layout_unit(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, diags)?;
+    return Bundle { tc: tc, ly: ly };
+}
+function find_kind(types: &typecheck::TypeTable:Read, kind: u8): u32 {
+    var i: u32 = 0;
+    while i < @len(types.entries) as u32 {
+        if types.entries[i].kind == kind { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function has_code(diags: &diag::DiagBuffer:Read, code: u16): bool {
+    var i: u32 = 0;
+    while i < diag::diagbuf_count(diags) {
+        if diags.diags[i].code.raw == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+// 字段组先按依赖编号再按导出编号排序；同组内允许多项。
+function imported_field(dep: u16, export_id: u32, field: u32): layout::ImportedFieldLayout {
+    return layout::ImportedFieldLayout { dep: dep, export_id: export_id, field: field, value_type_id: 1, offset: 0, size: 1, align: 1, known: true };
+}
+function check_imported_field_groups(): void!AllocError {
+    var table: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    assert(layout::imported_fields_ordered(&table:Read));
+    assert(layout::imported_fields_start(&table:Read, 1, 4, true) == 0);
+    @push(table.items, imported_field(1, 4, 1))?;
+    @push(table.items, imported_field(1, 4, 2))?;
+    @push(table.items, imported_field(1, 6, 1))?;
+    @push(table.items, imported_field(2, 3, 1))?;
+    let ordered: bool = layout::imported_fields_ordered(&table:Read);
+    assert(ordered);
+    assert(layout::imported_fields_start(&table:Read, 1, 4, ordered) == 0);
+    assert(layout::imported_fields_start(&table:Read, 1, 5, ordered) == 2);
+    assert(layout::imported_fields_start(&table:Read, 2, 3, ordered) == 3);
+    assert(layout::imported_fields_start(&table:Read, 2, 4, ordered) == 4);
+    @push(table.items, imported_field(1, 4, 3))?;
+    let mixed: bool = layout::imported_fields_ordered(&table:Read);
+    assert(!mixed);
+    assert(layout::imported_fields_start(&table:Read, 2, 3, mixed) == 0);
+    return;
+}
+function main(): void {
+    check_imported_field_groups()?;
+    // ── struct 字段顺序、padding 与尾部对齐 ──
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let b1: Bundle = run("struct P { a: u8, b: u32 }\n", 500, &d1:ReadWrite)?;
+    let s1: u32 = find_kind(&b1.tc.types:Read, TK_LOCAL);
+    assert(s1 != 0);
+    assert(b1.ly.table.items[s1 - 1].size == 8);
+    assert(b1.ly.table.items[s1 - 1].align == 4);
+    let def: u32 = b1.tc.types.entries[s1 - 1].def;
+    assert(layout::field_type_at(&b1.tc.types:Read, &b1.tc.fields:Read, &b1.tc.enums:Read, def, 0)? == b1.tc.fields.items[0].type_id);
+    assert(layout::field_type_at(&b1.tc.types:Read, &b1.tc.fields:Read, &b1.tc.enums:Read, def, 4)? == b1.tc.fields.items[1].type_id);
+    assert(layout::field_type_at(&b1.tc.types:Read, &b1.tc.fields:Read, &b1.tc.enums:Read, def, 1)? == 0);
+    assert(layout::field_type_at(&b1.tc.types:Read, &b1.tc.fields:Read, &b1.tc.enums:Read, def, 5)? == 0);
+    assert(layout::field_byte_offset_from_table(&b1.ly.table:Read, &b1.tc.fields:Read, def, 1) == 4);
+    assert(layout::field_byte_offset_from_table(&b1.ly.table:Read, &b1.tc.fields:Read, def, 2) == 4294967295u64);
+    // 交错字段不能按连续定义分组，但同一定义内仍按原顺序计算偏移。
+    let interleaved: typecheck::FieldTable = typecheck::FieldTable { items: [b1.tc.fields.items[0], typecheck::FieldType { def: def + 1, name: 0, type_id: b1.tc.fields.items[0].type_id }, b1.tc.fields.items[1]] };
+    var mixed_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let mixed: layout::LayoutResult = layout::layout_unit(&b1.tc.types:Read, &interleaved:Read, &b1.tc.enums:Read, &mixed_diags:ReadWrite)?;
+    assert(diag::diagbuf_count(&mixed_diags:Read) == 0);
+    assert(mixed.table.items[s1 - 1].size == 8);
+    assert(layout::field_byte_offset_from_table(&mixed.table:Read, &interleaved:Read, def, 1) == 4);
+    assert(layout::field_type_at(&b1.tc.types:Read, &b1.tc.fields:Read, &b1.tc.enums:Read, def, 8)? == 0);
+    assert(layout::field_type_at(&b1.tc.types:Read, &b1.tc.fields:Read, &b1.tc.enums:Read, 0, 0)? == 0);
+
+    // ── enum：tag 1、payload 对齐到 4、总大小 8 ──
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let b2: Bundle = run("enum E { A, B(u32) }\n", 501, &d2:ReadWrite)?;
+    let e2: u32 = find_kind(&b2.tc.types:Read, TK_LOCAL);
+    assert(b2.ly.table.items[e2 - 1].size == 8);
+    assert(b2.ly.table.items[e2 - 1].align == 4);
+    assert(b2.ly.table.items[e2 - 1].tag_size == 1);
+    assert(b2.ly.table.items[e2 - 1].payload_off == 4);
+
+    // ── 定长数组 [u32; 3] ──
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let b3: Bundle = run("function f(x: [u32; 3]): void { @drop(x); return; }\n", 502, &d3:ReadWrite)?;
+    let a3: u32 = find_kind(&b3.tc.types:Read, TK_FIXED_ARRAY);
+    assert(a3 != 0);
+    assert(b3.ly.table.items[a3 - 1].size == 12);
+    assert(b3.ly.table.items[a3 - 1].align == 4);
+
+    // ── 视图、切片、动态数组头部 ──
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let b4: Bundle = run("function f(a: &u32, b: &[u8], c: u32[]): void { @drop(a); @drop(b); @drop(c); return; }\n", 503, &d4:ReadWrite)?;
+    let r4: u32 = find_kind(&b4.tc.types:Read, TK_REF);
+    let v4: u32 = find_kind(&b4.tc.types:Read, TK_SLICE);
+    let h4: u32 = find_kind(&b4.tc.types:Read, TK_DYN_ARRAY);
+    assert(b4.ly.table.items[r4 - 1].size == 8 && b4.ly.table.items[r4 - 1].align == 8);
+    assert(b4.ly.table.items[v4 - 1].size == 16 && b4.ly.table.items[v4 - 1].align == 8);
+    assert(b4.ly.table.items[h4 - 1].size == 24 && b4.ly.table.items[h4 - 1].align == 8);
+
+    // ── u32!E：tag 1 + 4 字节偏移 + 8 字节最大 payload = 12 ──
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let b5: Bundle = run("enum E { A, B(u32) } function f(): u32!E { return 1; }\n", 504, &d5:ReadWrite)?;
+    let f5: u32 = find_kind(&b5.tc.types:Read, TK_FALLIBLE);
+    assert(f5 != 0);
+    assert(b5.ly.table.items[f5 - 1].size == 12);
+    assert(b5.ly.table.items[f5 - 1].align == 4);
+    assert(b5.ly.table.items[f5 - 1].payload_off == 4);
+
+    // ── void!E：success 空 payload，错误 payload 为 1 字节 enum → 2 ──
+    var d6: diag::DiagBuffer = diag::diagbuf_new();
+    let b6: Bundle = run("enum E { A } function f(): void!E { return; }\n", 505, &d6:ReadWrite)?;
+    let f6: u32 = find_kind(&b6.tc.types:Read, TK_FALLIBLE);
+    assert(b6.ly.table.items[f6 - 1].size == 2);
+    assert(b6.ly.table.items[f6 - 1].align == 1);
+
+    // ── LY-2：[T; 0] ──
+    var d7: diag::DiagBuffer = diag::diagbuf_new();
+    let b7: Bundle = run("function f(x: [u32; 0]): void { @drop(x); return; }\n", 506, &d7:ReadWrite)?;
+    assert(has_code(&d7:Read, LY_2));
+
+    // ── LY-2：空 struct ──
+    var d8: diag::DiagBuffer = diag::diagbuf_new();
+    let b8: Bundle = run("struct S {}\n", 507, &d8:ReadWrite)?;
+    assert(has_code(&d8:Read, LY_2));
+
+    // ── LY-9：按值递归 struct ──
+    var d9: diag::DiagBuffer = diag::diagbuf_new();
+    let b9: Bundle = run("struct Node { next: Node }\n", 508, &d9:ReadWrite)?;
+    assert(has_code(&d9:Read, LY_9));
+
+    // ── LY-4：void 字段 ──
+    var d10: diag::DiagBuffer = diag::diagbuf_new();
+    let b10: Bundle = run("struct V { v: void }\n", 509, &d10:ReadWrite)?;
+    assert(has_code(&d10:Read, LY_4));
+    // 动态数组不构成按值边，但零步长元素仍须拒绝。
+    var d11: diag::DiagBuffer = diag::diagbuf_new();
+    let b11: Bundle = run("struct Node { children: Node[] }\n", 510, &d11:ReadWrite)?;
+    assert(diag::diagbuf_count(&d11:Read) == 0);
+    let node: u32 = find_kind(&b11.tc.types:Read, TK_LOCAL);
+    assert(b11.ly.table.items[node - 1].size == 24);
+    var d12: diag::DiagBuffer = diag::diagbuf_new();
+    let b12: Bundle = run("function f(x: void[]): void { @drop(x); }\n", 511, &d12:ReadWrite)?;
+    assert(has_code(&d12:Read, LY_2));
+    assert(has_code(&d12:Read, LY_4));
+    var void_array_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let void_array: Bundle = run("function f(x: [void; 2]): void { @drop(x); }\n", 520, &void_array_diags:ReadWrite)?;
+    let void_array_type: u32 = find_kind(&void_array.tc.types:Read, TK_FIXED_ARRAY);
+    assert(void_array_type != 0 && !void_array.ly.table.items[void_array_type - 1].known);
+    assert(has_code(&void_array_diags:Read, LY_4));
+    var empty_void_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let empty_void: Bundle = run("function f(x: [void; 0]): void { @drop(x); }\n", 521, &empty_void_diags:ReadWrite)?;
+    assert(has_code(&empty_void_diags:Read, LY_2) && has_code(&empty_void_diags:Read, LY_4));
+    // 最大可表示尺寸不是溢出；相邻的加法和对齐溢出仍须拒绝。
+    var d13: diag::DiagBuffer = diag::diagbuf_new();
+    let b13: Bundle = run("struct S { a: [u8; 18446744073709551615u64] }\n", 512, &d13:ReadWrite)?;
+    let s13: u32 = find_kind(&b13.tc.types:Read, TK_LOCAL);
+    assert(!d13.has_error && s13 != 0 && b13.ly.table.items[s13 - 1].known && b13.ly.table.items[s13 - 1].size == 18446744073709551615u64);
+    var d14: diag::DiagBuffer = diag::diagbuf_new();
+    let b14: Bundle = run("enum E { A([u8; 18446744073709551614u64]) }\n", 513, &d14:ReadWrite)?;
+    let e14: u32 = find_kind(&b14.tc.types:Read, TK_LOCAL);
+    assert(!d14.has_error && e14 != 0 && b14.ly.table.items[e14 - 1].known && b14.ly.table.items[e14 - 1].size == 18446744073709551615u64);
+    var d15: diag::DiagBuffer = diag::diagbuf_new();
+    let b15: Bundle = run("struct S { a: [u8; 18446744073709551615u64], b: u8 }\n", 514, &d15:ReadWrite)?;
+    assert(has_code(&d15:Read, 5501));
+    var d16: diag::DiagBuffer = diag::diagbuf_new();
+    let b16: Bundle = run("struct S { a: [u8; 18446744073709551614u64], b: u32 }\n", 515, &d16:ReadWrite)?;
+    assert(has_code(&d16:Read, 5501));
+    var d17: diag::DiagBuffer = diag::diagbuf_new();
+    let b17: Bundle = run("struct S { a: u32, b: [u8; 18446744073709551611u64] }\n", 516, &d17:ReadWrite)?;
+    assert(has_code(&d17:Read, 5501));
+    var d18: diag::DiagBuffer = diag::diagbuf_new();
+    let b18: Bundle = run("enum E { A(u16), B([u8; 18446744073709551613u64]) }\n", 517, &d18:ReadWrite)?;
+    assert(has_code(&d18:Read, 5501));
+    // 导入成员布局未知时，依赖它的错误集和 fallible 也不可当作已知。
+    var d19: diag::DiagBuffer = diag::diagbuf_new();
+    var b19: Bundle = run("enum E { A } enum F { B } function f(): u32!(E | F) { return 1; }\n", 518, &d19:ReadWrite)?;
+    let errors19: u32 = find_kind(&b19.tc.types:Read, TK_ERROR_SET);
+    let fallible19: u32 = find_kind(&b19.tc.types:Read, TK_FALLIBLE);
+    assert(errors19 != 0 && fallible19 != 0 && !d19.has_error && b19.ly.table.items[errors19 - 1].known && b19.ly.table.items[fallible19 - 1].known);
+    let member19: u32 = b19.tc.types.members[b19.tc.types.entries[errors19 - 1].members_start];
+    b19.tc.types.entries[member19 - 1].kind = TK_IMPORTED;
+    let l19: layout::LayoutResult = layout::layout_unit(&b19.tc.types:Read, &b19.tc.fields:Read, &b19.tc.enums:Read, &d19:ReadWrite)?;
+    assert(!d19.has_error && !l19.table.items[errors19 - 1].known && !l19.table.items[fallible19 - 1].known);
+    b19.tc.types.entries[member19 - 1].kind = TK_LOCAL;
+    let other19: u32 = b19.tc.types.members[b19.tc.types.entries[errors19 - 1].members_start + 1];
+    b19.tc.types.entries[other19 - 1].kind = TK_IMPORTED;
+    let l19b: layout::LayoutResult = layout::layout_unit(&b19.tc.types:Read, &b19.tc.fields:Read, &b19.tc.enums:Read, &d19:ReadWrite)?;
+    assert(!d19.has_error && !l19b.table.items[errors19 - 1].known && !l19b.table.items[fallible19 - 1].known);
+    // 未知字段不能被误认为已确认的零尺寸结构体。
+    var d20: diag::DiagBuffer = diag::diagbuf_new();
+    var b20: Bundle = run("struct S { a: u32 }\n", 519, &d20:ReadWrite)?;
+    let struct20: u32 = find_kind(&b20.tc.types:Read, TK_LOCAL);
+    let field20: u32 = b20.tc.fields.items[0].type_id;
+    b20.tc.types.entries[field20 - 1].kind = TK_IMPORTED;
+    let l20: layout::LayoutResult = layout::layout_unit(&b20.tc.types:Read, &b20.tc.fields:Read, &b20.tc.enums:Read, &d20:ReadWrite)?;
+    assert(!d20.has_error && !l20.table.items[struct20 - 1].known);
+    // 导入名义类型：提供直接依赖的布局摘要后按摘要求值，不再一律未知。
+    var d21: diag::DiagBuffer = diag::diagbuf_new();
+    var b21: Bundle = run("struct S { a: u32, b: [u32; 1] }\n", 520, &d21:ReadWrite)?;
+    let struct21: u32 = find_kind(&b21.tc.types:Read, TK_LOCAL);
+    let imported21: u32 = b21.tc.fields.items[1].type_id;
+    b21.tc.types.entries[imported21 - 1].kind = TK_IMPORTED;
+    b21.tc.types.entries[imported21 - 1].dep = 1;
+    b21.tc.types.entries[imported21 - 1].export_id = 7;
+    var imports21: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    @push(imports21.items, layout::ImportedLayout { dep: 1, export_id: 7, size: 8, align: 8 })?;
+    let no_imported_enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    let l21: layout::LayoutResult = layout::layout_unit_with_imports(&b21.tc.types:Read, &b21.tc.fields:Read, &b21.tc.enums:Read, &imports21:Read, &no_imported_enums:Read, &d21:ReadWrite)?;
+    assert(!d21.has_error);
+    assert(l21.table.items[imported21 - 1].known && l21.table.items[imported21 - 1].size == 8);
+    // struct S { a: u32, b: imported(8, align 8) } → b 偏移 8、总大小 16、对齐 8。
+    assert(l21.table.items[struct21 - 1].known && l21.table.items[struct21 - 1].size == 16 && l21.table.items[struct21 - 1].align == 8);
+    // 摘要缺失时保持未知（失败关闭），不把导入类型当成零尺寸或已确认形态。
+    var d22: diag::DiagBuffer = diag::diagbuf_new();
+    let l22: layout::LayoutResult = layout::layout_unit(&b21.tc.types:Read, &b21.tc.fields:Read, &b21.tc.enums:Read, &d22:ReadWrite)?;
+    assert(!l22.table.items[struct21 - 1].known);
+    // 导入结构体字段偏移：{u32, u64} → 0 / 8；{u8, u32} → 0 / 4。
+    var f_sizes: u64[] = [];
+    var f_aligns: u8[] = [];
+    @push(f_sizes, 4u64)?; @push(f_aligns, 4u8)?;
+    @push(f_sizes, 8u64)?; @push(f_aligns, 8u8)?;
+    assert(layout::imported_field_offset(&f_sizes[0..@len(f_sizes)]:Read, &f_aligns[0..@len(f_aligns)]:Read, 1) == 0);
+    assert(layout::imported_field_offset(&f_sizes[0..@len(f_sizes)]:Read, &f_aligns[0..@len(f_aligns)]:Read, 2) == 8);
+    var g_sizes: u64[] = [];
+    var g_aligns: u8[] = [];
+    @push(g_sizes, 1u64)?; @push(g_aligns, 1u8)?;
+    @push(g_sizes, 4u64)?; @push(g_aligns, 4u8)?;
+    assert(layout::imported_field_offset(&g_sizes[0..@len(g_sizes)]:Read, &g_aligns[0..@len(g_aligns)]:Read, 2) == 4);
+    // 越界与非法对齐一律失败关闭。
+    assert(layout::imported_field_offset(&g_sizes[0..@len(g_sizes)]:Read, &g_aligns[0..@len(g_aligns)]:Read, 3) == 4294967295u64);
+    var bad_aligns: u8[] = [];
+    @push(bad_aligns, 3u8)?;
+    assert(layout::imported_field_offset(&g_sizes[0..@len(g_sizes)]:Read, &bad_aligns[0..@len(bad_aligns)]:Read, 1) == 4294967295u64);
+    // 导入结构体总体尺寸：{u32, u64} → 16；{u8, u32} → 8；空表/长度不等失败关闭。
+    assert(layout::imported_struct_size(&f_sizes[0..@len(f_sizes)]:Read, &f_aligns[0..@len(f_aligns)]:Read) == 16);
+    assert(layout::imported_struct_size(&g_sizes[0..@len(g_sizes)]:Read, &g_aligns[0..@len(g_aligns)]:Read) == 8);
+    var empty_sizes: u64[] = [];
+    var empty_aligns: u8[] = [];
+    assert(layout::imported_struct_size(&empty_sizes[0..0]:Read, &empty_aligns[0..0]:Read) == 4294967295u64);
+    return;
+}

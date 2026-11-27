@@ -1,0 +1,9 @@
+// t23: 自赋值 + assert验证值不变
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var x: u32 = 42;
+    x = x;
+    assert(x == 42);
+    return;
+}

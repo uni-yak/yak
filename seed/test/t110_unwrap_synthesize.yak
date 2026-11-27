@@ -1,0 +1,12 @@
+// t110: .unwrap() Err → 不正常完成，合成 <Enum>::<Variant>（S-9.4，无 Error 实现）
+// expected_trap: E::Bad
+enum E { Bad, }
+function maybe(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function main(): void {
+    let a: u32 = maybe(0).unwrap();
+    assert(false);
+    return;
+}

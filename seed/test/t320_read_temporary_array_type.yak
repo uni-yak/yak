@@ -1,0 +1,3 @@
+// expected_trap: reference referent type mismatch
+function take(values: &u8[]): void {}
+function main(): void { take([1, 2u32]); }

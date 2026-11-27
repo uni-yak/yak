@@ -1,0 +1,15 @@
+export function make(ok: bool): u32[]!AllocError {
+    if !ok { return AllocError::OutOfMemory; }
+    var bytes: u32[] = [];
+    @push(bytes, 19u32)?;
+    @push(bytes, 73u32)?;
+    return bytes;
+}
+
+export enum Rejected { Bad(u32) }
+
+export function make_guarded(ok: bool): u32[]!(AllocError | Rejected) {
+    if !ok { return Rejected::Bad(73u32); }
+    let values: u32[] = make(true)?;
+    return values;
+}

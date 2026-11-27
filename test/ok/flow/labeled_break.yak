@@ -1,0 +1,21 @@
+// expected_exit: 10
+// spec: spec/lang/base.md 6.2、spec/lang/parse.md 5.4
+// 嵌套循环中带标签 break 跳出外层循环：内层首次迭代即跳出，外层命中计数为 0，加基数 10 得退出码 10。
+// 注：seed 解释器拒绝带标签控制流，本案例只能经编译器产物验证。
+foreign exit(code: u8): void;
+
+function main(): void {
+    var hits: u32 = 0u32;
+    var i: u32 = 0u32;
+    outer: while i < 3u32 {
+        i = i + 1u32;
+        var j: u32 = 0u32;
+        inner: while j < 5u32 {
+            j = j + 1u32;
+            if j == 2u32 { break outer; }
+        }
+        hits = hits + 1u32;
+    }
+    exit((hits + 10u32) as u8);
+    return;
+}

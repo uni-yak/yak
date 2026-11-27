@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { let scalar: u32 = '中' as u32; assert(scalar == 20013); assert((scalar as char) == '中'); assert('A' < 'Z'); }

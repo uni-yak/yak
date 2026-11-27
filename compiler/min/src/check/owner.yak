@@ -1,0 +1,182 @@
+// 所有权、借用与 out 槽位状态机检查。
+//
+// 本模块按 spec/lang/owner.md 对 base 子集做静态检查：owning place 的
+// live/moved/dropped 状态、借用区域与能力、out 槽位的 empty/lent/full/consumed
+// 状态、Copy 判定与析构顺序。所有判定只依赖 AST、类型表与控制流结构，
+// 不使用哈希遍历、地址或时间，保证同一输入产生同一诊断集合。
+//
+// 诊断码取自 spec/proc/error.def 的 E6 段，括号内是对应的拒绝形态：
+//   6003（R-4）移动或析构后继续使用源
+//   6004（R-5）ReadWrite 活跃期间访问原变量名或其他引用
+//   6005（R-6）引用逃逸宿主区域
+//   6006（R-7）以引用或切片表达环、自引用
+//   6008（R-14）能力升级
+//   6009（R-15）对 let 绑定请求 ReadWrite
+//   6201（R-19）隐式 clone / move / drop
+//   6202（R-20）对非 Copy 类型使用 @copy
+//   6203（R-21）clone 未登记克隆契约
+//   6204（R-26）@move / @drop 作用于非 owning
+//   6102（R-22）对 out 槽位读取、部分写入、重复填充、借用或转发
+//   6103（R-23）控制流合流点对同一槽位状态不一致
+//   6104（R-25）out 的 T 类型非法
+//   6105（R-28）含 out 的 carrier 保存到绑定后判定
+import ast;
+import diag;
+import typecheck;
+import copy_facts;
+import resolve;
+import resolve_refs;
+import owner_write;
+import owner_flow;
+import owner_state;
+import owner_block;
+
+// 形参登记使用与块内状态机一致的初始状态。
+const PLACE_LIVE: u8 = 0;
+const SLOT_EMPTY: u8 = 0;
+
+// 检查结果：place 状态表、借用表、是否发现 owning 值与各函数析构计划。
+export struct OwnerResult { places: owner_state::PlaceTable, borrows: owner_state::BorrowTable, has_owning: bool, drop_plans: owner_state::DropPlanTable, write_budget_exhausted: bool, replay_budget_exhausted: bool, place_copy_exhausted: bool, slice_merge_exhausted: bool, slice_copy_exhausted: bool, slice_scope_exhausted: bool, slice_assignment_exhausted: bool, borrow_conflict_exhausted: bool, place_merge_exhausted: bool, place_lookup_exhausted: bool, place_exit_exhausted: bool, slot_jump_exhausted: bool, slice_jump_exhausted: bool }
+
+// 零额度表示不设该项上限；文档模式另控制侧表和后端产物。
+export struct OwnerLimits { write: u32, replay: u32, place_copy: u32, slice_merge: u32, slice_copy: u32, slice_scope: u32, slice_assignment: u32, borrow_conflict: u32, place_merge: u32, place_lookup: u32, place_exit: u32, slot_jump: u32, slice_jump: u32, document: bool }
+
+export function is_copy_type(checked: &typecheck::TypeCheckResult:Read, id: u32): bool {
+    return owner_state::is_copy_type(checked, id);
+}
+
+export function is_owning_type(checked: &typecheck::TypeCheckResult:Read, id: u32): bool {
+    return owner_state::is_owning_type(checked, id);
+}
+
+export function place_root(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32): u32 {
+    return owner_state::place_root(pool, refs, expr);
+}
+
+// 按函数顺序编码：[记录数, [边种类, AST 索引, 数量, DefId...]...]。
+// 边种类：0 为显式/隐式返回（最大 u32 表示隐式），1 为错误传播，2 为 break，3 为 continue，4 为子块正常落尾。
+export function encode_drop_plans(plans: &owner_state::DropPlanTable:Read): u32[]!AllocError {
+    var flat: u32[] = [];
+    var f: u32 = 0;
+    while f < @len(plans.items) as u32 {
+        @push(flat, 1 + @len(plans.items[f].returns.items) as u32 + @len(plans.items[f].returns.scopes) as u32)?;
+        @push(flat, 0u32)?;
+        @push(flat, 4294967295u32)?;
+        @push(flat, @len(plans.items[f].defs) as u32)?;
+        var i: u32 = 0;
+        while i < @len(plans.items[f].defs) as u32 { @push(flat, plans.items[f].defs[i])?; i = i + 1; }
+        var r: u32 = 0;
+        while r < @len(plans.items[f].returns.items) as u32 {
+            var kind: u32 = 0;
+            if plans.items[f].returns.items[r].on_error { kind = 1; }
+            @push(flat, kind)?;
+            @push(flat, plans.items[f].returns.items[r].site)?;
+            @push(flat, @len(plans.items[f].returns.items[r].defs) as u32)?;
+            i = 0;
+            while i < @len(plans.items[f].returns.items[r].defs) as u32 {
+                @push(flat, plans.items[f].returns.items[r].defs[i])?;
+                i = i + 1;
+            }
+            r = r + 1;
+        }
+        var s: u32 = 0;
+        while s < @len(plans.items[f].returns.scopes) as u32 {
+            @push(flat, plans.items[f].returns.scopes[s].edge)?;
+            @push(flat, plans.items[f].returns.scopes[s].site)?;
+            @push(flat, @len(plans.items[f].returns.scopes[s].defs) as u32)?;
+            i = 0;
+            while i < @len(plans.items[f].returns.scopes[s].defs) as u32 {
+                @push(flat, plans.items[f].returns.scopes[s].defs[i])?;
+                i = i + 1;
+            }
+            s = s + 1;
+        }
+        f = f + 1;
+    }
+    return flat;
+}
+
+struct FunctionSite { def: u32, id: u32, scope: u32, document: bool }
+
+// 函数级检查入口：为本函数建立独立的位置状态；批处理另收集析构计划和位置汇总。
+function check_function_ownership(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, history: &owner_state::BorrowTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, plans: &owner_state::DropPlanTable:ReadWrite, write_budget: &owner_write::WriteBudget:ReadWrite, flow: &owner_flow::FlowFacts:Read, control: &owner_block::ControlBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, site: FunctionSite): void!AllocError {
+    var fn_places: owner_state::PlaceTable = owner_state::PlaceTable { items: [] };
+    var p: u32 = 0;
+    while p < @len(pool.functions[site.id].params) as u32 {
+        let name: u32 = pool.functions[site.id].params[p].name;
+        var param_def: u32 = 0;
+        if site.document { param_def = resolve::function_param_def(tables, site.def, site.scope, p, name); }
+        else { param_def = lookup_param(tables, site.scope, name); }
+        if param_def != 0 {
+            owner_state::set_place(&fn_places:ReadWrite, work, param_def, PLACE_LIVE, SLOT_EMPTY, false, pool.functions[site.id].params[p].span)?;
+            if work.lookup_exhausted { return; }
+            owner_state::include_scalar_parameter(&borrows.slices:ReadWrite, checked, param_def, site.scope, &control.slice_assignments:ReadWrite)?;
+            if control.slice_assignments.exhausted { return; }
+            owner_write::check_parameter(pool, refs, checked, diags, write_budget, pool.functions[site.id].body, param_def)?;
+            if write_budget.exhausted { return; }
+        }
+        p = p + 1;
+    }
+    // 按值形参的所有权已由调用方的 @move 转移给本函数，须随函数出口清理（owner.md 2.3 / 6.1）；
+    // 引用形参自身是 Copy 类型，仍由 owner_state::def_is_owning 排除。子块落尾与循环跳转只清理本作用域局部，
+    // 故这些边保留形参数量作为下界，仅函数出口边从零开始。
+    let locals_start: u32 = @len(fn_places.items) as u32;
+    borrows.slot_live = true;
+    var returns: owner_state::ReturnDropTable = owner_state::ReturnDropTable { items: [], scopes: [], locals_start: locals_start, enabled: !site.document };
+    owner_block::check_block_ownership(pool, refs, checked, tables, &fn_places:ReadWrite, borrows, history, diags, &returns:ReadWrite, flow, control, work, pool.functions[site.id].body, site.scope)?;
+    if control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(work) || site.document { return; }
+    var defs: u32[] = [];
+    if borrows.slot_live { defs = owner_state::live_drop_defs(checked, borrows.copy_order, &fn_places:Read, 0)?; }
+    @push(plans.items, owner_state::DropPlan { func_def: site.def, defs: @move(defs), returns: @move(returns) })?;
+    var i: u32 = 0;
+    while i < @len(fn_places.items) as u32 {
+        @push(places.items, fn_places.items[i])?;
+        i = i + 1;
+    }
+    return;
+}
+
+// 在作用域内按名字查找绑定 DefId。
+function lookup_param(tables: &resolve::ResolveTables:Read, scope: u32, name: u32): u32 {
+    return resolve::lookup_binding(tables, scope, name);
+}
+
+// 调用前须完成名字解析、无错误的类型检查及布局检查；匹配穷尽性和递归分类依赖这些前置条件。
+export function check_unit(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, checked: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite): OwnerResult!AllocError {
+    let limits: OwnerLimits = OwnerLimits { write: 0, replay: 0, place_copy: 0, slice_merge: 0, slice_copy: 0, slice_scope: 0, slice_assignment: 0, borrow_conflict: 0, place_merge: 0, place_lookup: 0, place_exit: 0, slot_jump: 0, slice_jump: 0, document: false };
+    return check_unit_limited(file, pool, resolution, checked, diags, limits)?;
+}
+
+export function check_unit_limited(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, checked: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite, limits: OwnerLimits): OwnerResult!AllocError {
+    let flow: owner_flow::FlowFacts = owner_flow::build_facts(pool, limits.document)?;
+    let slices: owner_state::SliceMergeBudget = owner_state::SliceMergeBudget { limited: limits.slice_merge != 0u32, remaining: limits.slice_merge, exhausted: false };
+    let slice_copies: owner_state::SliceCopyBudget = owner_state::SliceCopyBudget { limited: limits.slice_copy != 0u32, remaining: limits.slice_copy, exhausted: false };
+    let slice_scopes: owner_state::SliceScopeBudget = owner_state::SliceScopeBudget { limited: limits.slice_scope != 0u32, remaining: limits.slice_scope, exhausted: false };
+    let slice_assignments: owner_state::SliceScopeBudget = owner_state::SliceScopeBudget { limited: limits.slice_assignment != 0u32, remaining: limits.slice_assignment, exhausted: false };
+    var control: owner_block::ControlBudget = owner_block::ControlBudget { document: limits.document, replay_limited: limits.replay != 0u32, replay_remaining: limits.replay, replay_exhausted: false, slices: slices, slice_copies: slice_copies, slice_scopes: slice_scopes, slice_assignments: slice_assignments };
+    var work: owner_state::OwnerWorkBudget = owner_state::OwnerWorkBudget { copy_limited: limits.place_copy != 0u32, copy_remaining: limits.place_copy, copy_exhausted: false, conflict_limited: limits.borrow_conflict != 0u32, conflict_remaining: limits.borrow_conflict, conflict_exhausted: false, merge_limited: limits.place_merge != 0u32, merge_remaining: limits.place_merge, merge_exhausted: false, lookup_limited: limits.place_lookup != 0u32, lookup_remaining: limits.place_lookup, lookup_exhausted: false, exit_limited: limits.place_exit != 0u32, exit_remaining: limits.place_exit, exit_exhausted: false, slot_jump_limited: limits.slot_jump != 0u32, slot_jump_remaining: limits.slot_jump, slot_jump_exhausted: false, slice_jump_limited: limits.slice_jump != 0u32, slice_jump_remaining: limits.slice_jump, slice_jump_exhausted: false, use_out_refs: limits.document, place_roots: [], slice_sources: [] };
+    var write_budget: owner_write::WriteBudget = owner_write::WriteBudget { limited: limits.write != 0, remaining: limits.write, exhausted: false };
+    var places: owner_state::PlaceTable = owner_state::PlaceTable { items: [] };
+    var history: owner_state::BorrowTable = owner_state::BorrowTable { items: [] };
+    var drop_plans: owner_state::DropPlanTable = owner_state::DropPlanTable { items: [] };
+    let tables: &resolve::ResolveTables = &resolution.result.tables:Read;
+    let refs: &resolve_refs::RefTable = &resolution.refs:Read;
+    if limits.document { work.place_roots = owner_state::build_place_roots(pool, refs)?; }
+    let copy_order: u8 = copy_facts::imported_copy_order(checked);
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        let item: ast::AstItem = file.items[i];
+        if item.kind == 0 {
+            let def: u32 = resolution.result.file.items[i].def_id;
+            let scope: u32 = typecheck::function_scope(tables, pool.functions[item.data].body, def);
+            var borrows: owner_state::BorrowState = owner_state::new_borrows(copy_order);
+            let site: FunctionSite = FunctionSite { def: def, id: item.data, scope: scope, document: limits.document };
+            check_function_ownership(pool, refs, checked, tables, &places:ReadWrite, &borrows:ReadWrite, &history:ReadWrite, diags, &drop_plans:ReadWrite, &write_budget:ReadWrite, &flow:Read, &control:ReadWrite, &work:ReadWrite, site)?;
+            if write_budget.exhausted || control.replay_exhausted || control.slices.exhausted || control.slice_copies.exhausted || control.slice_scopes.exhausted || control.slice_assignments.exhausted || owner_state::owner_work_stopped(&work:Read) { break; }
+        }
+        i = i + 1;
+    }
+    // 先求值布尔标志，再移动拥有数组，避免字段初始化与读取的求值顺序冲突。
+    let has_owning: bool = @len(places.items) > 0;
+    return OwnerResult { places: places, borrows: history, has_owning: has_owning, drop_plans: drop_plans, write_budget_exhausted: write_budget.exhausted, replay_budget_exhausted: control.replay_exhausted, place_copy_exhausted: work.copy_exhausted, slice_merge_exhausted: control.slices.exhausted, slice_copy_exhausted: control.slice_copies.exhausted, slice_scope_exhausted: control.slice_scopes.exhausted, slice_assignment_exhausted: control.slice_assignments.exhausted, borrow_conflict_exhausted: work.conflict_exhausted, place_merge_exhausted: work.merge_exhausted, place_lookup_exhausted: work.lookup_exhausted, place_exit_exhausted: work.exit_exhausted, slot_jump_exhausted: work.slot_jump_exhausted, slice_jump_exhausted: work.slice_jump_exhausted };
+}

@@ -1,0 +1,16 @@
+foreign assert(cond: bool): void;
+enum Failure { Bad }
+function fail(): u32!Failure { return Failure::Bad; }
+function write(value: &u32:ReadWrite, next: u32): void { assert(false); }
+function attempt(value: &u32:ReadWrite): u32!Failure {
+    write(*value, fail()?);
+    return 0u32;
+}
+function recover(error: &Failure): u32 { return 9u32; }
+function main(): void {
+    var count: u32 = 3u32;
+    let ref: &u32:ReadWrite = &count:ReadWrite;
+    assert(attempt(ref).catch(&recover) == 9u32);
+    *ref = 4u32;
+    assert(*ref == 4u32);
+}

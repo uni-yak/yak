@@ -1,0 +1,83 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck_driver;
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+function verify(deps: &resolve_refs::DependencySet:Read, source: &[u8], code: u16): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(source, 1u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 1u16)?;
+    if @len(lexed.diagnostics) != 0 || @len(parsed.diagnostics) != 0 { write(source); }
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: resolve_refs::Resolution = resolve_unit::resolve_unit_for_check(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, deps, @len(deps.ifaces) as u32, "case", &diags:ReadWrite)?;
+    if code == 5806 { assert(!diag::diagbuf_has_error(&diags:Read)); }
+    if !diag::diagbuf_has_error(&diags:Read) {
+        typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &result:Read, &diags:ReadWrite)?;
+    }
+    if code == 0 {
+        if @len(diags.diags) != 0 { write(source); diag::diagbuf_print_terminal(&diags:Read)?; }
+        assert(@len(diags.diags) == 0);
+    } else {
+        if @len(diags.diags) != 1 || diags.diags[0].code.raw != code { write(source); diag::diagbuf_print_terminal(&diags:Read)?; }
+        assert(@len(diags.diags) == 1 && diags.diags[0].code.raw == code);
+    }
+    return;
+}
+
+function main(): void {
+    var deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    verify(&deps:Read, "enum E { Zero, Data(u32) } function f(): E { return Zero; }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero, Data(u32) } function f(): E { return Data(7u32); }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } const C: E = Zero; function f(): E { return C; }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } function f(Zero: u32): E { return Zero; }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } enum F { Zero } function f(value: F, Zero: F): bool { return value == Zero; }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } enum F { Other } function f(value: F, Zero: F): bool { return value != Zero; }\n", 0)?;
+    verify(&deps:Read, "enum E { Zero } function f(): E { return Zero; } const Zero: u32 = 0u32;\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } function f(): E { var value: E = E::Zero; value = Zero; return value; }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } function g(value: E): E { return value; } function f(): E { return g(Zero); }\n", 5806)?;
+    verify(&deps:Read, "function f(): void!AllocError { return OutOfMemory; }\n", 5806)?;
+    verify(&deps:Read, "enum E { Bad(u32) } function f(): void!(AllocError | E) { return Bad(7u32); }\n", 5806)?;
+    verify(&deps:Read, "enum E { Zero } function f(Zero: u32): u32 { return Zero; }\n", 0)?;
+    verify(&deps:Read, "enum E { Zero } function Zero(): E { return E::Zero; } function f(): E { return Zero(); }\n", 0)?;
+    verify(&deps:Read, "enum E { Zero } function f(e: E): u32 { match e { Zero => { return 1u32; } } }\n", 0)?;
+    verify(&deps:Read, "enum E { Zero } enum F { One } function f(): F { return Zero; }\n", 4002)?;
+    verify(&deps:Read, "enum E { Zero } function f(): E { return Missing; }\n", 4002)?;
+    verify(&deps:Read, "enum E { Zero } function f(): u32 { return Zero; } const Zero: u32 = 0u32;\n", 4004)?;
+    var dependency: resolve_refs::Iface = resolve_refs::iface_new("dep")?;
+    let exported: u32 = resolve_refs::iface_add_export(&dependency:ReadWrite, "Mode", 2)?;
+    resolve_refs::iface_add_enum_member(&dependency:ReadWrite, exported, "Remote", 0)?;
+    @push(deps.ifaces, @move(dependency))?;
+    verify(&deps:Read, "import dep; function f(): dep::Mode { return Remote; }\n", 5806)?;
+    verify(&deps:Read, "import dep; function f(): dep::Mode { return dep::Mode::Remote; }\n", 0)?;
+    verify(&deps:Read, "import dep; enum Mode { Local } function f(): dep::Mode { return Local; }\n", 4002)?;
+}

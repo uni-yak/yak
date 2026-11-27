@@ -1,0 +1,6 @@
+// expected_code: E5504
+// spec: spec/lang/layout.md#LY-4、spec/lang/type/void.md#LY-4
+// 触发：把无存储类型 void 用作定长数组元素。
+function discard(x: [void; 2]): void { @drop(x); }
+
+function main(): void { return; }

@@ -1,0 +1,157 @@
+// 按函数驱动已检查的 AST 降级，构造完成后调用独立验证器。
+import types;
+import ast;
+import diag;
+import resolve;
+import resolve_refs;
+import typecheck;
+import type_import;
+import layout;
+import mir;
+import mir_verify;
+import mir_no_alloc;
+import mir_materialize;
+import mir_builder;
+import mir_lower_stmt;
+import mir_lower_finalize;
+
+function empty_module(): mir::MirModule {
+    return mir::MirModule { functions: [], types: typecheck::TypeTable { entries: [], members: [] }, signatures: typecheck::FuncTable { items: [], by_def: [] }, imports: [], import_params: [], fields: typecheck::FieldTable { items: [] }, enums: typecheck::EnumTable { items: [] }, statics: [], static_bytes: [], imported_layouts: layout::ImportedLayoutTable { items: [] }, imported_fields: layout::ImportedFieldLayoutTable { items: [] }, imported_field_types: typecheck::ImportedFieldTable { items: [] }, imported_enums: typecheck::ImportedEnumTable { items: [] }, imported_enum_signatures: typecheck::ImportedEnumTable { items: [] } };
+}
+
+function rejected_mir(kind: u8, span: types::Span): mir::MirResult {
+    return mir::MirResult { accepted: false, module: empty_module(), rejection: mir::MirRejection { kind: kind, span: span } };
+}
+
+// drops 按函数顺序分段，段内为 [记录数, [语句索引, 数量, 逆序 DefId...]...]。
+// imported_layouts/imported_fields/imported_enums 是直接依赖的布局事实；
+// 缺失时导入名义类型与导入枚举均按未知拒绝。
+export function build_mir_with_drops(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, tc: &typecheck::TypeCheckResult:Read, drops: &u32[]:Read, imported_layouts: &layout::ImportedLayoutTable:Read, imported_fields: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    return build_mir_inner(file, pool, resolution, tc, drops, imported_layouts, imported_fields, imported_enums, imported_enums, diags)?;
+}
+
+function populate_imports(module: &mir::MirModule:ReadWrite, refs: &resolve_refs::RefTable:Read): void!AllocError {
+    let total: u32 = @len(refs.imports) as u32;
+    if total == 0 { return; }
+    var cache: type_import::SlotCache = type_import::new_slot_cache()?;
+    var imported: u32 = 0;
+    while imported < total {
+        let dep: u16 = refs.imports[imported].dep;
+        let slots: &[resolve_refs::ImportType]:Read = &refs.imports[imported].types[0..@len(refs.imports[imported].types)]:Read;
+        let ret: u32 = type_import::import_slot_type_cached(&module.types:ReadWrite, &cache:ReadWrite, slots, refs.imports[imported].ret_slot, dep)?;
+        let start: u32 = @len(module.import_params) as u32;
+        var p: u32 = 0;
+        while p < refs.imports[imported].param_count as u32 {
+            let param: u32 = type_import::import_slot_type_cached(&module.types:ReadWrite, &cache:ReadWrite, slots, refs.imports[imported].param_start + p, dep)?;
+            @push(module.import_params, param)?;
+            p = p + 1;
+        }
+        @push(module.imports, mir::MirImport { dep: dep, export_id: refs.imports[imported].export_id, param_count: refs.imports[imported].param_count, param_start: start, ret: ret })?;
+        imported = imported + 1;
+    }
+    return;
+}
+
+// 模块记录的完整签名和降低可用的变体事实分开；简化入口只保留前者。
+function build_mir_inner(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, tc: &typecheck::TypeCheckResult:Read, drops: &u32[]:Read, imported_layouts: &layout::ImportedLayoutTable:Read, imported_fields: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, recorded_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let empty_span: types::Span = types::Span { file: file.file, offset: 0, length: 0 };
+    let resolved: &resolve::ResolveResult:Read = &resolution.result:Read;
+    if diags.has_error || @len(file.items) != @len(resolved.file.items) { return rejected_mir(7, empty_span); }
+    // 延迟名字可参与前端诊断，但通过类型检查后语义引用必须已有编号域。
+    var ref_index: u32 = 0;
+    while ref_index < @len(resolution.refs.items) as u32 {
+        let item: resolve_refs::ResolvedRef = resolution.refs.items[ref_index];
+        if item.kind == resolve_refs::pending_value_name() {
+            mir_builder::emit(diags, types::error_code(7018), item.span)?;
+            return rejected_mir(7, item.span);
+        }
+        ref_index = ref_index + 1;
+    }
+    var module: mir::MirModule = empty_module();
+    mir_materialize::copy_tables(&module:ReadWrite, tc)?;
+    module.imported_layouts = mir_materialize::copy_imported_layouts(imported_layouts)?;
+    module.imported_fields = mir::copy_imported_fields(imported_fields)?;
+    var field: u32 = 0;
+    while field < @len(tc.imported_fields.items) as u32 {
+        @push(module.imported_field_types.items, tc.imported_fields.items[field])?;
+        field = field + 1;
+    }
+    module.imported_enums = mir::copy_imported_enums(recorded_enums)?;
+    module.imported_enum_signatures = mir::copy_imported_enums(&tc.imported_enums:Read)?;
+    populate_imports(&module:ReadWrite, &resolution.refs:Read)?;
+    // 地址局部统一用 u64 承载指针；类型表中没有 u64 时登记一个，
+    // 避免地址落到「未知类型」而被误拒（不改变源程序语义）。
+    let ptr_ty: u32 = mir_lower_finalize::builtin_mir_type(&module:ReadWrite, 4100)?;
+    let bool_ty: u32 = mir_lower_finalize::builtin_mir_type(&module:ReadWrite, 4105)?;
+    if ptr_ty == 0 { return rejected_mir(4, empty_span); }
+    let string_type: u32 = mir_lower_finalize::find_u8_slice(&module.types:Read);
+    if @len(pool.statics) != 0 && string_type == 0 { return rejected_mir(4, empty_span); }
+    if !mir_materialize::copy_statics(pool, &module:ReadWrite, string_type)? { return rejected_mir(7, empty_span); }
+    // 聚合常量预物化 pass：字符串条目索引保持不变，聚合条目在其后追加，
+    // 池字节的唯一写入点在此（含对齐填充与未激活 payload 的零字节）。
+    var agg_map: u32[] = [];
+    var agg_len: u64[] = [];
+    let defs: u32 = @len(resolved.tables.defs) as u32;
+    if @len(module.signatures.by_def) == 0 && @len(module.signatures.items) != 0 {
+        typecheck::index_func_sigs(&module.signatures:ReadWrite, defs)?;
+    }
+    if !mir_materialize::materialize_consts(&module:ReadWrite, tc, defs, &agg_map:ReadWrite, &agg_len:ReadWrite)? {
+        return rejected_mir(7, empty_span);
+    }
+    var build: mir_builder::Builder = mir_lower_finalize::init_builder(file, pool, &module:Read, tc, imported_layouts, imported_fields, imported_enums, defs, ptr_ty, bool_ty, @move(agg_map), @move(agg_len), empty_span)?;
+    var source: mir_no_alloc::SourceMap = mir_no_alloc::SourceMap { starts: [], spans: [] };
+    var drop_cursor: u32 = 0;
+    var function_index: u32 = 0;
+    var previous_def: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 0 {
+            let def: u32 = resolved.file.items[i].def_id;
+            // 解析器按源码顺序分配唯一 DefId；私有调用索引只接收表内的函数身份。
+            if def <= previous_def || def > defs { return rejected_mir(7, file.items[i].span); }
+            let signature: u32 = mir::func_sig(&tc.funcs:Read, def);
+            @push(module.functions, mir_lower_finalize::empty_function(def, signature, pool.functions[file.items[i].data].is_hash))?;
+            let index: u32 = function_index;
+            function_index = function_index + 1;
+            previous_def = def;
+            var drop_defs: u32[] = [];
+            if !mir_lower_finalize::unpack_function_drops(pool, drops, &drop_cursor:ReadWrite, pool.functions[file.items[i].data].body, &drop_defs:ReadWrite)? {
+                return rejected_mir(7, file.items[i].span);
+            }
+            mir_lower_finalize::reset_builder(&build:ReadWrite, file.items[i].span, empty_span);
+            mir_lower_stmt::lower_function(&module.functions[index]:ReadWrite, &build:ReadWrite, file, pool, tc, resolution, diags, &drop_defs:Read, i)?;
+            mir_lower_finalize::finalize(&module.functions[index]:ReadWrite, &build:ReadWrite, tc, diags, &source:ReadWrite)?;
+            if build.rejection.kind != 0 { return rejected_mir(build.rejection.kind, build.rejection.span); }
+        }
+        i = i + 1;
+    }
+    if drop_cursor != @len((*drops)) as u32 { return rejected_mir(7, empty_span); }
+    mir_no_alloc::compute_no_alloc(&module:ReadWrite, &resolution.bridges:Read, defs)?;
+    i = 0;
+    while i < @len(module.functions) as u32 {
+        if module.functions[i].declared_no_alloc && !module.functions[i].no_alloc {
+            let cause: mir_no_alloc::NoAllocCause = mir_no_alloc::no_alloc_cause(&module:Read, &resolution.bridges:Read, &source:Read, i)?;
+            let cause_code: types::ErrorCode = cause.code;
+            if cause_code.raw == 0 { return rejected_mir(7, empty_span); }
+            mir_builder::emit(diags, cause_code, cause.span)?;
+            return rejected_mir(7, cause.span);
+        }
+        i = i + 1;
+    }
+    let verification: mir_verify::Validation = mir_verify::validate_module(&module:Read)?;
+    if !verification.ok {
+        if verification.code.raw != 0 { mir_builder::emit(diags, verification.code, empty_span)?; }
+        return mir::MirResult { accepted: false, module: @move(module), rejection: mir::MirRejection { kind: 6, span: empty_span } };
+    }
+    return mir::MirResult { accepted: true, module: @move(module), rejection: mir::MirRejection { kind: 0, span: empty_span } };
+}
+
+// 无析构计划、无导入布局的入口：仅供不需要跨模块聚合的本机用例使用。
+// 保留完整接口变体记录供验证；降低按空导入表处理，不猜测未知的名义布局。
+export function build_mir(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, tc: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let empty_drops: u32[] = [];
+    let empty_layouts: layout::ImportedLayoutTable = layout::ImportedLayoutTable { items: [] };
+    let empty_fields: layout::ImportedFieldLayoutTable = layout::ImportedFieldLayoutTable { items: [] };
+    let empty_enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    return build_mir_inner(file, pool, resolution, tc, &empty_drops:Read, &empty_layouts:Read, &empty_fields:Read, &empty_enums:Read, &tc.imported_enums:Read, diags)?;
+}

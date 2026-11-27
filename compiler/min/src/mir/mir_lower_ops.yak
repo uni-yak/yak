@@ -1,0 +1,341 @@
+// 表达式降级的无递归辅助：载体注入、临时值清理、调用发射与字段/步长查询。
+import types;
+import ast;
+import diag;
+import resolve;
+import resolve_refs;
+import typecheck;
+import layout;
+import mir;
+import mir_builder;
+
+export struct CallTarget { op: u8, identity: u32, dep: u32, formals: u32, count: u32, result: u32, service: u8 }
+export struct MemberOffset { field: u32, offset: u64, ok: bool }
+
+export function inject(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, target: u32, value: u32): u32!AllocError {
+    if build.rejection.kind != 0 { return 0; }
+    let actual: u32 = mir::local_type(ctx, value);
+    if actual == target { return value; }
+    if !mir::valid_type(&tc.types:Read, target) { mir_builder::reject(build, 4, build.span); return 0; }
+    let entry: typecheck::TypeEntry = tc.types.entries[target - 1];
+    if entry.kind != 9 { mir_builder::reject(build, 7, build.span); return 0; }
+    if (value == 0 && mir::is_void(&tc.types:Read, entry.success)) || actual == entry.success {
+        return mir_builder::result_inst(ctx, build, 160, target, value, entry.elem, 0)?;
+    }
+    if mir::error_member(&tc.types:Read, entry.elem, actual) || mir::error_subset(&tc.types:Read, actual, entry.elem) {
+        return mir_builder::result_inst(ctx, build, 161, target, value, entry.success, 0)?;
+    }
+    mir_builder::reject(build, 7, build.span);
+    return 0;
+}
+
+export function drop_expression_temps(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, depth: u32): void!AllocError {
+    var pending: u32 = build.expression_depth;
+    while pending > depth {
+        pending = pending - 1;
+        let local: u32 = build.expression_temps[pending];
+        mir_builder::inst(ctx, build, 115, 0, local, 0, 0, 0, 0, 0)?;
+    }
+    return;
+}
+
+export function hold_owned_temp(ctx: &mir::MirFunction:Read, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, local: u32): void!AllocError {
+    let id: u32 = mir::local_type(ctx, local);
+    if id == 0 || mir_builder::mir_copy_type(tc, id, build.copy_order) { return; }
+    let depth: u32 = build.expression_depth;
+    if depth == @len(build.expression_temps) as u32 { @push(build.expression_temps, local)?; }
+    else { build.expression_temps[depth] = local; }
+    build.expression_depth = depth + 1;
+    return;
+}
+
+export function emit_question_branch(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, expr: u32, carrier: u32, depth: u32): u32!AllocError {
+    let value_type_id: u32 = mir::local_type(ctx, carrier);
+    if !mir::valid_type(&tc.types:Read, value_type_id) || !mir::valid_type(&tc.types:Read, build.ret) { mir_builder::reject(build, 7, build.span); return 0; }
+    let src: typecheck::TypeEntry = tc.types.entries[value_type_id - 1];
+    let dst: typecheck::TypeEntry = tc.types.entries[build.ret - 1];
+    if src.kind != 9 || dst.kind != 9 || !mir::error_subset(&tc.types:Read, src.elem, dst.elem) { mir_builder::reject(build, 7, build.span); return 0; }
+    let ok: u16 = mir_builder::new_block(ctx, build)?;
+    let err: u16 = mir_builder::new_block(ctx, build)?;
+    var success: u32 = 0;
+    if !mir::is_void(&tc.types:Read, src.success) { success = mir_builder::new_local(ctx, build, src.success, 0)?; }
+    let failure: u32 = mir_builder::new_local(ctx, build, src.elem, 0)?;
+    if build.rejection.kind != 0 { return 0; }
+    ctx.blocks[ok].payload = success;
+    ctx.blocks[err].payload = failure;
+    mir_builder::term(ctx, build, 162, carrier, ok as u32, err as u32);
+    build.current = err;
+    let returned: u32 = mir_builder::result_inst(ctx, build, 161, build.ret, failure, dst.success, 0)?;
+    mir_builder::keep_expression_views(ctx, &*build:Read, 0)?;
+    mir_builder::end_bound_views(ctx, &*build:Read, 0)?;
+    // 临时值没有词法绑定，必须先于外层绑定逆序析构。
+    drop_expression_temps(ctx, build, 0)?;
+    mir_builder::emit_drops(ctx, build, err, 1, expr)?;
+    mir_builder::term(ctx, build, 194, returned, 0, 0);
+    build.current = ok;
+    // 带 out 的可错调用必须直接分派，借读临时值在两条边上各自清理。
+    drop_expression_temps(ctx, build, depth)?;
+    build.expression_depth = depth;
+    return success;
+}
+
+export function emit_dyn_push(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, value_type_id: u32, arr_value: u32, elem: u32, stride: u64): u32!AllocError {
+    let result: u32 = mir_builder::new_local(ctx, build, value_type_id, 1)?;
+    if result == 0 { return 0; }
+    if @len(ctx.args) + 2 > 4294967295u64 { mir_builder::reject(build, 5, build.span); return 0; }
+    let start: u32 = @len(ctx.args) as u32;
+    @push(ctx.args, arr_value)?;
+    @push(ctx.args, elem)?;
+    mir_builder::inst(ctx, build, 178 as u8, result, arr_value, elem, value_type_id, stride, start, 2)?;
+    return result;
+}
+
+export function emit_push_checked(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, expr: u32, value_type_id: u32, arr_type: u32, arr_value: u32, elem: u32): u32!AllocError {
+    if arr_value == 0 || arr_value > @len(ctx.locals) as u32 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    var base: u32 = arr_type;
+    if tc.types.entries[arr_type - 1].kind == 4 { base = tc.types.entries[arr_type - 1].elem; }
+    if base == 0 || base > @len(tc.types.entries) as u32 || tc.types.entries[base - 1].kind != 6 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    let element: u32 = tc.types.entries[base - 1].elem;
+    if element == 0 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    if elem == 0 || elem > @len(ctx.locals) as u32 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    if ctx.locals[elem - 1].value_type_id != element { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    let stride: u64 = mir::layout_size(&build.layouts:Read, element);
+    if stride == 0 || stride > 4294967295u64 { mir_builder::reject(build, 3, pool.exprs[expr].span); return 0; }
+    return emit_dyn_push(ctx, build, value_type_id, arr_value, elem, stride)?;
+}
+
+export function emit_len_builtin(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, resolution: &resolve_refs::Resolution:Read, expr: u32, call: u32, bid: u32, left: u32): u32!AllocError {
+    // @len：按 mir.md 4.10 统一走 0x92 call_builtin，由各端按 BuiltinId 分派。
+    let value_type_id: u32 = mir_builder::checked_type(build, tc, pool, expr);
+    if build.rejection.kind != 0 { return 0; }
+    if @len(ctx.args) + 1 > 4294967295u64 { mir_builder::reject(build, 5, build.span); return 0; }
+    let len_start: u32 = @len(ctx.args) as u32;
+    // 动态数组的 len 在头内，必须读取 place 本身而非按值临时副本。
+    var operand: u32 = mir_builder::place_local_of(build, ctx, pool, resolution, pool.calls[call].args[0].value);
+    if operand == 0 { operand = left; }
+    @push(ctx.args, operand)?;
+    let len_result: u32 = mir_builder::new_local(ctx, build, value_type_id, 1)?;
+    let op_builtin: u8 = 146;
+    mir_builder::inst(ctx, build, op_builtin, len_result, bid, 0, value_type_id, 0, len_start, 1)?;
+    return len_result;
+}
+
+// AST 调用位置是右括号；在建成指令后补录完整调用范围，不改其他诊断使用的构建位置。
+export function record_call_span(build: &mir_builder::Builder:ReadWrite, first: types::Span, last: types::Span, before: u64): void {
+    if build.track_spans && @len(build.spans) > before {
+        let end: u64 = last.offset as u64 + last.length as u64;
+        var span: types::Span = first;
+        if end >= first.offset as u64 {
+            var length: u64 = end - first.offset as u64;
+            if length > 4294967295u64 { length = 4294967295u64; }
+            span.length = length as u32;
+        }
+        build.spans[before] = span;
+    }
+    return;
+}
+
+// out 实参是名称而非表达式；使用解析阶段记录的 DefId。
+export function out_argument_local(ctx: &mir::MirFunction:Read, build: &mir_builder::Builder:Read, refs: &resolve_refs::RefTable:Read, call: u32, ordinal: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(refs.items) as u32 {
+        let item: resolve_refs::ResolvedRef = refs.items[i];
+        if item.node_kind == 3 && item.node == call && item.x == ordinal {
+            if item.y == 0 || item.y > @len(build.def_map) as u32 { return 0; }
+            let local: u32 = build.def_map[item.y - 1];
+            if local == 0 || local > @len(ctx.locals) as u32 { return 0; }
+            if ctx.locals[local - 1].kind == 3 && ctx.locals[local - 1].state == 10 { return local; }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+export function call_formal(build: &mir_builder::Builder:Read, tc: &typecheck::TypeCheckResult:Read, target: CallTarget, ordinal: u32): u32 {
+    if target.op == 145 { return build.import_params[target.formals + ordinal]; }
+    if target.op == 148 { return tc.types.members[target.formals + ordinal]; }
+    return tc.funcs.items[target.formals].params[ordinal];
+}
+
+export function emit_typed_call_inst(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, expr: u32, call: u32, target: CallTarget, collected: &u32[]:Read, ret: u32, count: u32, out_seen: bool, depth: u32): u32!AllocError {
+    if target.service == 1 {
+        if count != 1 { mir_builder::reject(build, 7, pool.exprs[expr].span); return 0; }
+        mir_builder::keep_expression_views(ctx, &*build:Read, 0)?;
+        mir_builder::end_bound_views(ctx, &*build:Read, 0)?;
+        mir_builder::term(ctx, build, 197, (*collected)[0], 0, 0);
+        return 0;
+    }
+    if @len(ctx.args) + count as u64 > 4294967295u64 { mir_builder::reject(build, 5, build.span); return 0; }
+    let start: u32 = @len(ctx.args) as u32;
+    var i: u32 = 0;
+    while i < count { @push(ctx.args, (*collected)[i])?; i = i + 1; }
+    var result: u32 = 0;
+    if !mir::is_void(&tc.types:Read, ret) { result = mir_builder::new_local(ctx, build, ret, 1)?; }
+    var opcode: u8 = target.op;
+    if target.op == 144 { opcode = 150; }
+    elseif target.op == 145 { opcode = 151; }
+    elseif target.op == 148 { opcode = 152; }
+    if mir::has_trap_edge(opcode) { build.needs_trap = true; }
+    let before: u64 = @len(build.spans);
+    mir_builder::inst(ctx, build, opcode, result, target.identity, target.dep, ret, 0, start, count)?;
+    let callee: u32 = pool.calls[call].callee;
+    record_call_span(build, pool.exprs[callee].span, pool.exprs[expr].span, before);
+    if !out_seen || tc.types.entries[ret - 1].kind != 9 {
+        drop_expression_temps(ctx, build, depth)?;
+        build.expression_depth = depth;
+    }
+    return result;
+}
+
+// 按 (dep, export_id, 字段序) 查导入字段偏移；缺表、缺偏移或未知返回 0xFFFFFFFF。
+export function imported_field_offset(fields: &layout::ImportedFieldLayoutTable:Read, dep: u16, export_id: u32, field: u32, ordered: bool): u64 {
+    var i: u32 = layout::imported_fields_start(fields, dep, export_id, ordered);
+    let total: u32 = @len(fields.items) as u32;
+    while i < total {
+        let item: layout::ImportedFieldLayout = fields.items[i];
+        if item.dep == dep && item.export_id == export_id {
+            if item.field == field {
+                if !item.known { return 4294967295u64; }
+                return item.offset;
+            }
+        } elseif ordered { return 4294967295u64; }
+        i = i + 1;
+    }
+    return 4294967295u64;
+}
+
+// 名义类型的 DefId；非名义类型返回 0。
+export function nominal_def(tt: &typecheck::TypeTable:Read, id: u32): u32 {
+    if id == 0 || id > @len(tt.entries) as u32 { return 0; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    if entry.kind != 1 && entry.kind != 2 && entry.kind != 3 { return 0; }
+    return entry.def;
+}
+
+// 数组或切片的元素类型；其余返回 0。
+export function element_type(tt: &typecheck::TypeTable:Read, id: u32): u32 {
+    if id == 0 || id > @len(tt.entries) as u32 { return 0; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    if entry.kind != 5 && entry.kind != 6 && entry.kind != 7 { return 0; }
+    return entry.elem;
+}
+
+// 缺少字段编号时在语义边界拒绝，不再回到 AST 中解析名称。
+export function reject_unbound_field(build: &mir_builder::Builder:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, span: types::Span): void!AllocError {
+    mir_builder::emit(diags, types::error_code(7018), span)?;
+    mir_builder::reject(build, 7, span);
+    return;
+}
+
+export function resolve_member_offset(build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite, data: u32, base_type: u32, writing: bool): MemberOffset!AllocError {
+    let object_entry: typecheck::TypeEntry = tc.types.entries[base_type - 1];
+    if data >= @len(tc.expr_types.members) as u32 || tc.expr_types.members[data] == 0 || tc.expr_types.members[data] > 65536 {
+        reject_unbound_field(build, diags, pool.members[data].span)?;
+        return MemberOffset { field: 0, offset: 0, ok: false };
+    }
+    let field: u32 = tc.expr_types.members[data] - 1;
+    var offset: u64 = 4294967295u64;
+    // 导入结构体只按直接依赖的字段布局表求偏移；缺表或未知一律拒绝，不做零偏移回退。
+    if object_entry.kind == 5 || object_entry.kind == 6 {
+        if writing { mir_builder::reject(build, 2, build.span); return MemberOffset { field: 0, offset: 0, ok: false }; }
+        offset = mir::array_field_offset(object_entry.kind, field) as u64;
+    } elseif object_entry.kind == 3 {
+        let ordered: bool = build.imported_fields_ordered;
+        offset = imported_field_offset(&build.imported_fields:Read, object_entry.dep, object_entry.export_id, field + 1, ordered);
+    } else {
+        let base_def: u32 = nominal_def(&tc.types:Read, base_type);
+        if base_def == 0 { mir_builder::reject(build, 3, build.span); return MemberOffset { field: 0, offset: 0, ok: false }; }
+        offset = layout::field_byte_offset_from_table(&build.layouts:Read, &tc.fields:Read, base_def, field);
+    }
+    // 该值保留为查询失败哨兵，字节偏移和字段编号均不得截断。
+    if offset >= 4294967295u64 || field > 65535 { mir_builder::reject(build, 3, build.span); return MemberOffset { field: 0, offset: 0, ok: false }; }
+    return MemberOffset { field: field, offset: offset, ok: true };
+}
+
+export function scope_belongs_to(tables: &resolve::ResolveTables:Read, scope: u32, fn_def: u32): bool {
+    var s: u32 = scope;
+    while s != 0 && s <= @len(tables.scopes) as u32 {
+        if tables.scopes[s - 1].owner == fn_def { return true; }
+        s = tables.scopes[s - 1].parent;
+    }
+    return false;
+}
+
+// 投影左值逐级取址；根必须是已登记的可写局部。
+export function is_projection(pool: &ast::AstPool:Read, expr: u32): bool {
+    let kind: u8 = pool.exprs[expr].kind;
+    return kind == 23 || kind == 24 || (kind == 21 && pool.unaries[pool.exprs[expr].data as u32].op == 13);
+}
+
+// 右侧可能扩容动态数组：保留左侧已求出的索引，但写入前重新读取数组头。
+// 只重发本次左侧求值生成的投影，不重跑调用或其他有副作用的表达式。
+export function refresh_write_addr(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, place: u32, first: u32, before: u32): u32!AllocError {
+    var i: u32 = before;
+    while i > first {
+        i = i - 1;
+        let origin: mir::MirInst = ctx.insts[i];
+        if origin.a != place { continue; }
+        if origin.op != 82 && origin.op != 83 { return place; }
+        let base: u32 = refresh_write_addr(ctx, build, tc, origin.b, first, i)?;
+        var refresh: bool = base != origin.b;
+        if origin.op == 83 {
+            var array: u32 = mir::projection_base(origin);
+            if array == 0 { array = mir::local_type(ctx, base); }
+            if mir::valid_type(&tc.types:Read, array) && tc.types.entries[array - 1].kind == 6 { refresh = true; }
+        }
+        if !refresh { return place; }
+        return mir_builder::result_inst(ctx, build, origin.op, origin.value_type_id, base, origin.c, origin.value)?;
+    }
+    return place;
+}
+
+export function count_struct_fields(build: &mir_builder::Builder:ReadWrite, pool: &ast::AstPool:Read, tc: &typecheck::TypeCheckResult:Read, diags: &diag::DiagBuffer:ReadWrite, data: u32, value_type_id: u32): u32!AllocError {
+    if !mir::valid_type(&tc.types:Read, value_type_id) { mir_builder::reject(build, 3, build.span); return 0; }
+    let type_entry: typecheck::TypeEntry = tc.types.entries[value_type_id - 1];
+    let imported_struct: bool = type_entry.kind == 3;
+    let def: u32 = nominal_def(&tc.types:Read, value_type_id);
+    if !imported_struct && def == 0 { mir_builder::reject(build, 3, build.span); return 0; }
+    // 字段总数来自本地字段表或直接依赖的导入字段表；导入字段缺签名时 type 为 0，按未知拒绝。
+    var total: u32 = 0;
+    if imported_struct {
+        var k: u32 = 0;
+        while k < @len(tc.imported_fields.items) as u32 {
+            if tc.imported_fields.items[k].dep == type_entry.dep && tc.imported_fields.items[k].export_id == type_entry.export_id {
+                total = total + 1;
+                if tc.imported_fields.items[k].value_type_id == 0 { mir_builder::reject(build, 3, build.span); return 0; }
+            }
+            k = k + 1;
+        }
+    } else {
+        var k: u32 = 0;
+        while k < @len(tc.fields.items) as u32 {
+            if tc.fields.items[k].def == def { total = total + 1; }
+            k = k + 1;
+        }
+    }
+    let count: u32 = @len(pool.ctors[data].fields) as u32;
+    if total == 0 || count == 0 || count > 255 || count != total { mir_builder::reject(build, 3, build.span); return 0; }
+    if data >= @len(tc.expr_types.ctors) as u32 || @len(tc.expr_types.ctors[data].fields) as u32 != count {
+        reject_unbound_field(build, diags, pool.ctors[data].span)?;
+        return 0;
+    }
+    return count;
+}
+
+// 载体由类型检查阶段驻留；在已有表中核对唯一错误成员，不另造类型。
+export function array_push_type(tt: &typecheck::TypeTable:Read): u32 {
+    var id: u32 = @len(tt.entries) as u32;
+    while id != 0 {
+        let carrier: typecheck::TypeEntry = tt.entries[id - 1];
+        if carrier.kind == 9 && mir::is_void(tt, carrier.success) {
+            let errorset: typecheck::TypeEntry = tt.entries[carrier.elem - 1];
+            if errorset.kind == 11 && errorset.members_count == 1 {
+                let member: u32 = tt.members[errorset.members_start];
+                if tt.entries[member - 1].kind == 1 && tt.entries[member - 1].builtin == 4108 { return id; }
+            }
+        }
+        id = id - 1;
+    }
+    return 0;
+}

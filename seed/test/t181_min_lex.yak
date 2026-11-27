@@ -1,0 +1,46 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+import lex;
+foreign assert(cond: bool): void;
+function main(): void {
+    let result: lex::LexResult = lex::lex_scan("function main(): void { return; }\n", 1)?;
+    assert(@len(result.diagnostics) == 0);
+    assert(@len(result.tokens) == 11);
+    assert(result.tokens[0].kind == 6);
+    assert(result.tokens[0].payload == 0);
+    assert(@len(result.names.entries) == 2);
+    assert(result.names.entries[0].text_len == 4);
+    assert(result.names.entries[1].builtin_id == 4107);
+    check_at_shape("bad@len\n", 1003, 3)?;
+    check_at_shape("#go@name\n", 1003, 3)?;
+    check_at_shape("bad@1\n", 1003, 3)?;
+    check_at_shape("@unknown\n", 1011, 0)?;
+    check_at_shape("bad@\n", 1011, 3)?;
+    check_at_shape("bad @unknown\n", 1011, 4)?;
+    check_at_shape("#return@len\n", 1016, 0)?;
+
+    // 关键字紧接原语与有空白分隔的合法原语均不构成用户名。
+    let tokens: lex::LexResult = lex::lex_scan("return@len(xs); xs @len(xs);\n", 1)?;
+    assert(@len(tokens.diagnostics) == 0);
+    assert(tokens.tokens[0].kind == 6);
+    assert(tokens.tokens[1].kind == 8);
+    assert(tokens.tokens[6].kind == 0);
+    assert(tokens.tokens[7].kind == 8);
+}
+
+function check_at_shape(src: &[u8], code: u16, offset: u32): void!AllocError {
+    let result: lex::LexResult = lex::lex_scan(src, 17)?;
+    assert(@len(result.diagnostics) == 1 && @len(result.tokens) == 0);
+    assert(result.diagnostics[0].code.raw == code);
+    assert(result.diagnostics[0].span.file == 17);
+    assert(result.diagnostics[0].span.offset == offset);
+    if code == 1003 {
+        assert(result.diagnostics[0].span.length == 1);
+        assert(@len(result.names.entries) == 0);
+    }
+    return;
+}

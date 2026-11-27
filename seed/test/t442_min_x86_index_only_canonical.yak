@@ -1,0 +1,77 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产加载直接用基址，覆盖零位移、负 disp8 边界与正 disp32。
+    var code: pe::Code = pe::code_new();
+    pe::load_base(&code:ReadWrite, 0, 1, 0, 8)?;
+    pe::load_base(&code:ReadWrite, 8, 9, 4294967168u32, 8)?;
+    pe::load_base(&code:ReadWrite, 0, 2, 128, 8)?;
+    let expected: [u8; 14] = [0x48, 0x8b, 0x01, 0x4d, 0x8b, 0x41, 0x80, 0x48, 0x8b, 0x82, 0x80, 0, 0, 0];
+    assert(pe::code_len(&code:Read) == 14);
+    var i: u32 = 0;
+    while i < 14 { assert(code.bytes[i] == expected[i]); i = i + 1; }
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // 无基址的 ×1 索引可移到基址位，扩展索引需把 REX.X 换为 B。
+    let long_forms: [u8; 24] = [0x48, 0x8b, 0x04, 0x0d, 0, 0, 0, 0,
+        0x4e, 0x8b, 0x04, 0x0d, 0x80, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x04, 0x15, 0x80, 0, 0, 0];
+    encoding(&long_forms[0..8]:Read, 7103)?;
+    encoding(&long_forms[8..16]:Read, 7103)?;
+    encoding(&long_forms[16..24]:Read, 7103)?;
+    encoding(&long_forms[0..7]:Read, 7101)?;
+    // 保留真缩放、绝对地址和实际 RBP；R12 与 R13 属于数据段，可作基址。
+    let controls: [u8; 52] = [0x48, 0x8b, 0x04, 0xcd, 0, 0, 0, 0,
+        0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x4a, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+        0x48, 0x8b, 0x04, 0x2d, 0, 0, 0, 0, 0x4a, 0x8b, 0x04, 0x2d, 0, 0, 0, 0,
+        0x48, 0x8b, 0x04, 0x08, 0x48, 0x8b, 0x04, 0x8d, 0, 0, 0, 0];
+    encoding(&controls[0..8]:Read, 0)?;
+    encoding(&controls[8..16]:Read, 7103)?;
+    encoding(&controls[16..24]:Read, 7103)?;
+    encoding(&controls[24..32]:Read, 0)?;
+    encoding(&controls[32..40]:Read, 7103)?;
+    encoding(&controls[40..52]:Read, 0)?;
+    // 同样的两个寄存器采用较小寄存器号作基址；写出时同时交换 REX.X 与 REX.B。
+    let alternatives: [u8; 17] = [0x48, 0x8b, 0x04, 0x01, 0x49, 0x8b, 0x44, 0x0a, 0x80,
+        0x49, 0x8b, 0x84, 0x0a, 0x80, 0, 0, 0];
+    encoding(&alternatives[0..4]:Read, 7102)?;
+    encoding(&alternatives[4..9]:Read, 7102)?;
+    encoding(&alternatives[9..17]:Read, 7102)?;
+    let ordered: [u8; 17] = [0x48, 0x8b, 0x04, 0x08, 0x4a, 0x8b, 0x44, 0x11, 0x80,
+        0x4a, 0x8b, 0x84, 0x11, 0x80, 0, 0, 0];
+    encoding(&ordered[0..17]:Read, 0)?;
+    code = pe::code_new();
+    pe::modrm_base_index(&code:ReadWrite, 0, 10, 1)?;
+    assert(pe::code_len(&code:Read) == 3 && code.bytes[0] == 0x4a && code.bytes[1] == 0x04 && code.bytes[2] == 0x11);
+
+    // 无基址 ×2 可拆用相同的两个寄存器。位移跨越 disp8 边界后只剩等长差异。
+    let doubles: [u8; 32] = [0x48, 0x8b, 0x04, 0x4d, 0, 0, 0, 0,
+        0x4a, 0x8b, 0x04, 0x4d, 0x80, 0xff, 0xff, 0xff,
+        0x4a, 0x8b, 0x04, 0x4d, 0x80, 0, 0, 0, 0x4a, 0x8b, 0x04, 0x4d, 0x7f, 0xff, 0xff, 0xff];
+    encoding(&doubles[0..8]:Read, 7103)?;
+    encoding(&doubles[8..16]:Read, 7103)?;
+    encoding(&doubles[16..24]:Read, 7102)?;
+    encoding(&doubles[24..32]:Read, 7102)?;
+    let doubles_canonical: [u8; 26] = [0x48, 0x8b, 0x04, 0x09, 0x4b, 0x8b, 0x44, 0x09, 0x80,
+        0x4b, 0x8b, 0x84, 0x09, 0x80, 0, 0, 0, 0x48, 0x8b, 0x04, 0x6d, 0, 0, 0, 0, 0xc3];
+    encoding(&doubles_canonical[0..26]:Read, 0)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

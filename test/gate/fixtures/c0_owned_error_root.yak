@@ -1,0 +1,18 @@
+import c0_owned_error_leaf;
+enum Other { Bytes(u8[]) }
+
+function bridge(mode: u8): u8[]!(Other | c0_owned_error_leaf::Fault) {
+    if mode == 3u8 { return Other::Bytes([31u8]); }
+    return c0_owned_error_leaf::read_case(mode)?;
+}
+
+export function observe_error(mode: u8): void {
+    if mode == 4u8 {
+        c0_owned_error_leaf::read_case(1u8);
+        return;
+    }
+    let result: u8[]!(Other | c0_owned_error_leaf::Fault) = bridge(mode);
+    @drop(result);
+}
+
+function main(): void { return; }

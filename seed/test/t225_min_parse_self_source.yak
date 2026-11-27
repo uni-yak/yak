@@ -1,0 +1,52 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: host=../../compiler/min/host/seed/host.yak
+// input: parse=../../compiler/min/src/parse/parse.yak
+// input: parse_core=../../compiler/min/src/parse/parse_core.yak
+// input: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// input: type_parser=../../compiler/min/src/parse/type_parser.yak
+// input: position=../../compiler/min/src/parse/position.yak
+// input: ast=../../compiler/min/src/parse/ast.yak
+// input: owner_write=../../compiler/min/src/check/owner_write.yak
+// input: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// input: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// input: owner_state=../../compiler/min/src/check/owner_state.yak
+// input: owner_block=../../compiler/min/src/check/owner_block.yak
+// input: owner=../../compiler/min/src/check/owner.yak
+import lex;
+import parse;
+import host;
+foreign assert(cond: bool): void;
+function parse_source(name: &[u8], file: u16): void!AllocError {
+    let bytes: u8[] = host::input_bytes(name)?;
+    let size: u32 = @len(bytes) as u32;
+    let r: lex::LexResult = lex::lex_scan(&bytes[0..size], file)?;
+    assert(@len(r.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    return;
+}
+function main(): void {
+    parse_source("parse", 60)?;
+    parse_source("parse_core", 61)?;
+    parse_source("type_parser", 62)?;
+    parse_source("position", 63)?;
+    parse_source("ast", 64)?;
+    parse_source("parse_expr", 66)?;
+    parse_source("owner", 65)?;
+    parse_source("owner_write", 67)?;
+    parse_source("owner_flow", 68)?;
+    parse_source("owner_expr", 69)?;
+    return;
+}

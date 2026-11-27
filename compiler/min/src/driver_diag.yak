@@ -1,0 +1,71 @@
+// 编译器驱动的拒绝输出，供各阶段共用。
+import buf;
+import types;
+import diag;
+import error_codes;
+
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+// 未登记的码位是编译器内部错误，不作为用户诊断写入终端或 JSONL。
+function require_code(code: types::ErrorCode): void {
+    if !error_codes::error_exists(code.raw) {
+        write("错误：编译器产生了未登记的错误码\n");
+        exit(1);
+    }
+}
+
+// 先核对整批，再输出任何一条诊断，避免留下不完整的诊断流。
+export function require_codes(diags: &diag::DiagBuffer:Read): void {
+    var i: u32 = 0;
+    while i < @len(diags.diags) as u32 {
+        require_code(diags.diags[i].code);
+        i = i + 1;
+    }
+}
+
+function push_decimal(dst: &buf::ByteBuf:ReadWrite, value: u32): void!AllocError {
+    var digits: u8[] = [];
+    var rest: u32 = value;
+    if rest == 0 {
+        buf::buf_push_u8(dst, 48 as u8)?;
+        return;
+    }
+    while rest > 0 {
+        @push(digits, (48 + rest % 10) as u8)?;
+        rest = rest / 10;
+    }
+    var i: u32 = @len(digits) as u32;
+    while i > 0 {
+        i = i - 1;
+        buf::buf_push_u8(dst, digits[i])?;
+    }
+    return;
+}
+// 结构化拒绝行：只复用规格错误码；MIR 的结构性拒绝没有对应码位，按种类与位置报告。
+export function report_code(prefix: &[u8], code: types::ErrorCode): void!AllocError {
+    require_code(code);
+    var line: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&line:ReadWrite, prefix)?;
+    buf::buf_push_bytes(&line:ReadWrite, " E")?;
+    push_decimal(&line:ReadWrite, code.raw as u32)?;
+    buf::buf_push_u8(&line:ReadWrite, 10 as u8)?;
+    let text: &[u8] = &line.data[0..buf::buf_len(&line:Read)];
+    write(text);
+    return;
+}
+export function report_mir(kind: u8, span: types::Span): void!AllocError {
+    var line: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&line:ReadWrite, "错误 MIR：不支持形态 种类=")?;
+    push_decimal(&line:ReadWrite, kind as u32)?;
+    buf::buf_push_bytes(&line:ReadWrite, " @ file=")?;
+    push_decimal(&line:ReadWrite, span.file as u32)?;
+    buf::buf_push_bytes(&line:ReadWrite, " off=")?;
+    push_decimal(&line:ReadWrite, span.offset)?;
+    buf::buf_push_bytes(&line:ReadWrite, " len=")?;
+    push_decimal(&line:ReadWrite, span.length)?;
+    buf::buf_push_u8(&line:ReadWrite, 10 as u8)?;
+    let text: &[u8] = &line.data[0..buf::buf_len(&line:Read)];
+    write(text);
+    return;
+}

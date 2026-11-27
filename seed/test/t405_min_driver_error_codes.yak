@@ -1,0 +1,29 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: error_codes=../../compiler/min/src/diag/error_codes.yak
+// module: driver_diag=../../compiler/min/src/driver_diag.yak
+// expected_stdout: 检查 E4002
+// expected_stdout: 错误 E4002 @ off=3
+// expected_stdout: 构建失败：1 个错误
+import types;
+import diag;
+import driver_diag;
+
+foreign exit(code: u8): void;
+
+function run_case(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    diag::diagbuf_emit(&diags:ReadWrite, diag::Diag { code: types::error_code(4002), severity: 0, span: types::Span { file: 0, offset: 3, length: 1 }, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    driver_diag::require_codes(&diags:Read);
+    driver_diag::report_code("检查", types::error_code(4002))?;
+    diag::diagbuf_print_terminal(&diags:Read)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run_case();
+    @drop(failed);
+    exit(1);
+}

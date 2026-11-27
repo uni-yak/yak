@@ -1,0 +1,18 @@
+// expected_exit: 34
+// expected_stdout: leaf
+// expected_stdout: mid
+// expected_stdout:
+// dependency: ordered_leaf.yak
+// dependency: ordered_mid.yak
+// spec: spec/lang/module.md 7.3、spec/proc/fixpoint.md 2.4
+// 三个单元按链式依赖链接，比较含末尾换行的两行输出。
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+import ordered_mid;
+
+function main(): void {
+    write("leaf\nmid\n");
+    exit(ordered_mid::doubled() as u8);
+    return;
+}

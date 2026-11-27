@@ -1,0 +1,8 @@
+// 顶层常量视图样例：模块常量在检查阶段求值，引用点按静态字节视图取值。
+// 验收方式：链接后运行，标准输出必须是 `global` 加一个换行，退出码为 0。
+foreign write(data: &[u8]): void;
+const BANNER: &[u8] = "global\n";
+function main(): void {
+    write(BANNER);
+    return;
+}

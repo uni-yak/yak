@@ -1,0 +1,498 @@
+// 表达式类型形态检查、字段定位及共享推断预算。
+import typecheck;
+import type_import;
+import resolve_refs;
+import ast;
+import types;
+import diag;
+
+const BUILTIN_U8: u16 = 4097;
+const BUILTIN_U64: u16 = 4100;
+const BUILTIN_I64: u16 = 4104;
+const BUILTIN_BOOL: u16 = 4105;
+const BUILTIN_CHAR: u16 = 4106;
+const BUILTIN_VOID: u16 = 4107;
+const BUILTIN_ALLOC_ERROR: u16 = 4108;
+const TK_BUILTIN: u8 = 1;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FN_REF: u8 = 8;
+const TK_FALLIBLE: u8 = 9;
+const TK_ERROR_SET: u8 = 11;
+
+// 纯整数形态、数组、本地构造器、匹配臂、out 实参引用、字段投影、等值检查和类型驻留各自计费，任一超限即停止函数体推断。
+export struct BodyInferenceBudget { shape_remaining: u32, shape_limited: bool, array_remaining: u32, array_limited: bool, ctor_remaining: u32, ctor_limited: bool, match_remaining: u32, match_limited: bool, out_remaining: u32, out_limited: bool, projection_remaining: u32, projection_limited: bool, equality_remaining: u32, equality_limited: bool, ordered_enums: bool, ordered_fields: bool, intern: typecheck::InternBudget, stop: u8, pending_names_base: u32 }
+
+const STOP_SHAPE: u8 = 1;
+const STOP_ARRAY: u8 = 2;
+const STOP_CTOR: u8 = 3;
+const STOP_MATCH: u8 = 4;
+const STOP_OUT: u8 = 5;
+const STOP_PROJECTION: u8 = 6;
+const STOP_EQUALITY: u8 = 7;
+const STOP_INTERN: u8 = 8;
+
+export function body_inference_budget(shape_limit: u32, array_limit: u32, ctor_limit: u32, match_limit: u32, out_limit: u32, projection_limit: u32, equality_limit: u32): BodyInferenceBudget {
+    return BodyInferenceBudget { shape_remaining: shape_limit, shape_limited: shape_limit != 0u32, array_remaining: array_limit, array_limited: array_limit != 0u32, ctor_remaining: ctor_limit, ctor_limited: ctor_limit != 0u32, match_remaining: match_limit, match_limited: match_limit != 0u32, out_remaining: out_limit, out_limited: out_limit != 0u32, projection_remaining: projection_limit, projection_limited: projection_limit != 0u32, equality_remaining: equality_limit, equality_limited: equality_limit != 0u32, ordered_enums: false, ordered_fields: false, intern: typecheck::intern_budget(0u32), stop: 0u8, pending_names_base: 0 };
+}
+
+// 等值检查只需要确认是否存在字段；文档按实际读取的候选行计费。
+function equality_charge(work: &BodyInferenceBudget:ReadWrite): bool {
+    if work.equality_remaining == 0u32 { work.stop = STOP_EQUALITY; return false; }
+    work.equality_remaining = work.equality_remaining - 1u32;
+    return true;
+}
+
+export function equality_has_fields(table: &typecheck::FieldTable:Read, def: u32, work: &BodyInferenceBudget:ReadWrite): bool {
+    let limited: bool = work.equality_limited;
+    if work.ordered_fields {
+        var left: u32 = 0;
+        var right: u32 = @len(table.items) as u32;
+        while left < right {
+            if limited && !equality_charge(work) { return false; }
+            let mid: u32 = left + (right - left) / 2u32;
+            let candidate: u32 = table.items[mid].def;
+            if candidate == def { return true; }
+            if candidate < def { left = mid + 1u32; } else { right = mid; }
+        }
+        return false;
+    }
+    var i: u32 = 0;
+    while i < @len(table.items) as u32 {
+        if limited && !equality_charge(work) { return false; }
+        if table.items[i].def == def { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 文档枚举定义唯一且有序；命中返回一基行号，未命中与超限由状态区分。
+function equality_enum_row(enums: &typecheck::EnumTable:Read, def: u32, work: &BodyInferenceBudget:ReadWrite): u32 {
+    var left: u32 = 0;
+    var right: u32 = @len(enums.items) as u32;
+    while left < right {
+        if work.equality_limited && !equality_charge(work) { return 0; }
+        let mid: u32 = left + (right - left) / 2u32;
+        let candidate: u32 = enums.items[mid].def;
+        if candidate == def { return mid + 1u32; }
+        if candidate < def { left = mid + 1u32; } else { right = mid; }
+    }
+    return 0;
+}
+
+// 沿本地枚举传播已知不可比较载荷；去重以防止循环和重复访问。
+export function enum_uncomparable_payload(tt: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, fields: &typecheck::FieldTable:Read, refs: &resolve_refs::RefTable:Read, def: u32, work: &BodyInferenceBudget:ReadWrite): bool!AllocError {
+    let limited: bool = work.equality_limited;
+    var pending: u32[] = [];
+    @push(pending, def)?;
+    var next: u32 = 0;
+    let ordered: bool = work.ordered_enums;
+    while next < @len(pending) as u32 {
+        let target: u32 = pending[next];
+        var i: u32 = 0;
+        var end: u32 = @len(enums.items) as u32;
+        if ordered {
+            end = equality_enum_row(enums, target, work);
+            if work.stop != 0u8 { return false; }
+            if end != 0 { i = end - 1u32; }
+        }
+        while i < end {
+            if !ordered && limited && !equality_charge(work) { return false; }
+            if ordered || enums.items[i].def == target {
+                var v: u32 = 0;
+                while v < @len(enums.items[i].payloads) as u32 {
+                    if limited && !equality_charge(work) { return false; }
+                    let id: u32 = enums.items[i].payloads[v];
+                    if id != 0 && id <= @len(tt.entries) as u32 {
+                        let entry: typecheck::TypeEntry = tt.entries[id - 1];
+                        if entry.kind == TK_FIXED_ARRAY || entry.kind == TK_DYN_ARRAY { return true; }
+                        if entry.kind == TK_LOCAL && equality_has_fields(fields, entry.def, work) { return true; }
+                        if work.stop != 0u8 { return false; }
+                        if type_import::imported_struct(refs, entry) || type_import::imported_uncomparable_payload(refs, entry)? { return true; }
+                        if entry.kind == TK_LOCAL {
+                            var seen: u32 = 0;
+                            while seen < @len(pending) as u32 {
+                                if limited && !equality_charge(work) { return false; }
+                                if pending[seen] == entry.def { break; }
+                                seen = seen + 1;
+                            }
+                            if seen == @len(pending) as u32 { @push(pending, entry.def)?; }
+                        }
+                    }
+                    v = v + 1;
+                }
+            }
+            i = i + 1;
+        }
+        next = next + 1;
+    }
+    return false;
+}
+
+export function body_shape_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_SHAPE; }
+export function body_array_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_ARRAY; }
+export function body_ctor_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_CTOR; }
+export function body_match_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_MATCH; }
+export function body_out_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_OUT; }
+export function body_projection_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_PROJECTION; }
+export function body_equality_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_EQUALITY; }
+export function body_intern_exceeded(work: &BodyInferenceBudget:Read): bool { return work.stop == STOP_INTERN; }
+// 管线读取首个中止原因，再映射到自身的诊断状态。
+export function body_stop_reason(work: &BodyInferenceBudget:Read): u8 { return work.stop; }
+
+// 函数体独立计费，不覆盖此前的中止原因；类型引用另走递归解析入口。
+export function body_intern(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, kind: u8, first: u32, second: u64): u32!AllocError {
+    if shape.stop != 0u8 { return 0; }
+    let id: u32 = typecheck::intern_body_type(tt, kind, first, second, &shape.intern:ReadWrite)?;
+    if shape.intern.exhausted { shape.stop = STOP_INTERN; }
+    return id;
+}
+export function body_resolve_type_ref(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, refs: &resolve_refs::RefTable:Read, pool: &ast::AstPool:Read, type_id: u32): u32!AllocError {
+    if shape.stop != 0u8 { return 0; }
+    let id: u32 = typecheck::resolve_type_ref_limited(tt, refs, pool, type_id, &shape.intern:ReadWrite)?;
+    if shape.intern.exhausted { shape.stop = STOP_INTERN; }
+    return id;
+}
+
+export function match_charge(shape: &BodyInferenceBudget:ReadWrite): bool {
+    if shape.match_remaining == 0u32 { shape.stop = STOP_MATCH; return false; }
+    shape.match_remaining = shape.match_remaining - 1u32;
+    return true;
+}
+
+function shape_charge(shape: &BodyInferenceBudget:ReadWrite): bool {
+    if shape.shape_remaining == 0u32 { shape.stop = STOP_SHAPE; return false; }
+    shape.shape_remaining = shape.shape_remaining - 1u32;
+    return true;
+}
+
+// 只为诊断查找多层引用后的宿主；实际投影仍只解引用一层。
+export function nested_projection_host(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:Read, first: u32): u32 {
+    var id: u32 = first;
+    while id != 0 && id <= @len(tt.entries) as u32 {
+        let entry: typecheck::TypeEntry = tt.entries[id - 1];
+        if entry.kind != TK_REF { return id; }
+        if entry.cap > 1 || entry.elem >= id { return 0; }
+        if shape.shape_limited && !shape_charge(shape) { return 0; }
+        id = entry.elem;
+    }
+    return 0;
+}
+
+export function indexable_host(kind: u8): bool {
+    return kind == TK_SLICE || kind == TK_DYN_ARRAY || kind == TK_FIXED_ARRAY;
+}
+
+export function array_charge(shape: &BodyInferenceBudget:ReadWrite): bool {
+    if shape.array_remaining == 0u32 { shape.stop = STOP_ARRAY; return false; }
+    shape.array_remaining = shape.array_remaining - 1u32;
+    return true;
+}
+
+// 本地构造器的初始化槽、字段定位与查找、已见字段回扫共用余额。
+export function ctor_charge(shape: &BodyInferenceBudget:ReadWrite, rows: u32): bool {
+    if rows > shape.ctor_remaining { shape.stop = STOP_CTOR; return false; }
+    shape.ctor_remaining = shape.ctor_remaining - rows;
+    return true;
+}
+
+function projection_charge(shape: &BodyInferenceBudget:ReadWrite): bool {
+    if shape.projection_remaining == 0u32 { shape.stop = STOP_PROJECTION; return false; }
+    shape.projection_remaining = shape.projection_remaining - 1u32;
+    return true;
+}
+
+export struct LocalFieldRange { start: u32, end: u32 }
+export struct FieldSelection { ordinal: u32, value_type_id: u32 }
+
+// 文档字段表按 DefId 分组，组内保持声明次序；每次二分比较先扣一步。
+function field_boundary(shape: &BodyInferenceBudget:ReadWrite, fields: &typecheck::FieldTable:Read, def: u32, start: u32, after: bool, ctor: bool): u32 {
+    var left: u32 = start;
+    var right: u32 = @len(fields.items) as u32;
+    while left < right {
+        if ctor {
+            if !ctor_charge(shape, 1u32) { return 0; }
+        } elseif !projection_charge(shape) { return 0; }
+        let mid: u32 = left + (right - left) / 2u32;
+        let candidate: u32 = fields.items[mid].def;
+        if candidate < def || (after && candidate == def) { left = mid + 1u32; }
+        else { right = mid; }
+    }
+    return left;
+}
+
+export function local_field_range(shape: &BodyInferenceBudget:ReadWrite, fields: &typecheck::FieldTable:Read, def: u32, ctor: bool): LocalFieldRange {
+    let start: u32 = field_boundary(shape, fields, def, 0u32, false, ctor);
+    if shape.stop != 0u8 { return LocalFieldRange { start: 0, end: 0 }; }
+    let end: u32 = field_boundary(shape, fields, def, start, true, ctor);
+    if shape.stop != 0u8 { return LocalFieldRange { start: 0, end: 0 }; }
+    return LocalFieldRange { start: start, end: end };
+}
+
+// 有序文档范围只查目标组；兼容入口传整表，仍按首项命中。
+export function scan_local_field(shape: &BodyInferenceBudget:ReadWrite, fields: &typecheck::FieldTable:Read, def: u32, name: u32, range: LocalFieldRange, ctor: bool): FieldSelection {
+    var i: u32 = range.start;
+    var ordinal: u32 = 0;
+    while i < range.end {
+        if ctor {
+            if shape.ctor_limited && !ctor_charge(shape, 1u32) { break; }
+        } elseif shape.projection_limited && !projection_charge(shape) { break; }
+        let field: typecheck::FieldType = fields.items[i];
+        if field.def == def {
+            ordinal = ordinal + 1;
+            if field.name == name { return FieldSelection { ordinal: ordinal, value_type_id: field.type_id }; }
+        }
+        i = i + 1;
+    }
+    return FieldSelection { ordinal: 0, value_type_id: 0 };
+}
+
+export function projection_field(shape: &BodyInferenceBudget:ReadWrite, fields: &typecheck::FieldTable:Read, def: u32, name: u32): FieldSelection {
+    var range: LocalFieldRange = LocalFieldRange { start: 0, end: @len(fields.items) as u32 };
+    if shape.projection_limited && shape.ordered_fields {
+        range = local_field_range(shape, fields, def, false);
+    }
+    return scan_local_field(shape, fields, def, name, range, false);
+}
+
+export function intern_push_result(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite): u32!AllocError {
+    let alloc_error: u32 = body_intern(shape, tt, TK_BUILTIN, BUILTIN_ALLOC_ERROR as u32, 0)?;
+    let errorset: u32 = body_intern(shape, tt, TK_ERROR_SET, alloc_error, 0)?;
+    let void_type: u32 = body_intern(shape, tt, TK_BUILTIN, BUILTIN_VOID as u32, 0)?;
+    return body_intern(shape, tt, TK_FALLIBLE, void_type, errorset as u64)?;
+}
+
+export function slice_bound_expected(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, pool: &ast::AstPool:Read, expr: u32): u32!AllocError {
+    if pool.exprs[expr].kind == 21 && pool.unaries[pool.exprs[expr].data as u32].op == 12 { return body_intern(shape, tt, TK_BUILTIN, BUILTIN_I64 as u32, 0)?; }
+    return body_intern(shape, tt, TK_BUILTIN, BUILTIN_U64 as u32, 0)?;
+}
+export function literal_type(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, pool: &ast::AstPool:Read, expr: u32, expected: u32): u32!AllocError {
+    let kind: u8 = pool.exprs[expr].kind;
+    let suffix: u8 = pool.exprs[expr].integer_suffix;
+    if kind == 2 {
+        if suffix != 0 { return body_intern(shape, tt, TK_BUILTIN, typecheck::integer_suffix_builtin(suffix) as u32, 0)?; }
+        if expected != 0 && typecheck::is_integer_type(tt, expected) { return expected; }
+        return 0;
+    }
+    if kind == 3 { return body_intern(shape, tt, TK_BUILTIN, BUILTIN_BOOL as u32, 0)?; }
+    if kind == 4 { return body_intern(shape, tt, TK_BUILTIN, BUILTIN_CHAR as u32, 0)?; }
+    if kind == 5 {
+        let u8_type: u32 = body_intern(shape, tt, TK_BUILTIN, BUILTIN_U8 as u32, 0)?;
+        return body_intern(shape, tt, TK_SLICE, 0, u8_type as u64)?;
+    }
+    return 0;
+}
+// 载体类型可能包含数组，其构造约束由各自的检查路径处理。
+
+function untyped_integer_expr(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, expr: u32, arrays: bool): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    if kind == 2 { return pool.exprs[expr].integer_suffix == 0; }
+    if kind == 21 && data < @len(pool.unaries) as u32 && pool.unaries[data].op == 12 {
+        return untyped_integer_expr(pool, refs, pool.unaries[data].operand, false);
+    }
+    if arrays && kind == 26 && data < @len(pool.arrays) as u32 {
+        var i: u32 = 0;
+        while i < @len(pool.arrays[data].elements) as u32 {
+            if !untyped_integer_expr(pool, refs, pool.arrays[data].elements[i], true) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if kind == 22 && data < @len(pool.calls) as u32 && @len(pool.calls[data].args) == 2 {
+        let callee: u32 = typecheck::ref_index(refs, 0, pool.calls[data].callee);
+        if callee == 0 || refs.items[callee - 1].kind != 1 { return false; }
+        let builtin: u32 = refs.items[callee - 1].x;
+        if builtin != 20493 && builtin != 20494 && builtin != 20495 { return false; }
+        return untyped_integer_expr(pool, refs, pool.calls[data].args[0].value, false) && untyped_integer_expr(pool, refs, pool.calls[data].args[1].value, false);
+    }
+    if kind == 20 && data < @len(pool.binaries) as u32 {
+        let op: u8 = pool.binaries[data].op;
+        if op == 7 || op == 8 || op == 11 || op == 12 || op == 13 || op == 14 || op == 15 || op == 19 || op == 20 || op == 21 {
+            return untyped_integer_expr(pool, refs, pool.binaries[data].left, false) && untyped_integer_expr(pool, refs, pool.binaries[data].right, false);
+        }
+    }
+    return false;
+}
+
+// 索引存在时只访问对应槽；旧引用表逐行查找，首次匹配即停止。
+function shape_ref_index(refs: &resolve_refs::RefTable:Read, shape: &BodyInferenceBudget:ReadWrite, node: u32): u32 {
+    if @len(refs.expr_index) != 0 {
+        if node >= @len(refs.expr_index) as u32 || !shape_charge(shape) { return 0; }
+        return refs.expr_index[node];
+    }
+    var i: u32 = 0;
+    while i < @len(refs.items) as u32 {
+        if !shape_charge(shape) { return 0; }
+        if refs.items[i].node_kind == 0 && refs.items[i].node == node { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 固定元数的形态随表达式访问计费；变长数组和引用查找单独计费。
+function integer_shape_limited(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, shape: &BodyInferenceBudget:ReadWrite, expr: u32, arrays: bool): bool {
+    if expr >= @len(pool.exprs) as u32 { return false; }
+    if !shape_charge(shape) { return false; }
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    if kind == 2 { return pool.exprs[expr].integer_suffix == 0; }
+    if kind == 21 && data < @len(pool.unaries) as u32 && pool.unaries[data].op == 12 {
+        return integer_shape_limited(pool, refs, shape, pool.unaries[data].operand, false);
+    }
+    if arrays && kind == 26 && data < @len(pool.arrays) as u32 {
+        var i: u32 = 0;
+        while i < @len(pool.arrays[data].elements) as u32 {
+            if !shape_charge(shape) { return false; }
+            if !integer_shape_limited(pool, refs, shape, pool.arrays[data].elements[i], true) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if kind == 22 && data < @len(pool.calls) as u32 && @len(pool.calls[data].args) == 2 {
+        let callee: u32 = shape_ref_index(refs, shape, pool.calls[data].callee);
+        if callee == 0 || !shape_charge(shape) { return false; }
+        if refs.items[callee - 1].kind != 1 { return false; }
+        let builtin: u32 = refs.items[callee - 1].x;
+        if builtin != 20493 && builtin != 20494 && builtin != 20495 { return false; }
+        return integer_shape_limited(pool, refs, shape, pool.calls[data].args[0].value, false) && integer_shape_limited(pool, refs, shape, pool.calls[data].args[1].value, false);
+    }
+    if kind == 20 && data < @len(pool.binaries) as u32 {
+        let op: u8 = pool.binaries[data].op;
+        if op == 7 || op == 8 || op == 11 || op == 12 || op == 13 || op == 14 || op == 15 || op == 19 || op == 20 || op == 21 {
+            return integer_shape_limited(pool, refs, shape, pool.binaries[data].left, false) && integer_shape_limited(pool, refs, shape, pool.binaries[data].right, false);
+        }
+    }
+    return false;
+}
+
+export function integer_shape(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, shape: &BodyInferenceBudget:ReadWrite, expr: u32, arrays: bool): bool {
+    if shape.stop != 0u8 { return false; }
+    if shape.shape_limited { return integer_shape_limited(pool, refs, shape, expr, arrays); }
+    return untyped_integer_expr(pool, refs, expr, arrays);
+}
+
+export function check_out_arg(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, defs: &typecheck::DefTypeTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, call: u32, ordinal: u32, formal: u32, span: types::Span): void!AllocError {
+    if formal == 0 { return; }
+    let target: u32 = typecheck::write_ref_target(tt, formal);
+    if target == 0 { typecheck::emit(diags, types::error_code(6101), span)?; return; }
+    let count: u32 = @len(refs.items) as u32;
+    if shape.out_limited {
+        // 名称解析按节点种类、调用编号、实参序号排序；每条 out 实参只有一行。
+        var lo: u32 = 0;
+        var hi: u32 = count;
+        while lo < hi {
+            if shape.out_remaining == 0u32 { shape.stop = STOP_OUT; return; }
+            shape.out_remaining = shape.out_remaining - 1u32;
+            let mid: u32 = lo + (hi - lo) / 2;
+            let item: resolve_refs::ResolvedRef = refs.items[mid];
+            if item.node_kind == 3 && item.node == call && item.x == ordinal {
+                check_assignable(tt, diags, typecheck::def_type(defs, item.y), target, span, types::error_code(5001))?;
+                return;
+            }
+            if item.node_kind < 3 || (item.node_kind == 3 && (item.node < call || (item.node == call && item.x < ordinal))) { lo = mid + 1; }
+            else { hi = mid; }
+        }
+        return;
+    }
+    // 批处理保留原来的首个命中查找，不要求额外索引。
+    var i: u32 = 0;
+    while i < count {
+        let item: resolve_refs::ResolvedRef = refs.items[i];
+        if item.node_kind == 3 && item.node == call && item.x == ordinal {
+            check_assignable(tt, diags, typecheck::def_type(defs, item.y), target, span, types::error_code(5001))?;
+            return;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+export function check_assignable(tt: &typecheck::TypeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, actual: u32, expected: u32, span: types::Span, code: types::ErrorCode): void!AllocError {
+    if expected == 0 || actual == 0 { return; }
+    if typecheck::same_type(actual, expected) { return; }
+    // 能力只允许 ReadWrite → Read 收窄（base.md 7.4 / owner.md 3.6）；任何升级仍拒绝。
+    if actual <= @len(tt.entries) as u32 && expected <= @len(tt.entries) as u32 {
+        let a: typecheck::TypeEntry = tt.entries[actual - 1];
+        let e: typecheck::TypeEntry = tt.entries[expected - 1];
+        if (a.kind == TK_REF || a.kind == TK_SLICE) && a.kind == e.kind && a.cap == 1 && e.cap == 0 && a.elem == e.elem { return; }
+    }
+    typecheck::emit(diags, code, span)?;
+    return;
+}
+// 仅在整数互转诊断和同型转换判定中查询枚举身份，并计费访问的声明行。
+export function cast_is_enum(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:Read, enums: &typecheck::EnumTable:Read, refs: &resolve_refs::RefTable:Read, id: u32): bool {
+    if id == 0 || id > @len(tt.entries) as u32 { return false; }
+    let entry: typecheck::TypeEntry = tt.entries[id - 1];
+    if entry.kind == TK_LOCAL {
+        var lo: u32 = 0;
+        var hi: u32 = @len(enums.items) as u32;
+        while lo < hi {
+            if shape.shape_limited && !shape_charge(shape) { return false; }
+            var at: u32 = lo;
+            if shape.ordered_enums { at = lo + (hi - lo) / 2u32; }
+            let candidate: u32 = enums.items[at].def;
+            if candidate == entry.def { return true; }
+            if shape.ordered_enums && candidate > entry.def { hi = at; }
+            else { lo = at + 1u32; }
+        }
+    } elseif entry.kind == TK_IMPORTED {
+        var i: u32 = 0;
+        while i < @len(refs.enums) as u32 {
+            if shape.shape_limited && !shape_charge(shape) { return false; }
+            if refs.enums[i].dep == entry.dep && refs.enums[i].export_id == entry.export_id { return true; }
+            i = i + 1u32;
+        }
+    }
+    return false;
+}
+
+export function function_address_type(shape: &BodyInferenceBudget:ReadWrite, tt: &typecheck::TypeTable:ReadWrite, funcs: &typecheck::FuncTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite, target: resolve_refs::ResolvedRef, unary: ast::UnaryExpr): u32!AllocError {
+    if unary.has_capability || (target.kind == 0 && target.y == 5) {
+        typecheck::emit(diags, types::error_code(5001), unary.span)?;
+        return 0;
+    }
+    var params: u32[] = [];
+    var result: u32 = 0;
+    if target.kind == 0 {
+        let row: u32 = typecheck::func_sig(funcs, target.x);
+        if row == 0 { return 0; }
+        result = funcs.items[row - 1].ret;
+        var i: u32 = 0;
+        while i < @len(funcs.items[row - 1].params) as u32 { @push(params, funcs.items[row - 1].params[i])?; i = i + 1; }
+    } else {
+        let dep: u16 = target.x as u16;
+        let row: u32 = type_import::import_signature(refs, dep, target.y);
+        if row == 0 { typecheck::emit(diags, types::error_code(5001), unary.span)?; return 0; }
+        let slots: &[resolve_refs::ImportType] = &refs.imports[row - 1].types[0..@len(refs.imports[row - 1].types)]:Read;
+        let start: u32 = refs.imports[row - 1].param_start;
+        var i: u32 = 0;
+        while i < refs.imports[row - 1].param_count as u32 {
+            let param: u32 = type_import::import_slot_type(tt, slots, start + i, dep)?;
+            @push(params, param)?;
+            i = i + 1;
+        }
+        result = type_import::import_slot_type(tt, slots, refs.imports[row - 1].ret_slot, dep)?;
+    }
+    var i: u32 = 0;
+    while i < @len(params) as u32 {
+        if params[i] == 0 { return 0; }
+        let formal: typecheck::TypeEntry = tt.entries[params[i] - 1];
+        if formal.kind != TK_REF && formal.kind != TK_SLICE && formal.kind != TK_FN_REF {
+            typecheck::emit(diags, types::error_code(5001), unary.span)?;
+            return 0;
+        }
+        i = i + 1;
+    }
+    if result == 0 { return 0; }
+    let id: u32 = typecheck::intern_fn_ref_limited(tt, @move(params), result, &shape.intern:ReadWrite)?;
+    if shape.intern.exhausted { shape.stop = STOP_INTERN; }
+    return id;
+}
+
+// 普通本地、远程与间接调用使用相同的形参匹配。foreign 不隐式建立借用。

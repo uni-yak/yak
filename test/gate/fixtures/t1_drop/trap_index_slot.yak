@@ -1,0 +1,33 @@
+// 当前帧边界陷阱：先显式释放更早取得的 owning 局部 e，再填满 Write 槽并取得 c、d；
+// 动态数组元素索引越界时，本次陷阱清理只应逆序释放 d、c、b、a。
+foreign write(data: &[u8]): void;
+
+struct Payload { first: u32[], second: u32[] }
+
+function trap_index(p: &Payload:Write, hi: u32): void!AllocError {
+    write("before-index\n");
+    var e: u32[] = [];
+    @push(e, 45u32)?;
+    @drop(e);
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, 41u32)?;
+    @push(b, 42u32)?;
+    *p = Payload { first: @move(a), second: @move(b) };
+    var c: u32[] = [];
+    @push(c, 43u32)?;
+    var d: u32[] = [];
+    @push(d, 44u32)?;
+    if d[hi] == 0u32 { return; }
+    @drop(d);
+    @drop(c);
+    return;
+}
+
+function outer(): void!AllocError {
+    out p: Payload;
+    trap_index(out p, 9u32)?;
+    return;
+}
+
+function main(): void { outer(); return; }

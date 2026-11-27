@@ -1,0 +1,2 @@
+// expected_trap: integer overflow
+function main(): void { let x: u8 = 255; let y: u8 = x + 1; }

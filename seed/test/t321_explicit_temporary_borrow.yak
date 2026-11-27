@@ -1,0 +1,4 @@
+// expected_trap: eval: expression is not a place
+struct Item { data: u32[] }
+function make(): Item { return Item { data: [7u32] }; }
+function main(): void { let view: &u32 = &make().data[0u32]; }

@@ -1,0 +1,11 @@
+// t37: 数组索引访问 + assert
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let arr: u8[] = [10, 20, 30];
+    let x: u8 = arr[1];
+    assert(x == 20);
+    assert(arr[0] == 10);
+    assert(arr[2] == 30);
+    return;
+}

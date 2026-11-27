@@ -1,0 +1,92 @@
+#!/bin/sh
+# 检查暂存的源码编码与换行，保留部分暂存和未暂存修改。
+set -eu
+
+if command -v python >/dev/null 2>&1; then
+    interpreter=python
+elif command -v python3 >/dev/null 2>&1; then
+    interpreter=python3
+else
+    echo '错误：pre-commit 需要 Python 检查暂存区。' >&2
+    exit 1
+fi
+
+exec "$interpreter" -X utf8 -B - <<'PY'
+import os
+from pathlib import PurePosixPath
+import subprocess
+import sys
+
+
+SOURCE_SUFFIXES = {
+    ".yak", ".c", ".h", ".s", ".py", ".sh", ".ps1", ".js", ".cjs", ".mjs",
+    ".lua", ".md", ".json", ".yaml", ".yml", ".def", ".lock",
+}
+EXACT_SOURCE_PATHS = {
+    b".githooks/pre-commit",
+    b".gitattributes",
+    b".gitignore",
+}
+
+
+def git(*args, input=None):
+    return subprocess.run(["git", *args], input=input, stdout=subprocess.PIPE, check=True).stdout
+
+
+def is_source(path):
+    suffix = PurePosixPath(os.fsdecode(path)).suffix.lower()
+    if suffix == ".yak" and path.startswith((b"test/bad/", b"seed/test/")):
+        # 负例和解释器夹具有意保留非法编码或换行。
+        return False
+    return path in EXACT_SOURCE_PATHS or suffix in SOURCE_SUFFIXES
+
+
+def check():
+    changed = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z").split(b"\0")
+    paths = {path for path in changed if path and is_source(path)}
+    if not paths:
+        return 0
+
+    staged = []
+    for entry in git("ls-files", "--stage", "-z").split(b"\0"):
+        if not entry:
+            continue
+        fields, path = entry.split(b"\t", 1)
+        mode, oid, stage = fields.split()
+        if path in paths and stage == b"0" and mode in {b"100644", b"100755"}:
+            staged.append((path, oid))
+
+    with subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as blobs:
+        invalid = 0
+        for path, oid in staged:
+            display = repr(os.fsdecode(path))
+            blobs.stdin.write(oid + b"\n")
+            blobs.stdin.flush()
+            header = blobs.stdout.readline().split()
+            if len(header) != 3 or header[:2] != [oid, b"blob"]:
+                raise ValueError(f"无法读取暂存内容 {display}")
+            size = int(header[2])
+            data = blobs.stdout.read(size)
+            if len(data) != size or blobs.stdout.read(1) != b"\n":
+                raise ValueError(f"暂存对象长度不符 {display}")
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                print(f"错误：{display} 的暂存内容不是 UTF-8。", file=sys.stderr)
+                invalid += 1
+                continue
+            if data.startswith(b"\xef\xbb\xbf") or b"\r" in data:
+                print(f"错误：{display} 的暂存内容应使用 UTF-8 无 BOM 和 LF 换行。", file=sys.stderr)
+                invalid += 1
+        blobs.stdin.close()
+        if blobs.wait():
+            raise ValueError("Git 暂存对象读取失败")
+    return int(invalid > 0)
+
+
+try:
+    sys.exit(check())
+except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    print(f"错误：无法检查暂存区。{error}", file=sys.stderr)
+    sys.exit(1)
+PY

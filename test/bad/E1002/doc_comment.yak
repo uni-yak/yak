@@ -1,0 +1,5 @@
+// expected_code: E1002
+// spec: spec/lang/lex.md L-2
+// 触发：base 不接受文档注释。
+/// 文档注释
+function main(): void { return; }

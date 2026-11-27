@@ -1,0 +1,2170 @@
+{
+  "structural_errors": [],
+  "documents": 63,
+  "error_entries": 197,
+  "explicit_code_aliases": 41,
+  "missing_specs": [],
+  "inactive_full_specs": [],
+  "rejection_rows_requiring_code_mapping": [],
+  "inactive_full_rejection_rows": [
+    "lang/asm.md:AS-1",
+    "lang/asm.md:AS-2",
+    "lang/asm.md:AS-3",
+    "lang/asm.md:AS-4",
+    "lang/asm.md:AS-5",
+    "lang/atomic.md:AT-1",
+    "lang/atomic.md:AT-2",
+    "lang/atomic.md:AT-3",
+    "lang/atomic.md:AT-4",
+    "lang/atomic.md:AT-5",
+    "lang/effect.md:EF-1",
+    "lang/effect.md:EF-2",
+    "lang/effect.md:EF-3",
+    "lang/effect.md:EF-4",
+    "lang/effect.md:EF-5",
+    "lang/generic.md:G-1",
+    "lang/generic.md:G-2",
+    "lang/generic.md:G-3",
+    "lang/generic.md:G-4",
+    "lang/generic.md:G-5",
+    "lang/generic.md:G-6",
+    "lang/generic.md:G-7",
+    "lang/generic.md:G-8",
+    "lang/generic.md:G-9",
+    "lang/generic.md:G-10",
+    "lang/sugar.md:SU-8",
+    "lang/type/ptr.md:P-1",
+    "lang/type/ptr.md:P-2",
+    "lang/type/ptr.md:P-3",
+    "lang/type/ptr.md:P-4",
+    "lang/type/ptr.md:P-5",
+    "lang/type/ptr.md:P-6",
+    "lang/type/ptr.md:P-7",
+    "lang/type/ptr.md:P-8",
+    "lang/type/ptr.md:P-9",
+    "lang/type/ptr.md:P-10",
+    "lang/type/tuple.md:TP-1",
+    "lang/type/tuple.md:TP-2",
+    "lang/type/tuple.md:TP-3",
+    "lang/type/tuple.md:TP-4",
+    "lang/unsafe.md:US-1",
+    "lang/unsafe.md:US-2",
+    "lang/unsafe.md:US-3",
+    "lang/unsafe.md:US-4",
+    "lang/unsafe.md:US-5",
+    "target/optimize.md:OPT-1",
+    "target/optimize.md:OPT-2",
+    "target/optimize.md:OPT-3",
+    "target/optimize.md:OPT-4",
+    "target/register.md:RG-1",
+    "target/register.md:RG-2",
+    "target/register.md:RG-3",
+    "target/register.md:RG-4",
+    "target/select.md:SL-1",
+    "target/select.md:SL-2",
+    "target/select.md:SL-3",
+    "target/select.md:SL-4"
+  ],
+  "gate_assertion_rows_by_exit_code": [
+    "proc/build.md:B-1",
+    "proc/build.md:B-2",
+    "proc/build.md:B-3",
+    "proc/build.md:B-4",
+    "proc/diag.md:D-1",
+    "proc/diag.md:D-2",
+    "proc/diag.md:D-3",
+    "proc/error.md:ER-1",
+    "proc/error.md:ER-2",
+    "proc/error.md:ER-3",
+    "proc/error.md:ER-4",
+    "proc/error.md:ER-5",
+    "proc/fixpoint.md:FP-1",
+    "proc/fixpoint.md:FP-2",
+    "proc/fixpoint.md:FP-4",
+    "proc/seed.md:SD-1",
+    "proc/seed.md:SD-2",
+    "proc/seed.md:SD-3",
+    "proc/shell.md:SH-1",
+    "proc/shell.md:SH-2",
+    "proc/shell.md:SH-3",
+    "proc/shell.md:SH-4"
+  ],
+  "unconfirmed_direct_dependencies": [
+    {
+      "spec": "ir/mir.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "ir/ysm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/mir.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/ysm.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/ysm.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "ir/ysm.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/ysm.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "ir/ysm.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "lang/effect.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "target/register.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/asm.md",
+      "dependency": "target/select.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "lang/effect.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "lang/type/ptr.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/atomic.md",
+      "dependency": "target/select.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/module.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/alloc-error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/bool.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/char.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/f32.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/f64.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/function.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/i16.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/i32.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/i64.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/i8.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/ptr.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/ref.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/string.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/struct.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/tuple.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/u16.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/u32.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/u64.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/u8.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/base.md",
+      "dependency": "lang/type/void.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/const.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/effect.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/effect.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/effect.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/effect.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/effect.md",
+      "dependency": "lang/asm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/effect.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "target/abi-win.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "target/abi-linux.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/foreign.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/generic.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/generic.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/generic.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/generic.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/generic.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/generic.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/generic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/struct.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/tuple.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/string.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/ptr.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/ref.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "lang/type/function.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "target/abi-win.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "target/abi-linux.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/layout.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/lex.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/lex.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/module.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/module.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/module.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/module.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/module.md",
+      "dependency": "proc/build.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/module.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/name.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/name.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/name.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/name.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/struct.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/owner.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/parse.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/parse.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/parse.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/parse.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/const.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/generic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/sugar.md",
+      "dependency": "lang/module.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/type/struct.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "proc/build.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/symbol.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/alloc-error.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/alloc-error.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/alloc-error.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/alloc-error.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/alloc-error.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/array.md",
+      "dependency": "lang/type/alloc-error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/bool.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/bool.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/bool.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/bool.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/bool.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/char.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/char.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/char.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/char.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/char.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/generic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "lang/const.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/enum.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/function.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/function.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/function.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/function.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/function.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i16.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i16.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i16.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i16.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i16.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i32.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i32.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i32.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i32.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i32.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i64.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i64.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i64.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i64.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i64.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i8.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i8.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i8.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/i8.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/i8.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/option.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ptr.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ptr.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ptr.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ptr.md",
+      "dependency": "lang/atomic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ptr.md",
+      "dependency": "target/abi-win.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ptr.md",
+      "dependency": "target/abi-linux.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ref.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ref.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ref.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/ref.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/ref.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/ref.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/result.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/slice.md",
+      "dependency": "lang/type/ref.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/string.md",
+      "dependency": "lang/type/array.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/string.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/string.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/string.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/generic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/struct.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/tuple.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/tuple.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/tuple.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/tuple.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/tuple.md",
+      "dependency": "lang/type/struct.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u16.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u16.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u16.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u16.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u16.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u32.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u32.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u32.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u32.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u32.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u64.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u64.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u64.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u64.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u64.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u8.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u8.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u8.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/u8.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/u8.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/union.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/void.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/void.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/type/void.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/asm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/atomic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/unsafe.md",
+      "dependency": "lang/type/ptr.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/build.md",
+      "dependency": "proc/shell.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/build.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/build.md",
+      "dependency": "proc/gate.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/build.md",
+      "dependency": "lang/module.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/build.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/diag.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/diag.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/diag.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/diag.md",
+      "dependency": "ir/ysm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/lex.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/parse.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/name.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/sugar.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/const.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/type/enum.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/error.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/fixpoint.md",
+      "dependency": "proc/build.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/fixpoint.md",
+      "dependency": "proc/gate.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/fixpoint.md",
+      "dependency": "ir/ysm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/fixpoint.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "proc/build.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "lang/type/result.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "lang/type/option.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "lang/type/union.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/gate.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/host.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/host.md",
+      "dependency": "proc/seed.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/host.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/lsp.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/lsp.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/lsp.md",
+      "dependency": "proc/diag.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/lsp.md",
+      "dependency": "proc/gate.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/seed.md",
+      "dependency": "proc/build.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/seed.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/seed.md",
+      "dependency": "proc/gate.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/seed.md",
+      "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/seed.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "proc/shell.md",
+      "dependency": "proc/build.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/status.md",
+      "dependency": "proc/gate.md",
+      "status": "草案"
+    },
+    {
+      "spec": "proc/status.md",
+      "dependency": "proc/error.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-linux.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-linux.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-linux.md",
+      "dependency": "target/elf.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-linux.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-linux.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-win.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-win.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-win.md",
+      "dependency": "target/pe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-win.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/abi-win.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/elf.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/elf.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/elf.md",
+      "dependency": "target/abi-linux.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/elf.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "ir/ysm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "target/abi-win.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "target/abi-linux.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "target/pe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/emitter.md",
+      "dependency": "target/elf.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "lang/owner.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "lang/unsafe.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "lang/asm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "lang/atomic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "proc/fixpoint.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/optimize.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/pe.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/pe.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/pe.md",
+      "dependency": "target/abi-win.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/pe.md",
+      "dependency": "lang/symbol.md",
+      "status": "草案-可实施"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "target/abi-win.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "target/abi-linux.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "target/select.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/register.md",
+      "dependency": "lang/asm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "target/x86.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "target/register.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "target/optimize.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "ir/mir.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "lang/atomic.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/select.md",
+      "dependency": "lang/asm.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/x86.md",
+      "dependency": "target/emitter.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/x86.md",
+      "dependency": "lang/layout.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/x86.md",
+      "dependency": "target/register.md",
+      "status": "草案"
+    },
+    {
+      "spec": "target/x86.md",
+      "dependency": "target/select.md",
+      "status": "草案"
+    }
+  ],
+  "semantic_confirmation": false
+}

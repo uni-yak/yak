@@ -1,0 +1,14 @@
+// 聚合值内存形态样例：结构体与定长数组在栈上构造，字段/元素按精确字节偏移读写。
+// 验收方式：链接后运行，退出码必须是 15（5 + 8 + 2），标准输出为空。
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+struct P { a: u32, b: u32 }
+
+function main(): void {
+    let p: P = P { a: 5u32, b: 8u32 };
+    let a: [u32; 2] = [1u32, 2u32];
+    let sum: u32 = p.a + p.b + a[1u32];
+    exit(sum as u8);
+    return;
+}

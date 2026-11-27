@@ -1,0 +1,380 @@
+// 构造单元引用侧表，并绑定依赖与宿主服务。
+import buf;
+import lex;
+import types;
+import ast;
+import diag;
+import resolve;
+import resolve_refs;
+import resolve_scope;
+import lextables;
+
+const builtin_void: u16 = 4107;
+
+function build_import_map(file: &ast::AstFile:Read, resolved: &resolve::ResolvedFile:Read): resolve_refs::ImportMap!AllocError {
+    var map: resolve_refs::ImportMap = resolve_refs::ImportMap { defs: [], data: [] };
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 5 {
+            @push(map.defs, resolved.items[i].def_id)?;
+            @push(map.data, file.items[i].data)?;
+        }
+        i = i + 1;
+    }
+    return map;
+}
+function bind_dependencies(tables: &resolve::ResolveTables:ReadWrite, file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &[resolve_refs::Iface]:Read, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite, imports: &resolve_refs::ImportMap:Read): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(imports.defs) as u32 {
+        let import_def: u32 = imports.defs[i];
+        let import_data: u32 = imports.data[i];
+        var matched: u32 = 0;
+        var ambiguous: bool = false;
+        var d: u32 = 0;
+        while d < @len(deps) as u32 {
+            if resolve_refs::iface_module_matches(names, pool, import_data, &deps[d]:Read) {
+                if matched != 0 { ambiguous = true; break; }
+                matched = d + 1;
+            }
+            d = d + 1;
+        }
+        let overflow: bool = matched > 65535;
+        if !ambiguous && !overflow { tables.defs[import_def - 1].import_dependency = matched as u16; }
+        let self_import: bool = @len(module_name) > 0 && resolve_refs::module_path_matches(names, pool, import_data, module_name);
+        if ambiguous || overflow || self_import {
+            var item: u32 = 0;
+            while item < @len(file.items) as u32 {
+                if file.items[item].kind == 5 && file.items[item].data == import_data {
+                    if ambiguous { resolve_refs::emit(diags, types::error_code(4003), file.items[item].span)?; }
+                    if !ambiguous && overflow { resolve_refs::emit(diags, types::error_code(9001), file.items[item].span)?; }
+                    if self_import { resolve_refs::emit(diags, types::error_code(4007), file.items[item].span)?; }
+                    break;
+                }
+                item = item + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+// 固有类型身份来自符号规格；切片形态使用不与固有类型重叠的内部期望值。
+const foreign_byte: u16 = 4097;
+const foreign_u32: u16 = 4099;
+const foreign_u64: u16 = 4100;
+const foreign_bool: u16 = 4105;
+const foreign_slice_read: u16 = 1;
+const foreign_slice_read_write: u16 = 2;
+function foreign_name_equals(names: &lex::NameTable:Read, name: u32, expected: &[u8]): bool {
+    if name == 0 || name > @len(names.entries) as u32 { return false; }
+    let entry: lex::NameEntry = names.entries[name - 1];
+    let len: u32 = @len(expected) as u32;
+    if entry.text_len as u32 != len { return false; }
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    let size: u32 = @len(arena.data) as u32;
+    if entry.text_off > size || len > size - entry.text_off { return false; }
+    var i: u32 = 0;
+    while i < len {
+        if arena.data[entry.text_off + i] != expected[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+function foreign_service_kind(names: &lex::NameTable:Read, name: u32): u8 {
+    // 名字表保存不带井号的逻辑名；井号能力不改变服务身份。
+    if foreign_name_equals(names, name, "exit") { return 1; }
+    if foreign_name_equals(names, name, "assert") { return 2; }
+    if foreign_name_equals(names, name, "read") { return 3; }
+    if foreign_name_equals(names, name, "write") { return 4; }
+    if foreign_name_equals(names, name, "args_count") { return 16; }
+    if foreign_name_equals(names, name, "args_len") { return 17; }
+    if foreign_name_equals(names, name, "args_read") { return 18; }
+    if foreign_name_equals(names, name, "file_size") { return 19; }
+    if foreign_name_equals(names, name, "file_read") { return 20; }
+    if foreign_name_equals(names, name, "file_write") { return 21; }
+    return 0;
+}
+function foreign_param_count(kind: u8): u32 {
+    if kind == 1 || kind == 2 || kind == 3 || kind == 4 || kind == 17 || kind == 19 { return 1; }
+    if kind == 18 || kind == 21 { return 2; }
+    if kind == 20 { return 3; }
+    return 0;
+}
+function foreign_param_type(kind: u8, index: u32): u16 {
+    if index == 0 {
+        if kind == 1 { return foreign_byte; }
+        if kind == 2 { return foreign_bool; }
+        if kind == 3 { return foreign_slice_read_write; }
+        if kind == 4 || kind == 19 || kind == 20 || kind == 21 { return foreign_slice_read; }
+        if kind == 17 || kind == 18 { return foreign_u32; }
+    } elseif index == 1 {
+        if kind == 18 { return foreign_slice_read_write; }
+        if kind == 20 { return foreign_u64; }
+        if kind == 21 { return foreign_slice_read; }
+    } elseif index == 2 && kind == 20 { return foreign_slice_read_write; }
+    return 0;
+}
+function foreign_return_type(kind: u8): u16 {
+    if kind == 1 || kind == 2 || kind == 4 || kind == 21 { return builtin_void; }
+    if kind == 3 || kind == 16 || kind == 17 || kind == 18 || kind == 20 { return foreign_u32; }
+    if kind == 19 { return foreign_u64; }
+    return 0;
+}
+function foreign_builtin_matches(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, type_id: u32, builtin: u16): bool {
+    if builtin == 0 || type_id >= @len(pool.types) as u32 { return false; }
+    if pool.types[type_id].kind != 1 { return false; }
+    // 引用侧表已排序，按类型节点查找身份；用户类型同名也不能冒充固有类型。
+    var low: u32 = 0;
+    var high: u32 = @len(refs.items) as u32;
+    while low < high {
+        let mid: u32 = low + (high - low) / 2;
+        let info: resolve_refs::ResolvedRef = refs.items[mid];
+        if info.node_kind < 1 || (info.node_kind == 1 && info.node < type_id) { low = mid + 1; }
+        else { high = mid; }
+    }
+    if low >= @len(refs.items) as u32 { return false; }
+    let info: resolve_refs::ResolvedRef = refs.items[low];
+    return info.node_kind == 1 && info.node == type_id && info.kind == 1 && info.x == builtin as u32;
+}
+function foreign_type_matches(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, type_id: u32, expected: u16): bool {
+    if expected != foreign_slice_read && expected != foreign_slice_read_write {
+        return foreign_builtin_matches(pool, refs, type_id, expected);
+    }
+    if type_id >= @len(pool.types) as u32 { return false; }
+    if pool.types[type_id].kind != 5 { return false; }
+    let data: u32 = pool.types[type_id].data;
+    if data >= @len(pool.refs) as u32 { return false; }
+    if !foreign_builtin_matches(pool, refs, pool.refs[data].referent, foreign_byte) { return false; }
+    let capability: u32 = pool.refs[data].capability;
+    // 解析器已把能力后缀规范成 TypeSig.cap：0=Read、1=ReadWrite、2=Write。
+    if expected == foreign_slice_read { return capability == 0; }
+    return capability == 1;
+}
+function foreign_signature_matches(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, data: u32, kind: u8): bool {
+    if kind == 0 || data >= @len(pool.foreigns) as u32 { return false; }
+    if @len(pool.foreigns[data].params) as u32 != foreign_param_count(kind) { return false; }
+    if !foreign_builtin_matches(pool, refs, pool.foreigns[data].ret_type, foreign_return_type(kind)) { return false; }
+    var p: u32 = 0;
+    while p < @len(pool.foreigns[data].params) as u32 {
+        if !foreign_type_matches(pool, refs, pool.foreigns[data].params[p].type_ref, foreign_param_type(kind, p)) { return false; }
+        p = p + 1;
+    }
+    return true;
+}
+function foreign_services(file: &ast::AstFile:Read, resolved: &resolve::ResolvedFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, refs: &resolve_refs::RefTable:Read, diags: &diag::DiagBuffer:ReadWrite): resolve_refs::ForeignService[]!AllocError {
+    var services: resolve_refs::ForeignService[] = [];
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 4 {
+            let data: u32 = file.items[i].data;
+            var kind: u8 = foreign_service_kind(names, pool.foreigns[data].name);
+            if !foreign_signature_matches(pool, refs, data, kind) {
+                kind = 0;
+                // F-1：未登记的名字或非固定签名均不得取得已登记服务身份。
+                resolve_refs::emit(diags, types::error_code(8001), file.items[i].span)?;
+            }
+            @push(services, resolve_refs::ForeignService { def: resolved.items[i].def_id, kind: kind })?;
+        }
+        i = i + 1;
+    }
+    return services;
+}
+function report_unused(tables: &resolve::ResolveTables:Read, diags: &diag::DiagBuffer:ReadWrite, file: &ast::AstFile:Read): void!AllocError {
+    var i: u32 = 0;
+    var reserved: u32 = 0;
+    while i < @len(tables.defs) as u32 {
+        let def: resolve::DefEntry = tables.defs[i];
+        let local: bool = def.kind == 4 || def.kind == 6 || def.kind == 7 || def.kind == 8 || def.kind == 9 || def.kind == 10 || def.kind == 12;
+        if reserved < @len(tables.reserved_if_bindings) as u32 && tables.reserved_if_bindings[reserved] == i + 1 {
+            // 保留绑定将在类型检查给出语法诊断，避免在前一阶段被未使用绑定遮蔽。
+            reserved = reserved + 1;
+        } elseif local && !def.used && !resolve::is_rejected_arm_binding(def) {
+            resolve_refs::emit(diags, types::error_code(4009), types::Span { file: file.file, offset: def.decl_offset, length: 0 })?;
+        }
+        i = i + 1;
+    }
+    return;
+}
+function ref_less(a: resolve_refs::ResolvedRef, b: resolve_refs::ResolvedRef): bool {
+    if a.node_kind != b.node_kind { return a.node_kind < b.node_kind; }
+    if a.node != b.node { return a.node < b.node; }
+    // out 行还按实参序号排列，供文档按完整键二分。
+    if a.node_kind == 3 && a.x != b.x { return a.x < b.x; }
+    return a.kind < b.kind;
+}
+// 文档引用排序和索引共用预算；普通批处理使用零作为无限制。
+export struct ReferenceOutputBudget { limited: bool, remaining: u64, exhausted: bool }
+export function reference_output_budget(limit: u64): ReferenceOutputBudget {
+    return ReferenceOutputBudget { limited: limit != 0u64, remaining: limit, exhausted: false };
+}
+function charge_reference_output(work: &ReferenceOutputBudget:ReadWrite, rows: u64): bool {
+    if !work.limited { return true; }
+    if rows > work.remaining { work.exhausted = true; return false; }
+    work.remaining = work.remaining - rows;
+    return true;
+}
+function sort_outputs(refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, work: &ReferenceOutputBudget:ReadWrite): void!AllocError {
+    // 稳定自底向上归并排序，保持相同键相对次序并把大文件引用排序降为 O(N log N)。
+    let n: u32 = @len(refs.items) as u32;
+    if n > 1 {
+        if !charge_reference_output(work, n as u64) { return; }
+        var scratch: resolve_refs::ResolvedRef[] = [];
+        var fill: u32 = 0;
+        while fill < n { @push(scratch, refs.items[fill])?; fill = fill + 1; }
+        var width: u32 = 1;
+        while width < n {
+            // 每轮写入暂存表并回写各一遍；比较次数不超过写入行数。
+            if !charge_reference_output(work, (n as u64) * 2u64) { return; }
+            var left: u32 = 0;
+            while left < n {
+                var mid: u32 = left + width;
+                if mid > n { mid = n; }
+                var right: u32 = mid + width;
+                if right > n { right = n; }
+                var a: u32 = left;
+                var b: u32 = mid;
+                var write_i: u32 = left;
+                while a < mid && b < right {
+                    // 仅当右侧严格小于左侧时取右侧，相等保留左侧以维持稳定性。
+                    if ref_less(refs.items[b], refs.items[a]) {
+                        scratch[write_i] = refs.items[b];
+                        b = b + 1;
+                    } else {
+                        scratch[write_i] = refs.items[a];
+                        a = a + 1;
+                    }
+                    write_i = write_i + 1;
+                }
+                while a < mid { scratch[write_i] = refs.items[a]; a = a + 1; write_i = write_i + 1; }
+                while b < right { scratch[write_i] = refs.items[b]; b = b + 1; write_i = write_i + 1; }
+                var copy_i: u32 = left;
+                while copy_i < right { refs.items[copy_i] = scratch[copy_i]; copy_i = copy_i + 1; }
+                left = right;
+            }
+            if width > n - width { break; }
+            width = width * 2;
+        }
+    }
+    var i: u32 = 1;
+    while i < @len(bridges.items) as u32 {
+        let key: resolve_refs::BridgeRecord = bridges.items[i];
+        var j: u32 = i;
+        while j > 0 && (bridges.items[j - 1].import_def > key.import_def || (bridges.items[j - 1].import_def == key.import_def && bridges.items[j - 1].name > key.name)) {
+            bridges.items[j] = bridges.items[j - 1];
+            j = j - 1;
+        }
+        bridges.items[j] = key;
+        i = i + 1;
+    }
+    i = 1;
+    while i < @len(bridges.variants) as u32 {
+        let key: resolve_refs::VariantBridge = bridges.variants[i];
+        var j: u32 = i;
+        while j > 0 && (bridges.variants[j - 1].dependency > key.dependency || (bridges.variants[j - 1].dependency == key.dependency && (bridges.variants[j - 1].enum_export > key.enum_export || (bridges.variants[j - 1].enum_export == key.enum_export && bridges.variants[j - 1].name > key.name)))) {
+            bridges.variants[j] = bridges.variants[j - 1];
+            j = j - 1;
+        }
+        bridges.variants[j] = key;
+        i = i + 1;
+    }
+    return;
+}
+export function resolve_unit(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): resolve_refs::Resolution!AllocError {
+    return resolve_unit_with_types(file, pool, names, deps, @len(deps.ifaces) as u32, module_name, diags)?;
+}
+// 按节点种类与编号建立直查索引表；同节点只保留首次出现项，与线性扫描语义一致。
+function build_ref_index(refs: &resolve_refs::RefTable:ReadWrite, pool: &ast::AstPool:Read, work: &ReferenceOutputBudget:ReadWrite): void!AllocError {
+    let slots: u64 = (@len(pool.exprs) as u64) + (@len(pool.types) as u64) + (@len(pool.patterns) as u64);
+    if !charge_reference_output(work, slots + (@len(refs.items) as u64)) { return; }
+    var i: u32 = 0;
+    while i < @len(pool.exprs) as u32 { @push(refs.expr_index, 0)?; i = i + 1; }
+    i = 0;
+    while i < @len(pool.types) as u32 { @push(refs.type_index, 0)?; i = i + 1; }
+    i = 0;
+    while i < @len(pool.patterns) as u32 { @push(refs.pattern_index, 0)?; i = i + 1; }
+    let pending_kind: u8 = resolve_refs::pending_value_name();
+    i = 0;
+    while i < @len(refs.items) as u32 {
+        let item: resolve_refs::ResolvedRef = refs.items[i];
+        if item.kind == pending_kind {
+            refs.items[i].y = refs.pending_names;
+            refs.pending_names = refs.pending_names + 1;
+        }
+        if item.node_kind == 0 && item.node < @len(refs.expr_index) as u32 && refs.expr_index[item.node] == 0 {
+            refs.expr_index[item.node] = i + 1;
+        } elseif item.node_kind == 1 && item.node < @len(refs.type_index) as u32 && refs.type_index[item.node] == 0 {
+            refs.type_index[item.node] = i + 1;
+        } elseif item.node_kind == 2 && item.node < @len(refs.pattern_index) as u32 && refs.pattern_index[item.node] == 0 {
+            refs.pattern_index[item.node] = i + 1;
+        }
+        i = i + 1;
+    }
+    return;
+}
+// 前缀保留产物直接依赖编号，后缀只可从已绑定的接口 TypeSig 到达。
+export function resolve_unit_limited(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, direct_count: u32, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite, work: &resolve::LookupBudget:ReadWrite, reservation: &resolve::ReservationBudget:ReadWrite, outputs: &ReferenceOutputBudget:ReadWrite): resolve_refs::Resolution!AllocError {
+    var base: resolve::ResolveResult = resolve::reserve_module_limited(file, pool, diags, reservation)?;
+    var refs: resolve_refs::RefTable = resolve_refs::RefTable { items: [], imports: [], variants: [], fields: [], structs: [], enums: [], expr_index: [], type_index: [], pattern_index: [], enum_names: [], pending_names: 0, contextual_enum_labels: work.contextual_enum_labels };
+    var bridges: resolve_refs::BridgeTable = resolve_refs::BridgeTable { items: [], variants: [] };
+    if reservation.exhausted {
+        return resolve_refs::Resolution { result: base, refs: refs, bridges: bridges, services: [], enum_identities: [] };
+    }
+    if @len(deps.ifaces) != 0 && (@len(names.arena.data) != names.source_bytes || @len(names.entries) != names.source_names) {
+        resolve_refs::emit(diags, types::error_code(7013), types::Span { file: file.file, offset: 0, length: 0 })?;
+        return resolve_refs::Resolution { result: base, refs: refs, bridges: bridges, services: [], enum_identities: [] };
+    }
+    let imports: resolve_refs::ImportMap = build_import_map(file, &base.file:Read)?;
+    bind_dependencies(&base.tables:ReadWrite, file, pool, names, &deps.ifaces[0..direct_count]:Read, module_name, diags, &imports:Read)?;
+    collect_local_enum_names(&refs:ReadWrite, &base.tables:Read, names)?;
+    resolve_refs::load_import_signatures(&refs:ReadWrite, deps, direct_count, names, &base.tables:Read, &imports:Read, diags)?;
+    resolve_refs::sort_enum_names(&refs:ReadWrite);
+    resolve_scope::resolve_items(&base.tables:ReadWrite, work, &refs:ReadWrite, &bridges:ReadWrite, diags, pool, names, deps, &imports:Read, file)?;
+    if work.exhausted {
+        return resolve_refs::Resolution { result: base, refs: refs, bridges: bridges, services: [], enum_identities: [] };
+    }
+    sort_outputs(&refs:ReadWrite, &bridges:ReadWrite, outputs)?;
+    if outputs.exhausted {
+        return resolve_refs::Resolution { result: base, refs: refs, bridges: bridges, services: [], enum_identities: [] };
+    }
+    build_ref_index(&refs:ReadWrite, pool, outputs)?;
+    if outputs.exhausted {
+        return resolve_refs::Resolution { result: base, refs: refs, bridges: bridges, services: [], enum_identities: [] };
+    }
+    let services: resolve_refs::ForeignService[] = foreign_services(file, &base.file:Read, pool, names, &refs:Read, diags)?;
+    report_unused(&base.tables:Read, diags, file)?;
+    let enum_identities: resolve_refs::EnumIdentity[] = resolve_refs::collect_enum_identities(&base.tables:Read, names, deps, module_name)?;
+    return resolve_refs::Resolution { result: base, refs: refs, bridges: bridges, services: services, enum_identities: enum_identities };
+}
+
+export function resolve_unit_with_types(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, direct_count: u32, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): resolve_refs::Resolution!AllocError {
+    var work: resolve::LookupBudget = resolve::lookup_budget(0, 0);
+    var reservation: resolve::ReservationBudget = resolve::reservation_budget(0);
+    var outputs: ReferenceOutputBudget = reference_output_budget(0);
+    return resolve_unit_limited(file, pool, names, deps, direct_count, module_name, diags, &work:ReadWrite, &reservation:ReadWrite, &outputs:ReadWrite)?;
+}
+
+function collect_local_enum_names(refs: &resolve_refs::RefTable:ReadWrite, tables: &resolve::ResolveTables:Read, names: &lex::NameTable:Read): void!AllocError {
+    if !refs.contextual_enum_labels { return; }
+    var i: u32 = 0;
+    while i < @len(tables.enum_members) as u32 {
+        let member: resolve::EnumMemberBinding = tables.enum_members[i];
+        @push(refs.enum_names, resolve_refs::EnumName { kind: 2, dep: 0, id: member.host, name: member.name })?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(names.variant_names) as u32 {
+        let name: u32 = names.variant_names[i];
+        if name != 0 && lextables::builtin_variant(4108, i + 1) != 4294967295u32 {
+            @push(refs.enum_names, resolve_refs::EnumName { kind: 1, dep: 0, id: 4108, name: name })?;
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+export function resolve_unit_for_check(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, direct_count: u32, module_name: &[u8], diags: &diag::DiagBuffer:ReadWrite): resolve_refs::Resolution!AllocError {
+    var work: resolve::LookupBudget = resolve::lookup_budget(0, 0);
+    work.contextual_enum_labels = true;
+    var reservation: resolve::ReservationBudget = resolve::reservation_budget(0);
+    var outputs: ReferenceOutputBudget = reference_output_budget(0);
+    return resolve_unit_limited(file, pool, names, deps, direct_count, module_name, diags, &work:ReadWrite, &reservation:ReadWrite, &outputs:ReadWrite)?;
+}

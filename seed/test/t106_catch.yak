@@ -1,0 +1,17 @@
+// t106: .catch 恢复糖 —— Err 时 h(&E) 恢复为 T，Ok 时解包（result.md full）
+foreign assert(cond: bool): void;
+enum E { Bad, }
+function f(x: u32): u32!E {
+    if x == 0 { return E::Bad; }
+    return x;
+}
+function recover(e: &E): u32 {
+    return 42;
+}
+function main(): void {
+    let a: u32 = f(0).catch(&recover);
+    let b: u32 = f(7).catch(&recover);
+    assert(a == 42);
+    assert(b == 7);
+    return;
+}

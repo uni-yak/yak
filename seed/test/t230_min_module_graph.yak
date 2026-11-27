@@ -1,0 +1,87 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: module=../../compiler/min/src/check/module.yak
+import lex;
+import parse;
+import diag;
+import module;
+foreign assert(cond: bool): void;
+function unit(name: &[u8], src: &[u8], file: u16): module::ModuleUnit!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(name) as u32 { @push(bytes, name[i])?; i = i + 1; }
+    let imports: module::ModuleImport[] = module::collect_imports(&p.file:Read, &p.pool:Read, &r.names:Read)?;
+    return module::ModuleUnit { name: @move(bytes), file_id: file, imports: @move(imports) };
+}
+function main(): void {
+    // ── DAG 拓扑序：A -> B -> C，被依赖单元在前 ──
+    var units1: module::ModuleUnit[] = [];
+    @push(units1, unit("A", "import B;\n", 600)?)?;
+    @push(units1, unit("B", "import lib::detail::C;\n", 601)?)?;
+    @push(units1, unit("lib::detail::C", "function c(): void { return; }\n", 602)?)?;
+    var d1: diag::DiagBuffer = diag::diagbuf_new();
+    let t1: module::ModuleTable = module::ModuleTable { units: units1 };
+    let g1: module::ModuleGraph = module::build_graph(&t1:Read, &d1:ReadWrite)?;
+    assert(diag::diagbuf_count(&d1:Read) == 0);
+    assert(@len(g1.order) == 3);
+    assert(g1.order[0] == 2);
+    assert(g1.order[1] == 1);
+    assert(g1.order[2] == 0);
+
+    // ── N-5：循环依赖 ──
+    var units2: module::ModuleUnit[] = [];
+    @push(units2, unit("A", "import B;\n", 610)?)?;
+    @push(units2, unit("B", "import A;\n", 611)?)?;
+    var d2: diag::DiagBuffer = diag::diagbuf_new();
+    let t2: module::ModuleTable = module::ModuleTable { units: units2 };
+    let g2: module::ModuleGraph = module::build_graph(&t2:Read, &d2:ReadWrite)?;
+    assert(diag::diagbuf_count(&d2:Read) == 1);
+    assert(d2.diags[0].code.raw == 4005);
+
+    // ── N-7：自导入 ──
+    var units3: module::ModuleUnit[] = [];
+    @push(units3, unit("A", "import A;\n", 620)?)?;
+    var d3: diag::DiagBuffer = diag::diagbuf_new();
+    let t3: module::ModuleTable = module::ModuleTable { units: units3 };
+    let g3: module::ModuleGraph = module::build_graph(&t3:Read, &d3:ReadWrite)?;
+    assert(diag::diagbuf_count(&d3:Read) == 1);
+    assert(d3.diags[0].code.raw == 4007);
+
+    // ── 缺失依赖 ──
+    var units4: module::ModuleUnit[] = [];
+    @push(units4, unit("A", "// x\nimport deep::missing;\n", 630)?)?;
+    var d4: diag::DiagBuffer = diag::diagbuf_new();
+    let t4: module::ModuleTable = module::ModuleTable { units: units4 };
+    let g4: module::ModuleGraph = module::build_graph(&t4:Read, &d4:ReadWrite)?;
+    assert(diag::diagbuf_count(&d4:Read) == 1);
+    assert(d4.diags[0].code.raw == 4002);
+    assert(d4.diags[0].span.file == 630 && d4.diags[0].span.offset == 5);
+    assert(@len(g4.edges) == 1 && g4.edges[0].span.length == 21);
+
+    // ── N-3：模块名重复 ──
+    var units5: module::ModuleUnit[] = [];
+    @push(units5, unit("A", "function a(): void { return; }\n", 640)?)?;
+    @push(units5, unit("A", "function b(): void { return; }\n", 641)?)?;
+    var d5: diag::DiagBuffer = diag::diagbuf_new();
+    let t5: module::ModuleTable = module::ModuleTable { units: units5 };
+    let g5: module::ModuleGraph = module::build_graph(&t5:Read, &d5:ReadWrite)?;
+    assert(diag::diagbuf_count(&d5:Read) == 1);
+    assert(d5.diags[0].code.raw == 4003);
+    return;
+}

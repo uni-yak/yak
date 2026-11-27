@@ -1,0 +1,562 @@
+// YSM 字节写出、TypeSig / 函数签名编码及 format 6 扩展扫描。
+import types;
+import diag;
+import typecheck;
+import layout;
+import mir;
+import iface;
+import ysm;
+
+const E_Y4: u16 = 7026;
+const DIGEST_SIZE: u32 = 32;
+
+export function put_u8(sink: &iface::ByteSink:ReadWrite, value: u8): void!AllocError {
+    @push(sink.bytes, value)?;
+    return;
+}
+export function put_u16(sink: &iface::ByteSink:ReadWrite, value: u16): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    return;
+}
+export function put_u32(sink: &iface::ByteSink:ReadWrite, value: u32): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 16) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 24) & 255) as u8)?;
+    return;
+}
+export function put_u64(sink: &iface::ByteSink:ReadWrite, value: u64): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 16) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 24) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 32) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 40) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 48) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 56) & 255) as u8)?;
+    return;
+}
+// LocalRecord 和 BlockRecord 尾部的八字节保留区必须全为零。
+export function put_padding(sink: &iface::ByteSink:ReadWrite): void!AllocError {
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    @push(sink.bytes, 0)?;
+    return;
+}
+export function put_bytes(sink: &iface::ByteSink:ReadWrite, data: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(data) as u32 {
+        @push(sink.bytes, data[i])?;
+        i = i + 1;
+    }
+    return;
+}
+
+export function set_u16(buf: &u8[]:ReadWrite, offset: u32, value: u16): void {
+    buf[offset] = (value & 255) as u8;
+    buf[offset + 1] = ((value >> 8) & 255) as u8;
+    return;
+}
+export function set_u32(buf: &u8[]:ReadWrite, offset: u32, value: u32): void {
+    buf[offset] = (value & 255) as u8;
+    buf[offset + 1] = ((value >> 8) & 255) as u8;
+    buf[offset + 2] = ((value >> 16) & 255) as u8;
+    buf[offset + 3] = ((value >> 24) & 255) as u8;
+    return;
+}
+
+// ── TypeSig 与函数签名编码：转交 iface，保证与 .iface 同源 ──
+
+// type_sigs 节累加器：同一类型或同一函数签名只登记一次，登记顺序即首次引用顺序。
+export struct SigCtx {
+    sink: iface::ByteSink,
+    type_keys: u32[],
+    type_offs: u32[],
+    ref_keys: u64[],
+    ref_offs: u32[],
+    def_keys: u32[],
+    def_offs: u32[],
+}
+export function sigctx_new(): SigCtx {
+    return SigCtx {
+        sink: iface::ByteSink { bytes: [] },
+        type_keys: [], type_offs: [], ref_keys: [], ref_offs: [], def_keys: [], def_offs: [],
+    };
+}
+function sig_append(ctx: &SigCtx:ReadWrite, piece: &iface::ByteSink:Read): u32!AllocError {
+    let offset: u32 = @len(ctx.sink.bytes) as u32;
+    var i: u32 = 0;
+    while i < @len(piece.bytes) as u32 {
+        @push(ctx.sink.bytes, piece.bytes[i])?;
+        i = i + 1;
+    }
+    return offset;
+}
+// 直接依赖数：YSM dependencies 节只登记直接依赖。
+export function ysm_direct_count(facts: &ysm::YsmFacts:Read): u32 {
+    return @len(facts.dependencies) as u32;
+}
+// 候选摘要数：driver 按“直接依赖前缀 + 传递目标后缀”拼接，每项固定 32 字节。
+function ysm_candidate_count(facts: &ysm::YsmFacts:Read): u32 {
+    let total: u32 = @len(facts.candidate_digests) as u32;
+    if total % DIGEST_SIZE != 0 { return 0; }
+    return total / DIGEST_SIZE;
+}
+function ysm_candidate_present(facts: &ysm::YsmFacts:Read, dep: u32): bool {
+    return dep > 0 && dep <= ysm_candidate_count(facts);
+}
+// 本地名义类型在 enum / struct 表中的声明类别：2=enum，3=struct，0=未知。
+export function ysm_local_nominal_kind(module: &mir::MirModule:Read, def: u32): u8 {
+    if def == 0 { return 0; }
+    var i: u32 = 0;
+    while i < @len(module.enums.items) as u32 {
+        if module.enums.items[i].def == def { return 2; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(module.fields.items) as u32 {
+        if module.fields.items[i].def == def { return 3; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 导入名义类型在已加载枚举/布局表中的类别：2=enum，3=struct，0=未知。
+function ysm_imported_nominal_kind(module: &mir::MirModule:Read, dep: u16, export_id: u32): u8 {
+    if dep == 0 || export_id == 0 { return 0; }
+    var i: u32 = 0;
+    while i < @len(module.imported_enums.items) as u32 {
+        let item: typecheck::ImportedEnumVariant = module.imported_enums.items[i];
+        if item.dep == dep && item.export_id == export_id { return 2; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(module.imported_enum_signatures.items) as u32 {
+        let item: typecheck::ImportedEnumVariant = module.imported_enum_signatures.items[i];
+        if item.dep == dep && item.export_id == export_id { return 2; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(module.imported_layouts.items) as u32 {
+        let item: layout::ImportedLayout = module.imported_layouts.items[i];
+        if item.dep == dep && item.export_id == export_id { return 3; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 错误集成员身份：与 iface 编码一致，用于拒绝重复成员。
+function ysm_member_identity(module: &mir::MirModule:Read, id: u32): u64 {
+    let member: typecheck::TypeEntry = module.types.entries[id - 1];
+    var identity: u64 = (member.kind as u64) << 48u64;
+    if member.kind == 1 {
+        identity = identity | (member.builtin as u64);
+    } elseif member.kind == 2 {
+        identity = identity | (member.def as u64);
+    } else {
+        identity = identity | ((member.dep as u64) << 32u64) | (member.export_id as u64);
+    }
+    return identity;
+}
+function ysm_error_members_unique(module: &mir::MirModule:Read, start: u32, count: u32): bool {
+    var i: u32 = 0;
+    while i < count {
+        var j: u32 = i + 1;
+        while j < count {
+            let left: u32 = module.types.members[start + i];
+            let right: u32 = module.types.members[start + j];
+            if ysm_member_identity(module, left) == ysm_member_identity(module, right) { return false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+// 错误集成员只允许 AllocError（builtin 4108）或 enum；本地/导入均按声明类别判定。
+function ysm_error_member_ok(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, id: u32): bool {
+    if id == 0 || id > @len(module.types.entries) as u32 { return false; }
+    let member: typecheck::TypeEntry = module.types.entries[id - 1];
+    if member.kind == 1 { return member.builtin == 4108; }
+    if member.kind == 2 { return ysm_local_nominal_kind(module, member.def) == 2; }
+    if member.kind == 3 {
+        if member.dep == 0 || member.export_id == 0 { return false; }
+        if member.dep as u32 > ysm_direct_count(facts) && !ysm_candidate_present(facts, member.dep as u32) { return false; }
+        return ysm_imported_nominal_kind(module, member.dep, member.export_id) == 2;
+    }
+    return false;
+}
+// 判定某类型能否编码为 YSM TypeSig。返回 0 表示可编码，否则返回拒绝码。
+// 私有本地名义使用 0x0E local_def；非直接依赖名义使用 0x0F external_nominal。
+function type_encodable(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, type_id: u32, depth: u32): u16 {
+    if depth > 64 { return E_Y4; }
+    if type_id == 0 || type_id > @len(module.types.entries) as u32 { return E_Y4; }
+    let entry: typecheck::TypeEntry = module.types.entries[type_id - 1];
+    if entry.kind == 0 { return 0; }
+    if entry.kind == 1 { return 0; }
+    if entry.kind == 2 {
+        if iface::export_id_of(&facts.exports:Read, entry.def) != 0 { return 0; }
+        if ysm_local_nominal_kind(module, entry.def) != 0 { return 0; }
+        return E_Y4;
+    }
+    if entry.kind == 3 {
+        if entry.dep == 0 || entry.export_id == 0 { return E_Y4; }
+        if entry.dep as u32 > ysm_direct_count(facts) {
+            if !ysm_candidate_present(facts, entry.dep as u32) { return E_Y4; }
+            if ysm_imported_nominal_kind(module, entry.dep, entry.export_id) == 0 { return E_Y4; }
+        }
+        return 0;
+    }
+    if entry.kind == 11 {
+        let total: u32 = @len(module.types.members) as u32;
+        if entry.members_count == 0 || entry.members_count > 65536 || entry.members_start > total || entry.members_count > total - entry.members_start { return E_Y4; }
+        var k: u32 = 0;
+        while k < entry.members_count {
+            if !ysm_error_member_ok(module, facts, module.types.members[entry.members_start + k]) { return E_Y4; }
+            k = k + 1;
+        }
+        if !ysm_error_members_unique(module, entry.members_start, entry.members_count) { return E_Y4; }
+        return 0;
+    }
+    if entry.kind == 7 || entry.kind == 6 || entry.kind == 4 || entry.kind == 5 || entry.kind == 10 {
+        return type_encodable(module, facts, entry.elem, depth + 1);
+    }
+    if entry.kind == 8 {
+        let total: u32 = @len(module.types.members) as u32;
+        if entry.members_count > 65535 || entry.members_start > total || entry.members_count > total - entry.members_start { return E_Y4; }
+        var i: u32 = 0;
+        while i < entry.members_count {
+            let inner: u16 = type_encodable(module, facts, module.types.members[entry.members_start + i], depth + 1);
+            if inner != 0 { return inner; }
+            i = i + 1;
+        }
+        return type_encodable(module, facts, entry.elem, depth + 1);
+    }
+    if entry.kind == 9 {
+        let success_code: u16 = type_encodable(module, facts, entry.success, depth + 1);
+        if success_code != 0 { return success_code; }
+        let errorset: u32 = entry.elem;
+        if errorset == 0 || errorset > @len(module.types.entries) as u32 { return E_Y4; }
+        let set: typecheck::TypeEntry = module.types.entries[errorset - 1];
+        let total: u32 = @len(module.types.members) as u32;
+        if set.kind != 11 || set.members_count == 0 || set.members_count > 65536 || set.members_start > total || set.members_count > total - set.members_start { return E_Y4; }
+        var j: u32 = 0;
+        while j < set.members_count {
+            if !ysm_error_member_ok(module, facts, module.types.members[set.members_start + j]) { return E_Y4; }
+            j = j + 1;
+        }
+        if !ysm_error_members_unique(module, set.members_start, set.members_count) { return E_Y4; }
+        return 0;
+    }
+    return E_Y4;
+}
+// 审计专用 TypeSig 编码：与 .iface 的 0x01–0x0C 字节同构，
+// 仅在不导出本地名义时使用 0x0E，在非直接依赖名义时使用 0x0F。
+function encode_type_ysm(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, type_id: u32, sink: &iface::ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, depth: u32): void!AllocError {
+    if depth > 64 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    if type_id == 0 || type_id > @len(module.types.entries) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    let entry: typecheck::TypeEntry = module.types.entries[type_id - 1];
+    if entry.kind == 0 {
+        put_u8(sink, 1)?;
+        put_u16(sink, 4107)?;
+        put_u16(sink, 0)?;
+        return;
+    }
+    if entry.kind == 1 {
+        put_u8(sink, 1)?;
+        put_u16(sink, entry.builtin)?;
+        put_u16(sink, 0)?;
+        return;
+    }
+    if entry.kind == 2 {
+        let export_id: u32 = iface::export_id_of(&facts.exports:Read, entry.def);
+        if export_id != 0 {
+            put_u8(sink, 2)?;
+            put_u32(sink, export_id)?;
+            put_u16(sink, 0)?;
+            return;
+        }
+        let local_kind: u8 = ysm_local_nominal_kind(module, entry.def);
+        if local_kind == 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        put_u8(sink, 14)?;
+        put_u32(sink, entry.def)?;
+        put_u8(sink, local_kind)?;
+        put_u16(sink, 0)?;
+        return;
+    }
+    if entry.kind == 3 {
+        if entry.dep == 0 || entry.export_id == 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        if entry.dep as u32 <= ysm_direct_count(facts) {
+            put_u8(sink, 3)?;
+            put_u16(sink, entry.dep)?;
+            put_u32(sink, entry.export_id)?;
+            put_u16(sink, 0)?;
+            return;
+        }
+        if !ysm_candidate_present(facts, entry.dep as u32) { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        let imported_kind: u8 = ysm_imported_nominal_kind(module, entry.dep, entry.export_id);
+        if imported_kind == 0 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        put_u8(sink, 15)?;
+        let base: u32 = (entry.dep as u32 - 1) * DIGEST_SIZE;
+        var d: u32 = 0;
+        while d < DIGEST_SIZE {
+            @push(sink.bytes, facts.candidate_digests[base + d])?;
+            d = d + 1;
+        }
+        put_u8(sink, imported_kind)?;
+        put_u32(sink, entry.export_id)?;
+        put_u16(sink, 0)?;
+        return;
+    }
+    if entry.kind == 4 {
+        put_u8(sink, 7)?;
+        put_u8(sink, entry.cap)?;
+        encode_type_ysm(module, facts, entry.elem, sink, diags, depth + 1)?;
+        return;
+    }
+    if entry.kind == 5 {
+        put_u8(sink, 8)?;
+        put_u8(sink, entry.cap)?;
+        encode_type_ysm(module, facts, entry.elem, sink, diags, depth + 1)?;
+        return;
+    }
+    if entry.kind == 6 {
+        put_u8(sink, 6)?;
+        encode_type_ysm(module, facts, entry.elem, sink, diags, depth + 1)?;
+        return;
+    }
+    if entry.kind == 7 {
+        put_u8(sink, 5)?;
+        put_u64(sink, entry.length)?;
+        encode_type_ysm(module, facts, entry.elem, sink, diags, depth + 1)?;
+        return;
+    }
+    if entry.kind == 8 {
+        let total: u32 = @len(module.types.members) as u32;
+        if entry.members_count > 65535 || entry.members_start > total || entry.members_count > total - entry.members_start { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        put_u8(sink, 9)?;
+        put_u16(sink, entry.members_count as u16)?;
+        var i: u32 = 0;
+        while i < entry.members_count {
+            encode_type_ysm(module, facts, module.types.members[entry.members_start + i], sink, diags, depth + 1)?;
+            i = i + 1;
+        }
+        encode_type_ysm(module, facts, entry.elem, sink, diags, depth + 1)?;
+        return;
+    }
+    if entry.kind == 9 {
+        put_u8(sink, 10)?;
+        encode_type_ysm(module, facts, entry.success, sink, diags, depth + 1)?;
+        let errorset: u32 = entry.elem;
+        if errorset == 0 || errorset > @len(module.types.entries) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        let set: typecheck::TypeEntry = module.types.entries[errorset - 1];
+        let total: u32 = @len(module.types.members) as u32;
+        if set.kind != 11 || set.members_count == 0 || set.members_count > 65536 || set.members_start > total || set.members_count > total - set.members_start { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        put_u32(sink, set.members_count)?;
+        var j: u32 = 0;
+        while j < set.members_count {
+            encode_type_ysm(module, facts, module.types.members[set.members_start + j], sink, diags, depth + 1)?;
+            j = j + 1;
+        }
+        return;
+    }
+    if entry.kind == 10 {
+        put_u8(sink, 11)?;
+        encode_type_ysm(module, facts, entry.elem, sink, diags, depth + 1)?;
+        return;
+    }
+    if entry.kind == 11 {
+        let total: u32 = @len(module.types.members) as u32;
+        if entry.members_count == 0 || entry.members_count > 65536 || entry.members_start > total || entry.members_count > total - entry.members_start { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+        put_u8(sink, 13)?;
+        put_u32(sink, entry.members_count)?;
+        var k: u32 = 0;
+        while k < entry.members_count {
+            encode_type_ysm(module, facts, module.types.members[entry.members_start + k], sink, diags, depth + 1)?;
+            k = k + 1;
+        }
+        return;
+    }
+    ysm::emit_code(diags, types::error_code(E_Y4))?;
+    return;
+}
+// 返回 def 的函数签名在 type_sigs 节中的偏移。
+function encode_function_ysm(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, def: u32, sink: &iface::ByteSink:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    var index: u32 = 0;
+    while index < @len(module.signatures.items) as u32 {
+        if module.signatures.items[index].def == def { break; }
+        index = index + 1;
+    }
+    if index >= @len(module.signatures.items) as u32 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    let sig: &typecheck::FuncSig:Read = &module.signatures.items[index]:Read;
+    if @len(sig.params) > 65535 { ysm::emit_code(diags, types::error_code(E_Y4))?; return; }
+    // 先整体校验再写字节，避免函数签名中途失败后留下不可回滚的部分条目。
+    var i: u32 = 0;
+    while i < @len(sig.params) as u32 {
+        let code: u16 = type_encodable(module, facts, sig.params[i], 0);
+        if code != 0 { ysm::emit_code(diags, types::error_code(code))?; return; }
+        i = i + 1;
+    }
+    let ret_code: u16 = type_encodable(module, facts, sig.ret, 0);
+    if ret_code != 0 { ysm::emit_code(diags, types::error_code(ret_code))?; return; }
+    put_u16(sink, 0)?;
+    put_u16(sink, @len(sig.params) as u16)?;
+    i = 0;
+    while i < @len(sig.params) as u32 {
+        encode_type_ysm(module, facts, sig.params[i], sink, diags, 1)?;
+        i = i + 1;
+    }
+    encode_type_ysm(module, facts, sig.ret, sink, diags, 1)?;
+    return;
+}
+// 返回 type_id 在 type_sigs 节中的偏移；无法编码的类型按 Y-4 拒绝。
+export function sig_type(ctx: &SigCtx:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, type_id: u32, diags: &diag::DiagBuffer:ReadWrite): u32!AllocError {
+    if type_id == 0 {
+        ysm::emit_code(diags, types::error_code(E_Y4))?;
+        return 0;
+    }
+    let encodable: u16 = type_encodable(module, facts, type_id, 0);
+    if encodable != 0 {
+        ysm::emit_code(diags, types::error_code(encodable))?;
+        return 0;
+    }
+    var i: u32 = 0;
+    while i < @len(ctx.type_keys) as u32 {
+        if ctx.type_keys[i] == type_id { return ctx.type_offs[i]; }
+        i = i + 1;
+    }
+    var piece: iface::ByteSink = iface::ByteSink { bytes: [] };
+    encode_type_ysm(module, facts, type_id, &piece:ReadWrite, diags, 0)?;
+    if diags.has_error { return 0; }
+    let offset: u32 = sig_append(ctx, &piece:Read)?;
+    @push(ctx.type_keys, type_id)?;
+    @push(ctx.type_offs, offset)?;
+    return offset;
+}
+// 原生 MIR 把投影地址放在 u64 局部；审计镜像以引用签名保留指向类型与能力。
+export function sig_projection(ctx: &SigCtx:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, referent: u32, cap: u8, diags: &diag::DiagBuffer:ReadWrite): u32!AllocError {
+    let encodable: u16 = type_encodable(module, facts, referent, 0);
+    if encodable != 0 { ysm::emit_code(diags, types::error_code(encodable))?; return 0; }
+    let key: u64 = (referent as u64 << 8u64) | cap as u64;
+    var i: u32 = 0;
+    while i < @len(ctx.ref_keys) as u32 {
+        if ctx.ref_keys[i] == key { return ctx.ref_offs[i]; }
+        i = i + 1;
+    }
+    var piece: iface::ByteSink = iface::ByteSink { bytes: [] };
+    put_u8(&piece:ReadWrite, 7)?;
+    put_u8(&piece:ReadWrite, cap)?;
+    encode_type_ysm(module, facts, referent, &piece:ReadWrite, diags, 0)?;
+    if diags.has_error { return 0; }
+    let offset: u32 = sig_append(ctx, &piece:Read)?;
+    @push(ctx.ref_keys, key)?;
+    @push(ctx.ref_offs, offset)?;
+    return offset;
+}
+// 返回 def 的函数签名在 type_sigs 节中的偏移。
+export function sig_function(ctx: &SigCtx:ReadWrite, module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, def: u32, diags: &diag::DiagBuffer:ReadWrite): u32!AllocError {
+    var i: u32 = 0;
+    while i < @len(ctx.def_keys) as u32 {
+        if ctx.def_keys[i] == def { return ctx.def_offs[i]; }
+        i = i + 1;
+    }
+    var piece: iface::ByteSink = iface::ByteSink { bytes: [] };
+    encode_function_ysm(module, facts, def, &piece:ReadWrite, diags)?;
+    if diags.has_error { return 0; }
+    let offset: u32 = sig_append(ctx, &piece:Read)?;
+    @push(ctx.def_keys, def)?;
+    @push(ctx.def_offs, offset)?;
+    return offset;
+}
+
+// 某类型树是否含需要 format 6 的节点：私有本地名义或非直接依赖名义。
+function type_needs_extended(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read, type_id: u32, depth: u32): bool {
+    if depth > 64 || type_id == 0 || type_id > @len(module.types.entries) as u32 { return false; }
+    let entry: typecheck::TypeEntry = module.types.entries[type_id - 1];
+    if entry.kind == 2 {
+        return iface::export_id_of(&facts.exports:Read, entry.def) == 0 && ysm_local_nominal_kind(module, entry.def) != 0;
+    }
+    if entry.kind == 3 { return entry.dep as u32 > ysm_direct_count(facts); }
+    if entry.kind == 4 || entry.kind == 5 || entry.kind == 6 || entry.kind == 7 || entry.kind == 10 {
+        return type_needs_extended(module, facts, entry.elem, depth + 1);
+    }
+    if entry.kind == 8 {
+        let total: u32 = @len(module.types.members) as u32;
+        if entry.members_start > total || entry.members_count > total - entry.members_start { return false; }
+        var i: u32 = 0;
+        while i < entry.members_count {
+            if type_needs_extended(module, facts, module.types.members[entry.members_start + i], depth + 1) { return true; }
+            i = i + 1;
+        }
+        return type_needs_extended(module, facts, entry.elem, depth + 1);
+    }
+    if entry.kind == 9 {
+        if type_needs_extended(module, facts, entry.success, depth + 1) { return true; }
+        let errorset: u32 = entry.elem;
+        if errorset == 0 || errorset > @len(module.types.entries) as u32 { return false; }
+        let set: typecheck::TypeEntry = module.types.entries[errorset - 1];
+        let total: u32 = @len(module.types.members) as u32;
+        if set.kind != 11 || set.members_start > total || set.members_count > total - set.members_start { return false; }
+        var j: u32 = 0;
+        while j < set.members_count {
+            if type_needs_extended(module, facts, module.types.members[set.members_start + j], depth + 1) { return true; }
+            j = j + 1;
+        }
+        return false;
+    }
+    if entry.kind == 11 {
+        let total: u32 = @len(module.types.members) as u32;
+        if entry.members_start > total || entry.members_count > total - entry.members_start { return false; }
+        var k: u32 = 0;
+        while k < entry.members_count {
+            if type_needs_extended(module, facts, module.types.members[entry.members_start + k], depth + 1) { return true; }
+            k = k + 1;
+        }
+    }
+    return false;
+}
+// 模块是否必须使用 format 6：实际被签名/局部/静态/指令引用的类型含扩展节点，或存在非零 drop 守卫。
+// 预扫描保证同一模块内所有 115 指令使用同一种带守卫字节形态。
+export function module_needs_extended(module: &mir::MirModule:Read, facts: &ysm::YsmFacts:Read): bool {
+    var fi: u32 = 0;
+    while fi < @len(module.functions) as u32 {
+        let f: &mir::MirFunction:Read = &module.functions[fi]:Read;
+        let sig_index: u32 = mir::func_sig(&module.signatures:Read, f.def);
+        if sig_index != 0 {
+            let sig: &typecheck::FuncSig:Read = &module.signatures.items[sig_index - 1]:Read;
+            var pi: u32 = 0;
+            while pi < @len(sig.params) as u32 {
+                if type_needs_extended(module, facts, sig.params[pi], 0) { return true; }
+                pi = pi + 1;
+            }
+            if type_needs_extended(module, facts, sig.ret, 0) { return true; }
+        }
+        var li: u32 = 0;
+        while li < @len(f.locals) as u32 {
+            if type_needs_extended(module, facts, f.locals[li].value_type_id, 0) { return true; }
+            li = li + 1;
+        }
+        var ii: u32 = 0;
+        while ii < @len(f.insts) as u32 {
+            if f.insts[ii].op == 115 && f.insts[ii].c != 0 { return true; }
+            if type_needs_extended(module, facts, f.insts[ii].value_type_id, 0) { return true; }
+            ii = ii + 1;
+        }
+        fi = fi + 1;
+    }
+    var si: u32 = 0;
+    while si < @len(facts.statics) as u32 {
+        if type_needs_extended(module, facts, facts.statics[si].type_sig, 0) { return true; }
+        si = si + 1;
+    }
+    // MIR 自身静态池也会写入 type_sigs；未扫描会让仅由静态池引用的私有名义类型漏升版本。
+    var mi: u32 = 0;
+    while mi < @len(module.statics) as u32 {
+        if type_needs_extended(module, facts, module.statics[mi].value_type_id, 0) { return true; }
+        mi = mi + 1;
+    }
+    return false;
+}

@@ -1,0 +1,197 @@
+// 计算 MIR 的传递无分配属性，并保留拒绝时的具体指令跨度。
+import types;
+import resolve_refs;
+import mir;
+
+const NONE: u32 = 4294967295u32;
+
+export struct SourceMap { starts: u64[], spans: types::Span[] }
+
+function allocation_code(module: &mir::MirModule:Read, bridges: &resolve_refs::BridgeTable:Read, instruction: mir::MirInst): u16 {
+    if mir::is_indirect_call(instruction.op) { return 7021; }
+    if instruction.op == 114 { return 7020; }
+    if mir::is_far_call(instruction.op) {
+        var found: bool = false;
+        var i: u32 = 0;
+        while i < @len(bridges.items) as u32 {
+            let target: resolve_refs::BridgeRecord = bridges.items[i];
+            if target.dependency as u32 == instruction.c && target.export_id == instruction.b {
+                if target.flags != 1 { return 7020; }
+                found = true;
+            }
+            i = i + 1;
+        }
+        if !found { return 7020; }
+    }
+    if instruction.op == 146 && instruction.b != 20486 { return 7020; }
+    // @push 是分配操作：`#` / no_alloc 函数中必须按 7020 拒绝。
+    if instruction.op == 178 { return 7020; }
+    if mir::is_foreign_call(instruction.op) {
+        let service: u8 = mir::foreign_service(module, instruction.b);
+        if service == 0 || service == 5 { return 7020; }
+    }
+    return 0;
+}
+
+struct CallNode {
+    start: u64, end: u64, next: u64, parent: u32, below: u32,
+    rank: u32, low: u32, done: bool,
+}
+
+function finish_component(module: &mir::MirModule:ReadWrite, nodes: &CallNode[]:ReadWrite, edges: &u32[]:Read, top: u32, end: u32): void {
+    var safe: bool = true;
+    var member: u32 = top;
+    while member != end && safe {
+        safe = module.functions[member].no_alloc;
+        var i: u64 = (*nodes)[member].start;
+        while i < (*nodes)[member].end && safe {
+            let target: u32 = (*edges)[i];
+            if (*nodes)[target].done { safe = module.functions[target].no_alloc; }
+            i = i + 1;
+        }
+        member = (*nodes)[member].below;
+    }
+    // 在求出整个分量的结果前，不把任何分量内边当作已求值的出边。
+    member = top;
+    while member != end {
+        module.functions[member].no_alloc = safe;
+        (*nodes)[member].done = true;
+        member = (*nodes)[member].below;
+    }
+    return;
+}
+
+export function compute_no_alloc(module: &mir::MirModule:ReadWrite, bridges: &resolve_refs::BridgeTable:Read, defs: u32): void!AllocError {
+    let count: u32 = @len(module.functions) as u32;
+    if count == 0 { return; }
+    var indices: u32[] = [];
+    while (@len(indices) as u32) < defs { @push(indices, 0)?; }
+    var i: u32 = 0;
+    while i < count {
+        indices[module.functions[i].def - 1] = i + 1;
+        i = i + 1;
+    }
+    var nodes: CallNode[] = [];
+    var edges: u32[] = [];
+    i = 0;
+    while i < count {
+        let start: u64 = @len(edges);
+        var safe: bool = true;
+        var j: u32 = 0;
+        while j < @len(module.functions[i].insts) as u32 {
+            let instruction: mir::MirInst = module.functions[i].insts[j];
+            if mir::is_local_call(instruction.op) {
+                let def: u32 = instruction.b;
+                if def == 0 || def > defs || indices[def - 1] == 0 { safe = false; }
+                else { @push(edges, indices[def - 1] - 1)?; }
+            } elseif safe && allocation_code(module, bridges, instruction) != 0 { safe = false; }
+            j = j + 1;
+        }
+        module.functions[i].no_alloc = safe;
+        @push(nodes, CallNode { start: start, end: @len(edges), next: start, parent: NONE, below: NONE, rank: 0, low: 0, done: false })?;
+        i = i + 1;
+    }
+    // parent 是深搜返回链；below 是尚未归入分量的 Tarjan 栈，两者不能混用。
+    var rank: u32 = 0;
+    var top: u32 = NONE;
+    i = 0;
+    while i < count {
+        if nodes[i].rank == 0 {
+            var node: u32 = i;
+            while node != NONE {
+                if nodes[node].rank == 0 {
+                    rank = rank + 1;
+                    nodes[node].rank = rank;
+                    nodes[node].low = rank;
+                    nodes[node].below = top;
+                    top = node;
+                }
+                let next: u64 = nodes[node].next;
+                if next < nodes[node].end {
+                    let target: u32 = edges[next];
+                    nodes[node].next = next + 1;
+                    let visited: u32 = nodes[target].rank;
+                    if visited == 0 {
+                        nodes[target].parent = node;
+                        node = target;
+                    } elseif !nodes[target].done && visited < nodes[node].low { nodes[node].low = visited; }
+                } else {
+                    let low: u32 = nodes[node].low;
+                    if low == nodes[node].rank {
+                        // 离开分量的目标已先出栈，直接沿分量 DAG 的逆拓扑序求值。
+                        let end: u32 = nodes[node].below;
+                        finish_component(module, &nodes:ReadWrite, &edges:Read, top, end);
+                        top = end;
+                    }
+                    let parent: u32 = nodes[node].parent;
+                    if parent != NONE && low < nodes[parent].low { nodes[parent].low = low; }
+                    node = parent;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+struct CauseFrame { function_index: u32, after: u32, next: u32, imported: u32 }
+
+export struct NoAllocCause { code: types::ErrorCode, span: types::Span }
+
+// 先按最终块内顺序检查函数自身，再按 DefId 深入本地调用，最后按接口身份选择远程调用。
+// 只遍历已判不安全的函数；遇到递归回边保留栈帧，继续查同一函数的其他出边。
+export function no_alloc_cause(module: &mir::MirModule:Read, bridges: &resolve_refs::BridgeTable:Read, source: &SourceMap:Read, root: u32): NoAllocCause!AllocError {
+    var seen: bool[] = [];
+    while @len(seen) < @len(module.functions) { @push(seen, false)?; }
+    var frames: CauseFrame[] = [];
+    let initial: CauseFrame = CauseFrame { function_index: root, after: 0, next: 0, imported: NONE };
+    @push(frames, initial)?;
+    seen[root] = true;
+    var depth: u32 = 1;
+    while depth > 0 {
+        let top: u32 = depth - 1;
+        let index: u32 = frames[top].function_index;
+        let start: u64 = source.starts[index];
+        let count: u32 = @len(module.functions[index].insts) as u32;
+        var target: u32 = 0;
+        var site: u32 = 0;
+        var i: u32 = 0;
+        while i < count {
+            let instruction: mir::MirInst = module.functions[index].insts[i];
+            if mir::is_local_call(instruction.op) && instruction.b > frames[top].after && (target == 0 || instruction.b < target) {
+                target = instruction.b;
+                site = i;
+            }
+            if frames[top].next == 0 {
+                let code: u16 = allocation_code(module, bridges, instruction);
+                if code != 0 {
+                    if !mir::is_far_call(instruction.op) { return NoAllocCause { code: types::error_code(code), span: source.spans[start + i as u64] }; }
+                    let chosen: u32 = frames[top].imported;
+                    if chosen == NONE || instruction.c < module.functions[index].insts[chosen].c ||
+                        (instruction.c == module.functions[index].insts[chosen].c && instruction.b < module.functions[index].insts[chosen].b) {
+                        frames[top].imported = i;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        frames[top].next = 1;
+        if target == 0 {
+            if frames[top].imported != NONE { return NoAllocCause { code: types::error_code(7020), span: source.spans[start + frames[top].imported as u64] }; }
+            depth = depth - 1;
+        } else {
+            frames[top].after = target;
+            let callee: u32 = mir::function_index(module, target);
+            if callee == 0 { return NoAllocCause { code: types::error_code(7020), span: source.spans[start + site as u64] }; }
+            if !module.functions[callee - 1].no_alloc && !seen[callee - 1] {
+                seen[callee - 1] = true;
+                let frame: CauseFrame = CauseFrame { function_index: callee - 1, after: 0, next: 0, imported: NONE };
+                if depth as u64 == @len(frames) { @push(frames, frame)?; }
+                else { frames[depth] = frame; }
+                depth = depth + 1;
+            }
+        }
+    }
+    // 无有效指令来源意味着分析与追踪不一致；交回结构性拒绝而非虚造诊断。
+    return NoAllocCause { code: types::error_code(0), span: types::Span { file: 0, offset: 0, length: 0 } };
+}

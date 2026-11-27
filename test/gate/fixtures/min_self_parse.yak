@@ -1,0 +1,30 @@
+// 用真实 min 词法与语法检查单个编译器源文件；失败保留原始诊断。
+import host;
+import lex;
+import parse;
+import diag;
+foreign exit(code: u8): void;
+
+function main(): void {
+    let bytes: u8[] = host::input_bytes("src")?;
+    let r: lex::LexResult = lex::lex_scan(&bytes[0..@len(bytes)]:Read, 1)?;
+    var diagnostics: diag::DiagBuffer = diag::diagbuf_new();
+    var i: u32 = 0;
+    while i < @len(r.diagnostics) as u32 {
+        diag::diagbuf_emit(&diagnostics:ReadWrite, diag::Diag { code: r.diagnostics[i].code, severity: 0, span: r.diagnostics[i].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    if !diag::diagbuf_has_error(&diagnostics:Read) {
+        let parsed: parse::ParseResult = parse::parse_lexed(&r:Read, 1)?;
+        i = 0;
+        while i < @len(parsed.diagnostics) as u32 {
+            diag::diagbuf_emit(&diagnostics:ReadWrite, diag::Diag { code: parsed.diagnostics[i].code, severity: 0, span: parsed.diagnostics[i].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+            i = i + 1;
+        }
+    }
+    if diag::diagbuf_has_error(&diagnostics:Read) {
+        diag::diagbuf_print_terminal(&diagnostics:Read)?;
+        exit(1u8);
+    }
+    return;
+}

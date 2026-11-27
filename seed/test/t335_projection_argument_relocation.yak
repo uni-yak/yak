@@ -1,0 +1,18 @@
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+function replace(items: &Item[]:ReadWrite, count: &u32:ReadWrite): u32 {
+    *count = *count + 1u32;
+    *items = [Item { data: [41u32] }];
+    return 0u32;
+}
+function outer(count: &u32:ReadWrite): u32 { *count = *count + 1u32; return 0u32; }
+function bump(value: &u32:ReadWrite): void { *value = *value + 1u32; }
+function main(): void {
+    var items: Item[] = [Item { data: [1u32] }];
+    var count: u32 = 0u32;
+    let view: &Item[]:ReadWrite = &items:ReadWrite;
+    let calls: &u32:ReadWrite = &count:ReadWrite;
+    bump((*view)[outer(calls)].data[replace(view, calls)]);
+    assert((*view)[0u32].data[0u32] == 42u32);
+    assert(*calls == 2u32);
+}

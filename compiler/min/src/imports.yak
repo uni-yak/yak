@@ -1,0 +1,211 @@
+// 构建入口的导入扫描与模块图驱动。
+// 扫描模式逐行输出单个文件的 import 路径，供构建脚本发现依赖闭包；
+// 图模式复用 check/module.yak 的既有诊断和稳定拓扑序，不进入类型检查。
+import host;
+import host_args;
+import types;
+import lex;
+import parse;
+import parse_core;
+import diag;
+import module;
+
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+// 比较命令行参数与给定文本是否逐字节相等。
+function arg_equals(arg: &[u8]:Read, text: &[u8]:Read): bool {
+    if @len(arg) != @len(text) {
+        return false;
+    }
+    var i: u32 = 0;
+    while i < @len(arg) as u32 {
+        if arg[i] != text[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 输出一行：前缀 + 名称 + 换行。
+function write_line(prefix: &[u8]:Read, name: &[u8]:Read): void!AllocError {
+    var line: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(prefix) as u32 {
+        @push(line, prefix[i])?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(name) as u32 {
+        @push(line, name[i])?;
+        i = i + 1;
+    }
+    @push(line, 10 as u8)?;
+    let view: &[u8] = &line[0..@len(line)];
+    write(view);
+    return;
+}
+
+// 十进制字段与路径同存一行，图阶段无需再读取源文件。
+function write_uint(value: u32): void!AllocError {
+    var digits: u8[] = [];
+    var n: u32 = value;
+    @push(digits, (48 + n % 10) as u8)?;
+    n = n / 10;
+    while n > 0 {
+        @push(digits, (48 + n % 10) as u8)?;
+        n = n / 10;
+    }
+    var i: u64 = @len(digits);
+    while i > 0 {
+        i = i - 1;
+        write(&digits[i..i + 1]);
+    }
+    return;
+}
+
+// 把词法诊断转交给统一诊断缓冲。
+function emit_lex(diags: &diag::DiagBuffer:ReadWrite, errors: &[lex::LexDiagnostic]:Read): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+
+// 把语法诊断转交给统一诊断缓冲。
+function emit_parse(diags: &diag::DiagBuffer:ReadWrite, errors: &[parse_core::ParseDiagnostic]:Read): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+
+// 扫描先解析并校验完整源文件，只在成功后写出导入清单。
+function scan(): void!AllocError {
+    let source: u8[] = host::input_bytes("src")?;
+    let lexed: lex::LexResult = lex::lex_scan(&source[0..@len(source)], 0)?;
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    emit_lex(&diags:ReadWrite, &lexed.diagnostics[0..@len(lexed.diagnostics)])?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 0)?;
+    emit_parse(&diags:ReadWrite, &parsed.diagnostics[0..@len(parsed.diagnostics)])?;
+    if diag::diagbuf_has_error(&diags:Read) {
+        diag::diagbuf_sort(&diags:ReadWrite);
+        diag::diagbuf_print_terminal(&diags:Read)?;
+        exit(1);
+    }
+    let imports: module::ModuleImport[] = module::collect_imports(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read)?;
+    var i: u64 = 0;
+    while i < @len(imports) {
+        write(&imports[i].name[0..@len(imports[i].name)]);
+        write(" ");
+        write_uint(imports[i].span.offset)?;
+        write(" ");
+        write_uint(imports[i].span.length)?;
+        write("\n");
+        i = i + 1;
+    }
+    return;
+}
+
+// 清单为构建进程的内部格式，既不读文件路径，也不接受溢出的源位置。
+function invalid_manifest(): void {
+    write("错误：无效的导入清单\n");
+    exit(2);
+    return;
+}
+
+struct NumberField { value: u32, next: u64 }
+function read_uint(data: &[u8], start: u64, separator: u8, limit: u32): NumberField {
+    var i: u64 = start;
+    var n: u64 = 0;
+    while i < @len(data) && data[i] >= 48u8 && data[i] <= 57u8 {
+        n = n * 10 + (data[i] - 48u8) as u64;
+        if n > limit as u64 { invalid_manifest(); }
+        i = i + 1;
+    }
+    if i == start || i == @len(data) || data[i] != separator { invalid_manifest(); }
+    return NumberField { value: n as u32, next: i + 1 };
+}
+function read_imports(data: &[u8]): module::ModuleImport[]!AllocError {
+    var imports: module::ModuleImport[] = [];
+    var i: u64 = 0;
+    while i < @len(data) {
+        var name: u8[] = [];
+        while i < @len(data) && data[i] != 32u8 && data[i] != 10u8 {
+            @push(name, data[i])?;
+            i = i + 1;
+        }
+        if @len(name) == 0 || i == @len(data) || data[i] != 32u8 { invalid_manifest(); }
+        let offset: NumberField = read_uint(data, i + 1, 32u8, 4294967295u32);
+        let length: NumberField = read_uint(data, offset.next, 10u8, 4294967295u32);
+        @push(imports, module::ModuleImport { name: @move(name), span: types::Span { file: 0, offset: offset.value, length: length.value } })?;
+        i = length.next;
+    }
+    return imports;
+}
+
+// 图模式只读每个成功扫描生成的导入清单，输出依赖优先的顺序。
+function graph(args: &[u8], argc: u32): void!AllocError {
+    var table: module::ModuleTable = module::ModuleTable { units: [] };
+    var index: u32 = 1;
+    while index + 1 < argc {
+        let input_name: u8[] = host_args::get(args, index)?;
+        let module_name: u8[] = host_args::get(args, index + 1)?;
+        let manifest: u8[] = host::input_bytes(&input_name[0..@len(input_name)])?;
+        let imports: module::ModuleImport[] = read_imports(&manifest[0..@len(manifest)])?;
+        @push(table.units, module::ModuleUnit { name: @move(module_name), file_id: 0, imports: @move(imports) })?;
+        index = index + 2;
+    }
+    if index != argc {
+        write("错误：模块图参数必须成对\n");
+        exit(2);
+    }
+    var graph_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: module::ModuleGraph = module::build_graph(&table:Read, &graph_diags:ReadWrite)?;
+    if diag::diagbuf_has_error(&graph_diags:Read) {
+        diag::diagbuf_sort(&graph_diags:ReadWrite);
+        diag::diagbuf_print_terminal(&graph_diags:Read)?;
+        exit(1);
+    }
+    var i: u32 = 0;
+    while i < @len(result.order) as u32 {
+        write_line("order ", &table.units[result.order[i]].name[0..@len(table.units[result.order[i]].name)]:Read)?;
+        i = i + 1;
+    }
+    return;
+}
+
+function run_imports(): void!AllocError {
+    let packed_args: u8[] = host::load_args()?;
+    let args: &[u8] = &packed_args[0..@len(packed_args)]:Read;
+    let argc: u32 = host_args::count(args);
+    if argc < 1 {
+        write("错误：imports.yak 参数不足\n");
+        exit(2);
+    }
+    let mode: u8[] = host_args::get(args, 0)?;
+    if arg_equals(&mode[0..@len(mode)]:Read, "scan") {
+        scan()?;
+        exit(0);
+    }
+    if arg_equals(&mode[0..@len(mode)]:Read, "graph") {
+        graph(args, argc)?;
+        exit(0);
+    }
+    write("错误：imports.yak 未知模式\n");
+    exit(2);
+    return;
+}
+
+function main(): void {
+    // 正常流程已退出；只有传播回来的分配错误会到达这里。
+    let failed: void!AllocError = run_imports();
+    @drop(failed);
+    write("错误：模块扫描器内存分配失败\n");
+    exit(1);
+}

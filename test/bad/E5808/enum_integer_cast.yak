@@ -1,0 +1,16 @@
+// expected_code: E5808
+// expected_diagnostics: E5808 E5808 E5808 E5808
+// dependency: enum_cast_dep.yak
+// spec: spec/lang/type/enum.md#EN-5
+// 触发：整数与本地或导入枚举在两个方向上均不得显式转换。
+import enum_cast_dep;
+
+enum Status { Ready }
+
+function encode(value: Status): i16 { return value as i16; }
+function decode(value: u32): Status { return value as Status; }
+
+function encode_imported(value: enum_cast_dep::Remote): u16 { return value as u16; }
+function decode_imported(value: i32): enum_cast_dep::Remote { return value as enum_cast_dep::Remote; }
+
+function main(): void { return; }

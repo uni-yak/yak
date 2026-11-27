@@ -1,0 +1,59 @@
+name: Seed 解释器回归
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'seed/**'
+      - 'runtime/**'
+      - 'tools/**'
+      - 'versions.lock'
+      - '.github/workflows/seed-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seed-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
+    timeout-minutes: 75
+    env:
+      MSYSTEM: UCRT64
+      CHERE_INVOKING: '1'
+      MSYS2_PATH_TYPE: inherit
+    steps:
+      - name: 核对运行器
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'self-hosted') {
+            throw '请配置 YAK_WINDOWS_RUNNER 指向预置锁定 UCRT64 工具链的 Windows runner'
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: 在隔离源码中双编译器重建并回归
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        run: |
+          export LC_ALL=C TZ=UTC YAK_CI_RECORD_TIMING=1
+          bash test/gate/ci_linux_snapshot.sh "$GITHUB_SHA" .cold-start
+          mkdir -p test/gate/tmp/ci-seed-evidence
+          evidence="$(pwd -P)/test/gate/tmp/ci-seed-evidence"
+          cd .cold-start
+          bash test/gate/ci_record.sh "$evidence" seed-regression -- bash seed/build.sh
+          sha256sum -- seed/out/yak-seed.exe seed/frozen.txt > "$evidence/SHA256SUMS"
+      - name: 上传 Seed 解释器回执
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: seed-regression-evidence
+          path: |
+            test/gate/tmp/ci-seed-evidence/
+            .cold-start/seed/tmp/build/
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true

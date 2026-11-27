@@ -1,0 +1,33 @@
+// expected_stdout: ok
+// mem_limit: 330000
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+enum ByteList { Bytes(u8[]) }
+
+function run(): u64 {
+    var iterations: u64 = 0u64;
+    var visited: u64 = 0u64;
+    outer: while iterations < 500u64 {
+        iterations = iterations + 1u64;
+        let outer_bytes: u8[] = [1u8];
+        let sample: ByteList = ByteList::Bytes([2u8]);
+        match sample {
+            Bytes(inner_bytes) => {
+                inner: while true {
+                    visited = visited + outer_bytes[0u64] as u64 + inner_bytes[0u64] as u64;
+                    if iterations < 300u64 { continue outer; }
+                    break inner;
+                }
+                break outer;
+            }
+        }
+    }
+    assert(iterations == 300u64);
+    return visited;
+}
+
+function main(): void {
+    assert(run() == 900u64);
+    write("ok");
+}

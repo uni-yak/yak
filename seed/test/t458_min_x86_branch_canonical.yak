@@ -1,0 +1,221 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function branch(code: &pe::Code:ReadWrite, conditional: bool): u32!AllocError {
+    if conditional { return pe::jcc_rel32(code, pe::cc_e())?; }
+    return pe::jmp_rel32(code)?;
+}
+
+function edge(conditional: bool, backward: bool, padding: u32, narrow: bool, relax: bool): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    if relax { pe::begin_layout(&code:ReadWrite); }
+    var field: u32 = 0;
+    if !backward { field = branch(&code:ReadWrite, conditional)?; }
+    var i: u32 = 0;
+    while i < padding { pe::nop(&code:ReadWrite)?; i = i + 1; }
+    if backward { field = branch(&code:ReadWrite, conditional)?; }
+    var target: u32 = pe::code_len(&code:Read);
+    if backward { target = 0; }
+    pe::patch_rel32(&code:ReadWrite, field, target);
+    // 目标始终落在本函数的指令上，而不是缓冲区末尾。
+    pe::code_u8(&code:ReadWrite, 0xc3)?;
+    if relax { assert(pe::finish_layout(&code:ReadWrite, 0)); }
+    var start: u32 = 0;
+    if backward { start = padding; }
+    var size: u32 = 5;
+    if conditional { size = 6; }
+    if narrow && relax {
+        size = 2;
+        var short_op: u8 = 0xeb;
+        if conditional { short_op = 0x74; }
+        assert(code.bytes[start] == short_op);
+    } else {
+        if conditional { assert(code.bytes[start] == 0x0f && code.bytes[start + 1] == 0x84); }
+        else { assert(code.bytes[start] == 0xe9); }
+    }
+    // 核对实际位移：前向目标同指令缩短，后向目标保持原位置。
+    var delta: u32 = padding;
+    if backward { delta = 256u32 - padding - size; }
+    var disp: u32 = start + 1;
+    if conditional && size == 6 { disp = disp + 1; }
+    assert(code.used == padding + size + 1 && code.bytes[disp] == delta as u8);
+    if size != 2 {
+        var sign: u8 = 0;
+        if backward { sign = 255; }
+        assert(code.bytes[disp + 1] == sign && code.bytes[disp + 2] == sign && code.bytes[disp + 3] == sign);
+    }
+    var expected: u16 = 0;
+    if narrow && !relax { expected = 7103; }
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function crossed(padding: u32, relax: bool): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::nop(&code:ReadWrite)?;
+    let start: u32 = pe::code_len(&code:Read);
+    if relax { pe::begin_layout(&code:ReadWrite); }
+    let forward: u32 = branch(&code:ReadWrite, true)?;
+    var i: u32 = 0;
+    while i < padding { pe::nop(&code:ReadWrite)?; i = i + 1; }
+    let backward: u32 = branch(&code:ReadWrite, false)?;
+    let target: u32 = pe::code_len(&code:Read);
+    pe::patch_rel32(&code:ReadWrite, forward, target);
+    pe::patch_rel32(&code:ReadWrite, backward, start);
+    pe::ret(&code:ReadWrite)?;
+    if relax { assert(pe::finish_layout(&code:ReadWrite, start)); }
+
+    // 在 124 个 NOP 时，两条分支单独缩短均越界，同时缩短则刚好可达。
+    var expected: u16 = 0;
+    if padding == 124 && !relax { expected = 7103; }
+    assert(x86_validate::validate(&code:Read, start)? == expected);
+    if padding == 124 && relax {
+        assert(code.bytes[start] == 0x74 && code.bytes[start + 1] == 126);
+        assert(code.bytes[start + 126] == 0xeb && code.bytes[start + 127] == 0x80);
+    }
+    if padding == 125 && !relax {
+        // 两条分支都保留长形态；前向目标错落回后一条的位移末字节。
+        pe::patch_rel32(&code:ReadWrite, forward, target - 1u32);
+        assert(x86_validate::validate(&code:Read, start)? == 7101);
+    }
+    return;
+}
+
+function omit_chain(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::ret(&code:ReadWrite)?;
+    let start: u32 = pe::code_len(&code:Read);
+    pe::begin_layout(&code:ReadWrite);
+    let first: u32 = branch(&code:ReadWrite, true)?;
+    let second: u32 = branch(&code:ReadWrite, false)?;
+    let dest: u32 = pe::code_len(&code:Read);
+    let address: u32 = pe::lea_rip(&code:ReadWrite, pe::rcx())?;
+    let call: u32 = pe::call_rel32(&code:ReadWrite)?;
+    let tail: u32 = pe::code_len(&code:Read);
+    pe::ret(&code:ReadWrite)?;
+    pe::patch_rel32(&code:ReadWrite, first, dest);
+    pe::patch_rel32(&code:ReadWrite, second, dest);
+    pe::patch_relative(&code:ReadWrite, address, address + 4, tail)?;
+    assert(pe::finish_layout(&code:ReadWrite, start));
+    // 两条分支及其目标合并到 LEA 的起点，调用重定位仍落在 CALL 字段。
+    assert(pe::layout_position(&code:Read, second - 1) == start);
+    assert(pe::layout_position(&code:Read, dest) == start);
+    let address_at: u32 = pe::layout_position(&code:Read, address);
+    let call_at: u32 = pe::layout_position(&code:Read, call);
+    assert(code.used == 14 && address_at == 4 && call_at == 9);
+    assert(code.bytes[0] == 0xc3 && code.bytes[1] == 0x48 && code.bytes[address_at] == 5);
+    assert(code.bytes[call_at - 1] == 0xe8 && code.bytes[13] == 0xc3);
+    let sites: [x86_validate::Rel32Site; 1] = [x86_validate::Rel32Site { offset: call_at, address: false }];
+    assert(x86_validate::validate_relocated(&code:Read, start, &sites[0..1]:Read)? == 0);
+    return;
+}
+
+function omit_at_width_limit(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::begin_layout(&code:ReadWrite);
+    let limit: u32 = branch(&code:ReadWrite, false)?;
+    let adjacent: u32 = branch(&code:ReadWrite, true)?;
+    let padding: u32 = pe::code_len(&code:Read);
+    pe::patch_rel32(&code:ReadWrite, adjacent, padding);
+    var i: u32 = 0;
+    while i < 127 { pe::nop(&code:ReadWrite)?; i = i + 1; }
+    let target: u32 = pe::code_len(&code:Read);
+    pe::patch_rel32(&code:ReadWrite, limit, target);
+    pe::ret(&code:ReadWrite)?;
+    assert(pe::finish_layout(&code:ReadWrite, 0));
+    // 删除中间分支后，前向跳转恰好能用 rel8。
+    assert(code.used == 130 && code.bytes[0] == 0xeb && code.bytes[1] == 127 && code.bytes[129] == 0xc3);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    return;
+}
+
+function check_short_fallthrough(): void!AllocError {
+    let bytes: [u8; 15] = [0xeb, 0, 0xc3, 0x74, 0, 0xc3, 0xeb, 0xfe, 0x75, 0xfe, 0xc3, 0x74, 1, 0x90, 0xc3];
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[0..3]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7103);
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[3..6]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7103);
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[6..15]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[11..12]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7101);
+    return;
+}
+
+function check_shared_destination(): void!AllocError {
+    // 首对分支都指向 RET，第二对去向不同，第三对之间还有指令。
+    let bytes: [u8; 20] = [0x75, 4, 0xeb, 2, 0x90, 0x90, 0xc3,
+        0x75, 2, 0xeb, 1, 0x90, 0xc3,
+        0x75, 4, 0x90, 0xeb, 1, 0x90, 0xc3];
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[0..7]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7103);
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[7..13]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &bytes[13..20]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+
+    // 两条分支都超出 rel8，也只需保留一个无条件跳转。
+    code = pe::code_new();
+    let conditional: u32 = branch(&code:ReadWrite, true)?;
+    let direct: u32 = branch(&code:ReadWrite, false)?;
+    var i: u32 = 0;
+    while i < 128 { pe::nop(&code:ReadWrite)?; i = i + 1; }
+    let dest: u32 = pe::code_len(&code:Read);
+    pe::ret(&code:ReadWrite)?;
+    pe::patch_rel32(&code:ReadWrite, conditional, dest);
+    pe::patch_rel32(&code:ReadWrite, direct, dest);
+    assert(x86_validate::validate(&code:Read, 0)? == 7103);
+    return;
+}
+
+function verify(): void!AllocError {
+    var flags: u32 = 0;
+    while flags < 8 {
+        let conditional: bool = (flags & 1u32) != 0;
+        let backward: bool = (flags & 2u32) != 0;
+        let relax: bool = (flags & 4u32) != 0;
+        var boundary: u32 = 127;
+        if backward { boundary = 126; }
+        edge(conditional, backward, boundary, true, relax)?;
+        edge(conditional, backward, boundary + 1, false, relax)?;
+        flags = flags + 1;
+    }
+    crossed(124, false)?;
+    crossed(124, true)?;
+    crossed(125, false)?;
+    crossed(125, true)?;
+    omit_chain()?;
+    omit_at_width_limit()?;
+    check_short_fallthrough()?;
+    check_shared_destination()?;
+    // CALL 不存在短形式；长条件分支缺一字节时仍报子集外。
+    var code: pe::Code = pe::code_new();
+    let at: u32 = pe::call_rel32(&code:ReadWrite)?;
+    let target: u32 = pe::code_len(&code:Read);
+    pe::patch_rel32(&code:ReadWrite, at, target);
+    pe::code_u8(&code:ReadWrite, 0xc3)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    let cut: [u8; 5] = [0x0f, 0x84, 0, 0, 0];
+    pe::code_bytes(&code:ReadWrite, &cut[0..5]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7101);
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

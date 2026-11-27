@@ -1,0 +1,77 @@
+// 原生编译驱动的内部流适配，只使用现有 read/write；登记名不产生文件权限。
+// 请求是 YKH1 加一帧参数表，随后是按调用顺序排列的具名输入帧。
+// 每个具名帧由名称和内容两帧组成，每帧是小端 u32 长度及对应字节。
+foreign read(buf: &[u8]:ReadWrite): u32;
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+function invalid_request(): void {
+    write("错误：无效的编译宿主输入流\n");
+    exit(2);
+    return;
+}
+
+function read_u32(): u32 {
+    var b: [u8; 4] = [0u8, 0u8, 0u8, 0u8];
+    if read(&b[0..4]:ReadWrite) != 4 { invalid_request(); }
+    return (b[0u64] as u32) | ((b[1u64] as u32) << 8) | ((b[2u64] as u32) << 16) | ((b[3u64] as u32) << 24);
+}
+
+function read_frame(size: u32): u8[]!AllocError {
+    var bytes: u8[] = [];
+    var i: u32 = 0;
+    while i < size {
+        @push(bytes, 0u8)?;
+        i = i + 1;
+    }
+    if size != 0 && read(&bytes[0..size]:ReadWrite) != size { invalid_request(); }
+    return bytes;
+}
+
+function write_frame(bytes: &[u8]): void {
+    let size: u64 = @len(bytes);
+    if size > 4294967295u64 { invalid_request(); }
+    let header: [u8; 4] = [(size & 255) as u8, ((size >> 8) & 255) as u8, ((size >> 16) & 255) as u8, ((size >> 24) & 255) as u8];
+    write(&header[0..4]:Read);
+    write(bytes);
+    return;
+}
+
+export function load_args(): u8[]!AllocError {
+    // 以读入顺序按小端解释 YKH1。
+    if read_u32() != 826821465u32 { invalid_request(); }
+    let size: u32 = read_u32();
+    if size > 1048576u32 { invalid_request(); }
+    let bytes: u8[] = read_frame(size)?;
+    if size != 0 && bytes[size - 1u32] != 0u8 { invalid_request(); }
+    return bytes;
+}
+
+export function input_bytes(name: &[u8]): u8[]!AllocError {
+    let name_len: u32 = read_u32();
+    if name_len == 0 || (name_len as u64) != @len(name) { invalid_request(); }
+    let actual: u8[] = read_frame(name_len)?;
+    var i: u64 = 0;
+    while i < @len(name) {
+        if actual[i] != name[i] { invalid_request(); }
+        i = i + 1;
+    }
+    let size: u32 = read_u32();
+    return read_frame(size);
+}
+
+// 具名输出只接受登记过的名字：产物三类加上 --diag=jsonl 的诊断帧。
+function output_name_valid(name: &[u8]:Read): bool {
+    if @len(name) as u32 == 4 && name[0] == 100 && name[1] == 105 && name[2] == 97 && name[3] == 103 { return true; }
+    if @len(name) as u32 == 3 && name[0] == 111 && name[1] == 98 && name[2] == 106 { return true; }
+    if @len(name) as u32 == 3 && name[0] == 121 && name[1] == 115 && name[2] == 109 { return true; }
+    if @len(name) as u32 == 5 && name[0] == 105 && name[1] == 102 && name[2] == 97 && name[3] == 99 && name[4] == 101 { return true; }
+    return false;
+}
+// 默认模式的终端诊断文本不进入具名帧；只有产物与 JSONL 诊断帧走这里。
+export function output_bytes(name: &[u8], bytes: &[u8]): void {
+    if !output_name_valid(&name[0..@len(name)]:Read) { invalid_request(); }
+    write_frame(name);
+    write_frame(bytes);
+    return;
+}

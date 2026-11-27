@@ -1,0 +1,23 @@
+export enum Handoff { BeforeWrite, PartialWrite }
+
+function fill(mode: u8, first: &u8:Write, second: &u64:Write): u32!Handoff {
+    if mode == 0u8 { return Handoff::BeforeWrite; }
+    *first = 231u8;
+    if mode == 1u8 { return Handoff::PartialWrite; }
+    *second = 4294967301u64;
+    return 42u32;
+}
+
+// 成功边同时移出两个槽；两个错误边均不得执行这里的断言。
+export function exercise(mode: u8): u32!Handoff {
+    out first: u8;
+    out second: u64;
+    let code: u32 = fill(mode, out first, out second)?;
+    let a: u8 = @move(first);
+    let b: u64 = @move(second);
+    assert(a == 231u8 && b == 4294967301u64);
+    return code;
+}
+
+foreign assert(cond: bool): void;
+function main(): void { return; }

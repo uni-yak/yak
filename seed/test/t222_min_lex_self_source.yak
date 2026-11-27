@@ -1,0 +1,21 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: host=../../compiler/min/host/seed/host.yak
+// input: source=../../compiler/min/src/lex/lex.yak
+import lex;
+import host;
+foreign assert(cond: bool): void;
+function main(): void {
+    let bytes: u8[] = host::input_bytes("source")?;
+    let size: u32 = @len(bytes) as u32;
+    let r: lex::LexResult = lex::lex_scan(&bytes[0..size], 4)?;
+    assert(@len(r.diagnostics) == 0);
+    let count: u32 = @len(r.tokens) as u32;
+    assert(count > 2000 && @len(r.names.entries) > 60);
+    assert(r.tokens[count - 1].kind == 9 && r.tokens[count - 1].span.offset == size);
+    assert(r.tokens[0].kind == 6 && r.tokens[0].payload == 16);
+}

@@ -1,0 +1,20 @@
+// 动态数组：24 字节头（ptr/len/cap）、`@push` 增长、索引与函数出口释放。
+// 验收方式：链接后运行，三次 push 后索引求和必须为 6。
+foreign exit(code: u8): void;
+
+function fill(): void!AllocError {
+    var a: u8[] = [];
+    @push(a, 1u8)?;
+    @push(a, 2u8)?;
+    @push(a, 3u8)?;
+    let n: u64 = @len(a);
+    if n != 3u64 { exit(99u8); }
+    let s: u32 = (a[0u32] as u32) + (a[1u32] as u32) + (a[2u32] as u32);
+    exit(s as u8);
+    return;
+}
+
+function main(): void {
+    fill();
+    return;
+}

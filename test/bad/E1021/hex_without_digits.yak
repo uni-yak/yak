@@ -1,0 +1,4 @@
+// expected_code: E1021
+// spec: spec/lang/lex.md L-21
+// 触发：十六进制前缀后没有任何数字。
+function main(): void { let value: u32 = 0x; return; }

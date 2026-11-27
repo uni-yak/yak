@@ -1,0 +1,10 @@
+// expected_code: E1004
+// spec: spec/lang/lex.md L-4；spec/lang/type/u8.md L-4
+// 触发：上下文将整数字面量定为 u8，但 256 超出其范围。
+foreign exit(code: u8): void;
+
+function main(): void {
+    let value: u8 = 256;
+    exit(value);
+    return;
+}

@@ -1,0 +1,161 @@
+// 只在单线程 stdio 会话中消费已提交的同版文档事件。
+import buf;
+import diag;
+import documents;
+import frame;
+import json_string;
+import positions;
+import pipeline;
+import session;
+import types;
+import diagnostic_wire;
+foreign exit(code: u8): void;
+
+function send(body: &buf::ByteBuf:Read): bool {
+    return frame::write_frame(&body.data[0..body.pos]:Read);
+}
+
+function inform(reason: u8): bool!AllocError {
+    let body: buf::ByteBuf = diagnostic_wire::status_message(reason)?;
+    return send(&body:Read);
+}
+
+// 发送前再次核对票据；源、索引和 URI 均来自同一只读快照。
+function emit(state: &session::State:Read, ticket: documents::Ticket, slot: &documents::Slot:Read,
+    src: &[u8], file: u16, diagnostics: &diag::DiagBuffer:Read, reason: u8): bool!AllocError {
+    let uri: &json_string::Decoded:Read = &slot.uri:Read;
+    let index: &positions::Index:Read = &slot.snapshot.index:Read;
+    let result: diagnostic_wire::Publication = diagnostic_wire::encode(&uri.data[0..@len(uri.data)]:Read,
+        ticket.version, state.diagnostic_versions, index, src, file, diagnostics)?;
+    if !documents::is_current(&state.store:Read, ticket) { return true; }
+    var status: u8 = reason;
+    if status == 0u8 && result.omitted { status = 2u8; }
+    if status != 0u8 {
+        let logged: bool = inform(status)?;
+        if !logged { return false; }
+    }
+    return send(&result.body:Read);
+}
+
+export function snapshot(state: &session::State:ReadWrite, ticket: documents::Ticket): bool!AllocError {
+    if !documents::is_current(&state.store:Read, ticket) { return true; }
+    var definitions: types::DocumentDefinitions = types::empty_definitions();
+    let wrote: bool = analyze_snapshot(&*state:Read, ticket, &definitions:ReadWrite)?;
+    if wrote { documents::commit_definitions(&state.store:ReadWrite, ticket, @move(definitions)); }
+    return wrote;
+}
+
+function analyze_snapshot(state: &session::State:Read, ticket: documents::Ticket, definitions: &types::DocumentDefinitions:ReadWrite): bool!AllocError {
+    let slot: &documents::Slot:Read = &state.store.slots[ticket.slot]:Read;
+    let text: &json_string::Decoded:Read = &slot.snapshot.text:Read;
+    let src: &[u8] = &text.data[0..@len(text.data)]:Read;
+    let file: u16 = (ticket.slot + 1u32) as u16;
+    if !documents::analysis_size_allowed(@len(src)) {
+        let blank: diag::DiagBuffer = diag::diagbuf_new();
+        return emit(state, ticket, slot, src, file, &blank:Read, 3u8)?;
+    }
+    let checked: pipeline::DocumentAnalysis = pipeline::run_document_indexed(src, file, state.definitions, definitions)?;
+    var i: u32 = 0;
+    while i < checked.diagnostics.count && i < 64u32 {
+        let d: diag::Diag = checked.diagnostics.diags[i];
+        @push(definitions.diagnostics, types::DocumentDiag { code: d.code.raw, span: d.span })?;
+        i = i + 1u32;
+    }
+    return emit_analysis(state, ticket, &checked:Read)?;
+}
+
+export function emit_current(state: &session::State:Read, ticket: documents::Ticket, diags: &diag::DiagBuffer:Read, reason: u8): bool!AllocError {
+    if !documents::is_current(&state.store:Read, ticket) { return true; }
+    let slot: &documents::Slot:Read = &state.store.slots[ticket.slot]:Read;
+    let text: &json_string::Decoded:Read = &slot.snapshot.text:Read;
+    return emit(state, ticket, slot, &text.data[0..@len(text.data)]:Read, (ticket.slot + 1u32) as u16, diags, reason)?;
+}
+
+export function emit_analysis(state: &session::State:Read, ticket: documents::Ticket, checked: &pipeline::DocumentAnalysis:Read): bool!AllocError {
+    let diagnostics: &diag::DiagBuffer:Read = &checked.diagnostics:Read;
+    var reason: u8 = 0;
+    if pipeline::analysis_diagnostics_truncated(checked.status) { reason = 5u8; }
+    elseif pipeline::analysis_parse_depth_exceeded(checked.status) { reason = 6u8; }
+    elseif pipeline::analysis_expression_depth_exceeded(checked.status) { reason = 7u8; }
+    elseif pipeline::analysis_value_depth_exceeded(checked.status) { reason = 8u8; }
+    elseif pipeline::analysis_token_limit_exceeded(checked.status) { reason = 9u8; }
+    elseif pipeline::analysis_name_limit_exceeded(checked.status) { reason = 10u8; }
+    elseif pipeline::analysis_copy_walk_exceeded(checked.status) { reason = 11u8; }
+    elseif pipeline::analysis_write_visits_exceeded(checked.status) { reason = 12u8; }
+    elseif pipeline::analysis_owner_replays_exceeded(checked.status) { reason = 13u8; }
+    elseif pipeline::analysis_place_copy_exceeded(checked.status) { reason = 14u8; }
+    elseif pipeline::analysis_slice_merge_exceeded(checked.status) { reason = 15u8; }
+    elseif pipeline::analysis_slice_copy_exceeded(checked.status) { reason = 16u8; }
+    elseif pipeline::analysis_slice_scope_exceeded(checked.status) { reason = 17u8; }
+    elseif pipeline::analysis_slice_assignment_exceeded(checked.status) { reason = 18u8; }
+    elseif pipeline::analysis_borrow_conflict_exceeded(checked.status) { reason = 19u8; }
+    elseif pipeline::analysis_place_merge_exceeded(checked.status) { reason = 20u8; }
+    elseif pipeline::analysis_place_lookup_exceeded(checked.status) { reason = 21u8; }
+    elseif pipeline::analysis_place_exit_exceeded(checked.status) { reason = 22u8; }
+    elseif pipeline::analysis_slot_jump_exceeded(checked.status) { reason = 23u8; }
+    elseif pipeline::analysis_slice_jump_exceeded(checked.status) { reason = 24u8; }
+    elseif pipeline::analysis_name_lookup_exceeded(checked.status) { reason = 25u8; }
+    elseif pipeline::analysis_reservation_exceeded(checked.status) { reason = 26u8; }
+    elseif pipeline::analysis_enum_lookup_exceeded(checked.status) { reason = 27u8; }
+    elseif pipeline::analysis_reference_output_exceeded(checked.status) { reason = 28u8; }
+    elseif pipeline::analysis_value_graph_exceeded(checked.status) { reason = 29u8; }
+    elseif pipeline::analysis_layout_exceeded(checked.status) { reason = 30u8; }
+    elseif pipeline::analysis_decl_intern_exceeded(checked.status) { reason = 31u8; }
+    elseif pipeline::analysis_const_init_exceeded(checked.status) { reason = 32u8; }
+    elseif pipeline::analysis_const_material_exceeded(checked.status) { reason = 33u8; }
+    elseif pipeline::analysis_const_fold_exceeded(checked.status) { reason = 34u8; }
+    elseif pipeline::analysis_integer_probe_exceeded(checked.status) { reason = 35u8; }
+    elseif pipeline::analysis_integer_scan_exceeded(checked.status) { reason = 36u8; }
+    elseif pipeline::analysis_integer_shape_exceeded(checked.status) { reason = 37u8; }
+    elseif pipeline::analysis_array_inference_exceeded(checked.status) { reason = 38u8; }
+    elseif pipeline::analysis_ctor_fields_exceeded(checked.status) { reason = 39u8; }
+    elseif pipeline::analysis_match_scan_exceeded(checked.status) { reason = 40u8; }
+    elseif pipeline::analysis_match_path_exceeded(checked.status) { reason = 41u8; }
+    elseif pipeline::analysis_parse_recovery_exceeded(checked.status) { reason = 42u8; }
+    elseif pipeline::analysis_out_ref_exceeded(checked.status) { reason = 43u8; }
+    elseif pipeline::analysis_projection_exceeded(checked.status) { reason = 44u8; }
+    elseif pipeline::analysis_equality_exceeded(checked.status) { reason = 45u8; }
+    elseif pipeline::analysis_const_snapshot_exceeded(checked.status) { reason = 46u8; }
+    elseif pipeline::analysis_body_intern_exceeded(checked.status) { reason = 47u8; }
+    elseif pipeline::analysis_lex_intern_exceeded(checked.status) { reason = 48u8; }
+    elseif pipeline::analysis_total_work_exceeded(checked.status) { reason = 50u8; }
+    elseif pipeline::analysis_needs_dependencies(checked.status) { reason = 1u8; }
+    elseif pipeline::analysis_rejected(checked.status) && diagnostics.count == 0u32 { reason = 2u8; }
+    return emit_current(state, ticket, diagnostics, reason)?;
+}
+
+export function publish(state: &session::State:ReadWrite, event: &documents::Event:Read): bool!AllocError {
+    if event.status == 1u8 { return snapshot(state, event.ticket); }
+    if event.status == 2u8 {
+        let uri: &json_string::Decoded:Read = &event.closed_uri:Read;
+        let clear: buf::ByteBuf = diagnostic_wire::clear(&uri.data[0..@len(uri.data)]:Read)?;
+        return send(&clear:Read);
+    }
+    if event.status == 5u8 { return inform(4u8); }
+    return true;
+}
+
+// 单帧内沿用同一独占引用，文档事件自身不借用状态。
+function serve_step(state: &session::State:ReadWrite): u8!AllocError {
+    let step: session::Step = session::advance(state)?;
+    if step.status != 3u8 { return step.status; }
+    let wrote: bool = publish(state, &step.event:Read)?;
+    if !wrote { return 2u8; }
+    return 3u8;
+}
+
+// 候选服务和诊断探针共用循环；探针保留空能力集。
+function serve(full_sync: bool): u8!AllocError {
+    var state: session::State = session::create_configured(16777216u32, full_sync);
+    while true {
+        let status: u8 = serve_step(&state:ReadWrite)?;
+        if status != 3u8 { exit(status); }
+    }
+    return 1;
+}
+
+export function run(full_sync: bool): void {
+    let failed: u8!AllocError = serve(full_sync);
+    @drop(failed);
+    exit(1u8);
+}

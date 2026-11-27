@@ -1,0 +1,2 @@
+// expected_trap: active Read borrows
+function main(): void { var x: i64 = 1; let r: &i64 = &x; let w: &i64:ReadWrite = &x:ReadWrite; }

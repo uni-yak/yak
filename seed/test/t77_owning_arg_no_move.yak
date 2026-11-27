@@ -1,0 +1,14 @@
+// t77: owning 实参未显式 @move → trap（owner.md 2.3）
+// expected_trap: owning argument requires explicit @move
+struct Point {
+    x: u32[],
+    y: u32,
+}
+function sink(p: Point): void {
+    return;
+}
+function main(): void {
+    let p: Point = Point { x: [1], y: 2 };
+    sink(p);
+    return;
+}

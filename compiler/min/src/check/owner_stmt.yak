@@ -1,0 +1,189 @@
+// 非控制流语句（局部声明、赋值、@drop）及块退出作用域的所有权检查。
+import ast;
+import types;
+import diag;
+import typecheck;
+import resolve;
+import resolve_refs;
+import owner_write;
+import owner_expr;
+import owner_state;
+
+const KIND_REF: u8 = 4;
+const KIND_SLICE: u8 = 5;
+const KIND_FN_REF: u8 = 8;
+
+const PLACE_LIVE: u8 = 0;
+const PLACE_MOVED: u8 = 1;
+const PLACE_DROPPED: u8 = 2;
+const PLACE_MAYBE_LIVE: u8 = 3;
+const SLOT_EMPTY: u8 = 0;
+
+// 局部声明：初始化后进入 live；out 局部进入 empty。
+export function check_local_decl(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, history: &owner_state::BorrowTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, returns: &owner_state::ReturnDropTable:ReadWrite, slice_assignments: &owner_state::SliceScopeBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, stmt_data: u32, scope: u32): void!AllocError {
+    let local: ast::LocalDecl = pool.locals[stmt_data];
+    if local.init != 4294967295u32 {
+        let init_kind: u8 = pool.exprs[local.init].kind;
+        let source: u32 = owner_state::indexed_place_root(pool, refs, work, local.init);
+        if owner_state::is_owning_projection(pool, checked, borrows.copy_order, local.init) {
+            // let 初始化从 owning 聚合取出投影值属于部分移动（owner.md 2.5 / OW-10）。
+            owner_state::emit(diags, types::error_code(6205), pool.exprs[local.init].span)?;
+            owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, local.init, scope)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        } elseif (init_kind == 0 || init_kind == 25) && source != 0 && owner_state::expr_is_owning(checked, borrows.copy_order, local.init) {
+            owner_state::consume_place(places, borrows, diags, work, source, PLACE_MOVED, pool.exprs[local.init].span)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        } else {
+            owner_expr::check_expr_with_out_context(pool, refs, checked, tables, places, borrows, history, diags, returns, work, local.init, scope, !local.is_const, 4294967295u32)?;
+            if owner_state::owner_work_stopped(work) { return; }
+        }
+    }
+    var def: u32 = 0;
+    if tables.index_locals { def = resolve::local_decl_def(tables, stmt_data, scope, local); }
+    else { def = resolve::lookup_binding(tables, scope, local.name); }
+    if def != 0 && !local.is_const {
+        owner_state::set_place(places, work, def, PLACE_LIVE, SLOT_EMPTY, local.is_out, local.span)?;
+        if work.lookup_exhausted { return; }
+        if local.init != 4294967295u32 {
+            owner_state::assign_slice(&borrows.slices:ReadWrite, pool, refs, checked, tables, diags, work, def, local.init, local.span, slice_assignments)?;
+            if !slice_assignments.exhausted { owner_state::assign_scalar(borrows, pool, refs, checked, tables, diags, work, def, local.init, local.span, slice_assignments)?; }
+        }
+    }
+    return;
+}
+
+// 投影目标须先检查根对象与索引；完整绑定可在右侧求值后重新初始化。
+export function check_assign_stmt(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, history: &owner_state::BorrowTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, returns: &owner_state::ReturnDropTable:ReadWrite, slice_assignments: &owner_state::SliceScopeBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, stmt_data: u32, stmt_span: types::Span, scope: u32): void!AllocError {
+    let assign: ast::AssignStmt = pool.assigns[stmt_data];
+    let target_kind: u8 = pool.exprs[assign.target].kind;
+    let target: u32 = owner_state::indexed_place_root(pool, refs, work, assign.target);
+    let write_fill: bool = owner_write::write_fill_target(pool, refs, checked, assign.target) != 0;
+    // 经标量引用写入看引用能力，而不是承载引用的绑定可重赋值性。
+    let view: u32 = owner_state::scalar_place_view(pool, checked, assign.target);
+    if view < @len(pool.exprs) as u32 && !write_fill {
+        let id: u32 = owner_state::scalar_ref_type(checked, view);
+        if id != 0 && checked.types.entries[id - 1].cap == 0 { owner_state::emit(diags, types::error_code(6008), pool.exprs[assign.target].span)?; return; }
+    }
+    // 直接绑定及普通投影仍遵守 let、const 和 out 的上界。
+    if view >= @len(pool.exprs) as u32 && target != 0 && target <= @len(tables.defs) as u32 {
+        let bind_kind: u8 = tables.defs[target - 1].kind;
+        if bind_kind == 8 { owner_state::emit(diags, types::error_code(6009), pool.exprs[assign.target].span)?; }
+        elseif bind_kind == 4 { owner_state::emit(diags, types::error_code(2006), pool.exprs[assign.target].span)?; }
+        elseif bind_kind == 10 || ((target_kind == 0 || target_kind == 25) && owner_write::is_write_channel(checked, target)) { owner_state::emit(diags, types::error_code(6102), pool.exprs[assign.target].span)?; }
+    }
+    let projected: bool = target_kind != 0 && target_kind != 25;
+    var target_ok: bool = true;
+    var entry: u32 = 0;
+    if projected && !write_fill {
+        let before_diags: u64 = diag::diagbuf_events(diags);
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, assign.target, scope)?;
+        if owner_state::owner_work_stopped(work) { return; }
+        target_ok = diag::diagbuf_events(diags) == before_diags;
+        entry = owner_state::place_index(places, work, target);
+        if work.lookup_exhausted { return; }
+    }
+    let live: bool = entry != 0 && places.items[entry - 1].state == PLACE_LIVE;
+    let before: u64 = borrows.active;
+    let value_kind: u8 = pool.exprs[assign.value].kind;
+    let source: u32 = owner_state::indexed_place_root(pool, refs, work, assign.value);
+    if owner_state::is_owning_projection(pool, checked, borrows.copy_order, assign.value) {
+        // 赋值右侧从 owning 聚合取出投影值属于部分移动（owner.md 2.5 / OW-10）。
+        owner_state::emit(diags, types::error_code(6205), pool.exprs[assign.value].span)?;
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, assign.value, scope)?;
+        if owner_state::owner_work_stopped(work) { return; }
+    } elseif (value_kind == 0 || value_kind == 25) && source != 0 && owner_state::expr_is_owning(checked, borrows.copy_order, assign.value) {
+        owner_state::consume_place(places, borrows, diags, work, source, PLACE_MOVED, pool.exprs[assign.value].span)?;
+        if owner_state::owner_work_stopped(work) { return; }
+    } else {
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, assign.value, scope)?;
+        if owner_state::owner_work_stopped(work) { return; }
+    }
+    // 投影需要写回原宿主；完整绑定则可以用右侧结果重新初始化。
+    if live && places.items[entry - 1].state != PLACE_LIVE { owner_state::emit(diags, types::error_code(6003), pool.exprs[assign.target].span)?; return; }
+    if !target_ok { return; }
+    var conflict: bool = false;
+    if view < @len(pool.exprs) as u32 {
+        conflict = owner_state::scalar_suspended(borrows, pool, refs, work, view, false)?;
+    } else {
+        conflict = owner_state::exclusively_borrowed(borrows, target, before, work) || (!work.conflict_exhausted && owner_state::shared_borrowed(borrows, target, work));
+    }
+    if work.conflict_exhausted { return; }
+    if conflict { owner_state::emit(diags, types::error_code(6004), pool.exprs[assign.target].span)?; return; }
+    if !projected && target != 0 {
+        owner_state::assign_slice(&borrows.slices:ReadWrite, pool, refs, checked, tables, diags, work, target, assign.value, stmt_span, slice_assignments)?;
+        if slice_assignments.exhausted { return; }
+        owner_state::assign_scalar(borrows, pool, refs, checked, tables, diags, work, target, assign.value, stmt_span, slice_assignments)?;
+        if slice_assignments.exhausted || owner_state::owner_work_stopped(work) { return; }
+        owner_state::set_place_state(places, work, target, PLACE_LIVE, stmt_span)?;
+        if work.lookup_exhausted { return; }
+    }
+    return;
+}
+
+// @drop 语句：立即析构实参所指 place，之后该 place 不得再用。
+export function check_drop_stmt(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, history: &owner_state::BorrowTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, returns: &owner_state::ReturnDropTable:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, stmt_data: u32, stmt_span: types::Span, scope: u32): void!AllocError {
+    // 消费后不再递归读取同一表达式，否则会把这次析构本身误报成移动后使用。
+    let root: u32 = owner_state::indexed_place_root(pool, refs, work, stmt_data);
+    let kind: u8 = pool.exprs[stmt_data].kind;
+    if kind == 23 || kind == 24 || kind == 27 {
+        // @drop 只接受整 place；对成员、索引或切片投影析构一律拒绝（owner.md 6.4 / OW-11）。
+        owner_state::emit(diags, types::error_code(6206), stmt_span)?;
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, stmt_data, scope)?;
+        return;
+    }
+    if (kind == 0 || kind == 25) && root != 0 && root <= @len(tables.defs) as u32 && tables.defs[root - 1].kind == 4 {
+        owner_state::emit(diags, types::error_code(6204), stmt_span)?;
+        return;
+    }
+    let bound: bool = (kind == 0 || kind == 25) && root != 0 && owner_state::place_index(places, work, root) != 0;
+    if work.lookup_exhausted { return; }
+    if bound {
+        let id: u32 = owner_state::def_type_of(checked, root);
+        if id != 0 && id <= @len(checked.types.entries) as u32 {
+            let type_kind: u8 = checked.types.entries[id - 1].kind;
+            if type_kind == KIND_REF || type_kind == KIND_SLICE || type_kind == KIND_FN_REF { owner_state::emit(diags, types::error_code(6204), stmt_span)?; return; }
+        }
+        owner_state::consume_place(places, borrows, diags, work, root, PLACE_DROPPED, stmt_span)?;
+    } else {
+        // 确定为值的表达式不是可析构的 place，仍需检查其内部求值。
+        if (kind == 21 && !owner_write::unary_is_deref(pool, stmt_data)) || (kind != 0 && kind != 25 && kind != 21 && kind != 23 && kind != 24 && kind != 27) { owner_state::emit(diags, types::error_code(6204), stmt_span)?; }
+        owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, stmt_data, scope)?;
+    }
+    return;
+}
+
+// 非函数体子块离块时记录本作用域仍 live 的 owning 局部析构计划，并过滤切片归属。
+export function finish_block_scope(checked: &typecheck::TypeCheckResult:Read, tables: &resolve::ResolveTables:Read, places: &owner_state::PlaceTable:ReadWrite, borrows: &owner_state::BorrowState:ReadWrite, returns: &owner_state::ReturnDropTable:ReadWrite, slice_scopes: &owner_state::SliceScopeBudget:ReadWrite, work: &owner_state::OwnerWorkBudget:ReadWrite, block: u32, block_scope: u32, fell_through: bool): void!AllocError {
+    if block_scope != 0 && block_scope <= @len(tables.scopes) as u32 && tables.scopes[block_scope - 1].kind != 3 {
+        var exit_scope: u32 = block_scope;
+        let parent: u32 = tables.scopes[block_scope - 1].parent;
+        // 匹配臂的载荷绑定属于臂域，按来源顺序先进入，再与臂体局部一起退出。
+        if parent != 0 && tables.scopes[parent - 1].kind == 5 { exit_scope = parent; }
+        if fell_through && returns.enabled {
+            var block_defs: u32[] = owner_write::live_drop_defs_scoped(checked, borrows.copy_order, tables, places, returns.locals_start, exit_scope, false)?;
+            if @len(block_defs) != 0 {
+                @push(returns.scopes, owner_state::ScopeDropPlan { edge: 4u32, site: block, defs: @move(block_defs) })?;
+            }
+        }
+        var d: u32 = returns.locals_start;
+        while d < @len(places.items) as u32 {
+            if !owner_state::visit_place_exit(work) { return; }
+            let def: u32 = places.items[d].def;
+            // 条件所有者在离块边上同样被清理，故一并置为已析构。
+            let owned: bool = places.items[d].state == PLACE_LIVE || places.items[d].state == PLACE_MAYBE_LIVE;
+            if def != 0 && def <= @len(tables.defs) as u32 && owned && owner_state::place_exit_scope_encloses(tables, exit_scope, tables.defs[def - 1].scope, work) {
+                places.items[d].state = PLACE_DROPPED;
+            }
+            if work.exit_exhausted { return; }
+            d = d + 1;
+        }
+    }
+    // 离块按声明域过滤；对子块中的外层变量赋值必须保留。
+    if @len(borrows.slices.items) != 0 {
+        let parent: u32 = tables.scopes[block_scope - 1].parent;
+        let kept: owner_state::SliceState = owner_state::keep_slices(&borrows.slices:Read, tables, parent, slice_scopes)?;
+        if slice_scopes.exhausted { return; }
+        borrows.slices = @move(kept);
+    }
+    return;
+}

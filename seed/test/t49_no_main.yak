@@ -1,0 +1,5 @@
+// t49: no main（应 trap）
+// expected_trap: no main function
+function foo(): void {
+    return;
+}

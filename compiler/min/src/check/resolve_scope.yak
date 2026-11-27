@@ -1,0 +1,634 @@
+// 单元内路径、类型与语句引用的遍历。
+import buf;
+import lex;
+import types;
+import ast;
+import diag;
+import resolve;
+import lextables;
+import resolve_refs;
+
+const builtin_void: u16 = 4107;
+const missing_variant: u32 = 4294967295u32;
+const invalid_variant_binding: u32 = 4294967294u32;
+
+function iface_name_equals(iface: &resolve_refs::Iface:Read, names: &lex::NameTable:Read, name_id: u32, off: u32, len: u32): bool {
+    if name_id == 0 || name_id > @len(names.entries) as u32 { return false; }
+    let entry: lex::NameEntry = names.entries[name_id - 1];
+    if entry.text_len as u32 != len { return false; }
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    var i: u32 = 0;
+    while i < len {
+        if off + i >= @len(iface.names) as u32 { return false; }
+        if iface.names[off + i] != arena.data[entry.text_off + i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+function dep_export_index(deps: &resolve_refs::DependencySet:Read, dep: u32, names: &lex::NameTable:Read, name_id: u32): u32 {
+    if dep == 0 || dep > @len(deps.ifaces) as u32 { return 0; }
+    let name_hash: u64 = names.entries[name_id - 1].hash;
+    let name_len: u32 = names.entries[name_id - 1].text_len as u32;
+    var i: u32 = 0;
+    while i < @len(deps.ifaces[dep - 1].exports) as u32 {
+        if deps.ifaces[dep - 1].exports[i].name_hash == name_hash && deps.ifaces[dep - 1].exports[i].name_len as u32 == name_len {
+            if iface_name_equals(&deps.ifaces[dep - 1]:Read, names, name_id, deps.ifaces[dep - 1].exports[i].name_off, name_len) {
+                return i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// 与 dep_export_index 同一匹配方式，只是在依赖的私有名表里查找。
+function dep_private_index(deps: &resolve_refs::DependencySet:Read, dep: u32, names: &lex::NameTable:Read, name_id: u32): u32 {
+    if dep == 0 || dep > @len(deps.ifaces) as u32 || name_id == 0 || name_id > @len(names.entries) as u32 { return 0; }
+    let name_hash: u64 = names.entries[name_id - 1].hash;
+    let name_len: u32 = names.entries[name_id - 1].text_len as u32;
+    var i: u32 = 0;
+    while i < @len(deps.ifaces[dep - 1].privates) as u32 {
+        if deps.ifaces[dep - 1].privates[i].name_hash == name_hash && deps.ifaces[dep - 1].privates[i].name_len as u32 == name_len {
+            if iface_name_equals(&deps.ifaces[dep - 1]:Read, names, name_id, deps.ifaces[dep - 1].privates[i].name_off, name_len) {
+                return i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+function dep_variant_find(deps: &resolve_refs::DependencySet:Read, dep: u32, enum_export: u32, names: &lex::NameTable:Read, name_id: u32): u32 {
+    if dep == 0 || dep > @len(deps.ifaces) as u32 { return missing_variant; }
+    let name_hash: u64 = names.entries[name_id - 1].hash;
+    let name_len: u32 = names.entries[name_id - 1].text_len as u32;
+    var i: u32 = 0;
+    while i < @len(deps.ifaces[dep - 1].enum_members) as u32 {
+        if deps.ifaces[dep - 1].enum_members[i].enum_export == enum_export && deps.ifaces[dep - 1].enum_members[i].name_hash == name_hash && deps.ifaces[dep - 1].enum_members[i].name_len as u32 == name_len {
+            if iface_name_equals(&deps.ifaces[dep - 1]:Read, names, name_id, deps.ifaces[dep - 1].enum_members[i].name_off, name_len) {
+                return deps.ifaces[dep - 1].enum_members[i].variant;
+            }
+        }
+        i = i + 1;
+    }
+    return missing_variant;
+}
+function import_data_of(imports: &resolve_refs::ImportMap:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(imports.defs) as u32 {
+        if imports.defs[i] == def { return imports.data[i]; }
+        i = i + 1;
+    }
+    return 4294967295u32;
+}
+function builtin_of(names: &lex::NameTable:Read, name: u32): u16 {
+    if name == 0 || name > @len(names.entries) as u32 { return 0; }
+    return names.entries[name - 1].builtin_id;
+}
+function builtin_variant_of(names: &lex::NameTable:Read, host: u16, name: u32): u32 {
+    if name == 0 || name > @len(names.entries) as u32 { return missing_variant; }
+    let label: u32 = names.entries[name - 1].variant_name;
+    if label == 0 { return missing_variant; }
+    if label > lextables::builtin_variant_name_count() || label > @len(names.variant_names) as u32 || names.variant_names[label - 1] != name {
+        return invalid_variant_binding;
+    }
+    return lextables::builtin_variant(host, label);
+}
+function use_def(tables: &resolve::ResolveTables:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, def: u32, ref_offset: u32, allow_call: bool, address: bool, node_kind: u8, node: u32, span: types::Span): void!AllocError {
+    if def == 0 || def > @len(tables.defs) as u32 { return; }
+    let info: resolve::DefEntry = tables.defs[def - 1];
+    tables.defs[def - 1].used = true;
+    if ref_offset < info.decl_offset {
+        if !(allow_call && (info.kind == 1 || info.kind == 5)) { resolve_refs::emit(diags, types::error_code(4004), span)?; }
+    }
+    var call_kind: u32 = 0;
+    if (allow_call || address) && node_kind == 0 { call_kind = info.kind as u32; }
+    resolve_refs::record(refs, node_kind, node, 0, def, call_kind, 0, span)?;
+    return;
+}
+function bridge_find(bridges: &resolve_refs::BridgeTable:Read, import_def: u32, name: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(bridges.items) as u32 {
+        if bridges.items[i].import_def == import_def && bridges.items[i].name == name { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function variant_bridge_find(bridges: &resolve_refs::BridgeTable:Read, dep: u32, enum_export: u32, name: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(bridges.variants) as u32 {
+        if bridges.variants[i].dependency as u32 == dep && bridges.variants[i].enum_export == enum_export && bridges.variants[i].name == name { return bridges.variants[i].variant; }
+        i = i + 1;
+    }
+    return missing_variant;
+}
+function add_variant_bridge(bridges: &resolve_refs::BridgeTable:ReadWrite, dep: u32, enum_export: u32, name: u32, variant: u32): void!AllocError {
+    @push(bridges.variants, resolve_refs::VariantBridge { dependency: dep as u16, enum_export: enum_export, name: name, variant: variant })?;
+    return;
+}
+function segment_count(pool: &ast::AstPool:Read, source: u8, id: u32): u32 {
+    if source == 3 { return 1; }
+    if source == 0 {
+        if id >= @len(pool.paths) as u32 { return 0; }
+        return @len(pool.paths[id].segments) as u32;
+    }
+    if source == 1 {
+        if id >= @len(pool.type_paths) as u32 { return 0; }
+        return @len(pool.type_paths[id].segments) as u32;
+    }
+    if source == 2 {
+        if id >= @len(pool.patterns) as u32 { return 0; }
+        return @len(pool.patterns[id].path) as u32;
+    }
+    if id >= @len(pool.ctors) as u32 { return 0; }
+    return @len(pool.ctors[id].path) as u32;
+}
+function segment_at(pool: &ast::AstPool:Read, source: u8, id: u32, index: u32): u32 {
+    if source == 3 { return id; }
+    if source == 0 { return pool.paths[id].segments[index]; }
+    if source == 1 { return pool.type_paths[id].segments[index]; }
+    if source == 2 { return pool.patterns[id].path[index]; }
+    return pool.ctors[id].path[index];
+}
+function mark_used(tables: &resolve::ResolveTables:ReadWrite, def: u32): void {
+    if def >= 1 && def <= @len(tables.defs) as u32 { tables.defs[def - 1].used = true; }
+    return;
+}
+// mode：0=值，1=类型，2=模式，3=取地址。只有直接调用可前向引用函数。
+struct PathSource { kind: u8, id: u32 }
+function defer_enum_spelling(refs: &resolve_refs::RefTable:ReadWrite, name: u32, node: u32, span: types::Span, fallback: u32): bool!AllocError {
+    if !resolve_refs::has_enum_spelling(&*refs:Read, name) { return false; }
+    resolve_refs::record(refs, 0, node, resolve_refs::pending_value_name(), name, 0, fallback, span)?;
+    return true;
+}
+
+function resolve_segments(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, scope: u32, origin: PathSource, mode: u8, node_kind: u8, node: u32, span: types::Span, allow_call: bool): void!AllocError {
+    let source: u8 = origin.kind;
+    let source_id: u32 = origin.id;
+    let count: u32 = segment_count(pool, source, source_id);
+    if count == 0 { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+    let first: u32 = segment_at(pool, source, source_id, 0);
+    let contextual: bool = work.contextual_enum_labels && source == 3 && mode == 0;
+    let def: u32 = resolve::lookup_binding_limited(tables, work, scope, first);
+    if work.exhausted { return; }
+    if def != 0 {
+        let info: resolve::DefEntry = tables.defs[def - 1];
+        if info.kind == 6 {
+            mark_used(tables, def);
+            if contextual && defer_enum_spelling(refs, first, node, span, 4002)? { return; }
+            let dep: u32 = info.import_dependency as u32;
+            let import_data: u32 = import_data_of(imports, def);
+            if dep == 0 || import_data == 4294967295u32 { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+            let import_len: u32 = @len(pool.imports[import_data].path) as u32;
+            var index: u32 = 1;
+            var suffix: bool = true;
+            while index < import_len {
+                if index >= count || segment_at(pool, source, source_id, index) != pool.imports[import_data].path[index] { suffix = false; break; }
+                index = index + 1;
+            }
+            if !suffix || index >= count { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+            let member: u32 = segment_at(pool, source, source_id, index);
+            var bridge: u32 = bridge_find(&*bridges:Read, def, member);
+            if bridge == 0 {
+                let export_index: u32 = dep_export_index(deps, dep, names, member);
+                if export_index == 0 {
+                    // 依赖的私有名节区分未导出和不存在。
+                    if dep_private_index(deps, dep, names, member) != 0 { resolve_refs::emit(diags, types::error_code(4008), span)?; return; }
+                    resolve_refs::emit(diags, types::error_code(4002), span)?; return;
+                }
+                let exported: resolve_refs::IfaceExport = deps.ifaces[dep - 1].exports[export_index - 1];
+                if exported.export_id == 0 { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                @push(bridges.items, resolve_refs::BridgeRecord { import_def: def, name: member, dependency: dep as u16,
+                    export_id: exported.export_id, kind: exported.kind, flags: exported.flags })?;
+                bridge = @len(bridges.items) as u32;
+            }
+            let export_id: u32 = bridges.items[bridge - 1].export_id;
+            let export_kind: u8 = bridges.items[bridge - 1].kind;
+            if mode == 1 {
+                if export_kind != 2 && export_kind != 3 { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                if index + 1 < count { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                resolve_refs::record(refs, node_kind, node, 2, dep, export_id, 0, span)?;
+                return;
+            }
+            if mode == 2 {
+                if export_kind != 2 { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                if index + 2 != count { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                let variant_name: u32 = segment_at(pool, source, source_id, index + 1);
+                var variant: u32 = variant_bridge_find(bridges, dep, export_id, variant_name);
+                if variant == missing_variant {
+                    variant = dep_variant_find(deps, dep, export_id, names, variant_name);
+                    if variant == missing_variant { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                    add_variant_bridge(bridges, dep, export_id, variant_name, variant)?;
+                }
+                resolve_refs::record(refs, node_kind, node, 4, dep, export_id, variant, span)?;
+                return;
+            }
+            // 值模式
+            if index + 1 < count {
+                if export_kind != 2 || index + 2 != count { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                let variant_name: u32 = segment_at(pool, source, source_id, index + 1);
+                var variant: u32 = variant_bridge_find(bridges, dep, export_id, variant_name);
+                if variant == missing_variant {
+                    variant = dep_variant_find(deps, dep, export_id, names, variant_name);
+                    if variant == missing_variant { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+                    add_variant_bridge(bridges, dep, export_id, variant_name, variant)?;
+                }
+                resolve_refs::record(refs, node_kind, node, 4, dep, export_id, variant, span)?;
+                return;
+            }
+            var call_kind: u32 = 0;
+            if (allow_call || mode == 3) && node_kind == 0 { call_kind = export_kind as u32; }
+            resolve_refs::record(refs, node_kind, node, 2, dep, export_id, call_kind, span)?;
+            return;
+        }
+        // 类型位置只接受类型定义，不回退到被遮蔽的内建名称。
+        if mode == 1 && (count != 1 || (info.kind != 2 && info.kind != 3 && info.kind != 11)) { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+        // 本地声明
+        if count == 1 {
+            if contextual && span.offset < info.decl_offset && !(allow_call && (info.kind == 1 || info.kind == 5)) {
+                if defer_enum_spelling(refs, first, node, span, 4004)? { mark_used(tables, def); return; }
+            }
+            use_def(tables, refs, diags, def, span.offset, allow_call, mode == 3, node_kind, node, span)?;
+            return;
+        }
+        if info.kind != 2 || count != 2 { resolve_refs::emit(diags, types::error_code(4002), span)?; return; }
+        let variant_name: u32 = segment_at(pool, source, source_id, 1);
+        var i: u32 = 0;
+        while i < @len(tables.enum_members) as u32 {
+            if !resolve::visit_enum_lookup(work) { return; }
+            if tables.enum_members[i].host == def && tables.enum_members[i].name == variant_name {
+                mark_used(tables, def);
+                resolve_refs::record(refs, node_kind, node, 3, def, tables.enum_members[i].variant, 0, span)?;
+                return;
+            }
+            i = i + 1;
+        }
+        resolve_refs::emit(diags, types::error_code(4002), span)?;
+        return;
+    }
+    if mode == 1 && count == 1 {
+        let builtin: u16 = builtin_of(names, first);
+        if builtin != 0 {
+            resolve_refs::record(refs, node_kind, node, 1, builtin as u32, 0, 0, span)?;
+            return;
+        }
+    }
+    if mode != 1 && count == 2 {
+        let host: u16 = builtin_of(names, first);
+        if host != 0 {
+            let variant: u32 = builtin_variant_of(names, host, segment_at(pool, source, source_id, 1));
+            if variant == invalid_variant_binding {
+                resolve_refs::emit(diags, types::error_code(7019), span)?;
+                return;
+            }
+            if variant != missing_variant {
+                resolve_refs::record(refs, node_kind, node, 5, host as u32, variant, 0, span)?;
+                return;
+            }
+        }
+    }
+    if contextual && defer_enum_spelling(refs, first, node, span, 4002)? { return; }
+    resolve_refs::emit(diags, types::error_code(4002), span)?;
+    return;
+}
+function resolve_path_expr(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, scope: u32, expr: u32, mode: u8, allow_call: bool): void!AllocError {
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    let span: types::Span = pool.exprs[expr].span;
+    if kind == 0 {
+        resolve_segments(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, PathSource { kind: 3, id: data }, mode, 0, expr, span, allow_call)?;
+        if work.exhausted { return; }
+    } elseif kind == 25 {
+        resolve_segments(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, PathSource { kind: 0, id: data }, mode, 0, expr, span, allow_call)?;
+        if work.exhausted { return; }
+    }
+    return;
+}
+function resolve_type(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, scope: u32, type_id: u32): void!AllocError {
+    if type_id >= @len(pool.types) as u32 { return; }
+    let kind: u8 = pool.types[type_id].kind;
+    let data: u32 = pool.types[type_id].data;
+    let span: types::Span = pool.types[type_id].span;
+    if kind == 1 {
+        resolve_segments(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, PathSource { kind: 1, id: data }, 1, 1, type_id, span, false)?;
+        if work.exhausted { return; }
+    } elseif kind == 2 {
+        let fixed_id: u32 = data;
+        if fixed_id < @len(pool.fixed_arrays) as u32 {
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.fixed_arrays[fixed_id].element)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 9 {
+        if data >= @len(pool.plain_unions) as u32 { return; }
+        var i: u32 = 0;
+        while i < @len(pool.plain_unions[data].members) as u32 {
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.plain_unions[data].members[i])?;
+            if work.exhausted { return; }
+            i = i + 1;
+        }
+    } elseif kind == 3 || kind == 8 {
+        resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, data)?;
+        if work.exhausted { return; }
+    } elseif kind == 4 || kind == 5 {
+        let ref_id: u32 = data;
+        if ref_id < @len(pool.refs) as u32 {
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.refs[ref_id].referent)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 6 {
+        let fn_id: u32 = data;
+        if fn_id < @len(pool.fn_refs) as u32 {
+            var i: u32 = 0;
+            while i < @len(pool.fn_refs[fn_id].params) as u32 {
+                resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.fn_refs[fn_id].params[i])?;
+                if work.exhausted { return; }
+                i = i + 1;
+            }
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.fn_refs[fn_id].ret_type)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 7 {
+        let fallible_id: u32 = data;
+        if fallible_id < @len(pool.fallibles) as u32 {
+            let success: u32 = pool.fallibles[fallible_id].success;
+            let success_ref: u32 = @len(refs.items) as u32;
+            let success_diags: u64 = diag::diagbuf_events(diags);
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, success)?;
+            if work.exhausted { return; }
+            let success_named: bool = success < @len(pool.types) as u32 && pool.types[success].kind == 1 && success_ref < @len(refs.items) as u32 && diag::diagbuf_events(diags) == success_diags;
+            var overlap: bool = false;
+            let set_id: u32 = pool.fallibles[fallible_id].error_set;
+            if set_id < @len(pool.error_sets) as u32 {
+                var i: u32 = 0;
+                while i < @len(pool.error_sets[set_id].members) as u32 {
+                    let member: u32 = pool.error_sets[set_id].members[i];
+                    let before_refs: u32 = @len(refs.items) as u32;
+                    let before_diags: u64 = diag::diagbuf_events(diags);
+                    resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, member)?;
+                    if work.exhausted { return; }
+                    if diag::diagbuf_events(diags) == before_diags && member < @len(pool.types) as u32 {
+                        var is_enum: bool = false;
+                        if pool.types[member].kind == 1 && before_refs < @len(refs.items) as u32 {
+                            let ref: resolve_refs::ResolvedRef = refs.items[before_refs];
+                            if ref.kind == 0 && ref.x >= 1 && ref.x <= @len(tables.defs) as u32 { is_enum = tables.defs[ref.x - 1].kind == 2; }
+                            elseif ref.kind == 1 { is_enum = ref.x == 4108; }
+                            elseif ref.kind == 2 { is_enum = resolve_refs::dep_export_kind(deps, ref.x, ref.y) == 2; }
+                        }
+                        if !is_enum { resolve_refs::emit(diags, types::error_code(5807), pool.types[member].span)?; }
+                        elseif success_named && !overlap {
+                            let left: resolve_refs::ResolvedRef = refs.items[success_ref];
+                            let right: resolve_refs::ResolvedRef = refs.items[before_refs];
+                            if left.kind == right.kind && left.x == right.x && left.y == right.y {
+                                resolve_refs::emit(diags, types::error_code(5802), span)?;
+                                overlap = true;
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    return;
+}
+function resolve_expr(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, scope: u32, expr: u32, direct_call: bool): void!AllocError {
+    if expr >= @len(pool.exprs) as u32 { return; }
+    let kind: u8 = pool.exprs[expr].kind;
+    let data: u32 = pool.exprs[expr].data as u32;
+    if kind == 0 || kind == 25 {
+        resolve_path_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, expr, 0, direct_call)?;
+        if work.exhausted { return; }
+    } elseif kind == 20 {
+        if data < @len(pool.binaries) as u32 {
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.binaries[data].left, false)?;
+            if work.exhausted { return; }
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.binaries[data].right, false)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 21 {
+        if data < @len(pool.unaries) as u32 {
+            let operand: u32 = pool.unaries[data].operand;
+            if pool.unaries[data].op == 19 && operand < @len(pool.exprs) as u32 &&
+                (pool.exprs[operand].kind == 0 || pool.exprs[operand].kind == 25) {
+                resolve_path_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, operand, 3, false)?;
+            } else { resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, operand, false)?; }
+            if work.exhausted { return; }
+        }
+    } elseif kind == 29 {
+        // @ 原语专用表达式：payload 已是 BuiltinId，直接登记为内置引用。
+        resolve_refs::record(refs, 0, expr, 1, data, 0, 0, pool.exprs[expr].span)?;
+    } elseif kind == 22 {
+        if data < @len(pool.calls) as u32 {
+            let callee: u32 = pool.calls[data].callee;
+            let first_ref: u32 = @len(refs.items) as u32;
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, callee, true)?;
+            if work.exhausted { return; }
+            // 常量调用的被调项是路径；只看刚解析出的身份，不按拼写猜测。
+            if pool.calls[data].in_const && first_ref < @len(refs.items) as u32 {
+                let target: resolve_refs::ResolvedRef = refs.items[first_ref];
+                if target.node == callee && ((target.kind == 0 && (target.y == 1 || target.y == 5)) || (target.kind == 2 && target.z == 1)) {
+                    resolve_refs::emit(diags, types::error_code(3008), pool.calls[data].span)?;
+                }
+            }
+            var i: u32 = 0;
+            while i < @len(pool.calls[data].args) as u32 {
+                let arg: ast::CallArg = pool.calls[data].args[i];
+                if arg.kind == 1 {
+                    let slot: u32 = resolve::lookup_binding_limited(tables, work, scope, arg.value);
+                    if work.exhausted { return; }
+                    if slot == 0 { resolve_refs::emit(diags, types::error_code(4002), arg.span)?; }
+                    else {
+                        mark_used(tables, slot);
+                        if tables.defs[slot - 1].kind != 10 { resolve_refs::emit(diags, types::error_code(6102), arg.span)?; }
+                        resolve_refs::record(refs, 3, data, 0, i, slot, 0, arg.span)?;
+                    }
+                } else {
+                    resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, arg.value, false)?;
+                    if work.exhausted { return; }
+                }
+                i = i + 1;
+            }
+        }
+    } elseif kind == 23 {
+        if data < @len(pool.members) as u32 {
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.members[data].object, false)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 24 {
+        if data < @len(pool.indices) as u32 {
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.indices[data].object, false)?;
+            if work.exhausted { return; }
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.indices[data].index, false)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 26 {
+        if data < @len(pool.arrays) as u32 {
+            var i: u32 = 0;
+            while i < @len(pool.arrays[data].elements) as u32 {
+                resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.arrays[data].elements[i], false)?;
+                if work.exhausted { return; }
+                i = i + 1;
+            }
+        }
+    } elseif kind == 27 {
+        if data < @len(pool.slices) as u32 {
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.slices[data].object, false)?;
+            if work.exhausted { return; }
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.slices[data].low, false)?;
+            if work.exhausted { return; }
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.slices[data].high, false)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 28 || kind == 32 {
+        if data < @len(pool.casts) as u32 {
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.casts[data].operand, false)?;
+            if work.exhausted { return; }
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.casts[data].target_type)?;
+            if work.exhausted { return; }
+        }
+    } elseif kind == 13 {
+        resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, data, false)?;
+        if work.exhausted { return; }
+    } elseif kind == 30 {
+        if data < @len(pool.ctors) as u32 {
+            let span: types::Span = pool.exprs[expr].span;
+            // 结构体构造本身取值，引用按表达式登记（node_kind 0），类型检查据此取名义类型。
+            resolve_segments(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, PathSource { kind: 4, id: data }, 1, 0, expr, span, false)?;
+            if work.exhausted { return; }
+            var i: u32 = 0;
+            while i < @len(pool.ctors[data].fields) as u32 {
+                resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.ctors[data].fields[i].value, false)?;
+                if work.exhausted { return; }
+                i = i + 1;
+            }
+        }
+    }
+    return;
+}
+function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, block_id: u32, scope: u32): void!AllocError {
+    var index: u32 = 0;
+    while index < @len(pool.blocks[block_id].stmts) as u32 {
+        let stmt: ast::Stmt = pool.stmts[pool.blocks[block_id].stmts[index]];
+        if stmt.kind == 1 {
+            let local: ast::LocalDecl = pool.locals[stmt.data];
+            let first_ref: u32 = @len(refs.items) as u32;
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, local.type_ref)?;
+            if work.exhausted { return; }
+            // 解析后的内置 void 不是可保存的具体值；不匹配同名路径或数组元素。
+            if local.is_out && first_ref < @len(refs.items) as u32 {
+                let item: resolve_refs::ResolvedRef = refs.items[first_ref];
+                if item.node_kind == 1 && item.node == local.type_ref && item.kind == 1 && item.x == builtin_void as u32 {
+                    resolve_refs::emit(diags, types::error_code(6104), item.span)?;
+                }
+            }
+            if local.init != 4294967295u32 { resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, local.init, false)?; if work.exhausted { return; } }
+        } elseif stmt.kind == 10 {
+            if stmt.data != 4294967295u32 { resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, stmt.data, false)?; if work.exhausted { return; } }
+        } elseif stmt.kind == 14 {
+            let if_id: u32 = stmt.data;
+            var branch: u32 = 0;
+            while branch < @len(pool.ifs[if_id].branches) as u32 {
+                resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.ifs[if_id].branches[branch].condition, false)?;
+                if work.exhausted { return; }
+                let body_scope: u32 = tables.block_scope[pool.ifs[if_id].branches[branch].body];
+                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, pool.ifs[if_id].branches[branch].body, body_scope)?;
+                if work.exhausted { return; }
+                branch = branch + 1;
+            }
+            let else_body: u32 = pool.ifs[if_id].else_body;
+            if else_body < @len(pool.blocks) as u32 {
+                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, else_body, tables.block_scope[else_body])?;
+                if work.exhausted { return; }
+            }
+        } elseif stmt.kind == 15 {
+            let while_id: u32 = stmt.data;
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.whiles[while_id].condition, false)?;
+            if work.exhausted { return; }
+            let body: u32 = pool.whiles[while_id].body;
+            resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body])?;
+            if work.exhausted { return; }
+        } elseif stmt.kind == 16 {
+            let match_id: u32 = stmt.data;
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.matches[match_id].scrutinee, false)?;
+            if work.exhausted { return; }
+            var arm: u32 = 0;
+            while arm < @len(pool.matches[match_id].arms) as u32 {
+                let pattern_id: u32 = pool.matches[match_id].arms[arm].pattern;
+                if pattern_id < @len(pool.patterns) as u32 && pool.patterns[pattern_id].kind == 0 {
+                    if segment_count(pool, 2, pattern_id) >= 2 {
+                        let span: types::Span = pool.patterns[pattern_id].span;
+                        resolve_segments(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, PathSource { kind: 2, id: pattern_id }, 2, 2, pattern_id, span, false)?;
+                        if work.exhausted { return; }
+                    } elseif segment_count(pool, 2, pattern_id) == 1 {
+                        let variant: u32 = builtin_variant_of(names, 4108, segment_at(pool, 2, pattern_id, 0));
+                        if variant == invalid_variant_binding { resolve_refs::emit(diags, types::error_code(7019), pool.patterns[pattern_id].span)?; }
+                        elseif variant != missing_variant { resolve_refs::record(refs, 2, pattern_id, 6, 4108, variant, 0, pool.patterns[pattern_id].span)?; }
+                    }
+                }
+                let body: u32 = pool.matches[match_id].arms[arm].body;
+                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body])?;
+                if work.exhausted { return; }
+                arm = arm + 1;
+            }
+        } elseif stmt.kind == 17 {
+            let assign_id: u32 = stmt.data;
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.assigns[assign_id].target, false)?;
+            if work.exhausted { return; }
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.assigns[assign_id].value, false)?;
+            if work.exhausted { return; }
+        } elseif stmt.kind == 13 || stmt.kind == 18 {
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, stmt.data, false)?;
+            if work.exhausted { return; }
+        }
+        index = index + 1;
+    }
+    return;
+}
+export function resolve_items(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, file: &ast::AstFile:Read): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        let item: ast::AstItem = file.items[i];
+        if item.kind == 0 {
+            let data: u32 = item.data;
+            var p: u32 = 0;
+            while p < @len(pool.functions[data].params) as u32 {
+                resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.functions[data].params[p].type_ref)?;
+                if work.exhausted { return; }
+                p = p + 1;
+            }
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.functions[data].ret_type)?;
+            if work.exhausted { return; }
+            let body: u32 = pool.functions[data].body;
+            resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body])?;
+            if work.exhausted { return; }
+        } elseif item.kind == 1 {
+            var v: u32 = 0;
+            while v < @len(pool.enums[item.data].variants) as u32 {
+                let payload: u32 = pool.enums[item.data].variants[v].payload_type;
+                if payload != 4294967295u32 { resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, payload)?; if work.exhausted { return; } }
+                v = v + 1;
+            }
+        } elseif item.kind == 2 {
+            var f: u32 = 0;
+            while f < @len(pool.structs[item.data].fields) as u32 {
+                resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.structs[item.data].fields[f].type_ref)?;
+                if work.exhausted { return; }
+                f = f + 1;
+            }
+        } elseif item.kind == 3 {
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.consts[item.data].type_ref)?;
+            if work.exhausted { return; }
+            resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.consts[item.data].init, false)?;
+            if work.exhausted { return; }
+        } elseif item.kind == 4 {
+            var p: u32 = 0;
+            while p < @len(pool.foreigns[item.data].params) as u32 {
+                resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.foreigns[item.data].params[p].type_ref)?;
+                if work.exhausted { return; }
+                p = p + 1;
+            }
+            resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.foreigns[item.data].ret_type)?;
+            if work.exhausted { return; }
+        }
+        i = i + 1;
+    }
+    return;
+}

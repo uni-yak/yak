@@ -1,0 +1,189 @@
+// 类型书写位置规则（parse.md P-9，base.md 4.4/5.5，result.md RE-8）。
+// 解析器只记录书写形态；名字与布局检查留给后续阶段。
+import ast;
+import types;
+import parse_core;
+
+export function type_kind(pool: &ast::AstPool:Read, id: u32): u8 {
+    if id >= @len(pool.types) as u32 { return 255; }
+    return pool.types[id].kind;
+}
+export function type_span(pool: &ast::AstPool:Read, id: u32): types::Span {
+    if id >= @len(pool.types) as u32 { return types::Span { file: 0, offset: 0, length: 0 }; }
+    return pool.types[id].span;
+}
+function is_view(kind: u8): bool { return kind == 4 || kind == 5 || kind == 11; }
+function wraps_fallible(p: &parse_core::Parser:Read, pool: &ast::AstPool:Read, id: u32): bool {
+    return type_kind(pool, id) == 8 && parse_core::option_syntax(p) && type_kind(pool, pool.types[id].data) == 7;
+}
+function is_write_view(pool: &ast::AstPool:Read, type_id: u32): bool {
+    let kind: u8 = type_kind(pool, type_id);
+    if kind != 4 && kind != 5 { return false; }
+    let ref_id: u32 = pool.types[type_id].data;
+    return ref_id < @len(pool.refs) as u32 && pool.refs[ref_id].capability == 2;
+}
+
+// 视图与 fallible carrier 不得出现在第一层聚合之下。
+export function validate_nested(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32, depth: u8): void!AllocError {
+    if p.depth_limit == 0u32 {
+        validate_nested_inner(p, pool, type_id, depth)?;
+        return;
+    }
+    if !parse_core::enter_depth(p) { return; }
+    validate_nested_inner(p, pool, type_id, depth)?;
+    parse_core::leave_depth(p);
+    return;
+}
+function validate_nested_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32, depth: u8): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if kind == 255 { return; }
+    if depth > 0 && is_view(kind) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(2009))?;
+        return;
+    }
+    if depth > 0 && (kind == 7 || wraps_fallible(p, pool, type_id)) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(5811))?;
+        return;
+    }
+    if kind == 2 {
+        let fixed_id: u32 = pool.types[type_id].data;
+        if fixed_id < @len(pool.fixed_arrays) as u32 {
+            validate_nested(p, pool, pool.fixed_arrays[fixed_id].element, depth + 1)?;
+        }
+    } elseif kind == 3 {
+        validate_nested(p, pool, pool.types[type_id].data, depth + 1)?;
+    } elseif kind == 4 || kind == 5 {
+        let ref_id: u32 = pool.types[type_id].data;
+        if ref_id < @len(pool.refs) as u32 {
+            let referent: u32 = pool.refs[ref_id].referent;
+            // 直接引用可错载体的可空包装仍可作参数或局部视图。
+            if kind == 4 && wraps_fallible(p, pool, referent) { return; }
+            validate_nested(p, pool, referent, depth + 1)?;
+        }
+    } elseif kind == 7 {
+        let fallible_id: u32 = pool.types[type_id].data;
+        if fallible_id < @len(pool.fallibles) as u32 {
+            validate_nested(p, pool, pool.fallibles[fallible_id].success, depth + 1)?;
+        }
+    }
+    return;
+}
+export function validate_return(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if is_view(kind) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(2009))?;
+        return;
+    }
+    validate_nested(p, pool, type_id, 0)?;
+    return;
+}
+export function validate_field(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if is_view(kind) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(2009))?;
+        return;
+    }
+    if kind == 7 || wraps_fallible(p, pool, type_id) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(5811))?;
+        return;
+    }
+    validate_nested(p, pool, type_id, 0)?;
+    return;
+}
+export function validate_param(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if kind == 7 || wraps_fallible(p, pool, type_id) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(5811))?;
+        return;
+    }
+    // 切片只有 Read / ReadWrite；Write 形参必须是 &T（base.md 5.2）。
+    if kind == 5 && is_write_view(pool, type_id) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(6101))?;
+        return;
+    }
+    // 参数形态由类型驱动（base.md 5.2）：视图、函数静态引用与
+    // 按值类型均在此接受；Copy / owning 调用点规则归检查阶段。
+    validate_nested(p, pool, type_id, 0)?;
+    return;
+}
+export function validate_local(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, keyword: u8, type_id: u32): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if keyword == 3 {
+        validate_const(p, pool, type_id)?;
+        return;
+    }
+    // 槽位顶层类型按 R-25 拒绝，不套用普通视图位置诊断。
+    if keyword == 19 && (is_view(kind) || kind == 6 || kind == 7) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(6104))?;
+        return;
+    }
+    if is_write_view(pool, type_id) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(6101))?;
+        return;
+    }
+    validate_nested(p, pool, type_id, 0)?;
+    return;
+}
+export function validate_const(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32): void!AllocError {
+    if is_write_view(pool, type_id) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(6101))?;
+        return;
+    }
+    let kind: u8 = type_kind(pool, type_id);
+    if kind == 5 {
+        // base.md 4.4：仅允许完整顶层静态 &[u8] 视图。
+        validate_nested(p, pool, type_id, 0)?;
+        return;
+    }
+    if kind == 4 {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(2009))?;
+        return;
+    }
+    if kind == 3 || kind == 6 || kind == 7 || kind == 10 {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(5006))?;
+        return;
+    }
+    if kind == 2 {
+        let fixed_id: u32 = pool.types[type_id].data;
+        if fixed_id < @len(pool.fixed_arrays) as u32 {
+            validate_const_element(p, pool, pool.fixed_arrays[fixed_id].element)?;
+        }
+        return;
+    }
+    return;
+}
+// 定长数组元素只有一条后继边；沿链检查而不为每层保留调用帧。
+function validate_const_element(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, start: u32): void!AllocError {
+    var type_id: u32 = start;
+    while true {
+        let kind: u8 = type_kind(pool, type_id);
+        if is_view(kind) {
+            parse_core::fail_span(p, type_span(pool, type_id), types::error_code(2009))?;
+            return;
+        }
+        if kind == 3 || kind == 6 || kind == 7 || kind == 8 {
+            parse_core::fail_span(p, type_span(pool, type_id), types::error_code(5006))?;
+            return;
+        }
+        if kind != 2 { return; }
+        let fixed_id: u32 = pool.types[type_id].data;
+        if fixed_id >= @len(pool.fixed_arrays) as u32 { return; }
+        type_id = pool.fixed_arrays[fixed_id].element;
+    }
+    return;
+}
+export function validate_foreign_param(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if kind == 2 || kind == 3 || kind == 6 || kind == 7 || kind == 8 || kind == 9 || kind == 10 || kind == 11 || is_write_view(pool, type_id) {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(9201))?;
+        return;
+    }
+    return;
+}
+export function validate_foreign_return(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Read, type_id: u32): void!AllocError {
+    let kind: u8 = type_kind(pool, type_id);
+    if kind != 1 {
+        parse_core::fail_span(p, type_span(pool, type_id), types::error_code(9201))?;
+    }
+    return;
+}

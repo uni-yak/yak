@@ -1,0 +1,122 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: iface_write=../../compiler/min/src/check/iface_write.yak
+// module: iface_write_sections=../../compiler/min/src/check/iface_write_sections.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import iface;
+import iface_write;
+foreign assert(cond: bool): void;
+struct Loaded { parsed: parse::ParseResult, lexed: lex::LexResult }
+function load(src: &[u8], file: u16): Loaded!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(r.diagnostics) == 0);
+    let p: parse::ParseResult = parse::parse_file(&r.tokens[0..@len(r.tokens)]:Read, &r.names:Read, file)?;
+    assert(@len(p.diagnostics) == 0);
+    return Loaded { parsed: p, lexed: r };
+}
+function read_u16(bytes: &[u8], offset: u32): u16 {
+    return (bytes[offset] as u16) | ((bytes[offset + 1] as u16) << 8);
+}
+function read_u32(bytes: &[u8], offset: u32): u32 {
+    return (bytes[offset] as u32) | ((bytes[offset + 1] as u32) << 8) | ((bytes[offset + 2] as u32) << 16) | ((bytes[offset + 3] as u32) << 24);
+}
+function bytes_equal(left: &[u8], right: &[u8]): bool {
+    if @len(left) as u32 != @len(right) as u32 { return false; }
+    var i: u32 = 0;
+    while i < @len(right) as u32 {
+        if left[i] != right[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+function main(): void {
+    let loaded: Loaded = load("export function add(a: u32, b: u32): u32 { return a + b; }\nexport function noop(): void { return; }\nfunction helper(): void { return; }\n", 800)?;
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &loaded.lexed.names:Read, &deps:Read, "", &d:ReadWrite)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    let result: iface::InterfaceResult = iface_write::write_function_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, "demo", &d:ReadWrite)?;
+    assert(diag::diagbuf_count(&d:Read) == 0);
+    assert(result.export_count == 2);
+    assert(@len(result.data.bytes) as u32 > 296);
+    assert(result.data.bytes[0] == 89 && result.data.bytes[1] == 75 && result.data.bytes[2] == 73 && result.data.bytes[3] == 70);
+    assert(read_u16(&result.data.bytes[0..@len(result.data.bytes)]:Read, 4) == 2);
+    assert(read_u16(&result.data.bytes[0..@len(result.data.bytes)]:Read, 6) == 1);
+    assert(read_u16(&result.data.bytes[0..@len(result.data.bytes)]:Read, 12) == 15);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, 16) == 56);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, 20) == @len(result.data.bytes) as u32);
+    var kind: u32 = 0;
+    while kind < 15 {
+        assert(read_u16(&result.data.bytes[0..@len(result.data.bytes)]:Read, 56 + kind * 16) == (kind + 1) as u16);
+        kind = kind + 1;
+    }
+    let exports_offset: u32 = read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, 56 + 3 * 16 + 4);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, 56 + 3 * 16 + 12) == 2);
+    assert(result.data.bytes[exports_offset + 6] == 1);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, exports_offset + 16) == 1);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, exports_offset + 24) > 0);
+    // 第 15 节是私有名表：一条固定 16 字节记录，私有函数名写入 name_bytes。
+    let private_entry: u32 = 56 + 14 * 16;
+    assert(read_u16(&result.data.bytes[0..@len(result.data.bytes)]:Read, private_entry) == 15);
+    let private_offset: u32 = read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, private_entry + 4);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, private_entry + 8) == 16);
+    assert(read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, private_entry + 12) == 1);
+    assert(result.data.bytes[private_offset + 6] == 1);
+    assert(result.data.bytes[private_offset + 7] == 0);
+    // 私有名记录的偏移相对于 name_bytes，而非文件或模块身份节。
+    let name_section_offset: u32 = read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, 56 + 4);
+    let name_section_length: u32 = read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, 56 + 8);
+    let helper_name_off: u32 = read_u32(&result.data.bytes[0..@len(result.data.bytes)]:Read, private_offset);
+    let helper_name_len: u32 = read_u16(&result.data.bytes[0..@len(result.data.bytes)]:Read, private_offset + 4) as u32;
+    assert(helper_name_len == 6);
+    assert(helper_name_off <= name_section_length && helper_name_len <= name_section_length - helper_name_off);
+    let helper_start: u32 = name_section_offset + helper_name_off;
+    assert(bytes_equal(&result.data.bytes[helper_start..helper_start + helper_name_len]:Read, "helper"));
+    assert(@len(result.digest) == 32);
+    var copy: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(result.data.bytes) as u32 { @push(copy, result.data.bytes[i])?; i = i + 1; }
+    i = 24;
+    while i < 56 { copy[i] = 0; i = i + 1; }
+    let recomputed: u8[] = iface::sha256(&copy[0..@len(copy)]:Read)?;
+    i = 0;
+    while i < 32 {
+        assert(result.data.bytes[24 + i] == recomputed[i]);
+        i = i + 1;
+    }
+    let again: iface::InterfaceResult = iface_write::write_function_interface(&loaded.parsed.file:Read, &loaded.parsed.pool:Read, &resolution:Read, &loaded.lexed.names:Read, &tc:Read, "demo", &d:ReadWrite)?;
+    assert(bytes_equal(&result.data.bytes[0..@len(result.data.bytes)]:Read, &again.data.bytes[0..@len(again.data.bytes)]:Read));
+    return;
+}

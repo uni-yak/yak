@@ -1,0 +1,2 @@
+// expected_trap: argument count mismatch
+function main(): void { @len(); }

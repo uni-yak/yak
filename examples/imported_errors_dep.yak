@@ -1,0 +1,9 @@
+// 故意倒序书写错误成员，验证目标标签不取决于声明顺序。
+export enum Widthy { Other(u32) }
+export enum Z { Bad(u8) }
+
+export function value(x: u32): u32!(Widthy | Z) {
+    if x == 0u32 { return Z::Bad(7u8); }
+    if x == 1u32 { return Widthy::Other(300u32); }
+    return x;
+}

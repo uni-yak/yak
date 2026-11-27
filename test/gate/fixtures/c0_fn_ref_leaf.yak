@@ -1,0 +1,18 @@
+export struct Record { first: u64, second: u64, third: u64 }
+export enum Variant { Empty, Byte(u8), Wide(u64) }
+
+export function combine(head: &u64, bytes: &[u8], tail: &u64, last: &u64): Record {
+    return Record { first: *head + bytes[0u64] as u64, second: *tail, third: *last };
+}
+
+export function select(): &function(&u64, &[u8], &u64, &u64): Record {
+    return &combine;
+}
+
+export function bump(dst: &u64:ReadWrite): void { *dst = *dst + 2u64; }
+
+export function fill_remote(slot: &u64:Write, value: &u64): void { *slot = *value; }
+
+export function dispatch(apply: &function(&function(&u64): u64, &u64): u64, callback: &function(&u64): u64, value: &u64): u64 {
+    return apply(callback, value);
+}

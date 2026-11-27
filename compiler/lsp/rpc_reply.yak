@@ -1,0 +1,382 @@
+// 编码结果交由帧层发送；只在候选服务入口声明全量同步。
+import rpc;
+import positions;
+import documents;
+
+// status：0 不发响应，1 正文可用，2 无法编码该内部路由。
+export struct Reply { status: u8, bytes: u8[] }
+
+function append(reply: &Reply:ReadWrite, bytes: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < (@len(bytes) as u32) {
+        @push(reply.bytes, bytes[i])?;
+        i = i + 1;
+    }
+    return;
+}
+
+function failure(code: i32, reply: &Reply:ReadWrite): bool!AllocError {
+    if code == -32700i32 { append(reply, ",\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}")?; }
+    elseif code == -32600i32 { append(reply, ",\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}")?; }
+    elseif code == -32601i32 { append(reply, ",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}")?; }
+    elseif code == -32602i32 { append(reply, ",\"error\":{\"code\":-32602,\"message\":\"Invalid params\"}}")?; }
+    elseif code == -32002i32 { append(reply, ",\"error\":{\"code\":-32002,\"message\":\"Server not initialized\"}}")?; }
+    elseif code == -32800i32 { append(reply, ",\"error\":{\"code\":-32800,\"message\":\"Request cancelled\"}}")?; }
+    else { return false; }
+    return true;
+}
+
+function natural(reply: &Reply:ReadWrite, value: u32): void!AllocError {
+    var scale: u32 = 1;
+    while value / scale >= 10u32 { scale = scale * 10u32; }
+    while scale != 0u32 {
+        @push(reply.bytes, 48u8 + ((value / scale) % 10u32) as u8)?;
+        scale = scale / 10u32;
+    }
+    return;
+}
+
+function point(reply: &Reply:ReadWrite, value: positions::Position): void!AllocError {
+    append(reply, "{\"line\":")?;
+    natural(reply, value.line)?;
+    append(reply, ",\"character\":")?;
+    natural(reply, value.character)?;
+    @push(reply.bytes, 125u8)?;
+    return;
+}
+
+// URI 已由文档存储或可信目标入口验证；仅需转义 JSON 引号与反斜杠。
+export function encode_definition(action: &rpc::Route:Read, src: &[u8], status: u8, uri: &[u8], range: positions::Range): Reply!AllocError {
+    if action.kind != 9u8 || action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 {
+        return Reply { status: 2, bytes: [] };
+    }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    if status == 0u8 {
+        let emitted: bool = failure(-32602i32, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    } elseif status == 1u8 { append(&reply:ReadWrite, ",\"result\":null}")?; }
+    elseif status == 2u8 {
+        append(&reply:ReadWrite, ",\"result\":{\"uri\":\"")?;
+        var i: u32 = 0;
+        while (i as u64) < @len(uri) {
+            let byte: u8 = uri[i];
+            if byte == 34u8 || byte == 92u8 { @push(reply.bytes, 92u8)?; }
+            @push(reply.bytes, byte)?;
+            i = i + 1u32;
+        }
+        append(&reply:ReadWrite, "\",\"range\":{\"start\":")?;
+        point(&reply:ReadWrite, range.start)?;
+        append(&reply:ReadWrite, ",\"end\":")?;
+        point(&reply:ReadWrite, range.end)?;
+        append(&reply:ReadWrite, "}}}")?;
+    } else { return Reply { status: 2, bytes: [] }; }
+    return reply;
+}
+
+// 文本来自同版索引，用纯文本而不是可执行或可解释的标记。
+export function encode_hover(action: &rpc::Route:Read, src: &[u8], status: u8, text: &[u8], range: positions::Range): Reply!AllocError {
+    if action.kind != 10u8 || action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 {
+        return Reply { status: 2, bytes: [] };
+    }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    if status == 0u8 {
+        let emitted: bool = failure(-32602i32, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    } elseif status == 1u8 { append(&reply:ReadWrite, ",\"result\":null}")?; }
+    elseif status == 2u8 {
+        append(&reply:ReadWrite, ",\"result\":{\"contents\":{\"kind\":\"plaintext\",\"value\":\"")?;
+        var i: u32 = 0;
+        while (i as u64) < @len(text) {
+            let byte: u8 = text[i];
+            if byte < 32u8 { return Reply { status: 2, bytes: [] }; }
+            if byte == 34u8 || byte == 92u8 { @push(reply.bytes, 92u8)?; }
+            @push(reply.bytes, byte)?;
+            i = i + 1u32;
+        }
+        append(&reply:ReadWrite, "\"},\"range\":{\"start\":")?;
+        point(&reply:ReadWrite, range.start)?;
+        append(&reply:ReadWrite, ",\"end\":")?;
+        point(&reply:ReadWrite, range.end)?;
+        append(&reply:ReadWrite, "}}}")?;
+    } else { return Reply { status: 2, bytes: [] }; }
+    return reply;
+}
+
+// 补全标签由词法识别的 ASCII 名称组成；文本编辑只替换同版名称记号。
+function completion_label(reply: &Reply:ReadWrite, item: documents::CompletionItem, text: &[u8], keywords: &[u8]): void!AllocError {
+    let end: u32 = item.offset + item.length;
+    if item.hash_name { @push(reply.bytes, 35u8)?; }
+    if item.kind == 14u8 { append(reply, &keywords[item.offset..end]:Read)?; }
+    else { append(reply, &text[item.offset..end]:Read)?; }
+    return;
+}
+
+export function encode_completion(action: &rpc::Route:Read, src: &[u8], result: &documents::Completion:Read, text: &[u8], keywords: &[u8]): Reply!AllocError {
+    if action.kind != 11u8 || action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 {
+        return Reply { status: 2, bytes: [] };
+    }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    if result.status == 0u8 {
+        let emitted: bool = failure(-32602i32, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    } elseif result.status == 1u8 { append(&reply:ReadWrite, ",\"result\":null}")?; }
+    elseif result.status == 2u8 {
+        append(&reply:ReadWrite, ",\"result\":{\"isIncomplete\":")?;
+        if result.incomplete { append(&reply:ReadWrite, "true")?; }
+        else { append(&reply:ReadWrite, "false")?; }
+        append(&reply:ReadWrite, ",\"items\":[")?;
+        var i: u32 = 0;
+        while i < @len(result.items) as u32 {
+            let item: documents::CompletionItem = result.items[i];
+            let end: u64 = (item.offset as u64) + (item.length as u64);
+            if (item.kind == 14u8 && end > @len(keywords)) || (item.kind != 14u8 && end > @len(text)) { return Reply { status: 2, bytes: [] }; }
+            if i != 0u32 { @push(reply.bytes, 44u8)?; }
+            append(&reply:ReadWrite, "{\"label\":\"")?;
+            completion_label(&reply:ReadWrite, item, text, keywords)?;
+            append(&reply:ReadWrite, "\",\"kind\":")?;
+            natural(&reply:ReadWrite, item.kind as u32)?;
+            append(&reply:ReadWrite, ",\"textEdit\":{\"range\":{\"start\":")?;
+            point(&reply:ReadWrite, result.range.start)?;
+            append(&reply:ReadWrite, ",\"end\":")?;
+            point(&reply:ReadWrite, result.range.end)?;
+            append(&reply:ReadWrite, "},\"newText\":\"")?;
+            completion_label(&reply:ReadWrite, item, text, keywords)?;
+            append(&reply:ReadWrite, "\"}}")?;
+            i = i + 1u32;
+        }
+        append(&reply:ReadWrite, "]}}")?;
+    } else { return Reply { status: 2, bytes: [] }; }
+    return reply;
+}
+
+export function encode_semantic_tokens(action: &rpc::Route:Read, src: &[u8], result: &documents::SemanticTokens:Read): Reply!AllocError {
+    if action.kind != 12u8 || action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 {
+        return Reply { status: 2, bytes: [] };
+    }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    if result.status == 0u8 {
+        let emitted: bool = failure(-32602i32, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    } elseif result.status == 1u8 { append(&reply:ReadWrite, ",\"result\":null}")?; }
+    elseif result.status == 2u8 {
+        append(&reply:ReadWrite, ",\"result\":{\"data\":[")?;
+        var i: u32 = 0;
+        while i < @len(result.data) as u32 {
+            if i != 0u32 { @push(reply.bytes, 44u8)?; }
+            natural(&reply:ReadWrite, result.data[i])?;
+            i = i + 1u32;
+        }
+        append(&reply:ReadWrite, "]}}")?;
+    } else { return Reply { status: 2, bytes: [] }; }
+    return reply;
+}
+
+function structure_range(reply: &Reply:ReadWrite, range: positions::Range): void!AllocError {
+    append(reply, "{\"start\":")?;
+    point(reply, range.start)?;
+    append(reply, ",\"end\":")?;
+    point(reply, range.end)?;
+    @push(reply.bytes, 125u8)?;
+    return;
+}
+
+function structure_string(reply: &Reply:ReadWrite, text: &[u8]): bool!AllocError {
+    @push(reply.bytes, 34u8)?;
+    var i: u32 = 0;
+    while i < @len(text) as u32 {
+        let byte: u8 = text[i];
+        if byte < 32u8 { return false; }
+        if byte == 34u8 || byte == 92u8 { @push(reply.bytes, 92u8)?; }
+        @push(reply.bytes, byte)?;
+        i = i + 1u32;
+    }
+    @push(reply.bytes, 34u8)?;
+    return true;
+}
+
+export function encode_structure(action: &rpc::Route:Read, src: &[u8], result: &documents::Structure:Read, text: &[u8], uri: &[u8], hierarchy: bool): Reply!AllocError {
+    if (action.kind != 13u8 && action.kind != 14u8) || action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 { return Reply { status: 2, bytes: [] }; }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    if result.status == 0u8 {
+        let emitted: bool = failure(-32602i32, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    } elseif result.status == 1u8 { append(&reply:ReadWrite, ",\"result\":null}")?; }
+    elseif result.status == 2u8 {
+        append(&reply:ReadWrite, ",\"result\":[")?;
+        var i: u32 = 0;
+        if action.kind == 13u8 {
+            while i < @len(result.symbols) as u32 {
+                let symbol: documents::DocumentSymbol = result.symbols[i];
+                let end: u32 = symbol.offset + symbol.length;
+                if (end as u64) > @len(text) { return Reply { status: 2, bytes: [] }; }
+                if i != 0u32 { @push(reply.bytes, 44u8)?; }
+                append(&reply:ReadWrite, "{\"name\":")?;
+                if !structure_string(&reply:ReadWrite, &text[symbol.offset..end]:Read)? { return Reply { status: 2, bytes: [] }; }
+                append(&reply:ReadWrite, ",\"kind\":")?;
+                natural(&reply:ReadWrite, symbol.kind as u32)?;
+                if hierarchy {
+                    append(&reply:ReadWrite, ",\"range\":")?;
+                    structure_range(&reply:ReadWrite, symbol.range)?;
+                    append(&reply:ReadWrite, ",\"selectionRange\":")?;
+                    structure_range(&reply:ReadWrite, symbol.selection)?;
+                } else {
+                    append(&reply:ReadWrite, ",\"location\":{\"uri\":")?;
+                    if !structure_string(&reply:ReadWrite, uri)? { return Reply { status: 2, bytes: [] }; }
+                    append(&reply:ReadWrite, ",\"range\":")?;
+                    structure_range(&reply:ReadWrite, symbol.selection)?;
+                    @push(reply.bytes, 125u8)?;
+                }
+                @push(reply.bytes, 125u8)?;
+                i = i + 1u32;
+            }
+        } else {
+            while i < @len(result.folds) as u32 {
+                if i != 0u32 { @push(reply.bytes, 44u8)?; }
+                append(&reply:ReadWrite, "{\"startLine\":")?;
+                natural(&reply:ReadWrite, result.folds[i].first)?;
+                append(&reply:ReadWrite, ",\"endLine\":")?;
+                natural(&reply:ReadWrite, result.folds[i].last)?;
+                @push(reply.bytes, 125u8)?;
+                i = i + 1u32;
+            }
+        }
+        append(&reply:ReadWrite, "]}")?;
+    } else { return Reply { status: 2, bytes: [] }; }
+    return reply;
+}
+
+function workspace_failure(action: &rpc::Route:Read, src: &[u8], status: u8): Reply!AllocError {
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    if status == 1u8 {
+        let emitted: bool = failure(-32602i32, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    } elseif status == 2u8 {
+        append(&reply:ReadWrite, ",\"error\":{\"code\":-32803,\"message\":\"Workspace symbol budget exceeded\"}}")?;
+    } else {
+        append(&reply:ReadWrite, ",\"error\":{\"code\":-32803,\"message\":\"Trusted workspace symbol coverage unavailable\"}}")?;
+    }
+    return reply;
+}
+
+function workspace_symbol_item(reply: &Reply:ReadWrite, target: &documents::DefinitionTarget:Read, row: documents::TargetSymbol): bool!AllocError {
+    let end: u64 = row.name_start as u64 + row.name_len as u64;
+    if row.name_len == 0u32 || end > @len(target.names) || row.export_id == 0u32 || row.export_id as u64 > @len(target.locations) { return false; }
+    let loc: positions::RangeResult = target.locations[row.export_id - 1u32];
+    if !loc.valid { return false; }
+    var kind: u32 = 0;
+    if row.kind == 1u8 { kind = 12u32; }
+    elseif row.kind == 2u8 { kind = 10u32; }
+    elseif row.kind == 3u8 { kind = 23u32; }
+    else { return false; }
+    append(reply, "{\"name\":")?;
+    if !structure_string(reply, &target.names[row.name_start..end]:Read)? { return false; }
+    append(reply, ",\"kind\":")?;
+    natural(reply, kind)?;
+    append(reply, ",\"location\":{\"uri\":")?;
+    if !structure_string(reply, &target.uri[0..@len(target.uri)]:Read)? { return false; }
+    append(reply, ",\"range\":")?;
+    structure_range(reply, loc.range)?;
+    append(reply, "}}")?;
+    return true;
+}
+
+// 遮蔽和拒绝不能编码为局部成功列表；响应按单个完整帧提交。
+export function encode_workspace_symbols(action: &rpc::Route:Read, src: &[u8], result: &documents::SymbolResult:Read,
+    targets: &[documents::DefinitionTarget]:Read): Reply!AllocError {
+    if action.kind != 15u8 || action.id_start >= action.id_end || action.id_end as u64 > @len(src) || action.id_end - action.id_start > 4096u32 { return Reply { status: 2, bytes: [] }; }
+    if result.status != 0u8 { return workspace_failure(action, src, result.status)?; }
+    if result.shadowed != 0u32 || result.covered == 0u32 || result.covered as u64 != @len(targets) { return workspace_failure(action, src, 3u8)?; }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?;
+    append(&reply:ReadWrite, ",\"result\":[")?;
+    var i: u32 = 0;
+    while i < @len(result.hits) as u32 {
+        let hit: documents::SymbolHit = result.hits[i];
+        if hit.target as u64 >= @len(targets) { return workspace_failure(action, src, 3u8)?; }
+        let target: &documents::DefinitionTarget:Read = &targets[hit.target]:Read;
+        if hit.symbol as u64 >= @len(target.symbols) { return workspace_failure(action, src, 3u8)?; }
+        if i != 0u32 { @push(reply.bytes, 44u8)?; }
+        if !workspace_symbol_item(&reply:ReadWrite, target, target.symbols[hit.symbol])? { return workspace_failure(action, src, 3u8)?; }
+        if @len(reply.bytes) > 262142u64 { return workspace_failure(action, src, 2u8)?; }
+        i = i + 1u32;
+    }
+    append(&reply:ReadWrite, "]}")?;
+    return reply;
+}
+
+// action 必须来自同一份 src 的封包路由；只复用经过验证的 id 字面量。
+export function encode(action: &rpc::Route:Read, src: &[u8]): Reply!AllocError {
+    return encode_configured(action, src, false, false)?;
+}
+
+export function encode_configured(action: &rpc::Route:Read, src: &[u8], full_sync: bool, definitions: bool): Reply!AllocError {
+    return encode_workspace(action, src, full_sync, definitions, false)?;
+}
+
+export function encode_workspace(action: &rpc::Route:Read, src: &[u8], full_sync: bool, definitions: bool, workspace_symbols: bool): Reply!AllocError {
+    return encode_initialize(action, src, full_sync, definitions, workspace_symbols, positions::enc_utf16())?;
+}
+
+export function encode_initialize(action: &rpc::Route:Read, src: &[u8], full_sync: bool, definitions: bool, workspace_symbols: bool, encoding: u8): Reply!AllocError {
+    let kind: u8 = action.kind;
+    if kind == 0u8 || kind == 3u8 || kind == 5u8 || kind == 16u8 || kind == 17u8 || rpc::document_method(kind) != 0u8 {
+        return Reply { status: 0, bytes: [] };
+    }
+    if kind != 1u8 && kind != 2u8 && kind != 4u8 { return Reply { status: 2, bytes: [] }; }
+    if action.id_end == 0 {
+        if kind != 1u8 || action.id_start != 0 { return Reply { status: 2, bytes: [] }; }
+    } elseif action.id_start >= action.id_end || (action.id_end as u64) > @len(src) || action.id_end - action.id_start > 4096u32 {
+        return Reply { status: 2, bytes: [] };
+    }
+    var reply: Reply = Reply { status: 1, bytes: [] };
+    append(&reply:ReadWrite, "{\"jsonrpc\":\"2.0\",\"id\":")?;
+    if action.id_end == 0 { append(&reply:ReadWrite, "null")?; }
+    else { append(&reply:ReadWrite, &src[action.id_start..action.id_end]:Read)?; }
+    if kind == 2u8 {
+        append(&reply:ReadWrite, ",\"result\":{\"capabilities\":{")?;
+        var has_cap: bool = false;
+        if full_sync || definitions {
+            if encoding == positions::enc_utf8() { append(&reply:ReadWrite, "\"positionEncoding\":\"utf-8\"")?; }
+            elseif encoding == positions::enc_utf32() { append(&reply:ReadWrite, "\"positionEncoding\":\"utf-32\"")?; }
+            else { append(&reply:ReadWrite, "\"positionEncoding\":\"utf-16\"")?; }
+            has_cap = true;
+        }
+        if full_sync {
+            if has_cap { append(&reply:ReadWrite, ",")?; }
+            append(&reply:ReadWrite, "\"textDocumentSync\":{\"openClose\":true,\"change\":2}")?;
+            has_cap = true;
+        }
+        if definitions {
+            if has_cap { append(&reply:ReadWrite, ",")?; }
+            append(&reply:ReadWrite, "\"definitionProvider\":true,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]}")?;
+            append(&reply:ReadWrite, ",\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"keyword\",\"string\",\"number\",\"operator\"],\"tokenModifiers\":[]},\"full\":true}")?;
+            append(&reply:ReadWrite, ",\"documentSymbolProvider\":true,\"foldingRangeProvider\":true")?;
+            append(&reply:ReadWrite, ",\"documentFormattingProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"codeActionProvider\":true")?;
+            has_cap = true;
+        }
+        if workspace_symbols || definitions {
+            if has_cap { append(&reply:ReadWrite, ",")?; }
+            append(&reply:ReadWrite, "\"workspaceSymbolProvider\":true")?;
+        }
+        append(&reply:ReadWrite, "}}}")?;
+    }
+    elseif kind == 4u8 { append(&reply:ReadWrite, ",\"result\":null}")?; }
+    else {
+        let emitted: bool = failure(action.code, &reply:ReadWrite)?;
+        if !emitted { return Reply { status: 2, bytes: [] }; }
+    }
+    return reply;
+}

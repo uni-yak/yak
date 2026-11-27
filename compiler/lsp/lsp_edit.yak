@@ -1,0 +1,371 @@
+// 高级编辑能力：同文件安全重命名（prepareRename / rename）与诊断 Quick Fix / 自动导入（codeAction）。
+import positions;
+import types;
+import workspace_index;
+
+const MAX_RENAME_EDITS: u32 = 256;
+const MAX_CODE_ACTIONS: u32 = 16;
+
+// status：0 参数非法，1 不可重命名，2 成功。
+export struct PrepareRenameResult {
+    status: u8,
+    range: positions::Range,
+    offset: u32,
+    length: u32,
+}
+
+// status：0 参数或新名称非法/冲突，1 无目标，2 成功。
+export struct RenameResult {
+    status: u8,
+    ranges: positions::Range[],
+    new_name: u8[],
+}
+
+export struct TextEdit {
+    range: positions::Range,
+    new_text: u8[],
+}
+
+export struct CodeActionItem {
+    title: u8[],
+    kind: u8[],
+    edits: TextEdit[],
+}
+
+// status：0 参数非法，1 无结果，2 成功。
+export struct CodeActionResult {
+    status: u8,
+    items: CodeActionItem[],
+}
+
+function empty_range(): positions::Range {
+    let zero: positions::Position = positions::Position { line: 0, character: 0 };
+    return positions::Range { start: zero, end: zero };
+}
+
+function ident_start(b: u8): bool {
+    return b == 95u8 || (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+function ident_cont(b: u8): bool {
+    return ident_start(b) || (b >= 48u8 && b <= 57u8);
+}
+
+function bytes_equal(a: &[u8], b: &[u8]): bool {
+    if @len(a) != @len(b) { return false; }
+    var i: u32 = 0;
+    while i < @len(a) as u32 {
+        if a[i] != b[i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function copy_bytes(src: &[u8]): u8[]!AllocError {
+    var dst: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(dst, src[i])?; i = i + 1u32; }
+    return @move(dst);
+}
+
+function is_keyword_or_reserved(word: &[u8]): bool {
+    if bytes_equal(word, "function") || bytes_equal(word, "let") || bytes_equal(word, "var") || bytes_equal(word, "const") { return true; }
+    if bytes_equal(word, "if") || bytes_equal(word, "else") || bytes_equal(word, "elseif") || bytes_equal(word, "while") { return true; }
+    if bytes_equal(word, "break") || bytes_equal(word, "continue") || bytes_equal(word, "return") || bytes_equal(word, "match") { return true; }
+    if bytes_equal(word, "enum") || bytes_equal(word, "struct") || bytes_equal(word, "true") || bytes_equal(word, "false") { return true; }
+    if bytes_equal(word, "import") || bytes_equal(word, "export") || bytes_equal(word, "foreign") || bytes_equal(word, "out") || bytes_equal(word, "as") { return true; }
+    if bytes_equal(word, "loop") || bytes_equal(word, "unsafe") || bytes_equal(word, "interface") || bytes_equal(word, "impl") || bytes_equal(word, "implements") { return true; }
+    if bytes_equal(word, "for") || bytes_equal(word, "in") || bytes_equal(word, "is") || bytes_equal(word, "type") || bytes_equal(word, "never") || bytes_equal(word, "null") { return true; }
+    return false;
+}
+
+// 校验新标识符是否符合 Yak base 词法（排除关键字、保留字与通配符 `_`）。
+export function valid_rename_name(name: &[u8], hash_name: bool): bool {
+    let n: u32 = @len(name) as u32;
+    if n == 0u32 || n > 128u32 { return false; }
+    var off: u32 = 0;
+    if hash_name {
+        if name[0] != 35u8 || n < 2u32 { return false; }
+        off = 1u32;
+    } else {
+        if name[0] == 35u8 { return false; }
+    }
+    if !ident_start(name[off]) { return false; }
+    var i: u32 = off + 1u32;
+    while i < n {
+        if !ident_cont(name[i]) { return false; }
+        i = i + 1u32;
+    }
+    let body: &[u8] = &name[off..n]:Read;
+    if @len(body) == 1u64 && body[0] == 95u8 { return false; }
+    if is_keyword_or_reserved(body) { return false; }
+    return true;
+}
+
+struct RenameTarget { found: bool, decl: types::RenameDecl, hit_offset: u32, hit_length: u32 }
+
+function locate_rename_target(defs: &types::DocumentDefinitions:Read, offset: u32): RenameTarget {
+    let none: RenameTarget = RenameTarget {
+        found: false,
+        decl: types::RenameDecl { offset: 0, length: 0, scope_start: 0, scope_end: 0, kind: 0, hash_name: false },
+        hit_offset: 0,
+        hit_length: 0,
+    };
+    let direct: types::RenameDecl = types::rename_decl_at(defs, offset);
+    if direct.length != 0u32 {
+        return RenameTarget { found: true, decl: direct, hit_offset: direct.offset, hit_length: direct.length };
+    }
+    let link: types::DefinitionLink = types::definition_at(defs, offset);
+    if link.target_length == 0u32 { return none; }
+    let decl: types::RenameDecl = types::rename_decl_at(defs, link.target_offset);
+    if decl.length == 0u32 { return none; }
+    return RenameTarget { found: true, decl: decl, hit_offset: link.use_offset, hit_length: link.use_length };
+}
+
+export function prepare_rename(defs: &types::DocumentDefinitions:Read, index: &positions::Index:Read, text: &[u8], file: u16, offset: u32): PrepareRenameResult {
+    let target: RenameTarget = locate_rename_target(defs, offset);
+    if !target.found {
+        return PrepareRenameResult { status: 1, range: empty_range(), offset: 0, length: 0 };
+    }
+    let mapped: positions::RangeResult = positions::span_range(index, text, file, file, target.hit_offset, target.hit_length);
+    if !mapped.valid {
+        return PrepareRenameResult { status: 1, range: empty_range(), offset: 0, length: 0 };
+    }
+    return PrepareRenameResult { status: 2, range: mapped.range, offset: target.hit_offset, length: target.hit_length };
+}
+
+function scopes_overlap(a: types::RenameDecl, b: types::RenameDecl): bool {
+    return a.scope_start < b.scope_end && b.scope_start < a.scope_end;
+}
+
+function insert_offset(offsets: &u32[]:ReadWrite, lengths: &u32[]:ReadWrite, off: u32, len: u32): bool!AllocError {
+    var i: u32 = 0;
+    while i < @len(*offsets) as u32 {
+        if (*offsets)[i] == off { return true; }
+        i = i + 1u32;
+    }
+    if @len(*offsets) >= (MAX_RENAME_EDITS as u64) { return false; }
+    @push(*offsets, off)?;
+    @push(*lengths, len)?;
+    return true;
+}
+
+export function compute_rename(defs: &types::DocumentDefinitions:Read, index: &positions::Index:Read, text: &[u8], file: u16, offset: u32, new_name: &[u8]): RenameResult!AllocError {
+    let target: RenameTarget = locate_rename_target(defs, offset);
+    if !target.found { return RenameResult { status: 1, ranges: [], new_name: [] }; }
+    let decl: types::RenameDecl = target.decl;
+    if !valid_rename_name(new_name, decl.hash_name) {
+        return RenameResult { status: 0, ranges: [], new_name: [] };
+    }
+    // 拒绝与同作用域或重叠作用域内既有声明同名。
+    var i: u32 = 0;
+    while i < @len(defs.rename_decls) as u32 {
+        let other: types::RenameDecl = defs.rename_decls[i];
+        if other.offset != decl.offset && scopes_overlap(decl, other) {
+            if (other.offset as u64) + (other.length as u64) <= @len(text) {
+                if bytes_equal(&text[other.offset..other.offset + other.length]:Read, new_name) {
+                    return RenameResult { status: 0, ranges: [], new_name: [] };
+                }
+            }
+        }
+        i = i + 1u32;
+    }
+    var offsets: u32[] = [];
+    var lengths: u32[] = [];
+    if !insert_offset(&offsets:ReadWrite, &lengths:ReadWrite, decl.offset, decl.length)? {
+        return RenameResult { status: 0, ranges: [], new_name: [] };
+    }
+    i = 0u32;
+    while i < @len(defs.links) as u32 {
+        let link: types::DefinitionLink = defs.links[i];
+        if link.target_offset == decl.offset && link.target_length == decl.length {
+            if !insert_offset(&offsets:ReadWrite, &lengths:ReadWrite, link.use_offset, link.use_length)? {
+                return RenameResult { status: 0, ranges: [], new_name: [] };
+            }
+        }
+        i = i + 1u32;
+    }
+    // 按 offset 升序排序以保证确定性编辑序。
+    var a: u32 = 1;
+    while a < @len(offsets) as u32 {
+        let ko: u32 = offsets[a];
+        let kl: u32 = lengths[a];
+        var b: u32 = a;
+        while b > 0u32 && offsets[b - 1u32] > ko {
+            offsets[b] = offsets[b - 1u32];
+            lengths[b] = lengths[b - 1u32];
+            b = b - 1u32;
+        }
+        offsets[b] = ko;
+        lengths[b] = kl;
+        a = a + 1u32;
+    }
+    var ranges: positions::Range[] = [];
+    i = 0u32;
+    while i < @len(offsets) as u32 {
+        let mapped: positions::RangeResult = positions::span_range(index, text, file, file, offsets[i], lengths[i]);
+        if !mapped.valid { return RenameResult { status: 1, ranges: [], new_name: [] }; }
+        @push(ranges, mapped.range)?;
+        i = i + 1u32;
+    }
+    return RenameResult { status: 2, ranges: @move(ranges), new_name: copy_bytes(new_name)? };
+}
+
+function ranges_overlap(a: positions::Range, b: positions::Range): bool {
+    if a.end.line < b.start.line || b.end.line < a.start.line { return false; }
+    if a.end.line == b.start.line && a.end.character < b.start.character { return false; }
+    if b.end.line == a.start.line && b.end.character < a.start.character { return false; }
+    return true;
+}
+
+// 检查源码顶部是否已包含 `import <mod>;`。
+function has_import(text: &[u8], mod_name: &[u8]): bool {
+    let n: u32 = @len(text) as u32;
+    let mn: u32 = @len(mod_name) as u32;
+    var p: u32 = 0;
+    while p + 7u32 + mn < n {
+        if (p == 0u32 || text[p - 1u32] == 10u8) &&
+            bytes_equal(&text[p..p + 7u32]:Read, "import ") &&
+            bytes_equal(&text[p + 7u32..p + 7u32 + mn]:Read, mod_name) &&
+            text[p + 7u32 + mn] == 59u8 {
+            return true;
+        }
+        p = p + 1u32;
+    }
+    return false;
+}
+
+function append_bytes(dst: &u8[]:ReadWrite, src: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(*dst, src[i])?; i = i + 1u32; }
+    return;
+}
+
+// 生成基于当前文档诊断与工作区导出表的确定性 Quick Fix 及自动导入。
+export function compute_code_actions(
+    uri: &[u8],
+    text: &[u8],
+    file: u16,
+    index: &positions::Index:Read,
+    diags: &[types::DocumentDiag]:Read,
+    ws: &workspace_index::Index:Read,
+    req_range: positions::Range
+): CodeActionResult!AllocError {
+    var items: CodeActionItem[] = [];
+    let n: u32 = @len(text) as u32;
+    var i: u32 = 0;
+    while i < @len(diags) as u32 && @len(items) < (MAX_CODE_ACTIONS as u64) {
+        let d: types::DocumentDiag = diags[i];
+        let code: u16 = d.code;
+        let span: types::Span = d.span;
+        let mapped: positions::RangeResult = positions::span_range(index, text, span.file, file, span.offset, span.length);
+        if mapped.valid && ranges_overlap(mapped.range, req_range) {
+            if code == 1018u16 {
+                // E1018：补齐末尾单换行或删除多余尾随空行。
+                if n == 0u32 || text[n - 1u32] != 10u8 {
+                    let eof_pos: positions::PositionResult = positions::to_position(index, text, n);
+                    if eof_pos.valid {
+                        var edits: TextEdit[] = [];
+                        @push(edits, TextEdit {
+                            range: positions::Range { start: eof_pos.position, end: eof_pos.position },
+                            new_text: copy_bytes("\n")?,
+                        })?;
+                        @push(items, CodeActionItem {
+                            title: copy_bytes("补齐文件末尾换行 (E1018)")?,
+                            kind: copy_bytes("quickfix")?,
+                            edits: @move(edits),
+                        })?;
+                    }
+                } elseif span.offset < n {
+                    let cut: positions::RangeResult = positions::span_range(index, text, file, file, span.offset, n - span.offset);
+                    if cut.valid {
+                        var edits: TextEdit[] = [];
+                        @push(edits, TextEdit { range: cut.range, new_text: [] })?;
+                        @push(items, CodeActionItem {
+                            title: copy_bytes("移除多余末尾空行 (E1018)")?,
+                            kind: copy_bytes("quickfix")?,
+                            edits: @move(edits),
+                        })?;
+                    }
+                }
+            } elseif code == 6201u16 && span.length > 0u32 && (span.offset as u64) + (span.length as u64) <= @len(text) {
+                // E6201：使用 @move(...) 显式转移所有权。
+                var wrapped: u8[] = [];
+                append_bytes(&wrapped:ReadWrite, "@move(")?;
+                append_bytes(&wrapped:ReadWrite, &text[span.offset..span.offset + span.length]:Read)?;
+                @push(wrapped, 41u8)?;
+                var edits: TextEdit[] = [];
+                @push(edits, TextEdit { range: mapped.range, new_text: @move(wrapped) })?;
+                @push(items, CodeActionItem {
+                    title: copy_bytes("使用 @move(...) 显式转移所有权 (E6201)")?,
+                    kind: copy_bytes("quickfix")?,
+                    edits: @move(edits),
+                })?;
+            } elseif code == 4009u16 && span.offset < n {
+                // E4009：清理未使用导入行。
+                let line_row: u32 = mapped.range.start.line;
+                if (line_row as u64) < @len(index.lines) {
+                    let line: positions::Line = index.lines[line_row];
+                    var ls: u32 = line.start;
+                    while ls < line.end && (text[ls] == 32u8 || text[ls] == 9u8) { ls = ls + 1u32; }
+                    if ls + 7u32 <= line.end && bytes_equal(&text[ls..ls + 7u32]:Read, "import ") {
+                        var del_end: positions::Position = positions::Position { line: line_row, character: line.units };
+                        if line_row + 1u32 < @len(index.lines) as u32 {
+                            del_end = positions::Position { line: line_row + 1u32, character: 0 };
+                        }
+                        var edits: TextEdit[] = [];
+                        @push(edits, TextEdit {
+                            range: positions::Range { start: positions::Position { line: line_row, character: 0 }, end: del_end },
+                            new_text: [],
+                        })?;
+                        @push(items, CodeActionItem {
+                            title: copy_bytes("移除未使用的导入 (E4009)")?,
+                            kind: copy_bytes("quickfix")?,
+                            edits: @move(edits),
+                        })?;
+                    }
+                }
+            } elseif code == 4002u16 && span.length > 0u32 && (span.offset as u64) + (span.length as u64) <= @len(text) {
+                // E4002：在工作区模块导出表中检索同名导出，提供自动导入 Quick Fix。
+                let sym: &[u8] = &text[span.offset..span.offset + span.length]:Read;
+                let found: workspace_index::ExportLookup = workspace_index::find_export_by_name(ws, uri, sym);
+                if found.found {
+                    let mod_bytes: &[u8] = &ws.files[found.file_slot].module[0..@len(ws.files[found.file_slot].module)]:Read;
+                    var edits: TextEdit[] = [];
+                    if !has_import(text, mod_bytes) {
+                        var imp: u8[] = [];
+                        append_bytes(&imp:ReadWrite, "import ")?;
+                        append_bytes(&imp:ReadWrite, mod_bytes)?;
+                        append_bytes(&imp:ReadWrite, ";\n")?;
+                        @push(edits, TextEdit {
+                            range: positions::Range {
+                                start: positions::Position { line: 0, character: 0 },
+                                end: positions::Position { line: 0, character: 0 },
+                            },
+                            new_text: @move(imp),
+                        })?;
+                    }
+                    var qualified: u8[] = [];
+                    append_bytes(&qualified:ReadWrite, mod_bytes)?;
+                    append_bytes(&qualified:ReadWrite, "::")?;
+                    append_bytes(&qualified:ReadWrite, sym)?;
+                    @push(edits, TextEdit { range: mapped.range, new_text: @move(qualified) })?;
+                    var title: u8[] = [];
+                    append_bytes(&title:ReadWrite, "导入模块 ")?;
+                    append_bytes(&title:ReadWrite, mod_bytes)?;
+                    append_bytes(&title:ReadWrite, " 并使用 ")?;
+                    append_bytes(&title:ReadWrite, mod_bytes)?;
+                    append_bytes(&title:ReadWrite, "::")?;
+                    append_bytes(&title:ReadWrite, sym)?;
+                    @push(items, CodeActionItem {
+                        title: @move(title),
+                        kind: copy_bytes("quickfix")?,
+                        edits: @move(edits),
+                    })?;
+                }
+            }
+        }
+        i = i + 1u32;
+    }
+    return CodeActionResult { status: 2, items: @move(items) };
+}

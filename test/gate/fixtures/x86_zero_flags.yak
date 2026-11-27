@@ -1,0 +1,46 @@
+import host;
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function output(name: &[u8], mode: u8): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::begin_layout(&code:ReadWrite);
+    pe::cmp_zero(&code:ReadWrite, pe::rcx())?;
+    // 比较标志将在下条分支读取；MOV 不能替换为改写标志的 XOR。
+    if mode == 0 { pe::mov_imm64(&code:ReadWrite, pe::rax(), 0)?; }
+    elseif mode == 1 { pe::clear_reg(&code:ReadWrite, pe::rax())?; }
+    let equal: u32 = pe::jcc_rel32(&code:ReadWrite, pe::cc_e())?;
+    // 分支已消费标志；此处可用更短的 XOR 产生返回值零。
+    if mode == 2 {
+        let start: u32 = pe::code_len(&code:Read);
+        pe::mov_int(&code:ReadWrite, pe::rax(), 0, 8)?;
+        assert(pe::code_len(&code:Read) == start + 2 && code.bytes[start] == 49 && code.bytes[start + 1] == 192);
+    }
+    pe::ret(&code:ReadWrite)?;
+    let target: u32 = pe::code_len(&code:Read);
+    pe::patch_rel32(&code:ReadWrite, equal, target);
+    pe::mov_int(&code:ReadWrite, pe::rax(), 1, 4)?;
+    pe::ret(&code:ReadWrite)?;
+    assert(pe::finish_layout(&code:ReadWrite, 0));
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    let end: u32 = pe::code_len(&code:Read);
+    host::output_bytes(name, &code.bytes[0..end]:Read);
+    return;
+}
+
+function exercise(completed: &bool:ReadWrite): void!AllocError {
+    output("live_mov", 0)?;
+    output("live_xor", 1)?;
+    output("dead_xor", 2)?;
+    *completed = true;
+    return;
+}
+
+function main(): void {
+    var completed: bool = false;
+    let status: void!AllocError = exercise(&completed:ReadWrite);
+    @drop(status);
+    assert(completed);
+    return;
+}

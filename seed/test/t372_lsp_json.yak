@@ -1,0 +1,95 @@
+// module: utf8=../../compiler/lsp/utf8.yak
+// module: json_string=../../compiler/lsp/json_string.yak
+// module: json=../../compiler/lsp/json.yak
+import json;
+import json_string;
+foreign assert(cond: bool): void;
+foreign exit(code: u8): void;
+
+function check(input: &[u8], status: u8, count: u32): void!AllocError {
+    let doc: json::Document = json::parse(input)?;
+    assert(doc.status == status);
+    assert(@len(doc.nodes) == (count as u64));
+    return;
+}
+
+function check_object(): void!AllocError {
+    let input: &[u8] = " {\"id\":-12.3e+4,\"payload\":[{\"id\":null},true,false],\"value\":\"é汉\\uD83d\\uDE00\\n\\u0000\"} \r\n";
+    let doc: json::Document = json::parse(input)?;
+    assert(doc.status == 0u8);
+    assert(json::is_object(doc.nodes[0].kind));
+    assert(doc.nodes[0].start == 1 && doc.nodes[0].end + 3 == (@len(input) as u32));
+    assert(doc.nodes[0].next == 12);
+    let id: json::Member = json::member(&doc:Read, input, 0, "id");
+    assert(id.status == 1u8);
+    assert(json::is_number(doc.nodes[id.id].kind));
+    assert(doc.nodes[id.id].end - doc.nodes[id.id].start == 8);
+    assert(json::member(&doc:Read, input, 0, "absent").status == 0u8);
+    let text: json::Member = json::member(&doc:Read, input, 0, "value");
+    assert(text.status == 1u8);
+    let item: json::Node = doc.nodes[text.id];
+    assert(json::is_string(item.kind));
+    let decoded: json_string::Decoded = json_string::decode(input, item.start, item.end, 11)?;
+    assert(decoded.ok && @len(decoded.data) == 11);
+    assert(decoded.data[9] == 10u8 && decoded.data[10] == 0u8);
+    assert(json_string::equals(input, item.start, item.end, "é汉😀\n\0"));
+    let small: json_string::Decoded = json_string::decode(input, item.start, item.end, 10)?;
+    assert(!small.ok && @len(small.data) == 0);
+    let duplicate: &[u8] = "{\"id\":1,\"\\u0069d\":2}";
+    let dup: json::Document = json::parse(duplicate)?;
+    assert(dup.status == 0u8 && json::member(&dup:Read, duplicate, 0, "id").status == 2u8);
+    return;
+}
+
+function check_limits(): void!AllocError {
+    var buf: u8[] = [];
+    var i: u32 = 0;
+    while i < 32 { @push(buf, 91u8)?; i = i + 1; }
+    while i < 64 { @push(buf, 93u8)?; i = i + 1; }
+    check(&buf[0..64]:Read, 0u8, 32)?;
+    var deep: u8[] = [];
+    i = 0;
+    while i < 33 { @push(deep, 91u8)?; i = i + 1; }
+    @push(deep, 93u8)?;
+    check(&deep[0..34]:Read, 2u8, 0)?;
+    return;
+}
+
+function run(): void!AllocError {
+    check_object()?;
+    check_limits()?;
+    check("\t\r null \n", 0u8, 1)?;
+    check("[0, -0, 0.0E-1, 1234567891234567891234567890, false, true]", 0u8, 7)?;
+    check("[{}, [], \"中文😀\", {\"\":true}]", 0u8, 7)?;
+    check("", 1u8, 0)?;
+    check("true false", 1u8, 0)?;
+    check("null//", 1u8, 0)?;
+    check("00", 1u8, 0)?;
+    check("[01]", 1u8, 0)?;
+    check("[+1]", 1u8, 0)?;
+    check("[1.]", 1u8, 0)?;
+    check("1e-", 1u8, 0)?;
+    check("-", 1u8, 0)?;
+    check("[1,]", 1u8, 0)?;
+    check("{\"x\":1,}", 1u8, 0)?;
+    check("{1:false}", 1u8, 0)?;
+    check("{\"x\" true}", 1u8, 0)?;
+    check("\"abc", 1u8, 0)?;
+    check("\"a\n b\"", 1u8, 0)?;
+    check("\"\\q\"", 1u8, 0)?;
+    check("\"\\u145\"", 1u8, 0)?;
+    check("\"\\uD800\"", 1u8, 0)?;
+    check("\"\\uDC00\"", 1u8, 0)?;
+    check("\"\\uD800\\u0041\"", 1u8, 0)?;
+    check("\"\\\"\\/\\\\\\t\\b\\r\\f\"", 0u8, 1)?;
+    let bad_utf8: [u8; 5] = [34u8, 237u8, 160u8, 128u8, 34u8];
+    check(&bad_utf8[0..5]:Read, 1u8, 0)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run();
+    @drop(failed);
+    exit(1);
+}

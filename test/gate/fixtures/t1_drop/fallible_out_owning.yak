@@ -1,0 +1,36 @@
+export struct Payload { first: u32[], second: u32[] }
+
+function fill(mode: u8, left: &Payload:Write, right: &Payload:Write): void!AllocError {
+    if mode == 0u8 { return AllocError::OutOfMemory; }
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, 11u32)?;
+    @push(b, 12u32)?;
+    *left = Payload { first: @move(a), second: @move(b) };
+    if mode == 1u8 { return AllocError::OutOfMemory; }
+    var c: u32[] = [];
+    var d: u32[] = [];
+    @push(c, 21u32)?;
+    @push(d, 22u32)?;
+    *right = Payload { first: @move(c), second: @move(d) };
+    if mode == 2u8 {
+        var witness: u32[] = [];
+        @push(witness, 31u32)?;
+        @drop(witness);
+    }
+    return;
+}
+
+// 错误时两槽回空；成功时只有调用方可以提取并析构。
+export function exercise(mode: u8): u32!AllocError {
+    out left: Payload;
+    out right: Payload;
+    fill(mode, out left, out right)?;
+    let a: Payload = @move(left);
+    let b: Payload = @move(right);
+    @drop(a);
+    @drop(b);
+    return 42u32;
+}
+
+function main(): void { return; }

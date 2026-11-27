@@ -1,0 +1,5 @@
+// expected_trap: cyclic dependency
+// module: a=fixtures/cycle_a.yak
+// module: b=fixtures/cycle_b.yak
+import a;
+function main(): void {  }

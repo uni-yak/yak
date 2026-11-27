@@ -1,0 +1,7 @@
+// expected_code: E7022
+// expected_diagnostics: E7022
+// spec: spec/ir/mir.md#M-9
+// 触发：无增泛型声明优先于增操作与普通泛型形态拒绝。
+function #make<T>(): u64 { let values: u32[] = [1u32]; return @len(values); }
+
+function main(): void { return; }

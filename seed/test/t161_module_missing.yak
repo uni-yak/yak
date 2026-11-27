@@ -1,0 +1,3 @@
+// expected_trap: unregistered dependency
+import missing;
+function main(): void {  }

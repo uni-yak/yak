@@ -1,0 +1,48 @@
+// MIR 降级所需的只读类型与布局判定。
+import layout;
+import mir;
+import typecheck;
+
+function supported_errors(tc: &typecheck::TypeCheckResult:Read, fields: &layout::ImportedFieldLayoutTable:Read, imported: &typecheck::ImportedEnumTable:Read, errors: u32): bool {
+    if !mir::valid_type(&tc.types:Read, errors) { return false; }
+    let set: typecheck::TypeEntry = tc.types.entries[errors - 1];
+    if set.kind != 11 || set.members_count == 0 { return false; }
+    if set.members_start > @len(tc.types.members) as u32 || set.members_count > @len(tc.types.members) as u32 - set.members_start { return false; }
+    var i: u32 = 0;
+    while i < set.members_count {
+        let member: u32 = tc.types.members[set.members_start + i];
+        if mir::enum_count_of(&tc.types:Read, &tc.enums:Read, imported, member) == 0 ||
+            mir::storage_shape(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, fields, imported, member, 0) == 0 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function supported_type(tc: &typecheck::TypeCheckResult:Read, imported: &layout::ImportedFieldLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, imported_layouts: &layout::ImportedLayoutTable:Read, id: u32, allow_void: bool): bool {
+    if !mir::valid_type(&tc.types:Read, id) { return false; }
+    var value_id: u32 = id;
+    var permits_void: bool = allow_void;
+    let outer: typecheck::TypeEntry = tc.types.entries[id - 1];
+    // 载体复用普通值的布局判定；错误位仍只接受已支持的错误枚举。
+    if outer.kind == 9 {
+        if !mir::valid_type(&tc.types:Read, outer.success) || !supported_errors(tc, imported, imported_enums, outer.elem) { return false; }
+        value_id = outer.success;
+        permits_void = true;
+    }
+    // 导入名义类型必须有可信布局摘要；缺摘要时整类拒绝，不进入枚举/聚合判定。
+    if tc.types.entries[value_id - 1].kind == 3 {
+        var known: bool = false;
+        var i: u32 = 0;
+        while i < @len(imported_layouts.items) as u32 {
+            if imported_layouts.items[i].dep == tc.types.entries[value_id - 1].dep && imported_layouts.items[i].export_id == tc.types.entries[value_id - 1].export_id && imported_layouts.items[i].size > 0 && imported_layouts.items[i].align > 0 { known = true; }
+            i = i + 1;
+        }
+        if !known { return false; }
+    }
+    if mir::is_void(&tc.types:Read, value_id) { return permits_void; }
+    let entry: typecheck::TypeEntry = tc.types.entries[value_id - 1];
+    if entry.kind == 4 { return entry.cap < 2 && mir::valid_type(&tc.types:Read, entry.elem); }
+    var storage: u32 = value_id;
+    if mir::is_slice_view(&tc.types:Read, value_id) { storage = entry.elem; }
+    return mir::storage_shape(&tc.types:Read, &tc.fields:Read, &tc.enums:Read, imported, imported_enums, storage, 0) != 0;
+}

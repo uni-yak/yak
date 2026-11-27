@@ -1,0 +1,392 @@
+// YKIF format 2 导出排序、类型描述符与私有名节序列化辅助。
+import iface;
+import buf;
+import lex;
+import ast;
+import diag;
+import resolve;
+import resolve_refs;
+import typecheck;
+
+const TK_LOCAL: u8 = 2;
+
+export function export_less(left: iface::ExportInput, right: iface::ExportInput, names: &lex::NameTable:Read): bool {
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    let le: lex::NameEntry = names.entries[left.name - 1];
+    let re: lex::NameEntry = names.entries[right.name - 1];
+    return iface::export_key_less(le.hash, &arena.data[le.text_off..le.text_off + le.text_len as u32]:Read, left.kind, re.hash, &arena.data[re.text_off..re.text_off + re.text_len as u32]:Read, right.kind);
+}
+export function set_u16(buf: &u8[]:ReadWrite, offset: u32, value: u16): void {
+    buf[offset] = (value & 255) as u8;
+    buf[offset + 1] = ((value >> 8) & 255) as u8;
+    return;
+}
+export function set_u32(buf: &u8[]:ReadWrite, offset: u32, value: u32): void {
+    buf[offset] = (value & 255) as u8;
+    buf[offset + 1] = ((value >> 8) & 255) as u8;
+    buf[offset + 2] = ((value >> 16) & 255) as u8;
+    buf[offset + 3] = ((value >> 24) & 255) as u8;
+    return;
+}
+export function push_bytes(sink: &iface::ByteSink:ReadWrite, data: &[u8]): void!AllocError {
+    let end: u32 = @len(data) as u32;
+    var i: u32 = 0;
+    while i < end { @push(sink.bytes, data[i])?; i = i + 1; }
+    return;
+}
+export function push_u8(sink: &iface::ByteSink:ReadWrite, value: u8): void!AllocError {
+    @push(sink.bytes, value)?;
+    return;
+}
+export function push_u16(sink: &iface::ByteSink:ReadWrite, value: u16): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    return;
+}
+export function push_u32(sink: &iface::ByteSink:ReadWrite, value: u32): void!AllocError {
+    @push(sink.bytes, (value & 255) as u8)?;
+    @push(sink.bytes, ((value >> 8) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 16) & 255) as u8)?;
+    @push(sink.bytes, ((value >> 24) & 255) as u8)?;
+    return;
+}
+export function push_u64(sink: &iface::ByteSink:ReadWrite, value: u64): void!AllocError {
+    push_u32(sink, (value & 4294967295u64) as u32)?;
+    push_u32(sink, (value >> 32) as u32)?;
+    return;
+}
+export function push_name(sink: &iface::ByteSink:ReadWrite, names: &lex::NameTable:Read, name: u32): void!AllocError {
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    let info_entry: lex::NameEntry = names.entries[name - 1];
+    let end: u32 = info_entry.text_off + info_entry.text_len as u32;
+    var position: u32 = info_entry.text_off;
+    while position < end {
+        @push(sink.bytes, arena.data[position])?;
+        position = position + 1;
+    }
+    return;
+}
+function find_local_type(types: &typecheck::TypeTable:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(types.entries) as u32 {
+        if types.entries[i].kind == TK_LOCAL && types.entries[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function layout_size(layouts: &iface::LayoutData:Read, type_id: u32): u64 {
+    if type_id == 0 || type_id > @len(layouts.sizes) as u32 { return 0; }
+    return layouts.sizes[type_id - 1];
+}
+function layout_align(layouts: &iface::LayoutData:Read, type_id: u32): u8 {
+    if type_id == 0 || type_id > @len(layouts.aligns) as u32 { return 0; }
+    return layouts.aligns[type_id - 1];
+}
+function layout_known(layouts: &iface::LayoutData:Read, type_id: u32): bool {
+    if type_id == 0 || type_id > @len(layouts.known) as u32 { return false; }
+    return layouts.known[type_id - 1];
+}
+function enum_data_of(file: &ast::AstFile:Read, resolution: &resolve_refs::Resolution:Read, def: u32): u32 {
+    let resolved: &resolve::ResolveResult:Read = &resolution.result:Read;
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        if file.items[i].kind == 1 && resolved.file.items[i].def_id == def { return file.items[i].data; }
+        i = i + 1;
+    }
+    return 4294967295u32;
+}
+function enum_info_of(tc: &typecheck::TypeCheckResult:Read, def: u32): u32 {
+    var i: u32 = 0;
+    while i < @len(tc.enums.items) as u32 {
+        if tc.enums.items[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+function index_less(left: iface::IndexPair, right: iface::IndexPair, names: &lex::NameTable:Read): bool {
+    let arena: &buf::ByteBuf:Read = &names.arena:Read;
+    if left.export_id != right.export_id { return left.export_id < right.export_id; }
+    let lh: u64 = names.entries[left.name - 1].hash;
+    let rh: u64 = names.entries[right.name - 1].hash;
+    if lh != rh { return lh < rh; }
+    let ll: u32 = names.entries[left.name - 1].text_len as u32;
+    let rl: u32 = names.entries[right.name - 1].text_len as u32;
+    var i: u32 = 0;
+    while i < ll && i < rl {
+        let lb: u8 = arena.data[names.entries[left.name - 1].text_off + i];
+        let rb: u8 = arena.data[names.entries[right.name - 1].text_off + i];
+        if lb != rb { return lb < rb; }
+        i = i + 1;
+    }
+    if ll != rl { return ll < rl; }
+    return left.member_id < right.member_id;
+}
+function sort_indexes(table: &iface::IndexPairTable:ReadWrite, names: &lex::NameTable:Read): void {
+    var i: u32 = 1;
+    while i < @len(table.items) as u32 {
+        let current: iface::IndexPair = table.items[i];
+        var pos: u32 = i;
+        while pos > 0 && index_less(current, table.items[pos - 1], names) {
+            table.items[pos] = table.items[pos - 1];
+            pos = pos - 1;
+        }
+        table.items[pos] = current;
+        i = i + 1;
+    }
+    return;
+}
+function collect_exports(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read): iface::ExportInput[]!AllocError {
+    let resolved: &resolve::ResolveResult:Read = &resolution.result:Read;
+    var exports: iface::ExportInput[] = [];
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        let item: ast::AstItem = file.items[i];
+        let def: u32 = resolved.file.items[i].def_id;
+        if item.kind == 0 && pool.functions[item.data].is_export {
+            @push(exports, iface::ExportInput { def: def, name: pool.functions[item.data].name, kind: 1 })?;
+        } elseif item.kind == 1 && pool.enums[item.data].is_export {
+            @push(exports, iface::ExportInput { def: def, name: pool.enums[item.data].name, kind: 2 })?;
+        } elseif item.kind == 2 && pool.structs[item.data].is_export {
+            @push(exports, iface::ExportInput { def: def, name: pool.structs[item.data].name, kind: 3 })?;
+        }
+        i = i + 1;
+    }
+    return exports;
+}
+export function sorted_inputs(items: &[iface::ExportInput]:Read, names: &lex::NameTable:Read): iface::ExportInput[]!AllocError {
+    var sorted: iface::ExportInput[] = [];
+    var next: u32 = 0;
+    while next < @len(items) as u32 {
+        let current: iface::ExportInput = items[next];
+        var pos: u32 = 0;
+        while pos < @len(sorted) as u32 && export_less(sorted[pos], current, names) { pos = pos + 1; }
+        @push(sorted, current)?;
+        var k: u32 = @len(sorted) as u32 - 1;
+        while k > pos { sorted[k] = sorted[k - 1]; k = k - 1; }
+        sorted[pos] = current;
+        next = next + 1;
+    }
+    return sorted;
+}
+export function sorted_exports(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read): iface::ExportInput[]!AllocError {
+    let exports: iface::ExportInput[] = collect_exports(file, pool, resolution)?;
+    return sorted_inputs(&exports[0..@len(exports)]:Read, names)?;
+}
+function collect_privates(file: &ast::AstFile:Read, pool: &ast::AstPool:Read): iface::ExportInput[]!AllocError {
+    var privates: iface::ExportInput[] = [];
+    var i: u32 = 0;
+    while i < @len(file.items) as u32 {
+        let item: ast::AstItem = file.items[i];
+        if item.kind == 0 && !pool.functions[item.data].is_export {
+            @push(privates, iface::ExportInput { def: 0, name: pool.functions[item.data].name, kind: 1 })?;
+        } elseif item.kind == 1 && !pool.enums[item.data].is_export {
+            @push(privates, iface::ExportInput { def: 0, name: pool.enums[item.data].name, kind: 2 })?;
+        } elseif item.kind == 2 && !pool.structs[item.data].is_export {
+            @push(privates, iface::ExportInput { def: 0, name: pool.structs[item.data].name, kind: 3 })?;
+        } elseif item.kind == 3 {
+            @push(privates, iface::ExportInput { def: 0, name: pool.consts[item.data].name, kind: 4 })?;
+        } elseif item.kind == 4 {
+            @push(privates, iface::ExportInput { def: 0, name: pool.foreigns[item.data].name, kind: 5 })?;
+        }
+        i = i + 1;
+    }
+    return privates;
+}
+export function sorted_privates(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read): iface::ExportInput[]!AllocError {
+    let privates: iface::ExportInput[] = collect_privates(file, pool)?;
+    return sorted_inputs(&privates[0..@len(privates)]:Read, names)?;
+}
+export function local_error_exports(sorted: &[iface::ExportInput]:Read): u32[]!AllocError {
+    var kinds: u32[] = [];
+    @push(kinds, 0u32)?;
+    var i: u32 = 0;
+    while i < @len(sorted) as u32 {
+        @push(kinds, sorted[i].kind as u32)?;
+        i = i + 1;
+    }
+    return kinds;
+}
+export function map_of_exports(sorted: &[iface::ExportInput]:Read): iface::ExportMap!AllocError {
+    var map: iface::ExportMap = iface::ExportMap { defs: [], exports: [] };
+    var i: u32 = 0;
+    while i < @len(sorted) as u32 {
+        @push(map.defs, sorted[i].def)?;
+        @push(map.exports, i + 1)?;
+        i = i + 1;
+    }
+    return map;
+}
+
+// 封装导出类型的布局摘要、枚举/结构体描述符、成员表及已排序的名称索引节。
+export struct TypeSections {
+    summary_data: iface::ByteSink,
+    enum_desc_data: iface::ByteSink,
+    enum_member_data: iface::ByteSink,
+    enum_index_data: iface::ByteSink,
+    struct_desc_data: iface::ByteSink,
+    struct_field_data: iface::ByteSink,
+    struct_index_data: iface::ByteSink,
+}
+
+export function encode_type_sections(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, resolution: &resolve_refs::Resolution:Read, names: &lex::NameTable:Read, tc: &typecheck::TypeCheckResult:Read, layouts: &iface::LayoutData:Read, sorted: &[iface::ExportInput]:Read, map: &iface::ExportMap:Read, export_kinds: &[u32]:Read, loaded: &[iface::LoadedInterface]:Read, order: &[u32]:Read, name_data: &iface::ByteSink:ReadWrite, sig_data: &iface::ByteSink:ReadWrite, aux_offs: &u32[]:ReadWrite, diags: &diag::DiagBuffer:ReadWrite): TypeSections!AllocError {
+    var summary_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var enum_desc_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var enum_member_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var struct_desc_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var struct_field_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var enum_indexes: iface::IndexPair[] = [];
+    var struct_indexes: iface::IndexPair[] = [];
+    var next: u32 = 0;
+    let total: u32 = @len(sorted) as u32;
+    while next < total {
+        if sorted[next].kind == 2 {
+            let def: u32 = sorted[next].def;
+            let type_id: u32 = find_local_type(&tc.types:Read, def);
+            if !layout_known(layouts, type_id) { iface::emit_unsupported(diags)?; }
+            else {
+                let sum_idx: u32 = @len(summary_data.bytes) as u32 / 16;
+                push_u32(&summary_data:ReadWrite, next + 1)?;
+                push_u64(&summary_data:ReadWrite, layout_size(layouts, type_id))?;
+                push_u8(&summary_data:ReadWrite, layout_align(layouts, type_id))?;
+                push_u8(&summary_data:ReadWrite, 0)?;
+                push_u16(&summary_data:ReadWrite, 0)?;
+                let data: u32 = enum_data_of(file, resolution, def);
+                let enum_info: u32 = enum_info_of(tc, def);
+                var count: u32 = 0;
+                if data != 4294967295u32 { count = @len(pool.enums[data].variants) as u32; }
+                (*aux_offs)[next] = @len(enum_desc_data.bytes) as u32;
+                push_u32(&enum_desc_data:ReadWrite, @len(enum_member_data.bytes) as u32 / 32)?;
+                push_u32(&enum_desc_data:ReadWrite, count)?;
+                push_u16(&enum_desc_data:ReadWrite, 0)?;
+                push_u8(&enum_desc_data:ReadWrite, 0)?;
+                push_u8(&enum_desc_data:ReadWrite, 0)?;
+                push_u32(&enum_desc_data:ReadWrite, sum_idx)?;
+                var v: u32 = 0;
+                while v < count {
+                    let variant_name: u32 = pool.enums[data].variants[v].name;
+                    let member_name_off: u32 = @len(name_data.bytes) as u32;
+                    push_name(name_data, names, variant_name)?;
+                    let member_name_len: u32 = @len(name_data.bytes) as u32 - member_name_off;
+                    var payload: u32 = 0;
+                    if enum_info != 0 { payload = tc.enums.items[enum_info - 1].payloads[v]; }
+                    var payload_off: u32 = 0;
+                    var payload_len: u32 = 0;
+                    if payload != 0 {
+                        payload_off = @len(sig_data.bytes) as u32;
+                        iface::encode_type_for(&tc.types:Read, map, payload, sig_data, diags, export_kinds, loaded, order, @len(order) as u32, true, 1)?;
+                        payload_len = @len(sig_data.bytes) as u32 - payload_off;
+                    }
+                    push_u32(&enum_member_data:ReadWrite, next + 1)?;
+                    push_u32(&enum_member_data:ReadWrite, member_name_off)?;
+                    push_u16(&enum_member_data:ReadWrite, member_name_len as u16)?;
+                    push_u16(&enum_member_data:ReadWrite, v as u16)?;
+                    var has_payload: u16 = 0;
+                    if payload != 0 { has_payload = 1; }
+                    push_u16(&enum_member_data:ReadWrite, has_payload)?;
+                    push_u16(&enum_member_data:ReadWrite, 0)?;
+                    push_u32(&enum_member_data:ReadWrite, payload_off)?;
+                    push_u32(&enum_member_data:ReadWrite, payload_len)?;
+                    push_u64(&enum_member_data:ReadWrite, names.entries[variant_name - 1].hash)?;
+                    @push(enum_indexes, iface::IndexPair { export_id: next + 1, member_id: v as u16, name: variant_name })?;
+                    v = v + 1;
+                }
+            }
+        } elseif sorted[next].kind == 3 {
+            let def: u32 = sorted[next].def;
+            let type_id: u32 = find_local_type(&tc.types:Read, def);
+            if !layout_known(layouts, type_id) { iface::emit_unsupported(diags)?; }
+            else {
+                let sum_idx: u32 = @len(summary_data.bytes) as u32 / 16;
+                push_u32(&summary_data:ReadWrite, next + 1)?;
+                push_u64(&summary_data:ReadWrite, layout_size(layouts, type_id))?;
+                push_u8(&summary_data:ReadWrite, layout_align(layouts, type_id))?;
+                push_u8(&summary_data:ReadWrite, 0)?;
+                push_u16(&summary_data:ReadWrite, 0)?;
+                let descriptor: u32 = @len(struct_desc_data.bytes) as u32;
+                (*aux_offs)[next] = descriptor;
+                push_u32(&struct_desc_data:ReadWrite, @len(struct_field_data.bytes) as u32 / 32)?;
+                push_u32(&struct_desc_data:ReadWrite, 0)?;
+                push_u16(&struct_desc_data:ReadWrite, 0)?;
+                push_u8(&struct_desc_data:ReadWrite, 0)?;
+                push_u8(&struct_desc_data:ReadWrite, 0)?;
+                push_u32(&struct_desc_data:ReadWrite, sum_idx)?;
+                var field_id: u32 = 0;
+                var f: u32 = 0;
+                let field_end: u32 = @len(tc.fields.items) as u32;
+                while f < field_end {
+                    if tc.fields.items[f].def == def {
+                        let field_name: u32 = tc.fields.items[f].name;
+                        let field_name_off: u32 = @len(name_data.bytes) as u32;
+                        push_name(name_data, names, field_name)?;
+                        let field_name_len: u32 = @len(name_data.bytes) as u32 - field_name_off;
+                        let type_off: u32 = @len(sig_data.bytes) as u32;
+                        iface::encode_type_for(&tc.types:Read, map, tc.fields.items[f].type_id, sig_data, diags, export_kinds, loaded, order, @len(order) as u32, true, 1)?;
+                        let type_len: u32 = @len(sig_data.bytes) as u32 - type_off;
+                        push_u32(&struct_field_data:ReadWrite, next + 1)?;
+                        push_u32(&struct_field_data:ReadWrite, field_name_off)?;
+                        push_u16(&struct_field_data:ReadWrite, field_name_len as u16)?;
+                        push_u16(&struct_field_data:ReadWrite, field_id as u16)?;
+                        push_u16(&struct_field_data:ReadWrite, 0)?;
+                        push_u16(&struct_field_data:ReadWrite, 0)?;
+                        push_u32(&struct_field_data:ReadWrite, type_off)?;
+                        push_u32(&struct_field_data:ReadWrite, type_len)?;
+                        push_u64(&struct_field_data:ReadWrite, names.entries[field_name - 1].hash)?;
+                        @push(struct_indexes, iface::IndexPair { export_id: next + 1, member_id: field_id as u16, name: field_name })?;
+                        field_id = field_id + 1;
+                    }
+                    f = f + 1;
+                }
+                set_u32(&struct_desc_data.bytes:ReadWrite, descriptor + 4, field_id);
+            }
+        }
+        next = next + 1;
+    }
+    var enum_pair_table: iface::IndexPairTable = iface::IndexPairTable { items: enum_indexes };
+    var struct_pair_table: iface::IndexPairTable = iface::IndexPairTable { items: struct_indexes };
+    sort_indexes(&enum_pair_table:ReadWrite, names);
+    sort_indexes(&struct_pair_table:ReadWrite, names);
+    var enum_index_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var struct_index_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    next = 0;
+    while next < @len(enum_pair_table.items) as u32 {
+        push_u32(&enum_index_data:ReadWrite, enum_pair_table.items[next].export_id)?;
+        push_u16(&enum_index_data:ReadWrite, enum_pair_table.items[next].member_id)?;
+        push_u16(&enum_index_data:ReadWrite, 0)?;
+        next = next + 1;
+    }
+    next = 0;
+    while next < @len(struct_pair_table.items) as u32 {
+        push_u32(&struct_index_data:ReadWrite, struct_pair_table.items[next].export_id)?;
+        push_u16(&struct_index_data:ReadWrite, struct_pair_table.items[next].member_id)?;
+        push_u16(&struct_index_data:ReadWrite, 0)?;
+        next = next + 1;
+    }
+    return TypeSections {
+        summary_data: @move(summary_data),
+        enum_desc_data: @move(enum_desc_data),
+        enum_member_data: @move(enum_member_data),
+        enum_index_data: @move(enum_index_data),
+        struct_desc_data: @move(struct_desc_data),
+        struct_field_data: @move(struct_field_data),
+        struct_index_data: @move(struct_index_data),
+    };
+}
+
+export function encode_privates(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, name_data: &iface::ByteSink:ReadWrite, out_count: &u32:ReadWrite): iface::ByteSink!AllocError {
+    let privates: iface::ExportInput[] = sorted_privates(file, pool, names)?;
+    var private_data: iface::ByteSink = iface::ByteSink { bytes: [] };
+    var next: u32 = 0;
+    let total: u32 = @len(privates) as u32;
+    while next < total {
+        let private_off: u32 = @len(name_data.bytes) as u32;
+        push_name(name_data, names, privates[next].name)?;
+        push_u32(&private_data:ReadWrite, private_off)?;
+        push_u16(&private_data:ReadWrite, (@len(name_data.bytes) as u32 - private_off) as u16)?;
+        push_u8(&private_data:ReadWrite, privates[next].kind)?;
+        push_u8(&private_data:ReadWrite, 0)?;
+        push_u64(&private_data:ReadWrite, names.entries[privates[next].name - 1].hash)?;
+        next = next + 1;
+    }
+    *out_count = total;
+    return private_data;
+}

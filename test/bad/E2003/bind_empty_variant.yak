@@ -1,0 +1,7 @@
+// expected_code: E2003
+// spec: spec/lang/parse.md P-3
+// 触发：无载荷标签仍尝试绑定一个载荷名。
+enum Choice { A }
+function bad(e: Choice): void { match e { A(v) => { v; } } }
+
+function main(): void { return; }

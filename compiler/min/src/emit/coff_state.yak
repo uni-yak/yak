@@ -1,0 +1,706 @@
+// Win64 发射共享状态、栈槽规划与低层搬运。
+
+import pe;
+import mir;
+import typecheck;
+import diag;
+import layout;
+
+// ── 链接输入 ──
+// MIR 不含符号名，符号名与外部目标由发射调用方经 LinkTable 提供。
+// kind：0=本地函数（本模块定义）、1=外部函数（foreign/依赖模块）、2=数据符号。
+export struct LinkSymbol { def: u64, kind: u8, name: u8[] }
+export struct LinkTable { symbols: LinkSymbol[] }
+
+// 高位保存非零 u16 DependencyId，低 32 位保留完整 ExportId。
+// 零键表示非法输入；本地与 foreign 的 DefId 只占低位。
+export function import_symbol_def(dep: u32, export_id: u32): u64 {
+    if dep == 0 || dep > 65535 || export_id == 0 { return 0; }
+    return ((dep as u64) << 32u64) | (export_id as u64);
+}
+
+// ABI 复制上限：栈槽模型按 8 字节块展开复制，超出上限按 EM-6 拒绝以限定代码体积。
+const ABI_COPY_LIMIT: u32 = 4096;
+export function abi_copy_limit(): u32 { return ABI_COPY_LIMIT; }
+
+// 调用点：位移字段偏移 + 目标 DefId/ImportRef + 调用种类（本地/外部）。
+export struct CallSite { at: u32, symbol: u64, kind: u8 }
+// 数据引用站点：.text 内 4 字节 RIP 相对位移字段偏移 + 静态池索引。
+// 装配阶段把它转成对 `.rdata` 内对应静态条目数据符号的 REL32 重定位。
+export struct DataRef { at: u32, index: u32 }
+
+// 栈帧与代码布局规划结果。
+// rejected 记录首个拒绝 op（0 表示无；255 也用于零操作码或无对应 opcode 的合成标记），
+// reject_kind 记录拒绝类别。3 为重定位，4 至 6 为对象内容，7 至 9 为 Win64 栈帧，10 至 12 为 x86 指令，13 至 14 为 System V 栈帧。
+export struct FunctionLayout {
+    def: u32, symbol: u32, text_offset: u32, code_size: u32,
+    frame_size: u32, slots: u32[], widths: u8[],
+    code: u8[], calls: CallSite[], data_refs: DataRef[],
+    rejected: u8, reject_kind: u8,
+}
+export struct ObjectLayout {
+    functions: FunctionLayout[], text: u8[], rdata: u8[], data: u8[],
+    static_offsets: u32[], rejected: u8, reject_kind: u8,
+}
+
+export function win64_reject_kind(code: u16): u8 {
+    if code == 8004 { return 3; }
+    if code >= 8006 && code <= 8008 { return (code - 7999u16) as u8; }
+    if code == 7103 { return 10; }
+    if code == 7102 { return 11; }
+    if code == 7101 { return 12; }
+    if code == 8014 { return 13; }
+    if code == 8015 { return 14; }
+    return 0;
+}
+
+export function win64_reject_code(kind: u8): u16 {
+    if kind == 3 { return 8004; }
+    if kind >= 7 && kind <= 9 { return 7999u16 + kind as u16; }
+    if kind == 10 { return 7103; }
+    if kind == 11 { return 7102; }
+    if kind == 12 { return 7101; }
+    if kind == 13 { return 8014; }
+    if kind == 14 { return 8015; }
+    return 0;
+}
+
+
+// 类型宽度：标量按 builtin，其余对象按 8 字节指针/句柄估计。
+// base 期发射的局部只出现标量与布尔，故此处覆盖即够用。
+export function builtin_width(builtin: u16): u8 {
+    if builtin == 4097 { return 1; }
+    if builtin == 4098 { return 2; }
+    if builtin == 4099 { return 4; }
+    if builtin == 4100 { return 8; }
+    if builtin == 4101 { return 1; }
+    if builtin == 4102 { return 2; }
+    if builtin == 4103 { return 4; }
+    if builtin == 4104 { return 8; }
+    if builtin == 4105 { return 1; }
+    if builtin == 4106 { return 4; }
+    if builtin == 4107 { return 0; }
+    if builtin == 4108 { return 1; }
+    return 8;
+}
+// 有符号内置类型：i8/i16/i32/i64。
+export function builtin_signed(builtin: u16): bool {
+    if builtin >= 4101 && builtin <= 4104 { return true; }
+    return false;
+}
+// 类型条目到宽度；非标量按要求给 8 字节槽。
+export function type_width(types: &typecheck::TypeTable:Read, id: u32): u8 {
+    if id == 0 || id > @len(types.entries) as u32 { return 8; }
+    let entry: typecheck::TypeEntry = types.entries[id - 1];
+    if entry.kind == 1 { return builtin_width(entry.builtin); }
+    if entry.kind == 0 { return 0; }
+    return 8;
+}
+// 切片型局部统一使用胖指针（指针 + 长度），索引时才读取元素布局。
+export function is_slice_type(types: &typecheck::TypeTable:Read, id: u32): bool {
+    if id == 0 || id > @len(types.entries) as u32 { return false; }
+    return types.entries[id - 1].kind == 5;
+}
+export function type_signed(types: &typecheck::TypeTable:Read, id: u32): bool {
+    if id == 0 || id > @len(types.entries) as u32 { return false; }
+    let entry: typecheck::TypeEntry = types.entries[id - 1];
+    if entry.kind != 1 { return false; }
+    return builtin_signed(entry.builtin);
+}
+
+// ── 栈帧规划 ──
+// 每个 LocalId 分配固定栈槽：偏移从 rbp 向下累加，槽宽按类型宽度并向上对齐到 8。
+// slots[i] 保存第 i 个局部（LocalId = i+1）相对 rbp 的负向距离。
+// 聚合局部（struct / 定长数组）按 layout 尺寸向上取整到 8 字节对齐，其余按 8 字节。
+// 栈槽规划结果：每个 LocalId（从 1 起）对应一个相对 rbp 的负向距离与类型宽度。
+// by_ptr 记录该局部是否按 Win64 聚合规则以指针传递；sret 非零时表示
+// 返回值为按指针返回，附加槽保存调用方提供的隐藏返回缓冲区地址。
+export struct SlotPlan { slots: u32[], widths: u8[], by_ptr: bool[], sret: u32 }
+// Win64 聚合分类（abi-win 2.7/2.8）：尺寸为 1/2/4/8 字节的聚合按同宽整数传递；
+// 其余尺寸（含 >8 与 3/5/6/7 字节）由调用方提供副本并以指针传递/返回。
+// ABI 分类与槽位规划共用已求值的聚合布局，含 fallible、nullable 与 ErrorSet。
+// 标量与未知类型返回 0。
+export function table_object_size(table: &layout::LayoutTable:Read, types: &typecheck::TypeTable:Read, id: u32): u64 {
+    if id == 0 || id > @len(types.entries) as u32 || id > @len(table.items) as u32 { return 0; }
+    let kind: u8 = types.entries[id - 1].kind;
+    if kind != 2 && kind != 3 && kind != 6 && kind != 7 && kind != 9 && kind != 10 && kind != 11 { return 0; }
+    if !table.items[id - 1].known { return 0; }
+    return table.items[id - 1].size;
+}
+export function plan_slots(func: &mir::MirFunction:Read, module: &mir::MirModule:Read): SlotPlan!AllocError {
+    var scratch: diag::DiagBuffer = diag::diagbuf_new();
+    let table: layout::LayoutTable = layout::layout_table_with_imports(&module.types:Read, &module.fields:Read, &module.enums:Read, &module.imported_layouts:Read, &module.imported_enums:Read, &scratch:ReadWrite)?;
+    return plan_slots_table(func, module, &table:Read)?;
+}
+export function plan_slots_table(func: &mir::MirFunction:Read, module: &mir::MirModule:Read, table: &layout::LayoutTable:Read): SlotPlan!AllocError {
+    return plan_target_slots(func, module, table, false)?;
+}
+export function plan_target_slots(func: &mir::MirFunction:Read, module: &mir::MirModule:Read, table: &layout::LayoutTable:Read, sysv: bool): SlotPlan!AllocError {
+    var plan: SlotPlan = SlotPlan { slots: [], widths: [], by_ptr: [], sret: 0 };
+    var used: u32 = 0;
+    var i: u32 = 0;
+    let count: u32 = @len(func.locals) as u32;
+    let types_count: u32 = @len(module.types.entries) as u32;
+    let layout_count: u32 = @len(table.items) as u32;
+    while i < count {
+        let id: u32 = func.locals[i].value_type_id;
+        var width: u8 = 8;
+        var by_ptr: bool = false;
+        var kind: u8 = 255;
+        if id != 0 && id <= types_count {
+            kind = module.types.entries[id - 1].kind;
+            if kind == 1 { width = builtin_width(module.types.entries[id - 1].builtin); }
+            elseif kind == 0 { width = 0; }
+        }
+        // 切片局部按胖指针占 16 字节：低 8 字节（偏移 0）放指针、高 8 字节（偏移 8）放长度。
+        // 栈槽以 [rbp - disp] 寻址，故长度字段的偏移为 disp - 8。
+        if func.locals[i].kind == 3 && func.locals[i].state == 11 {
+            // 借出形参保存地址，不按载荷宽度截断。
+            if used > 4294967287u32 { return plan; }
+            used = used + 8;
+            width = 8;
+        } elseif kind == 5 {
+            if used > 4294967279u32 { return plan; }
+            used = used + 16;
+        } else {
+            var bytes: u64 = 0;
+            if (kind == 2 || kind == 3 || kind == 6 || kind == 7 || kind == 9 || kind == 10 || kind == 11) && id <= layout_count {
+                if table.items[id - 1].known { bytes = table.items[id - 1].size; }
+            }
+            if bytes > 8 {
+                // 槽位最多可编码为 u32，先拒绝更大的尺寸以免对齐加法溢出。
+                if bytes > 4294967295u64 { return plan; }
+                // 聚合槽占用向上取整到 8 字节：搬运与字段读写按 8 字节块进行，
+                // 按精确字节累加会让 [u16; 3] 这类 6 字节聚合的槽尾越界 2 字节。
+                let rounded: u64 = ((bytes + 7) / 8) * 8;
+                // u32 溢出时提前返回部分计划，槽位数少于局部数，由 emit_function 拒绝。
+                if rounded > 4294967295u64 - used as u64 { return plan; }
+                used = used + rounded as u32;
+            } else {
+                // 其余局部一律占 8 字节槽，保证 8 字节对齐且读写宽度由 widths 记录。
+                if used > 4294967287u32 { return plan; }
+                used = used + 8;
+            }
+            if bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 { width = bytes as u8; }
+            elseif bytes != 0 { by_ptr = true; }
+        }
+        @push(plan.slots, used)?;
+        @push(plan.widths, width)?;
+        @push(plan.by_ptr, by_ptr)?;
+        i = i + 1;
+    }
+    // 按指针返回的聚合需要保存调用方传入的隐藏返回缓冲区指针（abi-win 2.8）。
+    if func.signature != 0 && func.signature <= @len(module.signatures.items) as u32 {
+        let bytes: u64 = table_object_size(table, &module.types:Read, module.signatures.items[func.signature - 1].ret);
+        let indirect: bool = sysv && bytes > 16 || !sysv && bytes != 0 && bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8;
+        if indirect {
+            if used > 4294967287u32 { return plan; }
+            used = used + 8;
+            plan.sret = used;
+            @push(plan.slots, used)?;
+            @push(plan.widths, 8)?;
+            @push(plan.by_ptr, false)?;
+        }
+    }
+    return plan;
+}
+// 取 LocalId 的声明类型；越界返回 0（调用方按无符号处理）。
+export function local_type(locals: &[u32]:Read, local: u32): u32 {
+    if local == 0 || local > @len(locals) as u32 { return 0; }
+    return locals[local - 1];
+}
+// 收集函数全部局部的声明类型，供符号性与宽度判定。
+export function local_types(func: &mir::MirFunction:Read): u32[]!AllocError {
+    var dst: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(func.locals) as u32 {
+        @push(dst, func.locals[i].value_type_id)?;
+        i = i + 1;
+    }
+    return dst;
+}
+// 把机器码字节流复制到独立数组：布局结构不持有对发射期缓冲的引用。
+export function copy_code(code: &pe::Code:Read): u8[]!AllocError {
+    if (code.used as u64) == @len(code.bytes) { return @clone(code.bytes)?; }
+    return copy_u8s(&code.bytes[0..code.used]:Read)?;
+}
+// 深拷贝类型表：发射期结构按值持有，不保留对检查阶段结果的视图（OW-3）。
+export function copy_types(src: &typecheck::TypeTable:Read): typecheck::TypeTable!AllocError {
+    var entries: typecheck::TypeEntry[] = [];
+    var i: u32 = 0;
+    while i < @len(src.entries) as u32 {
+        let e: &typecheck::TypeEntry:Read = &src.entries[i]:Read;
+        @push(entries, typecheck::TypeEntry { kind: e.kind, builtin: e.builtin, def: e.def,
+            dep: e.dep, export_id: e.export_id, elem: e.elem, cap: e.cap, length: e.length,
+            success: e.success, members_start: e.members_start, members_count: e.members_count })?;
+        i = i + 1;
+    }
+    let members: u32[] = copy_u32s(&src.members[0..@len(src.members)]:Read)?;
+    return typecheck::TypeTable { entries: entries, members: members };
+}
+// 复制字段表：发射期不得与 MIR 模块共享可变别名。
+export function copy_fields(src: &typecheck::FieldTable:Read): typecheck::FieldTable!AllocError {
+    var items: typecheck::FieldType[] = [];
+    var i: u32 = 0;
+    while i < @len(src.items) as u32 {
+        let f: &typecheck::FieldType:Read = &src.items[i]:Read;
+        @push(items, typecheck::FieldType { def: f.def, name: f.name, type_id: f.type_id })?;
+        i = i + 1;
+    }
+    return typecheck::FieldTable { items: items };
+}
+// 复制枚举表：发射期不得与 MIR 模块共享可变别名。
+export function copy_enums(src: &typecheck::EnumTable:Read): typecheck::EnumTable!AllocError {
+    var items: typecheck::EnumType[] = [];
+    var i: u32 = 0;
+    while i < @len(src.items) as u32 {
+        let e: &typecheck::EnumType:Read = &src.items[i]:Read;
+        var payloads: u32[] = copy_u32s(&e.payloads[0..@len(e.payloads)]:Read)?;
+        @push(items, typecheck::EnumType { def: e.def, payloads: @move(payloads) })?;
+        i = i + 1;
+    }
+    return typecheck::EnumTable { items: items };
+}
+// 复制 u32 数组：布局结构不得与发射期缓冲共享可变别名。
+export function copy_u32s(src: &[u32]:Read): u32[]!AllocError {
+    var dst: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(dst, src[i])?; i = i + 1; }
+    return dst;
+}
+export function copy_u8s(src: &[u8]:Read): u8[]!AllocError {
+    var dst: u8[] = [];
+    let size: u32 = @len(src) as u32;
+    var i: u32 = 0;
+    let full: u32 = size - size % 8;
+    while i < full {
+        @push(dst, src[i])?;
+        @push(dst, src[i + 1])?;
+        @push(dst, src[i + 2])?;
+        @push(dst, src[i + 3])?;
+        @push(dst, src[i + 4])?;
+        @push(dst, src[i + 5])?;
+        @push(dst, src[i + 6])?;
+        @push(dst, src[i + 7])?;
+        i = i + 8;
+    }
+    while i < size { @push(dst, src[i])?; i = i + 1; }
+    return dst;
+}
+export function copy_bools(src: &[bool]:Read): bool[]!AllocError {
+    var dst: bool[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(dst, src[i])?; i = i + 1; }
+    return dst;
+}
+// 复制静态条目的长度：发射期按值持有，不保留对 MIR 静态池的引用。
+export function copy_static_lengths(statics: &[mir::MirStatic]:Read): u32[]!AllocError {
+    var dst: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(statics) as u32 { @push(dst, statics[i].length)?; i = i + 1; }
+    return dst;
+}
+// 帧大小 = 局部区 + shadow space(32) + 出站实参区，向上 16 字节对齐（abi-win 2.6、4.1）。
+export function plan_frame_with_out(slots: &[u32]:Read, out_slots: u32): u32 {
+    var used: u32 = 0;
+    if @len(slots) > 0 { used = slots[@len(slots) - 1]; }
+    let total: u64 = (used as u64) + 32 + (out_slots as u64) * 8;
+    let aligned: u64 = ((total + 15) / 16) * 16;
+    // x86-64 的 imm32 会符号扩展，零表示帧无法用正数立即数表示。
+    if aligned > 2147483647u64 { return 0; }
+    return aligned as u32;
+}
+// 无出站实参区时的帧大小；保留原签名供既有调用点与定向测试直接使用。
+export function plan_frame(slots: &[u32]:Read): u32 {
+    return plan_frame_with_out(slots, 0);
+}
+// 出站实参区槽数：调用点第 5 个及以后的展开实参位于 [rsp + 32 + 8*(i-5)]（abi-win 2.1）。
+// 逐个调用指令按 ABI 展开宽度求需求并取全函数最大值；帧内一次预留，调用点无需移动 rsp。
+export function plan_out_slots(func: &mir::MirFunction:Read, module: &mir::MirModule:Read, plan: &SlotPlan:Read): u32 {
+    var max_out: u32 = 0;
+    var k: u32 = 0;
+    let inst_count: u32 = @len(func.insts) as u32;
+    while k < inst_count {
+        let op: u8 = func.insts[k].op;
+        if mir::is_slot_call(op) || mir::is_foreign_call(op) {
+            let inst: &mir::MirInst:Read = &func.insts[k]:Read;
+            // 按指针返回时隐藏返回缓冲区指针占第一个整型参数位，用户实参从第二个起算（abi-win 2.8）。
+            var need: u32 = 0;
+            if inst.a != 0 && inst.a <= @len(plan.by_ptr) as u32 && plan.by_ptr[inst.a - 1] { need = 1; }
+            var i: u32 = 0;
+            while i < inst.args_count {
+                let local: u32 = func.args[inst.args_start + i];
+                if local != 0 && local <= @len(func.locals) as u32 && func.locals[local - 1].kind == 3 {
+                    need = need + 1;
+                } elseif local != 0 && local <= @len(func.locals) as u32 && is_slice_type(&module.types:Read, func.locals[local - 1].value_type_id) {
+                    // 切片展开成指针与长度两个整型实参（abi-win 2.2）。
+                    need = need + 2;
+                } else {
+                    need = need + 1;
+                }
+                i = i + 1;
+            }
+            if need > 4 {
+                let spill: u32 = need - 4;
+                if spill > max_out { max_out = spill; }
+            }
+        }
+        k = k + 1;
+    }
+    return max_out;
+}
+
+// System V 的整数聚合最多占两个寄存器，寄存器不足时整值在栈上传递。
+// 切片遵循语言的独立 ptr/len 参数规则，允许跨寄存器与栈的边界。
+export struct SysvLocation { words: u32, registers: u32 }
+export function sysv_location(used: u32, size: u32, aggregate: bool): SysvLocation {
+    let words: u32 = (size - 1) / 8 + 1;
+    let available: u32 = 6 - used;
+    if words <= available && (!aggregate || words <= 2) { return SysvLocation { words: words, registers: words }; }
+    if aggregate { return SysvLocation { words: words, registers: 0 }; }
+    return SysvLocation { words: words, registers: available };
+}
+
+function sysv_stack_words(func: &mir::MirFunction:Read, module: &mir::MirModule:Read, table: &layout::LayoutTable:Read, inst: &mir::MirInst:Read): u32 {
+    var regs: u32 = 0;
+    if inst.a != 0 && inst.a <= @len(func.locals) as u32 && table_object_size(table, &module.types:Read, func.locals[inst.a - 1].value_type_id) > 16 { regs = 1; }
+    var stack: u64 = 0;
+    var i: u32 = 0;
+    while i < inst.args_count {
+        let arg: u32 = func.args[inst.args_start + i];
+        var size: u32 = 8;
+        var aggregate: bool = false;
+        if arg != 0 && arg <= @len(func.locals) as u32 && func.locals[arg - 1].kind != 3 {
+            let id: u32 = func.locals[arg - 1].value_type_id;
+            let total: u64 = table_object_size(table, &module.types:Read, id);
+            if total > 4294967295u64 { return 4294967295u32; }
+            if total != 0 { size = total as u32; aggregate = true; }
+            elseif is_slice_type(&module.types:Read, id) { size = 16; }
+        }
+        let placed: SysvLocation = sysv_location(regs, size, aggregate);
+        regs = regs + placed.registers;
+        stack = stack + (placed.words - placed.registers) as u64;
+        if stack > 268435454u64 { return 4294967295u32; }
+        i = i + 1;
+    }
+    return stack as u32;
+}
+
+export function plan_sysv_out_slots(func: &mir::MirFunction:Read, module: &mir::MirModule:Read, table: &layout::LayoutTable:Read): u32 {
+    var best: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(func.insts) as u32 {
+        let op: u8 = func.insts[i].op;
+        if mir::is_slot_call(op) || mir::is_foreign_call(op) {
+            let words: u32 = sysv_stack_words(func, module, table, &func.insts[i]:Read);
+            if words > best { best = words; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+// 取 LocalId 对应的负向偏移；0 或越界返回 0（调用方视为内部错误）。
+export function slot_of(slots: &[u32]:Read, local: u32): u32 {
+    if local == 0 || local > @len(slots) as u32 { return 0; }
+    return slots[local - 1];
+}
+export function width_of(widths: &[u8]:Read, local: u32): u8 {
+    if local == 0 || local > @len(widths) as u32 { return 8; }
+    return widths[local - 1];
+}
+
+// ── 指令降级 ──
+// 采用 rax/rcx 双累加器：所有局部变量先装入寄存器，算完再写回栈槽。
+// 每条指令各自成小函数，避免单函数超出语句上限。
+// 跳转回填条目：位移字段偏移 + 目标块号。rel32 在函数全部块布局完成后统一回填。
+export struct BlockFixup { at: u32, target: u16 }
+// 跳转表项回填：at 为表项偏移，table 为表基址，target 为目标块号。
+// 表项写 i32（目标块偏移 - 表基址偏移），同函数同节内自相对，零重定位。
+export struct ArmFixup { at: u32, table: u32, target: u16 }
+// 载荷桩：有载荷的臂先跳到桩，桩把载荷写入隐式局部后再跳臂块。
+export struct ArmStub { at: u32, table: u32, block: u16, payload: u32 }
+// 发射期状态：机器码流、栈槽映射、块偏移与待回填跳转。
+export struct Emitter {
+    code: pe::Code,
+    slots: u32[],
+    widths: u8[],
+    types: typecheck::TypeTable,
+    fields: typecheck::FieldTable,
+    enums: typecheck::EnumTable,
+    layouts: layout::LayoutTable,
+    // 导入结构体字段偏移：析构按字段递归时必须据此取地址，缺表即失败关闭。
+    imported_fields: layout::ImportedFieldLayoutTable,
+    imported_fields_ordered: bool,
+    // 导入枚举变体用于寻址活跃载荷。
+    imported_enums: typecheck::ImportedEnumTable,
+    locals: u32[],
+    slice_flags: bool[],
+    agg_sizes: u32[],
+    by_ptr: bool[],
+    sret: u32,
+    // 嵌套拥有型动态数组析构的栈上循环游标区（每层 16 字节：{元素指针, 剩余计数}）。
+    trap_status: u32,
+    resume_jumps: u32[],
+    drop_scratch: u32,
+    drop_depth: u32,
+    // 预计算的按 TypeId 索引的动态数组成员标记（1 表示含动态数组或未知导入结构体）。
+    dyn_flags: u8[],
+    type_sizes: u32[],
+    type_tags: u8[],
+    type_payloads: u32[],
+    frame_size: u32,
+    // 出站实参区槽数：调用点第 5 个及以后展开实参的落栈位置由它决定（abi-win 2.1）。
+    out_slots: u32,
+    block_offsets: u32[],
+    fixups: BlockFixup[],
+    arm_fixups: ArmFixup[],
+    trap: u16,
+    calls: CallSite[],
+    data_refs: DataRef[],
+    static_lengths: u32[],
+    // 克隆与活跃枚举载荷析构共用只读描述。子节点在父节点之前，以向前距离引用。
+    value_shapes: u32[],
+    shape_indices: u32[],
+    shape_refs: u32[],
+    rejected: u8,
+    reject_kind: u8,
+}
+
+
+// 把局部装入目标寄存器（零扩展）。
+export function load_local(em: &Emitter:ReadWrite, local: u32, reg: u8): void!AllocError {
+    var disp: u32 = 0;
+    var width: u8 = 8;
+    if local != 0 {
+        let index: u32 = local - 1;
+        if index < @len(em.slots) as u32 { disp = em.slots[index]; }
+        if index < @len(em.widths) as u32 { width = em.widths[index]; }
+    }
+    pe::load_slot(&em.code:ReadWrite, reg, disp, width)?;
+    return;
+}
+// 把寄存器写回局部（按槽宽截断）。
+export function store_local(em: &Emitter:ReadWrite, local: u32, reg: u8): void!AllocError {
+    var disp: u32 = 0;
+    var width: u8 = 8;
+    if local != 0 {
+        let index: u32 = local - 1;
+        if index < @len(em.slots) as u32 { disp = em.slots[index]; }
+        if index < @len(em.widths) as u32 { width = em.widths[index]; }
+    }
+    pe::store_slot(&em.code:ReadWrite, reg, disp, width)?;
+    return;
+}
+// 条件失败与普通分支共用块号回填，块号来自当前指令。
+export function jump_trap(em: &Emitter:ReadWrite, cc: u8): void!AllocError {
+    let jz_at: u32 = pe::jcc_rel32(&em.code:ReadWrite, cc)?;
+    @push(em.fixups, BlockFixup { at: jz_at, target: em.trap })?;
+    return;
+}
+// 算术二元：a 装入 rax，b 装入 rcx，运算后写回，溢出按需跳 trap。
+// 加减按类型宽度及符号性检查溢出；回绕操作不产生溢出跳转。
+export function emit_binary(em: &Emitter:ReadWrite, inst: &mir::MirInst:Read, opcode: u8, need_trap: bool): void!AllocError {
+    load_local(em, inst.b, pe::rax())?;
+    load_local(em, inst.c, pe::rcx())?;
+    if need_trap && (opcode == 16 || opcode == 17) {
+        let width: u8 = width_of(&em.widths[0..@len(em.widths)]:Read, inst.a);
+        pe::addsub_width(&em.code:ReadWrite, width, opcode == 17)?;
+        if type_signed(&em.types:Read, inst.value_type_id) { jump_trap(em, pe::cc_o())?; }
+        else { jump_trap(em, pe::cc_b())?; }
+        store_local(em, inst.a, pe::rax())?;
+        return;
+    }
+    if need_trap && opcode == 18 {
+        let width: u8 = width_of(&em.widths[0..@len(em.widths)]:Read, inst.a);
+        let signed: bool = type_signed(&em.types:Read, inst.value_type_id);
+        var overflow: u8 = pe::cc_o();
+        if signed { pe::multiply_signed(&em.code:ReadWrite, width)?; }
+        else { overflow = pe::multiply_unsigned(&em.code:ReadWrite, width)?; }
+        jump_trap(em, overflow)?;
+        store_local(em, inst.a, pe::rax())?;
+        return;
+    }
+    if opcode == 16 { pe::add_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?; }
+    elseif opcode == 17 { pe::sub_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?; }
+    elseif opcode == 18 { pe::imul_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?; }
+    elseif opcode == 32 { pe::and_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?; }
+    elseif opcode == 33 { pe::or_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?; }
+    elseif opcode == 34 { pe::xor_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?; }
+    else { return; }
+    if need_trap { jump_trap(em, pe::cc_o())?; }
+    store_local(em, inst.a, pe::rax())?;
+    return;
+}
+
+// ── MIR opcode（以 compiler/min/src/mir/mir.yak 实际发出的编号为准）──
+// 注意：这些编号与 spec/ir/mir.md 第四节的表格在部分区间不同，
+// 发射器只消费构建器确实产出的值，故此处以构建器为准并在 README 记录差异。
+export function mop_const_int(): u8 { return 1; }
+export function mop_const_bool(): u8 { return 2; }
+export function mop_const_bytes(): u8 { return 3; }
+// 聚合常量复制（mir.md 0x04）：把静态池里的聚合常量镜像整块复制到目标聚合槽。
+export function mop_const_aggregate(): u8 { return 4; }
+export function mop_add(): u8 { return 16; }
+export function mop_sub(): u8 { return 17; }
+export function mop_mul(): u8 { return 18; }
+export function mop_div(): u8 { return 19; }
+export function mop_rem(): u8 { return 20; }
+export function mop_neg(): u8 { return 21; }
+export function mop_wrap_add(): u8 { return 22; }
+export function mop_wrap_sub(): u8 { return 23; }
+export function mop_wrap_mul(): u8 { return 24; }
+export function mop_bit_and(): u8 { return 32; }
+export function mop_bit_or(): u8 { return 33; }
+export function mop_bit_xor(): u8 { return 34; }
+export function mop_shl(): u8 { return 35; }
+export function mop_shr(): u8 { return 36; }
+export function mop_eq(): u8 { return 48; }
+export function mop_ne(): u8 { return 49; }
+export function mop_lt(): u8 { return 50; }
+export function mop_le(): u8 { return 51; }
+export function mop_gt(): u8 { return 52; }
+export function mop_ge(): u8 { return 53; }
+export function mop_cast(): u8 { return 64; }
+export function mop_move(): u8 { return 112; }
+export function mop_copy(): u8 { return 113; }
+export function mop_load(): u8 { return 80; }
+export function mop_store(): u8 { return 81; }
+export function mop_drop(): u8 { return 115; }
+export function mop_field_addr(): u8 { return 82; }
+export function mop_index_addr(): u8 { return 83; }
+export function mop_struct_construct(): u8 { return 96; }
+export function mop_array_construct(): u8 { return 97; }
+export function mop_br(): u8 { return 192; }
+export function mop_branch(): u8 { return 193; }
+export function mop_ret(): u8 { return 194; }
+export function mop_trap(): u8 { return 195; }
+export function mop_enum_dispatch(): u8 { return 177; }
+export function mop_carrier_ok(): u8 { return 160; }
+export function mop_carrier_err(): u8 { return 161; }
+export function mop_carrier_dispatch(): u8 { return 162; }
+export function mop_enum_construct(): u8 { return 176; }
+// @push 降级（mir.md 4.14）：a 结果载体、b 数组局部、c 元素局部、type 载体类型。
+export function mop_dyn_push(): u8 { return 178; }
+// 内建运行时符号的合成 def：高位段避开真实 DefId，供 LinkTable 与调用点对齐。
+export function rt_symbol_push(): u64 { return 18446744069414584321u64; }
+export function rt_symbol_free(): u64 { return 18446744069414584322u64; }
+export function rt_symbol_clone(): u64 { return 18446744069414584323u64; }
+export function rt_symbol_drop_value(): u64 { return 18446744069414584324u64; }
+export function rt_symbol_service_abort(): u64 { return 18446744069414584325u64; }
+export function rt_symbol_exit(): u64 { return 18446744069414584326u64; }
+export function rt_def_is_builtin(def: u64): bool { return def >= 18446744069414584321u64; }
+
+// 比较指令按操作数类型的符号性选择条件码（x86.md 3.2；混用即 EM-5）。
+// 未知 opcode 返回 cc_invalid()，由调用方按 EM-5 拒绝，绝不默认成某一条件码（emitter.md 2.5）。
+export function cmp_condition(opcode: u8, is_signed: bool): u8 {
+    if opcode == mop_eq() { return pe::cc_e(); }
+    if opcode == mop_ne() { return pe::cc_ne(); }
+    if opcode == mop_lt() { if is_signed { return pe::cc_lt_signed(); } return pe::cc_b(); }
+    if opcode == mop_le() { if is_signed { return pe::cc_le(); } return pe::cc_be(); }
+    if opcode == mop_gt() { if is_signed { return pe::cc_g(); } return pe::cc_a(); }
+    if opcode == mop_ge() { if is_signed { return pe::cc_ge(); } return pe::cc_ae(); }
+    return cc_invalid();
+}
+// 非法条件码哨兵：16 超出 4 位条件码范围，只能出现在拒绝路径上。
+export function cc_invalid(): u8 { return 16; }
+export function is_compare(opcode: u8): bool {
+    if opcode >= mop_eq() && opcode <= mop_ge() { return true; }
+    return false;
+}
+// 有序比较（eq/ne 与符号性无关，lt/le/gt/ge 才需要按类型选条件码）。
+export function is_ordered_compare(opcode: u8): bool {
+    if opcode >= mop_lt() && opcode <= mop_ge() { return true; }
+    return false;
+}
+// 先给每个块预留起始偏移（发射前顺序布局），再逐块发射并按需回填。
+export function block_offset(offsets: &[u32]:Read, block: u16): u32 {
+    if block as u32 >= @len(offsets) as u32 { return 0; }
+    return offsets[block];
+}
+// 类型尺寸：0 表示布局未知（空类型不会出现在载体/枚举构造位）。
+export function type_size(em: &Emitter:ReadWrite, id: u32): u64 {
+    if id == 0 || id > @len(em.type_sizes) as u32 { return 0; }
+    return em.type_sizes[id - 1] as u64;
+}
+export function type_tag(em: &Emitter:ReadWrite, id: u32): u8 {
+    if id == 0 || id > @len(em.type_tags) as u32 { return 0; }
+    return em.type_tags[id - 1];
+}
+export function type_payload_off(em: &Emitter:ReadWrite, id: u32): u64 {
+    if id == 0 || id > @len(em.type_payloads) as u32 { return 0; }
+    return em.type_payloads[id - 1] as u64;
+}
+// 目标槽按 8 字节块清零；槽已按 8 字节取整分配，清零不会越过槽尾。
+export function zero_slot_blocks(em: &Emitter:ReadWrite, disp: u32, size: u64): void!AllocError {
+    var blocks: u64 = (size + 7u64) / 8u64;
+    pe::clear_reg(&em.code:ReadWrite, pe::rax())?;
+    var at: u64 = 0;
+    while at < blocks {
+        pe::store_slot_off(&em.code:ReadWrite, pe::rax(), disp, (at * 8u64) as u32, 8)?;
+        at = at + 1;
+    }
+    return;
+}
+// 两端带偏移的精确宽度搬运（8/4/2/1 组合）。
+export function copy_bytes_between(em: &Emitter:ReadWrite, src_disp: u32, src_off: u32, dst_disp: u32, dst_off: u32, size: u32): void!AllocError {
+    var done: u32 = 0;
+    while done < size {
+        let remain: u32 = size - done;
+        var width: u8 = 1;
+        if remain >= 8 { width = 8; }
+        elseif remain >= 4 { width = 4; }
+        elseif remain >= 2 { width = 2; }
+        pe::load_slot_off(&em.code:ReadWrite, pe::rax(), src_disp, src_off + done, width)?;
+        pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst_disp, dst_off + done, width)?;
+        done = done + width as u32;
+    }
+    return;
+}
+// EM-6：ABI 值形态不被当前 profile 支持（spec/proc/error.def 的 8023，
+// spec/target/emitter.md 的 EM-6 条款：切片按值返回、>8 字节聚合按值返回/按值实参）。
+// rejected 只记首个此类 op，int3 只写一次，reject_kind 随后不再被其他拒绝路径改写。
+export function reject_abi_form(em: &Emitter:ReadWrite, op: u8): void!AllocError {
+    if em.rejected == 0 { em.rejected = op; em.reject_kind = 6; }
+    pe::int3(&em.code:ReadWrite)?;
+    return;
+}
+
+
+// 未支持的指令：记录首个拒绝 opcode 并写入 int3，绝不静默跳过（emitter.md 2.5）。
+// reject_kind 区分拒绝类别：0 为未识别 opcode，5 为 EM-5（条件跳转符号性不匹配），6 为 EM-6。
+// 只有首个拒绝才写入 reject_kind，保证 rejected 与 reject_kind 描述同一处拒绝。
+export function unsupported_op(em: &Emitter:ReadWrite, op: u8): void!AllocError {
+    if em.rejected == 0 {
+        // 零表示没有拒绝，零操作码用合成标记保留失败状态。
+        if op == 0 { em.rejected = 255; } else { em.rejected = op; }
+        em.reject_kind = 0;
+    }
+    pe::int3(&em.code:ReadWrite)?;
+    return;
+}
+// ── 调用降级 ──
+// Win64 前四个整型实参走 rcx/rdx/r8/r9（abi-win 4.2），其余经栈传递。
+// 调用前把实参装入寄存器；call 目标先写 4 字节占位，由重定位或块内偏移回填。
+export function mop_call_local(): u8 { return 144; }
+export function mop_call_far(): u8 { return 145; }
+export function mop_call_builtin(): u8 { return 146; }
+export function mop_call_foreign(): u8 { return 147; }
+export function mop_call_indirect(): u8 { return 148; }
+
+// 实参寄存器顺序，按 ABI 只用到前四个。
+export function arg_reg(index: u32): u8 {
+    if index == 0 { return pe::rcx(); }
+    if index == 1 { return pe::rdx(); }
+    if index == 2 { return pe::r8(); }
+    return pe::r9();
+}
+export function call_reg(sysv: bool, index: u32): u8 {
+    if sysv { return pe::sysv_arg_reg(index); }
+    return arg_reg(index);
+}
+// 局部是否为切片：切片实参在 ABI 上展开成两个整型实参（指针、长度）。
+// 判定结果由发射准备阶段预计算成表，避免在降级路径上对 Emitter 内层字段取引用。
+export function local_slice(em: &Emitter:Read, local: u32): bool {
+    if local == 0 || local > @len(em.slice_flags) as u32 { return false; }
+    return em.slice_flags[local - 1];
+}

@@ -1,0 +1,254 @@
+// Win64 枚举与可错载体的构造、成员转换和分派。
+import pe;
+import mir;
+import typecheck;
+import coff_state;
+
+// enum 变体总数（布局口径）：内置 AllocError 只有一个变体；
+// 导入枚举要求直接依赖的变体表完整。
+export function enum_count_in(em: &coff_state::Emitter:Read, value_type_id: u32): u32 {
+    if value_type_id == 0 || value_type_id > @len(em.types.entries) as u32 { return 0; }
+    let entry: typecheck::TypeEntry = em.types.entries[value_type_id - 1];
+    if entry.kind == 1 && entry.builtin == 4108 { return 1; }
+    if entry.kind == 3 {
+        var count: u32 = 0;
+        var i: u32 = 0;
+        while i < @len(em.imported_enums.items) as u32 {
+            if em.imported_enums.items[i].dep == entry.dep && em.imported_enums.items[i].export_id == entry.export_id {
+                if !em.imported_enums.items[i].known { return 0; }
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+    if entry.kind != 2 { return 0; }
+    var i: u32 = 0;
+    while i < @len(em.enums.items) as u32 {
+        if em.enums.items[i].def == entry.def { return @len(em.enums.items[i].payloads) as u32; }
+        i = i + 1;
+    }
+    return 0;
+}
+// tag 宽度：变体数超过 256 时用 2 字节（layout.md 的枚举布局规则）。
+export function enum_tag_width(count: u32): u8 {
+    if count > 256 { return 2; }
+    return 1;
+}
+// enum_dispatch：tag 索引函数内相对跳转表后间接跳转（emitter.md 2.6）。
+// 表项为 i32 = 目标块偏移 - 表基址偏移；表与目标同处 .text，零重定位。
+export function lower_enum_dispatch(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read, term: &mir::MirTerminator:Read): bool!AllocError {
+    if term.a == 0 || term.a > @len(em.slots) as u32 { return false; }
+    let value_type_id: u32 = em.locals[term.a - 1];
+    let count: u32 = enum_count_in(em, value_type_id);
+    if count == 0 || term.c != count { return false; }
+    if term.b > @len(func.arms) as u32 || term.c > @len(func.arms) as u32 - term.b { return false; }
+    let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, term.a);
+    pe::load_slot(&em.code:ReadWrite, pe::rax(), disp, enum_tag_width(count))?;
+    pe::add_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+    pe::add_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+    let lea_at: u32 = pe::lea_rip(&em.code:ReadWrite, pe::rcx())?;
+    pe::add_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+    pe::movsxd_rax(&em.code:ReadWrite, pe::rdx())?;
+    pe::add_rr(&em.code:ReadWrite, pe::rdx(), pe::rcx())?;
+    pe::jmp_rm64(&em.code:ReadWrite, pe::rdx())?;
+    // 跳转之后内联表：先定表基址并回填 lea，再逐项写占位并在函数末尾统一回填。
+    let table: u32 = pe::code_len(&em.code:Read);
+    pe::patch_relative(&em.code:ReadWrite, lea_at, lea_at + 4, table)?;
+    let payload_off: u64 = coff_state::type_payload_off(em, value_type_id);
+    if payload_off > 4294967295u64 { return false; }
+    // 无载荷臂直接指向臂块；有载荷臂先指向装载桩。
+    var stubs: coff_state::ArmStub[] = [];
+    var i: u32 = 0;
+    while i < term.c {
+        let at: u32 = pe::code_len(&em.code:Read);
+        pe::code_u32(&em.code:ReadWrite, 0)?;
+        let arm: mir::MirArm = func.arms[term.b + i];
+        let payload: u32 = func.blocks[arm.block].payload;
+        if payload == 0 {
+            @push(em.arm_fixups, coff_state::ArmFixup { at: at, table: table, target: arm.block })?;
+        } else {
+            @push(stubs, coff_state::ArmStub { at: at, table: table, block: arm.block, payload: payload })?;
+        }
+        i = i + 1;
+    }
+    pe::mark_jump_table(&em.code:ReadWrite, table)?;
+    i = 0;
+    while i < @len(stubs) as u32 {
+        let stub_at: u32 = pe::code_len(&em.code:Read);
+        let payload_type: u32 = em.locals[stubs[i].payload - 1];
+        let payload_size: u64 = coff_state::type_size(em, payload_type);
+        let payload_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, stubs[i].payload);
+        let size: u64 = coff_state::type_size(em, value_type_id);
+        if payload_disp == 0 || payload_size == 0 || size > coff_state::abi_copy_limit() as u64 || payload_off > size || payload_size > size - payload_off { return false; }
+        coff_state::copy_bytes_between(em, disp, payload_off as u32, payload_disp, 0, payload_size as u32)?;
+        let to_arm: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+        @push(em.fixups, coff_state::BlockFixup { at: to_arm, target: stubs[i].block })?;
+        // 表项 = 桩偏移 - 表基址偏移（i32 自相对，零重定位）。
+        if stub_at < stubs[i].table { return false; }
+        pe::patch_relative(&em.code:ReadWrite, stubs[i].at, stubs[i].table, stub_at)?;
+        i = i + 1;
+    }
+    return true;
+}
+// ── 枚举与载体构造（mir.md 4.13 的 160/161/176）──
+// 160：成功载体；b 为成功局部（void 为 0），c 为错误集类型。
+export function lower_carrier_ok(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let size: u64 = coff_state::type_size(em, inst.value_type_id);
+    let tag_width: u8 = coff_state::type_tag(em, inst.value_type_id);
+    let payload_off: u64 = coff_state::type_payload_off(em, inst.value_type_id);
+    if dst == 0 || size == 0 || tag_width == 0 || payload_off > 4294967295u64 { return false; }
+    coff_state::zero_slot_blocks(em, dst, size)?;
+    if inst.b != 0 {
+        let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+        let payload_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+        let payload_size: u64 = coff_state::type_size(em, payload_type);
+        if src == 0 || payload_size == 0 || payload_size > 4294967295u64 { return false; }
+        coff_state::copy_bytes_between(em, src, 0, dst, payload_off as u32, payload_size as u32)?;
+    }
+    return true;
+}
+// 目标错误集成员的标签来自规范序，而不是枚举的类型编号。
+function error_set_tag(em: &coff_state::Emitter:ReadWrite, set: typecheck::TypeEntry, member: u32): u32 {
+    let total: u32 = @len(em.types.members) as u32;
+    if set.members_start > total || set.members_count > total - set.members_start { return 65536; }
+    var tag: u32 = 0;
+    while tag < set.members_count {
+        if em.types.members[set.members_start + tag] == member { return tag; }
+        tag = tag + 1;
+    }
+    return 65536;
+}
+// 两层标签各自使用布局表；只拷贝活跃的完整枚举对象。
+function write_error_member(em: &coff_state::Emitter:ReadWrite, src: u32, src_off: u32, dst: u32, dst_off: u32, set_id: u32, member: u32): bool!AllocError {
+    let target: typecheck::TypeEntry = em.types.entries[set_id - 1];
+    let tag: u32 = error_set_tag(em, target, member);
+    let set_size: u64 = coff_state::type_size(em, set_id);
+    let size: u64 = coff_state::type_size(em, member);
+    var offset: u64 = 0;
+    if target.members_count > 1 { offset = coff_state::type_payload_off(em, set_id); }
+    if tag >= 65536 || offset > set_size || size == 0 || size > set_size - offset || set_size + dst_off as u64 > 4294967295u64 { return false; }
+    if target.members_count > 1 {
+        let width: u8 = coff_state::type_tag(em, set_id);
+        if width != 1 && width != 2 { return false; }
+        pe::mov_int(&em.code:ReadWrite, pe::rax(), tag as u64, width)?;
+        pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst, dst_off, width)?;
+    }
+    coff_state::copy_bytes_between(em, src, src_off, dst, dst_off + offset as u32, size as u32)?;
+    return true;
+}
+// 161：错误载体；b 为源错误局部，目标错误集来自载体类型。
+export function lower_carrier_err(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    if inst.b == 0 || inst.value_type_id == 0 || inst.value_type_id > @len(em.types.entries) as u32 { return false; }
+    let target: u32 = em.types.entries[inst.value_type_id - 1].elem;
+    let actual: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, inst.b);
+    if target == 0 || actual == 0 || target > @len(em.types.entries) as u32 || actual > @len(em.types.entries) as u32 { return false; }
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.b);
+    let size: u64 = coff_state::type_size(em, inst.value_type_id);
+    let tag_width: u8 = coff_state::type_tag(em, inst.value_type_id);
+    let payload_off: u64 = coff_state::type_payload_off(em, inst.value_type_id);
+    let target_size: u64 = coff_state::type_size(em, target);
+    let actual_size: u64 = coff_state::type_size(em, actual);
+    if dst == 0 || src == 0 || size == 0 || tag_width != 1 || target_size == 0 || actual_size == 0 { return false; }
+    if size > 4294967295u64 || payload_off > size || target_size > size - payload_off { return false; }
+    coff_state::zero_slot_blocks(em, dst, size)?;
+    pe::mov_int(&em.code:ReadWrite, pe::rax(), 1, tag_width)?;
+    pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst, 0, tag_width)?;
+    if actual == target {
+        coff_state::copy_bytes_between(em, src, 0, dst, payload_off as u32, actual_size as u32)?;
+        return true;
+    }
+    if em.types.entries[target - 1].kind != 11 { return false; }
+    let actual_entry: typecheck::TypeEntry = em.types.entries[actual - 1];
+    if actual_entry.kind != 11 { return write_error_member(em, src, 0, dst, payload_off as u32, target, actual)?; }
+    let width: u8 = coff_state::type_tag(em, actual);
+    let off: u64 = coff_state::type_payload_off(em, actual);
+    let total: u32 = @len(em.types.members) as u32;
+    if actual_entry.members_count == 0 || actual_entry.members_start > total || actual_entry.members_count > total - actual_entry.members_start { return false; }
+    if actual_entry.members_count == 1 { return write_error_member(em, src, 0, dst, payload_off as u32, target, em.types.members[actual_entry.members_start])?; }
+    if (width != 1 && width != 2) || off > actual_size { return false; }
+    var exits: u32[] = [];
+    var i: u32 = 0;
+    while i < actual_entry.members_count {
+        let member: u32 = em.types.members[actual_entry.members_start + i];
+        if coff_state::type_size(em, member) > actual_size - off { return false; }
+        pe::load_slot_off(&em.code:ReadWrite, pe::rax(), src, 0, width)?;
+        pe::mov_imm64(&em.code:ReadWrite, pe::rcx(), i as u64)?;
+        pe::cmp_rr(&em.code:ReadWrite, pe::rax(), pe::rcx())?;
+        let next: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+        if !(write_error_member(em, src, off as u32, dst, payload_off as u32, target, member)?) { return false; }
+        @push(exits, pe::jmp_rel32(&em.code:ReadWrite)?)?;
+        let next_at: u32 = pe::code_len(&em.code:Read);
+        pe::patch_rel32(&em.code:ReadWrite, next, next_at);
+        i = i + 1;
+    }
+    // 无效标签不是另一个成员；沿用编译器的异常终止路径。
+    pe::int3(&em.code:ReadWrite)?;
+    let end: u32 = pe::code_len(&em.code:Read);
+    i = 0;
+    while i < @len(exits) as u32 { pe::patch_rel32(&em.code:ReadWrite, exits[i], end); i = i + 1; }
+    return true;
+}
+// 176：枚举标签构造；c 为变体，value 为可选 payload 局部（MIR 限制为标量）。
+export function lower_enum_construct(em: &coff_state::Emitter:ReadWrite, inst: &mir::MirInst:Read): bool!AllocError {
+    let dst: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, inst.a);
+    let size: u64 = coff_state::type_size(em, inst.value_type_id);
+    let payload_off: u64 = coff_state::type_payload_off(em, inst.value_type_id);
+    let count: u32 = enum_count_in(em, inst.value_type_id);
+    if dst == 0 || size == 0 || count == 0 || inst.c >= count { return false; }
+    coff_state::zero_slot_blocks(em, dst, size)?;
+    let width: u8 = enum_tag_width(count);
+    pe::mov_int(&em.code:ReadWrite, pe::rax(), inst.c as u64, width)?;
+    pe::store_slot_off(&em.code:ReadWrite, pe::rax(), dst, 0, width)?;
+    if inst.value != 0 {
+        let payload: u32 = inst.value as u32;
+        let src: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, payload);
+        let payload_type: u32 = coff_state::local_type(&em.locals[0..@len(em.locals)]:Read, payload);
+        let payload_size: u64 = coff_state::type_size(em, payload_type);
+        if src == 0 || payload_size == 0 || size > coff_state::abi_copy_limit() as u64 || payload_off > size || payload_size > size - payload_off { return false; }
+        coff_state::copy_bytes_between(em, src, 0, dst, payload_off as u32, payload_size as u32)?;
+    }
+    return true;
+}
+
+// 162：载体分派；tag 0 走成功臂，非 0 走错误臂；臂载荷在臂入口处装载。
+export function lower_carrier_dispatch(em: &coff_state::Emitter:ReadWrite, func: &mir::MirFunction:Read, term: &mir::MirTerminator:Read): bool!AllocError {
+    if term.a == 0 || term.a > @len(em.slots) as u32 { return false; }
+    let disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, term.a);
+    let carrier_type: u32 = em.locals[term.a - 1];
+    let tag_width: u8 = coff_state::type_tag(em, carrier_type);
+    if disp == 0 || tag_width != 1 { return false; }
+    if term.b > 65535 || term.c > 65535 || term.b >= @len(func.blocks) as u32 || term.c >= @len(func.blocks) as u32 { return false; }
+    let payload_off: u64 = coff_state::type_payload_off(em, carrier_type);
+    if payload_off > 4294967295u64 { return false; }
+    let ok_payload: u32 = func.blocks[term.b].payload;
+    let err_payload: u32 = func.blocks[term.c].payload;
+    pe::load_slot(&em.code:ReadWrite, pe::rax(), disp, 1)?;
+    pe::test_rr(&em.code:ReadWrite, pe::rax(), pe::rax())?;
+    let jne_at: u32 = pe::jcc_rel32(&em.code:ReadWrite, pe::cc_ne())?;
+    // 成功路径：把成功位载荷写入臂载荷局部后跳到成功臂。
+    if ok_payload != 0 {
+        let ok_type: u32 = em.locals[ok_payload - 1];
+        let ok_size: u64 = coff_state::type_size(em, ok_type);
+        let ok_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, ok_payload);
+        if ok_size == 0 || ok_size > 4294967295u64 || ok_disp == 0 { return false; }
+        coff_state::copy_bytes_between(em, disp, payload_off as u32, ok_disp, 0, ok_size as u32)?;
+    }
+    let to_ok: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+    @push(em.fixups, coff_state::BlockFixup { at: to_ok, target: term.b as u16 })?;
+    // 错误路径从当前偏移开始；条件跳转回填到这里。
+    let err_stub: u32 = pe::code_len(&em.code:Read);
+    pe::patch_rel32(&em.code:ReadWrite, jne_at, err_stub);
+    if err_payload != 0 {
+        let err_type: u32 = em.locals[err_payload - 1];
+        let err_size: u64 = coff_state::type_size(em, err_type);
+        let err_disp: u32 = coff_state::slot_of(&em.slots[0..@len(em.slots)]:Read, err_payload);
+        if err_size == 0 || err_size > 4294967295u64 || err_disp == 0 { return false; }
+        coff_state::copy_bytes_between(em, disp, payload_off as u32, err_disp, 0, err_size as u32)?;
+    }
+    let to_err: u32 = pe::jmp_rel32(&em.code:ReadWrite)?;
+    @push(em.fixups, coff_state::BlockFixup { at: to_err, target: term.c as u16 })?;
+    return true;
+}

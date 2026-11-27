@@ -1,0 +1,47 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function main(): void {
+    // 近控制转移带 66 时，处理器之间的位移长度或操作数宽度可能不同。
+    let direct: [u8; 27] = [0x66, 0xe8, 0, 0, 0, 0, 0x66, 0xe9, 0, 0, 0, 0,
+        0x66, 0x0f, 0x84, 0, 0, 0, 0, 0x66, 0xeb, 0, 0x66, 0x74, 0, 0x66, 0xc3];
+    encoding(&direct[0..6]:Read, 7101)?;
+    encoding(&direct[6..12]:Read, 7101)?;
+    encoding(&direct[12..19]:Read, 7101)?;
+    encoding(&direct[19..22]:Read, 7101)?;
+    encoding(&direct[22..25]:Read, 7101)?;
+    encoding(&direct[25..27]:Read, 7101)?;
+    encoding(&direct[0..4]:Read, 7101)?;
+    encoding(&direct[12..17]:Read, 7101)?;
+
+    let indirect: [u8; 14] = [0x66, 0x41, 0xff, 0xd0, 0x66, 0xff, 0x20, 0x66, 0xc2, 0, 0,
+        0x66, 0xff, 0x10];
+    encoding(&indirect[0..4]:Read, 7101)?;
+    encoding(&indirect[4..7]:Read, 7101)?;
+    encoding(&indirect[7..11]:Read, 7101)?;
+    encoding(&indirect[11..14]:Read, 7101)?;
+
+    // 近转移不影响正常 CALL 重定位；16 位 PUSH、POP、ENTER 和 LEAVE 仍可编码。
+    let controls: [u8; 21] = [0xe8, 0, 0, 0, 0, 0x41, 0xff, 0xd0, 0xff, 0x20,
+        0x66, 0x50, 0x66, 0x58, 0x66, 0xc8, 0, 0, 0, 0x66, 0xc9];
+    encoding(&controls[0..21]:Read, 0)?;
+    let redundant: [u8; 6] = [0x67, 0xff, 0xd0, 0x67, 0x74, 0];
+    encoding(&redundant[0..3]:Read, 7103)?;
+    encoding(&redundant[3..6]:Read, 7103)?;
+
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, &direct[0..6]:Read)?;
+    let site: [x86_validate::Rel32Site; 1] = [x86_validate::Rel32Site { offset: 2, address: false }];
+    assert(x86_validate::validate_relocated(&code:Read, 0, &site[0..1]:Read)? == 7101);
+    return;
+}

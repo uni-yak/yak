@@ -1,0 +1,22 @@
+// module: fields=fixtures/field_names.yak
+import fields;
+foreign assert(cond: bool): void;
+enum Failure { Bad, }
+function index(ok: bool): u32!Failure { if !ok { return Failure::Bad; } return 0; }
+function recover(e: &Failure): u32 { return 99; }
+function length(ok: bool): u32!Failure {
+    let items: [fields::Item; 1] = [fields::make()];
+    return items[index(ok)?].len;
+}
+function capacity(ok: bool): u32!Failure {
+    let items: [fields::Item; 1] = [fields::make()];
+    return items[index(ok)?].cap;
+}
+function main(): void {
+    assert(length(false).catch(&recover) == 99u32);
+    assert(length(true).catch(&recover) == 10u32);
+    assert(capacity(false).catch(&recover) == 99u32);
+    assert(capacity(true).catch(&recover) == 20u32);
+    let item: fields::Item = fields::make();
+    assert(item.other == 30u32);
+}

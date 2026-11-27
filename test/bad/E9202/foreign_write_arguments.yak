@@ -1,0 +1,14 @@
+// expected_code: E9202
+// expected_diagnostics: E9202 E9202
+// spec: spec/lang/foreign.md F-3
+// 触发：合法外部服务不能接受 Write 形参或 out 槽位。
+foreign assert(cond: bool): void;
+
+function forward(x: &bool:Write): void {
+    assert(x);
+}
+
+function main(): void {
+    out slot: bool;
+    assert(out slot);
+}

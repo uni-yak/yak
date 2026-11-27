@@ -1,0 +1,14 @@
+// t16: while + break + assert验证循环终止值
+foreign assert(cond: bool): void;
+
+function main(): void {
+    var i: u32 = 0;
+    while i < 100 {
+        if i >= 5 {
+            break;
+        }
+        i = i + 1;
+    }
+    assert(i == 5);
+    return;
+}

@@ -1,0 +1,18 @@
+// mem_limit: 150000
+foreign assert(cond: bool): void;
+struct Leaf { data: u32[] }
+struct Item { leaves: Leaf[] }
+function make(value: u32): Item[] { return [Item { leaves: [Leaf { data: [value] }] }]; }
+function first(data: &u32[]): u32 {
+    let view: &u32[] = &*data;
+    return view[0u32];
+}
+function main(): void {
+    let indirect: &function(&u32[]): u32 = &first;
+    var i: u32 = 0u32;
+    while i < 500u32 {
+        assert(indirect(make(i)[0u32].leaves[0u32].data) == i);
+        assert(first([[i]][0u32]) == i);
+        i = i + 1u32;
+    }
+}

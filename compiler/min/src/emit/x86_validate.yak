@@ -1,0 +1,611 @@
+// 校验已定稿的 x86-64 指令字节。指令族取自 spec/target/x86.md，编码按 Intel SDM 第 2 卷。
+import pe;
+
+const OUTSIDE: u16 = 7101;
+const ALTERNATE: u16 = 7102;
+const LONG_FORM: u16 = 7103;
+const BAD_RELOCATION: u16 = 8004;
+const DIRECT_CALL: u8 = 1;
+const RIP_ADDRESS: u8 = 2;
+const RIP_WORD_ADDRESS: u8 = 3;
+const LONG_JUMP: u8 = 4;
+const SHORT_JUMP: u8 = 5;
+const LONG_CONDITIONAL: u8 = 6;
+const SHORT_CONDITIONAL: u8 = 7;
+
+export struct Rel32Site { offset: u32, address: bool }
+struct Instruction { end: u32, code: u16, indirect_jump: bool, relative: u8 }
+
+function invalid(code: u16): Instruction {
+    return Instruction { end: 0, code: code, indirect_jump: false, relative: 0 };
+}
+
+function condition(code: u8): bool {
+    // 条件码 8 至 11 分别检测符号与奇偶，均在 base 允许范围之外。
+    return code < 8 || code >= 12;
+}
+
+function alu_group(group: u8): bool {
+    // 立即数运算组中的 /2 ADC 与 /3 SBB 不在允许子集内。
+    return group < 2 || group >= 4;
+}
+
+function shift_group(group: u8): bool {
+    return group == 4 || group == 5 || group == 7;
+}
+
+function immediate(code: &pe::Code:Read, start: u32, size: u32): i64 {
+    var raw: u32 = code.bytes[start] as u32;
+    raw = raw | ((code.bytes[start + 1] as u32) << 8u32);
+    if size == 2 { return ((raw as i16) as i64); }
+    raw = raw | ((code.bytes[start + 2] as u32) << 16u32) | ((code.bytes[start + 3] as u32) << 24u32);
+    return ((raw as i32) as i64);
+}
+
+function fits_i8(value: i64): bool { return value >= -128i64 && value <= 127i64; }
+
+// 低四位依次标记 ModRM、字节宽度、reg 字段参与操作和寄存器方向别名。
+// 无 ModRM 时 2/4 分别表示累加器 imm8/操作数宽度立即数，其余由下方分支选择。
+// 高四位按下方分派编码：LEA、三种 /0、三种立即数 ALU、两种 TEST、
+// INC/DEC、FF 群、两种移位、两种 IMUL。0 表示不需群内检查。
+const OPCODE_00: [u8; 64] = [
+    0x07, 0x05, 0x0f, 0x0d, 0x02, 0x04, 0x00, 0x00, 0x07, 0x05, 0x0f, 0x0d, 0x02, 0x04, 0x00, 0x00, // 00–0F
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 10–1F
+    0x07, 0x05, 0x0f, 0x0d, 0x02, 0x04, 0x00, 0x00, 0x07, 0x05, 0x0f, 0x0d, 0x02, 0x04, 0x00, 0x00, // 20–2F
+    0x07, 0x05, 0x0f, 0x0d, 0x02, 0x04, 0x00, 0x00, 0x07, 0x05, 0x0f, 0x0d, 0x02, 0x04, 0x00, 0x00 // 30–3F
+];
+const OPCODE_40: [u8; 64] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 40–4F
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 50–5F
+    0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf5, 0x00, 0xe5, 0x00, 0x00, 0x00, 0x00, // 60–6F
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // 70–7F
+];
+const OPCODE_80: [u8; 64] = [
+    0x53, 0x61, 0x00, 0x71, 0x07, 0x05, 0x00, 0x00, 0x07, 0x05, 0x0f, 0x0d, 0x00, 0x15, 0x00, 0x41, // 80–8F
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 90–9F
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // A0–AF
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // B0–BF
+];
+const OPCODE_C0: [u8; 64] = [
+    0xc3, 0xc1, 0x00, 0x00, 0x00, 0x00, 0x23, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // C0–CF
+    0xd3, 0xd1, 0xd3, 0xd1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // D0–DF
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // E0–EF
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x83, 0x91, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa3, 0xb1 // F0–FF
+];
+
+struct DecodeState {
+    start: u32, at: u32, operand: u32, imm: u32,
+    op: u8, rex: u8, shape: u8, extension: u8, rex_used: u8,
+    logical_immediate_group: u8, relative: u8,
+    legacy16: bool, address32: bool, address_before_operand: bool, ignored_segment: bool,
+    wide: bool, mov_offset: bool, mov_modrm: bool, check_address32: bool,
+    redundant: bool, indirect: bool, operand_alternate: bool,
+    variable_width: bool, stack_width: bool, bare_rex: bool, short_imm: bool,
+    shift_imm: bool, shift_register: bool, narrow_equivalent: bool, test_register_immediate: bool,
+}
+
+function parse_prefixes(code: &pe::Code:Read, s: &DecodeState:ReadWrite, limit: u32): bool {
+    // 调用方只在 at 小于指令边界时进入；前缀后先检查再读取下一字节。
+    var op: u8 = code.bytes[s.at];
+    while op == 0x66 || op == 0x67 || (op & 0xf0u8) == 0x40 || (op & 0xe7u8) == 0x26 {
+        if (op & 0xf0u8) == 0x40 {
+            if s.rex != 0 { s.redundant = true; }
+            s.rex = op;
+        } elseif (op & 0xe7u8) == 0x26 {
+            // ES、CS、SS、DS 共用一组；先识别，随后核对它确实修饰访存。
+            if s.ignored_segment { return false; }
+            s.ignored_segment = true;
+            s.redundant = true;
+            s.rex = 0;
+        } else {
+            if s.rex != 0 || (op == 0x66 && s.legacy16) || (op == 0x67 && s.address32) { s.redundant = true; }
+            if op == 0x66 {
+                s.legacy16 = true;
+                if s.address32 { s.address_before_operand = true; }
+            }
+            else { s.address32 = true; }
+            s.rex = 0;
+        }
+        s.at = s.at + 1;
+        if s.at == limit || s.at - s.start == 15 { return false; }
+        op = code.bytes[s.at];
+    }
+    s.op = op;
+    s.at = s.at + 1;
+    // 近控制转移的 66 在处理器之间可能改变位移长度、目标或栈操作数。
+    if s.legacy16 && (op >= 0x70 && op <= 0x7f || op == 0xe8 || op == 0xe9 || op == 0xeb
+        || op == 0xc2 || op == 0xc3) { return false; }
+    return true;
+}
+
+function decode_escape_or_direct(code: &pe::Code:Read, s: &DecodeState:ReadWrite, limit: u32): bool {
+    let op: u8 = s.op;
+    if op == 0x0f {
+        if s.at == limit { return false; }
+        s.extension = code.bytes[s.at];
+        s.at = s.at + 1;
+        if s.extension >= 0x80 && s.extension <= 0x8f && condition(s.extension & 15u8) {
+            if s.legacy16 { return false; }
+            s.imm = 4;
+            s.relative = LONG_CONDITIONAL;
+        }
+        elseif s.extension == 0x1f { s.shape = 1; }
+        elseif s.extension == 0xaf || s.extension == 0xb6 || s.extension == 0xb7 || s.extension == 0xbe || s.extension == 0xbf {
+            // 字源 MOVZX／MOVSX 只登记 32 位和 64 位目的，不能当成同宽 MOV。
+            if s.operand == 2 && (s.extension == 0xb7 || s.extension == 0xbf) { return false; }
+            s.shape = 5;
+            s.narrow_equivalent = s.extension == 0xb6 || s.extension == 0xb7;
+        } else { return false; }
+        return true;
+    }
+    if (s.shape & 1u8) != 0 { return true; }
+    if s.shape == 2 { s.imm = 1; }
+    elseif s.shape == 4 { s.imm = s.operand; s.variable_width = true; s.short_imm = s.operand == 4; }
+    elseif op == 0xeb { s.imm = 1; s.relative = SHORT_JUMP; }
+    elseif op >= 0x70 && op <= 0x7f && condition(op & 15u8) { s.imm = 1; s.relative = SHORT_CONDITIONAL; }
+    elseif op >= 0xb0 && op <= 0xb7 { s.imm = 1; s.rex_used = 1; s.bare_rex = (op & 7u8) >= 4; }
+    elseif op >= 0xb8 && op <= 0xbf {
+        s.imm = s.operand;
+        s.rex_used = 1;
+        s.variable_width = true;
+        if s.wide { s.imm = 8; }
+    } elseif op == 0xe8 { s.imm = 4; s.relative = DIRECT_CALL; }
+    elseif op == 0xe9 { s.imm = 4; s.relative = LONG_JUMP; }
+    elseif op == 0xa8 { s.imm = 1; }
+    elseif op == 0x6a { s.imm = 1; s.stack_width = true; }
+    elseif op == 0x68 { s.imm = 4; s.stack_width = true; s.short_imm = true; if s.legacy16 { s.imm = 2; } }
+    elseif op == 0xa9 { s.imm = s.operand; s.variable_width = true; }
+    elseif s.mov_offset {
+        s.imm = 8;
+        if s.address32 { s.imm = 4; }
+        s.variable_width = (op & 1u8) != 0;
+        if limit - s.at < s.imm { return false; }
+        if !s.address32 {
+            let high: i64 = immediate(code, s.at + 4, 4);
+            // 低 4 GiB 用 moffs32，符号扩展的负地址用绝对 SIB。
+            if high == 0 || high == -1 && (code.bytes[s.at + 3] & 128u8) != 0 { s.redundant = true; }
+        }
+    }
+    elseif op == 0xc2 { s.imm = 2; s.stack_width = true; }
+    elseif op == 0xc8 {
+        s.imm = 3;
+        s.stack_width = true;
+        // ENTER 的嵌套级仅取低五位，保留低五位不变的等长编码只接受高位清零形态。
+        if limit - s.at >= s.imm && code.bytes[s.at + 2] >= 32 { s.operand_alternate = true; }
+    }
+    elseif op >= 0x50 && op <= 0x5f { s.rex_used = 1; s.stack_width = true; }
+    elseif op == 0xc3 || op == 0xc9 { s.stack_width = true; }
+    elseif op == 0xcc { }
+    elseif op == 0x90 && (s.rex & 1u8) == 0 { }
+    elseif op == 0x99 && (s.wide || !s.legacy16) { s.variable_width = true; }
+    else { return false; }
+    return true;
+}
+
+function decode_modrm_rule(s: &DecodeState:ReadWrite, form: u8, group: u8): bool {
+    let rule: u8 = s.shape >> 4;
+    if rule != 0 {
+        if rule == 1 { if form == 3 { return false; } }
+        elseif rule <= 4 {
+            if group != 0 { return false; }
+            if rule == 2 { s.imm = 1; }
+            elseif rule == 3 { s.imm = s.operand; }
+        } elseif rule <= 7 {
+            if !alu_group(group) { return false; }
+            s.imm = 1;
+            if rule == 6 { s.imm = s.operand; s.short_imm = true; }
+        } elseif rule <= 9 {
+            if group == 0 {
+                s.imm = 1;
+                if rule == 9 { s.imm = s.operand; }
+            } elseif group != 2 && group != 3 && group != 5 && group != 7 { return false; }
+        } elseif rule == 10 { if group >= 2 { return false; } }
+        elseif rule == 11 {
+            if group >= 2 {
+                if group != 2 && group != 4 && group != 6 { return false; }
+                s.indirect = group == 4;
+                s.variable_width = false;
+                s.stack_width = true;
+            }
+        } elseif rule <= 13 {
+            if !shift_group(group) { return false; }
+            if rule == 12 { s.imm = 1; s.shift_imm = true; s.shift_register = form == 3; }
+        } elseif rule == 14 { s.imm = 1; }
+        else { s.imm = s.operand; s.short_imm = true; }
+    } elseif s.extension == 0x1f {
+        if group != 0 { return false; }
+        // 先解析完整寻址，再拒绝可由单字节 NOP 表达的长形态。
+        s.redundant = true;
+    }
+    return true;
+}
+
+function decode_modrm_reg(s: &DecodeState:ReadWrite, group: u8, rm: u8, rule: u8, byte_operand: bool): void {
+    let op: u8 = s.op;
+    let rex: u8 = s.rex;
+    if s.check_address32 { s.redundant = true; }
+    if (s.shape & 8u8) != 0 { s.operand_alternate = true; }
+    s.rex_used = s.rex_used | 1u8;
+    s.test_register_immediate = group == 0 && op == 0xf7;
+    let same_register: bool = rm == group && (rex & 1u8) == ((rex >> 2) & 1u8);
+    // 32 位自传送清高半部，其余宽度的同寄存器 MOV 可用单字节 NOP。
+    if s.mov_modrm && same_register && (byte_operand || s.operand == 2 || s.wide) { s.redundant = true; }
+    if s.wide {
+        // 只有真正相同的寄存器才允许缩窄清零，须同时核对 REX.R 与 REX.B。
+        if (op == 0x31 || op == 0x33 || op == 0x29 || op == 0x2b)
+            && same_register { s.narrow_equivalent = true; }
+    }
+    if byte_operand || s.operand == 2 || s.wide {
+        // 32 位写回会清空高半部；其它宽度的同值写回可以改用 TEST。
+        let family: u8 = op & 0xfcu8;
+        if same_register && (family == 0x08 || family == 0x20) { s.operand_alternate = true; }
+    }
+    if (op == 0x80 || op == 0x81 || op == 0x83) && (group == 1 || group == 4 || group == 6) {
+        s.logical_immediate_group = group;
+    }
+    if (op & 0xfcu8) == 0x38 && same_register {
+        let reg: u8 = rm | ((rex & 1u8) << 3);
+        let use_byte: bool = pe::cmp_self_byte(reg);
+        if byte_operand {
+            // 无 REX 的高字节寄存器不等于同编号的低字节寄存器。
+            if rex != 0 && !use_byte { s.redundant = true; }
+        } else {
+            s.narrow_equivalent = true;
+            if s.legacy16 { s.redundant = true; }
+            if use_byte { s.operand_alternate = true; }
+        }
+    }
+    if rm >= 4 && (byte_operand || s.extension == 0xb6 || s.extension == 0xbe) { s.bare_rex = true; }
+    if op == 0x84 || op == 0x85 {
+        // TEST 只更新标志位，交换两个寄存器不改变结果。
+        let left: u8 = rm | ((rex & 1u8) << 3);
+        let right: u8 = group | ((rex & 4u8) << 1);
+        if left > right { s.operand_alternate = true; }
+    }
+    if rule != 0 {
+        // 直接寄存器 MOV、PUSH 或 POP 选独占短形态。
+        if rule == 2 || rule == 3 && !s.wide || rule == 4 || rule == 11 && group == 6 { s.redundant = true; }
+        // 累加器特定形态更短；83 的 imm8 本身已是最短形态。
+        elseif (rule == 5 || rule == 6 || (rule == 8 || rule == 9) && group == 0)
+            && rm == 0 && (rex & 1u8) == 0 { s.redundant = true; }
+        // 16 位 AX 上的累加器 imm16 与通用 imm8 一样长，优先使用专用形态。
+        elseif rule == 7 && s.operand == 2 && rm == 0 && (rex & 1u8) == 0 { s.operand_alternate = true; }
+    }
+    return;
+}
+
+function decode_modrm_mem(code: &pe::Code:Read, s: &DecodeState:ReadWrite, limit: u32, form: u8, group: u8, rm: u8): bool {
+    let op: u8 = s.op;
+    let rex: u8 = s.rex;
+    let absolute32: bool = s.check_address32 && s.extension != 0x1f;
+    if absolute32 && (form != 0 || rm != 4) { return false; }
+    var base: u8 = rm;
+    var double_index_only: bool = false;
+    var r12_index_only: bool = false;
+    var fixed_word_disp32: bool = false;
+    var absolute_sib: bool = false;
+    var single_base: bool = true;
+    if rm == 4 {
+        if s.at == limit { return false; }
+        let sib: u8 = code.bytes[s.at];
+        base = sib & 7u8;
+        s.rex_used = s.rex_used | 2u8;
+        if (sib & 0x38u8) == 0x20 && (rex & 2u8) == 0 {
+            if base != 4 && (form != 0 || base != 5) {
+                s.redundant = true;
+            } elseif (sib & 0xc0u8) != 0 {
+                // 无索引时缩放位不参与计算；必须保留 SIB 时统一清零。
+                s.operand_alternate = true;
+            }
+        }
+        let scale: u8 = sib >> 6;
+        let index_rm: u8 = (sib >> 3) & 7u8;
+        let full_index: u8 = index_rm | ((rex & 2u8) << 2);
+        single_base = full_index == 4;
+        absolute_sib = form == 0 && base == 5 && full_index == 4;
+        if absolute32 && !absolute_sib { return false; }
+        if form == 0 && base == 5 {
+            // R13 与 R12 属于数据段；只有真实的 RBP 会在访存时改用栈段。
+            let can_be_base: bool = full_index != 4 && (full_index != 5 || op == 0x8d);
+            if scale == 0 && can_be_base {
+                if full_index == 12 { r12_index_only = true; }
+                else { s.redundant = true; }
+            }
+            // 真正的 ×4／×8 索引仍需 disp32；16 位 LEA 只保留位移低半字。
+            fixed_word_disp32 = op == 0x8d && s.operand == 2 && scale >= 2 && !absolute_sib;
+            // ×2 可拆为同一寄存器的基址与 ×1 索引。
+            double_index_only = scale == 1 && can_be_base;
+        } elseif scale == 0 {
+            let full_base: u8 = base | ((rex & 1u8) << 3);
+            // LEA 不访问内存；把非 BP 类寄存器放在基址位，零位移可省，其余为等长别名。
+            if op == 0x8d && base == 5 && full_index != 4 && index_rm != 5 {
+                if form == 1 && limit - s.at >= 2 && code.bytes[s.at + 1] == 0 { s.redundant = true; }
+                else { s.operand_alternate = true; }
+            } elseif op == 0x8d && base == 5 && index_rm == 5 && full_index < full_base {
+                // 两端都需要位移，等长时按寄存器号选择较小的基址。
+                s.operand_alternate = true;
+            } elseif op == 0x8d && (full_base == 12 || full_index == 12)
+                && full_base != 4 && full_index != 4 && base != 5 && index_rm != 5 {
+                // R12 两处都可编码，且 LEA 不访问默认段；等长时继续按寄存器号排序。
+                if full_index < full_base { s.operand_alternate = true; }
+            } elseif pe::swap_unit_index(full_base, full_index) {
+                if full_base == 13 && form == 1 && limit - s.at >= 2 && code.bytes[s.at + 1] == 0 { s.redundant = true; }
+                else { s.operand_alternate = true; }
+            }
+        }
+        s.at = s.at + 1;
+    }
+    if form != 0 || base != 5 { s.rex_used = s.rex_used | 1u8; }
+    var displacement: u32 = 0;
+    if form == 1 { displacement = 1; }
+    elseif form == 2 || base == 5 { displacement = 4; }
+    if displacement > limit - s.at { return false; }
+    if absolute_sib {
+        let low_half: bool = (code.bytes[s.at + 3] & 128u8) == 0;
+        // 绝对 LEA 的 16／32 位结果是常量，同宽 MOV 立即数更短且保留标志位。
+        if op == 0x8d && !s.wide { s.redundant = true; }
+        // 低 2 GiB 的零扩展与符号扩展相同；累加器 MOV 另有更短的 moffs32。
+        elseif absolute32 && low_half { s.redundant = true; }
+        elseif s.mov_modrm && group == 0 && (rex & 4u8) == 0 && (absolute32 || low_half) { s.redundant = true; }
+    }
+    if form == 1 && code.bytes[s.at] == 0 && base != 5 { s.redundant = true; }
+    // 有基址且无索引、无位移的 LEA 只是寄存器传送。
+    if op == 0x8d && single_base && (form != 0 || base != 5) {
+        if displacement == 0 {
+            let dst: u8 = group | ((rex & 4u8) << 1);
+            let src: u8 = base | ((rex & 1u8) << 3);
+            if rm == 4 || dst == src && (s.operand == 2 || s.wide) { s.redundant = true; }
+            else { s.operand_alternate = true; }
+        } elseif form == 1 && code.bytes[s.at] == 0 {
+            s.redundant = true;
+        }
+    }
+    if form == 2 || double_index_only || r12_index_only {
+        let delta: i64 = immediate(code, s.at, 4);
+        var effective: i64 = delta;
+        // 有基址或可改用基址的 16 位 LEA 只保留结果低半字。
+        if op == 0x8d && s.operand == 2 { effective = ((delta as i16) as i64); }
+        if fits_i8(effective) { s.redundant = true; }
+        // 仍需 disp32 时，保留有基址且位移已符号扩展的形式。
+        elseif effective != delta || double_index_only || r12_index_only { s.operand_alternate = true; }
+    } elseif fixed_word_disp32 {
+        let delta: i64 = immediate(code, s.at, 4);
+        if ((delta as i16) as i64) != delta { s.operand_alternate = true; }
+    }
+    s.at = s.at + displacement;
+    return true;
+}
+
+function finish_instruction(code: &pe::Code:Read, s: &DecodeState:ReadWrite): Instruction {
+    let op: u8 = s.op;
+    let byte_accumulator: bool = op == 0x0c || op == 0x24 || op == 0x34;
+    if op == 0x0c || op == 0x0d { s.logical_immediate_group = 1; }
+    if op == 0x24 || op == 0x25 { s.logical_immediate_group = 4; }
+    if op == 0x34 || op == 0x35 { s.logical_immediate_group = 6; }
+    if s.logical_immediate_group != 0 {
+        var mask: i64 = ((code.bytes[s.at] as i8) as i64);
+        if s.imm != 1 { mask = immediate(code, s.at, s.imm); }
+        let byte_form: bool = byte_accumulator || op == 0x80;
+        let clears_high: bool = !byte_form && s.operand == 4 && !s.wide;
+        let and_mask: bool = s.logical_immediate_group == 4;
+        // 非负 AND 的结果最高位为零，32 位写回也清空高半部。
+        if and_mask && s.wide && !byte_form && mask >= 0 { s.narrow_equivalent = true; }
+        // AND 零可用 XOR 清零；保留全值的 AND 全一、OR 零和 XOR 零用 TEST。
+        let unchanged: bool = !clears_high && (and_mask && mask == -1 || !and_mask && mask == 0);
+        if and_mask && mask == 0 || unchanged {
+            if byte_accumulator { s.operand_alternate = true; }
+            else { s.redundant = true; }
+        }
+    }
+    if op == 0xa9 || s.test_register_immediate {
+        let mask: i64 = immediate(code, s.at, s.imm);
+        if mask >= 0 {
+            if s.wide { s.narrow_equivalent = true; }
+            // 低七位可用字节，低十五位可用字；缩窄后仍未触及符号位。
+            if mask < 128 || s.imm == 4 && mask < 32768 { s.redundant = true; }
+        }
+    }
+    // 32/64 位累加器立即数若可符号扩展，83 /n 的 imm8 更短。
+    if s.short_imm && fits_i8(immediate(code, s.at, s.imm)) { s.redundant = true; }
+    // RET imm16 的栈调整为零时，可用同宽度的无立即数 RET。
+    if op == 0xc2 && immediate(code, s.at, 2) == 0 { s.redundant = true; }
+    var shift_alternate: bool = false;
+    if s.shift_imm {
+        // 硬件对 64 位移位保留低六位，其它宽度保留低五位。
+        var mask: u8 = 31;
+        if op == 0xc1 && s.wide { mask = 63; }
+        let raw: u8 = code.bytes[s.at];
+        let count: u8 = raw & mask;
+        // 有效计数为零时寄存器只需 NOP 或 32 位自传送，内存仍保留原访问。
+        if count == 1 || count == 0 && s.shift_register { s.redundant = true; }
+        elseif count != raw { shift_alternate = true; }
+    }
+    if s.legacy16 && (!s.variable_width && !s.stack_width || s.variable_width && s.wide) { s.redundant = true; }
+    // 写 r32 会清空高位；已证明等价时只保留寄存器所需的 REX。
+    if s.variable_width && !s.narrow_equivalent { s.rex_used = s.rex_used | 8u8; }
+    let rex_bits: u8 = s.rex & 15u8;
+    let unused_bits: u8 = rex_bits & (15u8 ^ s.rex_used);
+    // 只清掉忽略位且仍需要 REX 时，字节数不变。
+    if unused_bits != 0 {
+        if s.bare_rex || (rex_bits & s.rex_used) != 0 { s.operand_alternate = true; }
+        else { s.redundant = true; }
+    } elseif s.rex == 0x40 && !s.bare_rex {
+        s.redundant = true;
+    }
+    var diagnostic: u16 = 0;
+    if s.redundant { diagnostic = LONG_FORM; }
+    elseif s.operand_alternate || s.address_before_operand || shift_alternate {
+        diagnostic = ALTERNATE;
+    }
+    return Instruction { end: s.at + s.imm, code: diagnostic, indirect_jump: s.indirect, relative: s.relative };
+}
+
+function instruction(code: &pe::Code:Read, start: u32, limit: u32): Instruction {
+    var s: DecodeState = DecodeState {
+        start: start, at: start, operand: 4, imm: 0,
+        op: 0, rex: 0, shape: 0, extension: 0, rex_used: 0,
+        logical_immediate_group: 0, relative: 0,
+        legacy16: false, address32: false, address_before_operand: false, ignored_segment: false,
+        wide: false, mov_offset: false, mov_modrm: false, check_address32: false,
+        redundant: false, indirect: false, operand_alternate: false,
+        variable_width: false, stack_width: false, bare_rex: false, short_imm: false,
+        shift_imm: false, shift_register: false, narrow_equivalent: false, test_register_immediate: false,
+    };
+    if !parse_prefixes(code, &s:ReadWrite, limit) { return invalid(OUTSIDE); }
+    s.wide = (s.rex & 8u8) != 0;
+    s.mov_offset = s.op >= 0xa0 && s.op <= 0xa3;
+    s.mov_modrm = s.op >= 0x88 && s.op <= 0x8b;
+    let address_lea: bool = s.address32 && s.op == 0x8d;
+    s.check_address32 = s.address32 && !address_lea && !s.mov_offset;
+    if address_lea {
+        // 32 位地址写入 64 位目的可用 32 位 LEA 零扩展；窄目的本来就只保留低位。
+        // RIP 相对形态的已定值位移随下一条指令修正，符号引用由移动后的字段重定位。
+        s.redundant = true;
+    }
+    if s.legacy16 && !s.wide { s.operand = 2; }
+    let opcode_index: u32 = (s.op & 63u8) as u32;
+    if s.op < 0x80 {
+        if s.op < 0x40 { s.shape = OPCODE_00[opcode_index]; }
+        else { s.shape = OPCODE_40[opcode_index]; }
+    } elseif s.op < 0xc0 { s.shape = OPCODE_80[opcode_index]; }
+    else { s.shape = OPCODE_C0[opcode_index]; }
+    if !decode_escape_or_direct(code, &s:ReadWrite, limit) { return invalid(OUTSIDE); }
+    if (s.shape & 1u8) == 0 {
+        if s.ignored_segment && !s.mov_offset { return invalid(OUTSIDE); }
+        // 这些指令没有受地址宽度影响的显式地址；隐式栈寻址固定使用 RSP。
+        if s.check_address32 { s.redundant = true; }
+    } else {
+        if s.at == limit { return invalid(OUTSIDE); }
+        let byte: u8 = code.bytes[s.at];
+        s.at = s.at + 1;
+        let form: u8 = byte >> 6;
+        let group: u8 = (byte >> 3) & 7u8;
+        let rm: u8 = byte & 7u8;
+        if s.op == 0x63 && !s.wide {
+            // 16 位目的 MOVSXD 的内存源在两类处理器上读取的字节数不同。
+            if s.operand == 2 && form != 3 { return invalid(OUTSIDE); }
+            // 寄存器的低位和 32 位内存源仍可用等长 MOV 表达。
+            s.operand_alternate = true;
+        }
+        // 控制转移可另行解释这些前缀，不能当成可忽略的段覆盖。
+        let near_indirect: bool = s.op == 0xff && (group == 2 || group == 4);
+        if s.ignored_segment && (form == 3 || near_indirect) || s.legacy16 && near_indirect { return invalid(OUTSIDE); }
+        if s.op == 0x8d && form == 0 && rm == 5 {
+            s.relative = RIP_ADDRESS;
+            if s.operand == 2 { s.relative = RIP_WORD_ADDRESS; }
+        }
+        let rule: u8 = s.shape >> 4;
+        let byte_operand: bool = (s.shape & 2u8) != 0;
+        s.stack_width = rule == 4;
+        s.variable_width = !byte_operand && !s.stack_width && s.extension != 0x1f;
+        if (s.shape & 4u8) != 0 {
+            s.rex_used = s.rex_used | 4u8;
+            if byte_operand && group >= 4 { s.bare_rex = true; }
+        }
+        if !decode_modrm_rule(&s:ReadWrite, form, group) { return invalid(OUTSIDE); }
+        if form == 3 { decode_modrm_reg(&s:ReadWrite, group, rm, rule, byte_operand); }
+        elseif !decode_modrm_mem(code, &s:ReadWrite, limit, form, group, rm) { return invalid(OUTSIDE); }
+    }
+    if s.imm > limit - s.at || s.at - s.start + s.imm > 15 { return invalid(OUTSIDE); }
+    return finish_instruction(code, &s:ReadWrite);
+}
+
+export function validate(code: &pe::Code:Read, start: u32): u16!AllocError {
+    let sites: [Rel32Site; 1] = [Rel32Site { offset: 0, address: false }];
+    return validate_relocated(code, start, &sites[0..0]:Read)?;
+}
+
+// 跳转表必须完整位于两条指令之间，且紧随间接跳转。分段限制可阻止截断的
+// 指令拿表项或下一个函数的字节补足自己的立即数、ModRM 或位移。
+// 待链接站点使用定稿后的绝对偏移，按发射顺序与完整指令匹配。
+export function validate_relocated(code: &pe::Code:Read, start: u32, sites: &[Rel32Site]): u16!AllocError {
+    let end: u32 = code.used;
+    if start >= end || (end as u64) > @len(code.bytes) { return OUTSIDE; }
+    var at: u32 = start;
+    var index: u32 = 0;
+    let count: u32 = @len(code.tables) as u32;
+    var site: u32 = 0;
+    let sites_count: u32 = @len(sites) as u32;
+    var next: u32 = end;
+    var branches: pe::Branch[] = [];
+    var conditional_end: u32 = 0;
+    var conditional_target: i64 = 0;
+    if sites_count != 0 { next = sites[0].offset; }
+    while true {
+        var boundary: u32 = end;
+        if index < count { boundary = code.tables[index].start; }
+        if boundary < at || boundary > end { return OUTSIDE; }
+        var indirect: bool = false;
+        while at < boundary {
+            let decoded: Instruction = instruction(code, at, boundary);
+            if decoded.end == 0 { return decoded.code; }
+            if next < decoded.end {
+                var compatible: bool = decoded.relative == DIRECT_CALL;
+                if sites[site].address { compatible = decoded.relative == RIP_ADDRESS || decoded.relative == RIP_WORD_ADDRESS; }
+                if !compatible || next != decoded.end - 4 { return BAD_RELOCATION; }
+                site = site + 1;
+                next = end;
+                if site < sites_count { next = sites[site].offset; }
+                if next < decoded.end { return BAD_RELOCATION; }
+            } elseif decoded.relative == RIP_WORD_ADDRESS && decoded.code == 0 {
+                // 已回填的 RIP 位移只参与结果的低 16 位；同宽规范形态为低半字的符号扩展。
+                // 带重定位时由链接器解释字段与加数，不用定稿缓冲区的字节替代它们。
+                let delta: i64 = immediate(code, decoded.end - 4, 4);
+                if ((delta as i16) as i64) != delta { return ALTERNATE; }
+            }
+            // 先核对重定位，避免把错位的链接占位值解释为本地分支位移。
+            let long_jump: bool = decoded.relative == LONG_JUMP || decoded.relative == LONG_CONDITIONAL;
+            let short_jump: bool = decoded.relative == SHORT_JUMP || decoded.relative == SHORT_CONDITIONAL;
+            if long_jump || short_jump {
+                var delta: i64 = (code.bytes[decoded.end - 1] as i8) as i64;
+                if long_jump { delta = immediate(code, decoded.end - 4, 4); }
+                let target: i64 = decoded.end as i64 + delta;
+                if long_jump && target > at as i64 && target < decoded.end as i64 { return OUTSIDE; }
+                if decoded.code != 0 { return decoded.code; }
+                if delta == 0 { return LONG_FORM; }
+                if decoded.relative == LONG_CONDITIONAL || decoded.relative == SHORT_CONDITIONAL {
+                    conditional_end = decoded.end;
+                    conditional_target = target;
+                } elseif conditional_end != 0 && at == conditional_end && target == conditional_target {
+                    // 相邻条件跳转与无条件跳转同目标，条件跳转没有独立作用。
+                    return LONG_FORM;
+                }
+                if long_jump {
+                    let full_size: u32 = decoded.end - at;
+                    // 向前缩短时目标也前移；向后时只改变当前指令的末端。
+                    var short_delta: i64 = delta;
+                    if delta < 0 { short_delta = delta + (full_size as i64) - 2i64; }
+                    if fits_i8(short_delta) { return LONG_FORM; }
+                    if target >= start as i64 && target <= end as i64 {
+                        @push(branches, pe::Branch { start: at, target: target as u32, saved: 0,
+                            short_op: 0, long_size: full_size as u8, size: 2, resolved: true })?;
+                    }
+                }
+            } elseif decoded.code != 0 {
+                return decoded.code;
+            }
+            at = decoded.end;
+            indirect = decoded.indirect_jump;
+        }
+        if index == count {
+            if site != sites_count { return BAD_RELOCATION; }
+            let branch_count: u32 = @len(branches) as u32;
+            if branch_count > 1 {
+                if !pe::branch_targets_clear(&branches[0..branch_count]:Read) { return OUTSIDE; }
+                pe::plan_branch_widths(&branches:ReadWrite);
+                var i: u32 = 0;
+                while i < branch_count {
+                    if branches[i].size == 2 { return LONG_FORM; }
+                    i = i + 1;
+                }
+            }
+            return 0;
+        }
+        let last: u32 = code.tables[index].end;
+        if !indirect || last <= at || last > end || (last - at) % 4u32 != 0 { return OUTSIDE; }
+        if next < last { return BAD_RELOCATION; }
+        at = last;
+        index = index + 1;
+    }
+    return OUTSIDE;
+}

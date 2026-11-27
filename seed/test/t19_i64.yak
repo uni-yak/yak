@@ -1,0 +1,11 @@
+// t19: i64 大整数运算 + assert
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let big: i64 = 9223372036854775807;
+    let neg: i64 = -1;
+    let sum: i64 = big + neg;
+    assert(sum == 9223372036854775806);
+    assert(neg == -1);
+    return;
+}

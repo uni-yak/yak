@@ -1,0 +1,58 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(word: u32, size: u32, expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    var i: u32 = 0;
+    while i < size {
+        pe::code_u8(&code:ReadWrite, (word >> (i * 8u32)) as u8)?;
+        i = i + 1;
+    }
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 专用寄存器短形态、真正的栈内存操作和寄存器间接跳转均有效。
+    encoding(0x55u32, 1, 0)?;
+    encoding(0x5du32, 1, 0)?;
+    encoding(0x5441u32, 2, 0)?;
+    encoding(0x5c41u32, 2, 0)?;
+    encoding(0x5566u32, 2, 0)?;
+    encoding(0x5d66u32, 2, 0)?;
+    encoding(0x0875ffu32, 3, 0)?;
+    encoding(0x08458fu32, 3, 0)?;
+    encoding(0xe0ffu32, 2, 0)?;
+    encoding(0xffu32, 1, 7101)?;
+    encoding(0x8fu32, 1, 7101)?;
+    // ModRM 直寻址的长形态含相同的宽度和寄存器选择。
+    encoding(0xf5ffu32, 2, 7103)?;
+    encoding(0xc58fu32, 2, 7103)?;
+    encoding(0xf4ff41u32, 3, 7103)?;
+    encoding(0xc48f41u32, 3, 7103)?;
+    encoding(0xf5ff66u32, 3, 7103)?;
+    encoding(0xc58f66u32, 3, 7103)?;
+    // 16 位 R12W 同时需要操作数宽度前缀与扩展寄存器位。
+    encoding(0x544166u32, 3, 0)?;
+    encoding(0x5c4166u32, 3, 0)?;
+    encoding(0xf4ff4166u32, 4, 7103)?;
+    encoding(0xc48f4166u32, 4, 7103)?;
+    // 真正的内存操作保留 ModRM；缺少位移时不得报成冗余编码。
+    encoding(0x0875ff66u32, 4, 0)?;
+    encoding(0x08458f66u32, 4, 0)?;
+    encoding(0x0075ff66u32, 3, 7101)?;
+    encoding(0x00458f66u32, 3, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

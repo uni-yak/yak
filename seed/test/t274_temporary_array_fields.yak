@@ -1,0 +1,15 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+function values(): u32[] { return [1u32, 2u32, 3u32]; }
+function main(): void {
+    let held: u32[] = [1u32, 2u32];
+    let ref: &u32[] = &held;
+    assert(ref.len == 2u64);
+    var i: u32 = 0;
+    while i < 2000 {
+        assert(values().len == 3u64);
+        assert(values().cap >= 3u64);
+        i = i + 1;
+    }
+    assert(held.len == 2u64);
+}

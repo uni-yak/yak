@@ -1,0 +1,14 @@
+// expected_stdout: ok
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+function classify(value: AllocError): u32 {
+    match value { OutOfMemory => { return 5u32; } }
+}
+
+function main(): void {
+    let value: AllocError = AllocError::OutOfMemory;
+    assert(classify(value) == 5u32);
+    assert(value == AllocError::OutOfMemory);
+    match value { AllocError::OutOfMemory => { write("ok"); } }
+}

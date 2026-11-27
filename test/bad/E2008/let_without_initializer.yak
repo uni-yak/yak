@@ -1,0 +1,4 @@
+// expected_code: E2008
+// spec: spec/lang/parse.md P-8
+// 触发：普通局部绑定声明缺少初始化器。
+function main(): void { let x: i32; return; }

@@ -1,0 +1,4 @@
+// expected_trap: index out of bounds
+struct Item { values: [u32; 1] }
+function make(): Item { return Item { values: [1u32] }; }
+function main(): void { let value: u32 = make().values[1u32]; }

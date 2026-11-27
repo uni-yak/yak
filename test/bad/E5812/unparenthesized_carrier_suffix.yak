@@ -1,0 +1,6 @@
+// expected_code: E5812
+// spec: spec/lang/type/result.md RE-9
+// 触发：在可错返回类型后直接接可空后缀。
+enum Fault { Bad }
+function bad(): i32!Fault? { return; }
+function main(): void { return; }

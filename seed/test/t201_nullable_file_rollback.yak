@@ -1,0 +1,4 @@
+// output: dst
+// expected_trap: null nullable value
+foreign file_write(name: &[u8], data: &[u8]): void;
+function main(): void { file_write("dst", "pending"); let value: i64? = null; value.unwrap(); }

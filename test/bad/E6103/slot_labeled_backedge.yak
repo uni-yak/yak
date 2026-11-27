@@ -1,0 +1,17 @@
+// expected_code: E6103
+// spec: spec/lang/base.md R-23
+// 触发：内层循环跳回外层时，满槽位与外层循环入口的空槽位合流。
+
+function fill(x: &u32:Write): void {
+    *x = 1u32;
+}
+
+function main(): void {
+    out slot: u32;
+    again: while true {
+        while true {
+            fill(out slot);
+            continue again;
+        }
+    }
+}

@@ -1,0 +1,31 @@
+import drop_leaf;
+foreign assert(cond: bool): void;
+
+struct Box { pre: u8, a: drop_leaf::Leaf, guard: u32, b: drop_leaf::Leaf }
+
+function exercise(): void!AllocError {
+    var p: u32[] = [];
+    var q: u32[] = [];
+    var r: u32[] = [];
+    var s: u32[] = [];
+    var t: u32[] = [];
+    var u: u32[] = [];
+    var v: u32[] = [];
+    var w: u32[] = [];
+    @push(p, 1u32)?;
+    @push(q, 2u32)?;
+    @push(r, 3u32)?;
+    @push(s, 4u32)?;
+    @push(t, 5u32)?;
+    @push(u, 6u32)?;
+    @push(v, 7u32)?;
+    @push(w, 8u32)?;
+    let x: Box = Box { pre: 11u8, a: drop_leaf::Leaf { first: @move(p), second: @move(q) }, guard: 42u32, b: drop_leaf::Leaf { first: @move(r), second: @move(s) } };
+    let y: Box = Box { pre: 12u8, a: drop_leaf::Leaf { first: @move(t), second: @move(u) }, guard: 43u32, b: drop_leaf::Leaf { first: @move(v), second: @move(w) } };
+    assert(x.pre == 11u8 && x.guard == 42u32 && y.pre == 12u8 && y.guard == 43u32);
+    let both: [Box; 2] = [@move(x), @move(y)];
+    @drop(both);
+    return;
+}
+
+function main(): void { exercise(); return; }

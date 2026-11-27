@@ -1,0 +1,619 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+// module: coff_code=../../compiler/min/src/emit/coff_code.yak
+// module: coff_state=../../compiler/min/src/emit/coff_state.yak
+// module: coff_call=../../compiler/min/src/emit/coff_call.yak
+// module: coff_place=../../compiler/min/src/emit/coff_place.yak
+// module: coff_inst=../../compiler/min/src/emit/coff_inst.yak
+// module: coff_carrier=../../compiler/min/src/emit/coff_carrier.yak
+// module: coff_func=../../compiler/min/src/emit/coff_func.yak
+// module: coff_layout=../../compiler/min/src/emit/coff_layout.yak
+// module: coff=../../compiler/min/src/emit/coff.yak
+// module: coff_symbols=../../compiler/min/src/emit/coff_symbols.yak
+// 聚合值内存形态的定向用例：结构体构造与字段访问、数组构造与索引访问，
+// 验证 MIR 产出 96/97/82/83/80 指令，且发射器按精确字节偏移落位。
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import resolve_unit;
+import typecheck;
+import typecheck_driver;
+import mir;
+import mir_lower;
+import mir_verify;
+import coff_code;
+import coff;
+import coff_state;
+import coff_place;
+import layout;
+import pe;
+foreign assert(cond: bool): void;
+
+// 结构体构造后读取字段：应产生 struct_construct(96)、field_addr(82) 与 load(80)。
+const STRUCT_SOURCE: &[u8] = "struct P { a: u32, b: u32 } function main(): u32 { let p: P = P { a: 1u32, b: 2u32 }; return p.b; }\n";
+
+// 定长数组构造后按常量下标读取：应产生 array_construct(97)、index_addr(83) 与 load(80)。
+// 动态数组 `T[]` 带堆头部且非 Copy，不属于本项的栈上聚合形态，仍按不支持拒绝。
+const ARRAY_SOURCE: &[u8] = "function main(): u32 { let a: [u32; 2] = [7u32, 8u32]; return a[1u32]; }\n";
+
+// 走带静态池的解析入口，其余阶段与运行器保持一致。
+function compile(src: &[u8], file: u16, diags: &diag::DiagBuffer:ReadWrite): mir::MirResult!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(src, file)?;
+    assert(@len(lexed.diagnostics) == 0);
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, file)?;
+    assert(@len(parsed.diagnostics) == 0);
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let resolution: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", diags)?;
+    let tc: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, diags)?;
+    return mir_lower::build_mir(&parsed.file:Read, &parsed.pool:Read, &resolution:Read, &tc:Read, diags)?;
+}
+
+// 统计模块内某 opcode 的出现次数。
+function count_op(m: &mir::MirModule:Read, op: u8): u32 {
+    var n: u32 = 0;
+    var f: u32 = 0;
+    while f < @len(m.functions) as u32 {
+        var k: u32 = 0;
+        while k < @len(m.functions[f].insts) as u32 {
+            if m.functions[f].insts[k].op == op { n = n + 1; }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    return n;
+}
+
+// 取模块内第一条指定 opcode 的指令整体。
+function first_inst(m: &mir::MirModule:Read, op: u8): mir::MirInst {
+    var f: u32 = 0;
+    while f < @len(m.functions) as u32 {
+        var k: u32 = 0;
+        while k < @len(m.functions[f].insts) as u32 {
+            if m.functions[f].insts[k].op == op { return m.functions[f].insts[k]; }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    return mir::MirInst { op: 0, a: 0, b: 0, c: 0, value: 0, value_type_id: 0, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false };
+}
+
+// 取模块内第一条指定 opcode 指令的 c 字段；没有则返回 0xFFFFFFFF。
+function first_c(m: &mir::MirModule:Read, op: u8): u32 {
+    let one: mir::MirInst = first_inst(m, op);
+    if one.op == 0 { return 4294967295u32; }
+    return one.c;
+}
+
+// 取模块内第一条指定 opcode 指令的字节偏移字段；没有则返回 0xFFFFFFFF。
+function first_value(m: &mir::MirModule:Read, op: u8): u64 {
+    var f: u32 = 0;
+    while f < @len(m.functions) as u32 {
+        var k: u32 = 0;
+        while k < @len(m.functions[f].insts) as u32 {
+            if m.functions[f].insts[k].op == op { return m.functions[f].insts[k].value; }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    return 4294967295u64;
+}
+
+// 结构体：一次 struct_construct 携带两个分量，字段地址一条、载入一条；
+// 字段 b 的偏移由 field_addr(82) 承载，必须是 4（a 为 u32 占 4 字节）。
+function struct_construct(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(STRUCT_SOURCE, 1247, &diags:ReadWrite)?;
+    assert(diags_empty(&diags:Read));
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    // 整条聚合构造只发一条 96，分量经参数表给出。
+    assert(count_op(&result.module:Read, 96u8) == 1);
+    // 字段访问：82 求地址 + 80 载入。
+    assert(count_op(&result.module:Read, 82u8) == 1);
+    assert(count_op(&result.module:Read, 80u8) == 1);
+    // 构造指令的参数个数等于字段数。
+    let ctor: mir::MirInst = first_inst(&result.module:Read, 96u8);
+    assert(ctor.args_count == 2);
+    // 读取字段 b，其字节偏移为 4。
+    assert(first_c(&result.module:Read, 82u8) == 4);
+    return;
+}
+
+// 数组：一次 array_construct 携带两个元素；索引访问一条 83；元素宽度 u32 为 4。
+function array_construct(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(ARRAY_SOURCE, 1248, &diags:ReadWrite)?;
+    assert(diags_empty(&diags:Read));
+    assert(result.accepted && result.rejection.kind == 0);
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    assert(count_op(&result.module:Read, 97u8) == 1);
+    let ctor: mir::MirInst = first_inst(&result.module:Read, 97u8);
+    assert(ctor.args_count == 2);
+    assert(count_op(&result.module:Read, 83u8) == 1);
+    assert(count_op(&result.module:Read, 80u8) == 1);
+    // 元素宽度由 83 的 value 承载。
+    assert(first_value(&result.module:Read, 83u8) == 4);
+    var changed: mir::MirResult = compile(ARRAY_SOURCE, 1263, &diags:ReadWrite)?;
+    assert(changed.accepted && changed.module.functions[0].has_trap_target);
+    changed.module.functions[0].has_trap_target = false;
+    assert(!mir_verify::verify_module(&changed.module:Read)?);
+    changed.module.functions[0].has_trap_target = true;
+    var index: u32 = 0;
+    while index < @len(changed.module.functions[0].insts) as u32 && changed.module.functions[0].insts[index].op != 83 { index = index + 1; }
+    assert(index < @len(changed.module.functions[0].insts) as u32);
+    changed.module.functions[0].insts[index].value = 8;
+    assert(!mir_verify::verify_module(&changed.module:Read)?);
+    var mixed_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var mixed: mir::MirResult = compile(ARRAY_SOURCE, 1270, &mixed_diags:ReadWrite)?;
+    assert(!mixed_diags.has_error && mixed.accepted && mir_verify::verify_module(&mixed.module:Read)?);
+    var address: u32 = 0;
+    while address < @len(mixed.module.functions[0].insts) as u32 && mixed.module.functions[0].insts[address].op != 83 { address = address + 1; }
+    assert(address < @len(mixed.module.functions[0].insts) as u32);
+    var load: u32 = 0;
+    while load < @len(mixed.module.functions[0].insts) as u32 && mixed.module.functions[0].insts[load].op != 80 { load = load + 1; }
+    assert(load < @len(mixed.module.functions[0].insts) as u32);
+    let old_type: u32 = mixed.module.functions[0].insts[load].value_type_id;
+    let other_type: u32 = mixed.module.functions[0].insts[address].value_type_id;
+    let local: u32 = mixed.module.functions[0].insts[load].a;
+    let signature: u32 = mixed.module.functions[0].signature - 1;
+    mixed.module.functions[0].insts[load].value_type_id = other_type;
+    mixed.module.functions[0].locals[local - 1].value_type_id = other_type;
+    mixed.module.signatures.items[signature].ret = other_type;
+    assert(!mir_verify::verify_module(&mixed.module:Read)?);
+    mixed.module.functions[0].insts[load].value_type_id = old_type;
+    mixed.module.functions[0].locals[local - 1].value_type_id = old_type;
+    mixed.module.signatures.items[signature].ret = old_type;
+    assert(mir_verify::verify_module(&mixed.module:Read)?);
+    // 用真实元素地址构造存储，单独验证存储类型与元素类型的关系。
+    let array_ctor: mir::MirInst = first_inst(&mixed.module:Read, 97);
+    let element: u32 = mixed.module.functions[0].args[array_ctor.args_start];
+    let address_local: u32 = mixed.module.functions[0].insts[address].a;
+    assert(mixed.module.functions[0].insts[load].b == address_local);
+    mixed.module.functions[0].insts[load].op = 81;
+    mixed.module.functions[0].insts[load].a = 0;
+    mixed.module.functions[0].insts[load].c = element;
+    mixed.module.functions[0].blocks[0].terminator.a = element;
+    assert(mir_verify::verify_module(&mixed.module:Read)?);
+    // 地址局部为 u64，也可作为已定义的不同类型存储值。
+    mixed.module.functions[0].insts[load].value_type_id = other_type;
+    mixed.module.functions[0].insts[load].c = address_local;
+    assert(!mir_verify::verify_module(&mixed.module:Read)?);
+    mixed.module.functions[0].insts[load].value_type_id = old_type;
+    mixed.module.functions[0].insts[load].c = element;
+    assert(mir_verify::verify_module(&mixed.module:Read)?);
+    var invalid_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let invalid: mir::MirResult = compile("function f(i: bool): u32 { let a: [u32; 2] = [7u32, 8u32]; return a[i]; }\n", 1264, &invalid_diags:ReadWrite)?;
+    assert(!invalid.accepted);
+    var slice_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var slice: mir::MirResult = compile("function f(a: &[u8], i: u32): u8 { return a[i]; }\n", 1265, &slice_diags:ReadWrite)?;
+    assert(!slice_diags.has_error && slice.accepted && mir_verify::verify_module(&slice.module:Read)?);
+    assert(slice.module.functions[0].has_trap_target);
+    var slice_index: u32 = 0;
+    while slice_index < @len(slice.module.functions[0].insts) as u32 && slice.module.functions[0].insts[slice_index].op != 83 { slice_index = slice_index + 1; }
+    assert(slice_index < @len(slice.module.functions[0].insts) as u32);
+    assert(slice.module.functions[0].insts[slice_index].value == 1);
+    // 切片索引按元素宽度寻址；验证器必须拒绝篡改过的步长。
+    slice.module.functions[0].insts[slice_index].value = 2;
+    assert(!mir_verify::verify_module(&slice.module:Read)?);
+    return;
+}
+
+// 发射：聚合局部必须按真实尺寸分配栈槽，结构体 P 为 8 字节。
+function aggregate_slots(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(STRUCT_SOURCE, 1249, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0);
+    assert(@len(layout.functions) == 1);
+    // 聚合局部占满 8 字节槽：字段 a、b 都能落在槽内。
+    assert(layout.functions[0].slots[0] >= 8);
+    return;
+}
+
+// 聚合 copy 的栈槽位移编码：源槽与目标槽必须各自落在自己的槽位上。
+// 历史上曾把「槽位移 + 聚合内偏移」按无符号正数编码，导致写入落到错误地址，
+// 结构体字段读回 0；这里用逐块搬运指令的位移字节做定点防护。
+function aggregate_copy_displacement(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(STRUCT_SOURCE, 1251, &diags:ReadWrite)?;
+    assert(result.accepted);
+    let layout: coff_state::ObjectLayout = coff::build_layout(&result.module:Read)?;
+    assert(layout.rejected == 0);
+    assert(@len(layout.functions) == 1);
+    // 取第一个聚合局部的槽位移，搬运块的位移必须严格小于该槽位移。
+    var slot: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].locals) as u32 {
+        if result.module.functions[0].locals[i].kind == 1 {
+            if layout.functions[0].slots[i] >= 8 { slot = layout.functions[0].slots[i]; }
+        }
+        i = i + 1;
+    }
+    assert(slot >= 8);
+    // 直接用位移换算原语验证：偏移 0 的块位移必须等于槽位移的补码。
+    var code: pe::Code = pe::code_new();
+    pe::load_slot_off(&code:ReadWrite, pe::rax(), slot, 0, 8)?;
+    let width: u32 = pe::disp_width(slot) as u32;
+    assert(@len(code.bytes) == (3 + width) as u64);
+    var modrm: u8 = 133;
+    if width == 1 { modrm = 69; }
+    assert(code.bytes[0] == 72 && code.bytes[1] == 139 && code.bytes[2] == modrm);
+    // 位移按最短宽度写入 -(slot) 的低字节，ModRM 决定处理器如何扩展其符号位。
+    let disp: u32 = pe::neg_disp32(slot);
+    i = 0;
+    while i < width { assert(code.bytes[3 + i] == ((disp >> (i * 8)) & 255u32) as u8); i = i + 1; }
+    return;
+}
+
+// 发射成功：聚合指令不再走「未识别 → EM-4」拒绝路径。
+function aggregate_emits(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile(ARRAY_SOURCE, 1250, &diags:ReadWrite)?;
+    assert(result.accepted);
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var entry: u8[] = [];
+    push_text(&entry:ReadWrite, "main")?;
+    @push(table.symbols, coff_state::LinkSymbol { def: result.module.functions[0].def as u64, kind: 0u8, name: @move(entry) })?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    return;
+}
+
+// 追加一段 ASCII 字节。
+function push_text(dst: &u8[]:ReadWrite, text: &[u8]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(text) as u32 { @push(*dst, text[i])?; i = i + 1; }
+    return;
+}
+
+// 诊断缓冲是否为空。
+function diags_empty(diags: &diag::DiagBuffer:Read): bool {
+    return @len(diags.diags) == 0;
+}
+
+// 超出字段偏移编码范围时不得生成截断地址。
+function reject_large_offset(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile("struct S { a: [u8; 4294967296u64], b: u8 } function f(x: S): u8 { return x.b; }\n", 1252, &diags:ReadWrite)?;
+    assert(!result.accepted && result.rejection.kind != 0);
+    var edge_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let edge: mir::MirResult = compile("struct S { a: [u8; 4294967295u64], b: u8 } function f(x: S): u8 { return x.b; }\n", 1253, &edge_diags:ReadWrite)?;
+    assert(!edge.accepted && edge.rejection.kind != 0);
+    var mutable_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var mutable: mir::MirResult = compile(STRUCT_SOURCE, 1255, &mutable_diags:ReadWrite)?;
+    var i: u32 = 0;
+    while i < @len(mutable.module.functions[0].insts) as u32 {
+        if mutable.module.functions[0].insts[i].op == 82 { mutable.module.functions[0].insts[i].c = 2147483648u32; }
+        i = i + 1;
+    }
+    let rejected: coff_state::ObjectLayout = coff::build_layout(&mutable.module:Read)?;
+    assert(rejected.rejected != 0);
+    i = 0;
+    while i < @len(mutable.module.functions[0].insts) as u32 {
+        if mutable.module.functions[0].insts[i].op == 82 { mutable.module.functions[0].insts[i].c = 2147483647u32; }
+        i = i + 1;
+    }
+    let supported: coff_state::ObjectLayout = coff::build_layout(&mutable.module:Read)?;
+    assert(supported.rejected == 0);
+    var valid_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let valid: mir::MirResult = compile("struct S { a: [u8; 4294967294u64], b: u8 } function f(x: S): u8 { return x.b; }\n", 1254, &valid_diags:ReadWrite)?;
+    assert(valid.accepted && !valid_diags.has_error && first_c(&valid.module:Read, 82) == 4294967294u32);
+    return;
+}
+// 字段序号属于结构体自身，不能使用整个字段表的下标。
+function multiple_struct_fields(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let result: mir::MirResult = compile("struct P { x: u8 } struct Q { a: u8, b: u32 } function f(q: Q): u32 { return q.b; }\n", 1256, &diags:ReadWrite)?;
+    assert(!diags.has_error && result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    assert(first_c(&result.module:Read, 82) == 4);
+    var first_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let first: mir::MirResult = compile("struct P { x: u8 } struct Q { a: u32, b: u32 } function f(q: Q): u32 { return q.a; }\n", 1257, &first_diags:ReadWrite)?;
+    assert(!first_diags.has_error && first.accepted && mir_verify::verify_module(&first.module:Read)?);
+    assert(first_c(&first.module:Read, 82) == 0);
+    var reverse_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let reverse: mir::MirResult = compile("struct Q { a: u32, b: u32 } function f(): Q { return Q { b: 31u32, a: 17u32 }; }\n", 1258, &reverse_diags:ReadWrite)?;
+    assert(!reverse_diags.has_error && reverse.accepted && mir_verify::verify_module(&reverse.module:Read)?);
+    let ctor: mir::MirInst = first_inst(&reverse.module:Read, 96);
+    assert(ctor.args_count == 2 && reverse.module.functions[0].args[ctor.args_start] > reverse.module.functions[0].args[ctor.args_start + 1]);
+    var nested_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let nested: mir::MirResult = compile("struct Q { a: u32, b: u32 } function id(x: u32): u32 { return x; } function f(): Q { return Q { a: 17u32, b: id(31u32) }; }\n", 1259, &nested_diags:ReadWrite)?;
+    assert(!nested_diags.has_error && nested.accepted && mir_verify::verify_module(&nested.module:Read)?);
+    let nested_ctor: mir::MirInst = first_inst(&nested.module:Read, 96);
+    let call: mir::MirInst = first_inst(&nested.module:Read, 150);
+    assert(nested_ctor.args_count == 2 && call.op == 150);
+    assert(nested.module.functions[1].args[nested_ctor.args_start + 1] == call.a);
+    var array_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let array: mir::MirResult = compile("function id(x: u32): u32 { return x; } function f(): [u32; 2] { return [17u32, id(31u32)]; }\n", 1260, &array_diags:ReadWrite)?;
+    assert(!array_diags.has_error && array.accepted && mir_verify::verify_module(&array.module:Read)?);
+    let array_ctor: mir::MirInst = first_inst(&array.module:Read, 97);
+    let array_call: mir::MirInst = first_inst(&array.module:Read, 150);
+    assert(array_ctor.args_count == 2 && array.module.functions[1].args[array_ctor.args_start + 1] == array_call.a);
+    return;
+}
+// 验证器必须核对聚合分量数量与声明类型，不能只检查标量。
+function aggregate_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var result: mir::MirResult = compile("struct Q { a: u32, b: bool } function f(): Q { return Q { a: 17u32, b: true }; }\n", 1261, &diags:ReadWrite)?;
+    assert(!diags.has_error && result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    var index: u32 = 0;
+    while index < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[index].op != 96 { index = index + 1; }
+    assert(index < @len(result.module.functions[0].insts) as u32);
+    let start: u32 = result.module.functions[0].insts[index].args_start;
+    let first: u32 = result.module.functions[0].args[start];
+    let second: u32 = result.module.functions[0].args[start + 1];
+    result.module.functions[0].args[start] = second;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].args[start] = first;
+    result.module.functions[0].insts[index].args_count = 1;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[index].args_count = 2;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    let field_type: u32 = result.module.fields.items[0].type_id;
+    result.module.fields.items[0].type_id = 0;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.fields.items[0].type_id = field_type;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var array_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var array: mir::MirResult = compile("function f(b: bool): [u32; 2] { if b { return [1u32, 2u32]; } return [3u32, 4u32]; }\n", 1262, &array_diags:ReadWrite)?;
+    assert(!array_diags.has_error && array.accepted && mir_verify::verify_module(&array.module:Read)?);
+    index = 0;
+    while index < @len(array.module.functions[0].insts) as u32 && array.module.functions[0].insts[index].op != 97 { index = index + 1; }
+    assert(index < @len(array.module.functions[0].insts) as u32);
+    let array_start: u32 = array.module.functions[0].insts[index].args_start;
+    let saved: u32 = array.module.functions[0].args[array_start];
+    array.module.functions[0].args[array_start] = array.module.functions[0].params[0];
+    assert(!mir_verify::verify_module(&array.module:Read)?);
+    array.module.functions[0].args[array_start] = saved;
+    let value_type_id: u32 = array.module.functions[0].insts[index].value_type_id;
+    array.module.types.entries[value_type_id - 1].length = 4294967298u64;
+    assert(!mir_verify::verify_module(&array.module:Read)?);
+    array.module.types.entries[value_type_id - 1].length = 2;
+    let element: u32 = array.module.types.entries[value_type_id - 1].elem;
+    array.module.types.entries[value_type_id - 1].elem = 0;
+    assert(!mir_verify::verify_module(&array.module:Read)?);
+    array.module.types.entries[value_type_id - 1].elem = element;
+    assert(mir_verify::verify_module(&array.module:Read)?);
+    return;
+}
+// 直接存储槽的类型必须与写入或载入的类型一致。
+function slot_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var result: mir::MirResult = compile("function f(): u32 { var x: u32 = 17u32; return x; }\n", 1266, &diags:ReadWrite)?;
+    assert(!diags.has_error && result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    let store: mir::MirInst = first_inst(&result.module:Read, 81);
+    let load: mir::MirInst = first_inst(&result.module:Read, 80);
+    assert(store.op == 81 && load.op == 80 && store.b == load.b);
+    let saved: u32 = result.module.functions[0].locals[store.b - 1].value_type_id;
+    var other: u32 = 0;
+    while other < @len(result.module.types.entries) as u32 && (other + 1 == saved || result.module.types.entries[other].kind != 1) { other = other + 1; }
+    assert(other < @len(result.module.types.entries) as u32);
+    result.module.functions[0].locals[store.b - 1].value_type_id = other + 1;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].locals[store.b - 1].value_type_id = saved;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var second_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var second: mir::MirResult = compile("function f(): u32 { var x: u32 = 17u32; var y: bool = true; if y { return x; } return 0u32; }\n", 1267, &second_diags:ReadWrite)?;
+    assert(!second_diags.has_error);
+    assert(second.accepted);
+    assert(mir_verify::verify_module(&second.module:Read)?);
+    var index: u32 = 0;
+    while index < @len(second.module.functions[0].insts) as u32 && second.module.functions[0].insts[index].op != 80 { index = index + 1; }
+    assert(index < @len(second.module.functions[0].insts) as u32);
+    let original: u32 = second.module.functions[0].insts[index].b;
+    var slot: u32 = 0;
+    while slot < @len(second.module.functions[0].locals) as u32 && (second.module.functions[0].locals[slot].kind != 2 || second.module.functions[0].locals[slot].value_type_id == second.module.functions[0].locals[original - 1].value_type_id) { slot = slot + 1; }
+    assert(slot < @len(second.module.functions[0].locals) as u32);
+    second.module.functions[0].insts[index].b = slot + 1;
+    assert(!mir_verify::verify_module(&second.module:Read)?);
+    second.module.functions[0].insts[index].b = original;
+    assert(mir_verify::verify_module(&second.module:Read)?);
+    return;
+}
+// 字段地址必须来自结构体，且偏移不能超出布局范围。
+function field_validation(): void!AllocError {
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    var result: mir::MirResult = compile(STRUCT_SOURCE, 1268, &diags:ReadWrite)?;
+    assert(!diags.has_error && result.accepted && mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 82 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let offset: u32 = result.module.functions[0].insts[i].c;
+    result.module.functions[0].insts[i].c = 1;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].c = 8;
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].c = offset;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    let base: u32 = result.module.functions[0].insts[i].b;
+    let ctor: mir::MirInst = first_inst(&result.module:Read, 96);
+    result.module.functions[0].insts[i].b = result.module.functions[0].args[ctor.args_start];
+    assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].b = base;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var mixed_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var mixed: mir::MirResult = compile("struct P { a: u8, b: u32 } function f(p: P): u32 { return p.b; }\n", 1269, &mixed_diags:ReadWrite)?;
+    assert(!mixed_diags.has_error);
+    assert(mixed.accepted);
+    assert(mir_verify::verify_module(&mixed.module:Read)?);
+    var field: u32 = 0;
+    while field < @len(mixed.module.functions[0].insts) as u32 && mixed.module.functions[0].insts[field].op != 82 { field = field + 1; }
+    assert(field < @len(mixed.module.functions[0].insts) as u32);
+    mixed.module.functions[0].insts[field].c = 0;
+    assert(!mir_verify::verify_module(&mixed.module:Read)?);
+    var write_diags: diag::DiagBuffer = diag::diagbuf_new();
+    var write: mir::MirResult = compile("struct P { a: u8, b: u32 } function f(): u32 { let p: P = P { a: 1u8, b: 2u32 }; return p.b; }\n", 1271, &write_diags:ReadWrite)?;
+    assert(!write_diags.has_error);
+    assert(write.accepted);
+    assert(mir_verify::verify_module(&write.module:Read)?);
+    field = 0;
+    while field < @len(write.module.functions[0].insts) as u32 && write.module.functions[0].insts[field].op != 82 { field = field + 1; }
+    assert(field < @len(write.module.functions[0].insts) as u32);
+    var load: u32 = 0;
+    while load < @len(write.module.functions[0].insts) as u32 && write.module.functions[0].insts[load].op != 80 { load = load + 1; }
+    assert(load < @len(write.module.functions[0].insts) as u32);
+    let write_ctor: mir::MirInst = first_inst(&write.module:Read, 96);
+    assert(write_ctor.args_count == 2);
+    let value: u32 = write.module.functions[0].args[write_ctor.args_start + 1];
+    assert(write.module.functions[0].insts[load].b == write.module.functions[0].insts[field].a);
+    write.module.functions[0].insts[load].op = 81;
+    write.module.functions[0].insts[load].a = 0;
+    write.module.functions[0].insts[load].c = value;
+    write.module.functions[0].blocks[0].terminator.a = value;
+    assert(mir_verify::verify_module(&write.module:Read)?);
+    let write_offset: u32 = write.module.functions[0].insts[field].c;
+    write.module.functions[0].insts[field].c = 0;
+    assert(!mir_verify::verify_module(&write.module:Read)?);
+    write.module.functions[0].insts[field].c = write_offset;
+    assert(mir_verify::verify_module(&write.module:Read)?);
+    return;
+}
+// 构造仅供析构发射使用的三种类型：标量、拥有型数组、导入结构体。
+function drop_emitter(): coff_state::Emitter!AllocError {
+    var types: typecheck::TypeTable = typecheck::TypeTable { entries: [], members: [] };
+    @push(types.entries, typecheck::TypeEntry { kind: 1, builtin: 4099, def: 0, dep: 0, export_id: 0, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    @push(types.entries, typecheck::TypeEntry { kind: 6, builtin: 0, def: 0, dep: 0, export_id: 0, elem: 1, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    @push(types.entries, typecheck::TypeEntry { kind: 3, builtin: 0, def: 0, dep: 2, export_id: 4, elem: 0, cap: 0, length: 0, success: 0, members_start: 0, members_count: 0 })?;
+    var sizes: u32[] = [];
+    @push(sizes, 4u32)?;
+    var flags: u8[] = [];
+    @push(flags, 0u8)?;
+    @push(flags, 1u8)?;
+    return coff_state::Emitter { code: pe::code_new(), slots: [], widths: [], types: @move(types),
+        fields: typecheck::FieldTable { items: [] }, enums: typecheck::EnumTable { items: [] },
+        layouts: layout::LayoutTable { items: [], states: [], field_order: 0 }, imported_fields: layout::ImportedFieldLayoutTable { items: [] },
+        imported_fields_ordered: false, imported_enums: typecheck::ImportedEnumTable { items: [] },
+        locals: [], slice_flags: [], agg_sizes: [], by_ptr: [], sret: 0, trap_status: 0, resume_jumps: [], drop_scratch: 0, drop_depth: 0,
+        dyn_flags: @move(flags), type_sizes: @move(sizes), type_tags: [], type_payloads: [],
+        frame_size: 0, out_slots: 0, block_offsets: [], fixups: [], arm_fixups: [], trap: 0,
+        calls: [], data_refs: [], static_lengths: [], value_shapes: [], shape_indices: [], shape_refs: [], rejected: 0, reject_kind: 0 };
+}
+
+function assert_drop_emission(actual: &coff_state::Emitter:Read, expected: &coff_state::Emitter:Read): void {
+    assert(@len(actual.calls) == 2 && @len(expected.calls) == 2);
+    assert(@len(actual.code.bytes) == @len(expected.code.bytes));
+    var i: u32 = 0;
+    while i < @len(expected.code.bytes) as u32 {
+        assert(actual.code.bytes[i] == expected.code.bytes[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 2 {
+        assert(actual.calls[i].at == expected.calls[i].at);
+        assert(actual.calls[i].symbol == coff_state::rt_symbol_free() && actual.calls[i].kind == 115);
+        i = i + 1;
+    }
+    return;
+}
+
+// 两个相同类型但偏移不同的动态字段，必须先发射后声明字段的释放。
+function imported_drop_emits(): void!AllocError {
+    var expected: coff_state::Emitter = drop_emitter()?;
+    assert(coff_place::drop_value(&expected:ReadWrite, 96, 24, 2, false, 0)?);
+    assert(coff_place::drop_value(&expected:ReadWrite, 96, 0, 2, false, 0)?);
+    let first: layout::ImportedFieldLayout = layout::ImportedFieldLayout { dep: 2, export_id: 4, field: 1, value_type_id: 2, offset: 0, size: 24, align: 8, known: true };
+    let second: layout::ImportedFieldLayout = layout::ImportedFieldLayout { dep: 2, export_id: 4, field: 2, value_type_id: 2, offset: 24, size: 24, align: 8, known: true };
+    // 前一组复用导出编号，后一组复用依赖编号；都不属于目标类型。
+    let before: layout::ImportedFieldLayout = layout::ImportedFieldLayout { dep: 1, export_id: 4, field: 1, value_type_id: 0, offset: 0, size: 0, align: 0, known: false };
+    let after: layout::ImportedFieldLayout = layout::ImportedFieldLayout { dep: 2, export_id: 5, field: 1, value_type_id: 0, offset: 0, size: 0, align: 0, known: false };
+    var sorted: coff_state::Emitter = drop_emitter()?;
+    @push(sorted.imported_fields.items, before)?;
+    @push(sorted.imported_fields.items, first)?;
+    @push(sorted.imported_fields.items, second)?;
+    @push(sorted.imported_fields.items, after)?;
+    let sorted_order: bool = layout::imported_fields_ordered(&sorted.imported_fields:Read);
+    sorted.imported_fields_ordered = sorted_order;
+    assert(sorted.imported_fields_ordered);
+    assert(coff_place::drop_value(&sorted:ReadWrite, 96, 0, 3, false, 0)?);
+    assert_drop_emission(&sorted:Read, &expected:Read);
+    var mixed: coff_state::Emitter = drop_emitter()?;
+    @push(mixed.imported_fields.items, first)?;
+    @push(mixed.imported_fields.items, before)?;
+    @push(mixed.imported_fields.items, second)?;
+    @push(mixed.imported_fields.items, after)?;
+    let mixed_order: bool = layout::imported_fields_ordered(&mixed.imported_fields:Read);
+    mixed.imported_fields_ordered = mixed_order;
+    assert(!mixed.imported_fields_ordered);
+    assert(coff_place::drop_value(&mixed:ReadWrite, 96, 0, 3, false, 0)?);
+    assert_drop_emission(&mixed:Read, &expected:Read);
+    return;
+}
+
+function imported_drop_rejects_unknown(): void!AllocError {
+    var em: coff_state::Emitter = drop_emitter()?;
+    @push(em.imported_fields.items, layout::ImportedFieldLayout { dep: 2, export_id: 5, field: 1, value_type_id: 0, offset: 0, size: 0, align: 0, known: false })?;
+    let ordered: bool = layout::imported_fields_ordered(&em.imported_fields:Read);
+    em.imported_fields_ordered = ordered;
+    assert(em.imported_fields_ordered);
+    // 下界存在，但同键字段不存在；不能把相邻项当作目标。
+    assert(!coff_place::drop_value(&em:ReadWrite, 96, 0, 3, false, 0)?);
+    em.imported_fields.items[0].export_id = 4;
+    assert(!coff_place::drop_value(&em:ReadWrite, 96, 0, 3, false, 0)?);
+    // 枚举识别仍优先，不会把未知结构字段误用作枚举载荷。
+    @push(em.imported_enums.items, typecheck::ImportedEnumVariant { dep: 2, export_id: 4, variant: 1, payload: 0, known: true })?;
+    assert(coff_place::drop_value(&em:ReadWrite, 96, 0, 3, false, 0)?);
+    assert(@len(em.code.bytes) == 0 && @len(em.calls) == 0);
+    return;
+}
+
+function main(): void {
+    imported_drop_emits()?;
+    imported_drop_rejects_unknown()?;
+    field_validation()?;
+    slot_validation()?;
+    aggregate_validation()?;
+    multiple_struct_fields()?;
+    reject_large_offset()?;
+    struct_construct()?;
+    array_construct()?;
+    aggregate_slots()?;
+    aggregate_copy_displacement()?;
+    aggregate_emits()?;
+    return;
+}

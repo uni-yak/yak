@@ -1,0 +1,5 @@
+// expected_code: E1003
+// spec: lang/lex.md#L-3
+// 触发：原语拼写紧贴普通名称，试图将 @ 用作用户名的一部分。
+function bad@len(): void {}
+function main(): void {}

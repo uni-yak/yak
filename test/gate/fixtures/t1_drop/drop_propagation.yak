@@ -1,0 +1,13 @@
+// 测试包装器控制第三次 push 的运行时失败。
+export function exercise_push(): u32!AllocError {
+    var a: u32[] = [];
+    @push(a, 1u32)?;
+    var b: u32[] = [];
+    @push(b, 2u32)?;
+    var c: u32[] = [];
+    @push(c, 3u32)?;
+    @push(c, 4u32)?;
+    return @len(c) as u32;
+}
+
+function main(): void { return; }

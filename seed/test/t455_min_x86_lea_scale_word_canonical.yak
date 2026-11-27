@@ -1,0 +1,56 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 生产 RIP 引用为 64 位，位移留待重定位或回填。
+    var code: pe::Code = pe::code_new();
+    let at: u32 = pe::lea_rip(&code:ReadWrite, pe::rax())?;
+    assert(at == 3 && pe::code_len(&code:Read) == 7 && code.bytes[0] == 0x48);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // 普通访存、宽目的、绝对与 RIP 取址保持原判定。
+    let memory: [u8; 9] = [0x66, 0x42, 0x8b, 0x04, 0xa5, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&memory[0..9]:Read, 0)?;
+    let dword: [u8; 8] = [0x42, 0x8d, 0x04, 0xa5, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&dword[0..8]:Read, 0)?;
+    let qword: [u8; 8] = [0x48, 0x8d, 0x04, 0xcd, 0x00, 0x80, 0x00, 0x00];
+    encoding(&qword[0..8]:Read, 0)?;
+    let absolute: [u8; 8] = [0x66, 0x8d, 0x04, 0x25, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&absolute[0..8]:Read, 7103)?;
+    let no_index: [u8; 8] = [0x66, 0x8d, 0x04, 0xa5, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&no_index[0..8]:Read, 7103)?;
+    let rip: [u8; 7] = [0x66, 0x8d, 0x05, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&rip[0..7]:Read, 0)?;
+    let rip_alias: [u8; 7] = [0x66, 0x8d, 0x05, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&rip_alias[0..7]:Read, 7102)?;
+    // 真实缩放仍需完整位移；非规范高半字只构成等长别名。
+    let scale4_canonical: [u8; 9] = [0x66, 0x42, 0x8d, 0x04, 0xa5, 0x7f, 0x00, 0x00, 0x00];
+    encoding(&scale4_canonical[0..9]:Read, 0)?;
+    let scale4_alias: [u8; 9] = [0x66, 0x42, 0x8d, 0x04, 0xa5, 0x7f, 0x00, 0x01, 0x00];
+    encoding(&scale4_alias[0..8]:Read, 7101)?;
+    encoding(&scale4_alias[0..9]:Read, 7102)?;
+    let scale8_canonical: [u8; 8] = [0x66, 0x8d, 0x04, 0xcd, 0x00, 0x80, 0xff, 0xff];
+    encoding(&scale8_canonical[0..8]:Read, 0)?;
+    let scale8_alias: [u8; 8] = [0x66, 0x8d, 0x04, 0xcd, 0x00, 0x80, 0x00, 0x00];
+    encoding(&scale8_alias[0..7]:Read, 7101)?;
+    encoding(&scale8_alias[0..8]:Read, 7102)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

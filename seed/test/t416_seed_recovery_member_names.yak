@@ -1,0 +1,31 @@
+// expected_stdout: ok
+// mem_limit: 330000
+foreign assert(condition: bool): void;
+foreign write(data: &[u8]): void;
+
+struct Callbacks {
+    then: &function(): u32,
+    catch: &function(): u32,
+    or: &function(): u32,
+    unwrap: &function(): u32,
+    bytes: u8[]
+}
+
+function seven(): u32 { return 7u32; }
+
+function make(count: &u32:ReadWrite): Callbacks {
+    *count = *count + 1u32;
+    return Callbacks { then: &seven, catch: &seven, or: &seven, unwrap: &seven, bytes: [1u8] };
+}
+
+function check(source: &Callbacks): void {
+    assert(source.catch() + source.or() + source.unwrap() == 21u32);
+}
+
+function main(): void {
+    var count: u32 = 0u32;
+    while count < 500u32 { assert(make(count).then() == 7u32); }
+    assert(count == 500u32);
+    check(make(count));
+    write("ok");
+}

@@ -1,0 +1,11 @@
+import c0_slice_leaf;
+
+export struct Token { kind: u8, span: c0_slice_leaf::Span, payload: u64, suffix: u8 }
+
+export function make(offset: u32, payload: u64): Token {
+    return Token { kind: 1, span: c0_slice_leaf::Span { file: 2, offset: offset, length: 3 }, payload: payload, suffix: 4 };
+}
+
+export function read(tokens: &[Token], index: u64): u64 {
+    return tokens[index].payload + tokens[index].span.offset as u64;
+}

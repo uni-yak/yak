@@ -1,0 +1,32 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+import lex;
+foreign assert(cond: bool): void;
+function rejects(bytes: &[u8], off: u32): void!AllocError {
+    let r: lex::LexResult = lex::lex_scan(bytes, 0)?;
+    assert(@len(r.tokens) == 0 && @len(r.diagnostics) == 1);
+    assert(r.diagnostics[0].code.raw == 1001 && r.diagnostics[0].span.offset == off);
+    return;
+}
+function main(): void {
+    let bom: u8[] = [239, 187, 191, 10];
+    let overlong: u8[] = [192, 128, 10];
+    let surrogate: u8[] = [237, 160, 128, 10];
+    let overflow: u8[] = [244, 144, 128, 128, 10];
+    let truncated: u8[] = [34, 240, 159, 10];
+    let in_comment: u8[] = [47, 47, 255, 10];
+    rejects(&bom[0..4], 0)?;
+    rejects(&overlong[0..3], 0)?;
+    rejects(&surrogate[0..4], 0)?;
+    rejects(&overflow[0..5], 0)?;
+    rejects(&truncated[0..4], 1)?;
+    rejects(&in_comment[0..4], 2)?;
+    let good: lex::LexResult = lex::lex_scan("/* 中文 */ 'é' '😀'\r\n", 0)?;
+    assert(@len(good.diagnostics) == 0 && @len(good.tokens) == 3);
+    assert(good.tokens[0].payload == 233 && good.tokens[0].span.length == 4);
+    assert(good.tokens[1].payload == 128512 && good.tokens[1].span.length == 6);
+}

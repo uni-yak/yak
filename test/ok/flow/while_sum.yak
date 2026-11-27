@@ -1,0 +1,15 @@
+// expected_exit: 55
+// spec: spec/lang/base.md 六、控制流与求值
+// while 循环累加 1..10，退出码 55 验证循环求和与整数运算。
+foreign exit(code: u8): void;
+
+function main(): void {
+    var i: u32 = 1u32;
+    var s: u32 = 0u32;
+    while i <= 10u32 {
+        s = s + i;
+        i = i + 1u32;
+    }
+    exit(s as u8);
+    return;
+}

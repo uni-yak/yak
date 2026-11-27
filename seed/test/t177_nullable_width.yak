@@ -1,0 +1,2 @@
+// expected_trap: integer overflow
+function main(): void { let a: u8? = 256; }

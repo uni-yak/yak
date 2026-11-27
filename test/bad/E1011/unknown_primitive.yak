@@ -1,0 +1,4 @@
+// expected_code: E1011
+// spec: spec/lang/lex.md L-11
+// 触发：@ 后的原语名未登记。
+function main(): void { @not_registered(); return; }

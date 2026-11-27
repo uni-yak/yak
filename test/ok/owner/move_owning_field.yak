@@ -1,0 +1,28 @@
+// expected_exit: 3
+// spec: spec/lang/base.md 7.11、spec/lang/owner.md 2.3
+// owning 聚合按 @move 转移进被调方：转移后读长度三次、被调方出口自动析构，退出码 3。
+foreign exit(code: u8): void;
+
+struct Buf { data: u8[] }
+
+function consume(b: Buf): void!AllocError {
+    let m: u64 = @len(b.data);
+    if m != 3u64 { exit(99u8); }
+    return;
+}
+
+function run(): void!AllocError {
+    var b: Buf = Buf { data: [] };
+    @push(b.data, 1u8)?;
+    @push(b.data, 2u8)?;
+    @push(b.data, 3u8)?;
+    let n: u64 = @len(b.data);
+    consume(@move(b))?;
+    exit(n as u8);
+    return;
+}
+
+function main(): void {
+    run();
+    return;
+}

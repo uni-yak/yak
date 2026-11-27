@@ -1,0 +1,7 @@
+// expected_code: E1004
+// spec: spec/lang/type/u32.md L-4
+// 触发：带类型后缀的数值 4294967296 超出 u32 的正值上界。
+function main(): void {
+    @drop(4294967296u32);
+    return;
+}

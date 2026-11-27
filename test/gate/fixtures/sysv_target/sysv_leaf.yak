@@ -1,0 +1,21 @@
+export struct Pair { wide: u64, tail: u32 }
+export struct Big { left: u64, marker: u8, right: u64 }
+
+// 切片指针使用第六个寄存器，长度和最后一个参数在栈上。
+export function split(a: u64, b: u64, c: u64, d: u64, e: u64, data: &[u8], tail: u64): u64 {
+    return a + b * 2 + c * 3 + d * 4 + e * 5 + @len(data) * 7 + (data[0] as u64) + tail * 11;
+}
+
+// 两个机器字的聚合不能占半个寄存器窗口，末尾的标量仍可使用第六个寄存器。
+export function whole_stack(a: u64, b: u64, c: u64, d: u64, e: u64, value: Pair, tail: u64): u64 {
+    return a + b + c + d + e + value.wide * 3 + (value.tail as u64) * 5 + tail * 7;
+}
+
+export function small(value: Pair): Pair {
+    return Pair { wide: value.wide + 17, tail: value.tail + 23 };
+}
+
+// 大值参数在栈上，大值返回需要第一个整数位置传入隐藏缓冲区。
+export function large(base: u64, value: Big, tail: u64): Big {
+    return Big { left: value.left + base, marker: value.marker + 1, right: value.right + tail };
+}

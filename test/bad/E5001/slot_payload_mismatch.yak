@@ -1,0 +1,10 @@
+// expected_code: E5001
+// spec: spec/lang/base.md R-1
+// 触发：out 槽位载荷类型与 Write 形参目标类型不一致。
+function fill(x: &u32:Write): void { *x = 1u32; }
+
+function main(): void {
+    out r: u64;
+    fill(out r);
+    return;
+}

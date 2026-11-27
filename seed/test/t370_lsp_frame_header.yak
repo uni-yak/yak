@@ -1,0 +1,23 @@
+// module: frame=../../compiler/lsp/frame.yak
+import frame;
+foreign assert(cond: bool): void;
+
+function main(): void {
+    assert(frame::parse_header("Content-Length: 5\r\n\r\n") == 5);
+    assert(frame::parse_header("cOnTeNt-LeNgTh:\t003 \t\r\nX-Trace: value\r\n\r\n") == 3);
+    assert(frame::parse_header("Content-Length: 0\r\n\r\n") == 0);
+    assert(frame::parse_header("Content-Length: 33554432\r\n\r\n") == 33554432);
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 33554433\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 18446744073709551616\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 1\r\ncontent-length: 2\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: +1\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 1 2\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: \t\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length : 1\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 1\n\n")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 1\r\n\r\nX")));
+    assert(frame::invalid_header(frame::parse_header("Content-Length: 1\r\nX: 中文\r\n\r\n")));
+    assert(frame::invalid_header(frame::parse_header("\r\n")));
+    assert(frame::invalid_header(frame::parse_header("")));
+}

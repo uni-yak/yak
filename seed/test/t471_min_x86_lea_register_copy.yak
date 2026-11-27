@@ -1,0 +1,83 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 0)?;
+    pe::lea_rbp(&code:ReadWrite, pe::r8(), 0)?;
+    assert(pe::code_len(&code:Read) == 6);
+    assert(code.bytes[0] == 0x48 && code.bytes[1] == 0x89 && code.bytes[2] == 0xe8);
+    assert(code.bytes[3] == 0x49 && code.bytes[4] == 0x89 && code.bytes[5] == 0xe8);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+
+    var no_effect: pe::Code = pe::code_new();
+    pe::mov_rr(&no_effect:ReadWrite, pe::rax(), pe::rax())?;
+    pe::mov_rr(&no_effect:ReadWrite, pe::r12(), pe::r12())?;
+    pe::lea_rbp(&no_effect:ReadWrite, pe::rbp(), 0)?;
+    assert(pe::code_len(&no_effect:Read) == 3);
+    assert(no_effect.bytes[0] == 0x90 && no_effect.bytes[1] == 0x90 && no_effect.bytes[2] == 0x90);
+    assert(x86_validate::validate(&no_effect:Read, 0)? == 0);
+
+    // AH 与 SPL 都能自传送；32 位自传送仍负责清零高半部。
+    let self_moves: [u8; 22] = [0x88, 0xe4, 0x40, 0x88, 0xe4, 0x66, 0x8b, 0xc0,
+        0x4d, 0x89, 0xc0, 0x48, 0x89, 0xe4, 0x89, 0xc0, 0x45, 0x89, 0xc0, 0x49, 0x89, 0xc0];
+    encoding(&self_moves[0..2]:Read, 7103)?;
+    encoding(&self_moves[2..5]:Read, 7103)?;
+    encoding(&self_moves[5..8]:Read, 7103)?;
+    encoding(&self_moves[8..11]:Read, 7103)?;
+    encoding(&self_moves[11..14]:Read, 7103)?;
+    encoding(&self_moves[14..22]:Read, 0)?;
+    let self_lea: [u8; 9] = [0x66, 0x8d, 0x00, 0x4d, 0x8d, 0x00, 0x45, 0x8d, 0x00];
+    encoding(&self_lea[0..3]:Read, 7103)?;
+    encoding(&self_lea[3..6]:Read, 7103)?;
+    encoding(&self_lea[6..9]:Read, 7102)?;
+
+    // 只有单个基址且有效位移为零时，LEA 才能化为 MOV。
+    let copies: [u8; 27] = [0x48, 0x8d, 0x01, 0x66, 0x8d, 0x01, 0x8d, 0x01,
+        0x48, 0x8d, 0x45, 0, 0x49, 0x8d, 0x04, 0x24, 0x48, 0x8d, 0x04, 0x24,
+        0x66, 0x8d, 0x81, 0, 0, 1, 0];
+    encoding(&copies[0..3]:Read, 7102)?;
+    encoding(&copies[3..6]:Read, 7102)?;
+    encoding(&copies[6..8]:Read, 7102)?;
+    encoding(&copies[8..12]:Read, 7103)?;
+    encoding(&copies[12..16]:Read, 7103)?;
+    encoding(&copies[16..20]:Read, 7103)?;
+    encoding(&copies[20..27]:Read, 7103)?;
+
+    // 取址结果的零扩展由 32 位目的寄存器完成，计算仍只保留低 32 位。
+    let widths: [u8; 35] = [0x67, 0x4c, 0x8d, 0x04, 0x25, 0, 0, 0, 0x80,
+        0x67, 0x48, 0x8d, 0x44, 0x91, 0x01, 0x67, 0x48, 0x8d, 0x05, 0, 0, 0, 0,
+        0x44, 0x8d, 0x04, 0x25, 0, 0, 0, 0x80, 0x8d, 0x44, 0x91, 0x01];
+    encoding(&widths[0..9]:Read, 7103)?;
+    encoding(&widths[9..15]:Read, 7103)?;
+    encoding(&widths[15..23]:Read, 7103)?;
+    encoding(&widths[23..31]:Read, 7103)?;
+    encoding(&widths[31..35]:Read, 0)?;
+    encoding(&widths[0..8]:Read, 7101)?;
+
+    // 保留真实索引、非零位移、RIP 和正常访存。
+    let controls: [u8; 21] = [0x48, 0x8d, 0x04, 0x11, 0x48, 0x8d, 0x45, 1,
+        0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8b, 0x45, 0, 0x48, 0x8b];
+    encoding(&controls[0..19]:Read, 0)?;
+    encoding(&controls[19..21]:Read, 7101)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

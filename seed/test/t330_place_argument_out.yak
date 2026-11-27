@@ -1,0 +1,3 @@
+// expected_trap: eval: out argument requires a Write parameter (OW-8)
+function read(value: &u32): void {}
+function main(): void { var count: u32 = 3u32; read(out count); }

@@ -1,0 +1,12 @@
+// t101: @push OOM → Err(AllocError) → ? 传播 → 顶层 trap（owner.md 5.4）
+// mem_limit: 70000
+// expected_trap: uncaught error propagation
+function main(): void {
+    var arr: u32[] = [];
+    var i: u32 = 0;
+    while i < 600 {
+        @push(arr, i)?;
+        i = i + 1;
+    }
+    return;
+}

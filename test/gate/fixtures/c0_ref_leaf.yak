@@ -1,0 +1,18 @@
+// 在不同字段偏移验证普通引用的显式读写，以及单参数位和跨单元传递。
+export struct Cell { pad: u64, value: u32 }
+
+export function get(src: &Cell:Read): u32 {
+    return src.value;
+}
+
+export function update(a: u32, b: u32, c: u32, d: u32, dst: &Cell:ReadWrite): void {
+    dst.value = dst.value + a + b * 2 + c * 3 + d * 4;
+}
+
+export function get_pad(src: &u64:Read): u64 {
+    return *src;
+}
+
+export function set_pad(dst: &u64:ReadWrite, value: u64): void {
+    *dst = value;
+}

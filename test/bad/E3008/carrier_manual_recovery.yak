@@ -1,0 +1,8 @@
+// expected_code: E3008
+// spec: spec/lang/type/result.md#RE-5
+// 触发：base 中对可错载体调用手动恢复方法。
+enum Failure { Bad }
+
+function fail(): u32!Failure { return Failure::Bad; }
+
+function main(): void { fail().or(7u32); }

@@ -1,0 +1,21 @@
+// 按值 owning 形参隐式析构：局部先释放，形参按声明逆序释放，调用方局部最后释放。
+function consume(v: u32[], u: u32[]): void!AllocError {
+    let n: u64 = @len(v) + @len(u);
+    var w: u32[] = [];
+    @push(w, 72u32)?;
+    if n == 999u64 { return; }
+    return;
+}
+
+function outer(): void!AllocError {
+    var keep: u32[] = [];
+    @push(keep, 73u32)?;
+    var e1: u32[] = [];
+    var e2: u32[] = [];
+    @push(e1, 71u32)?;
+    @push(e2, 70u32)?;
+    consume(@move(e1), @move(e2))?;
+    return;
+}
+
+function main(): void { outer(); return; }

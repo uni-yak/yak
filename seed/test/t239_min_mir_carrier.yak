@@ -1,0 +1,213 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: runner=mir_runner.yak
+import typecheck;
+import mir;
+import mir_verify;
+import runner;
+foreign assert(cond: bool): void;
+
+// 同一组执行与结构检查复用于标量和载体，避免两个解释器给出不同语义。
+function return_type(m: &mir::MirModule:Read, index: u32): u32 {
+    return m.signatures.items[m.functions[index].signature - 1].ret;
+}
+function only_error(m: &mir::MirModule:Read, index: u32): u32 {
+    let carrier: typecheck::TypeEntry = m.types.entries[return_type(m, index) - 1];
+    assert(carrier.kind == 9);
+    let set: typecheck::TypeEntry = m.types.entries[carrier.elem - 1];
+    assert(set.kind == 11 && set.members_count == 1);
+    return m.types.members[set.members_start];
+}
+function success(m: &mir::MirModule:Read, index: u32, value: runner::Value, bits: u64): void {
+    let value_type_id: u32 = return_type(m, index);
+    assert(value.tag == 2 && value.value_type_id == value_type_id && value.bits == bits);
+    let payload: u32 = m.types.entries[value_type_id - 1].success;
+    if m.types.entries[payload - 1].kind == 0 { assert(value.payload_type == 0); }
+    else { assert(value.payload_type == payload); }
+    return;
+}
+function failure(m: &mir::MirModule:Read, index: u32, value: runner::Value, enum_type: u32, variant: u32, bits: u64): void {
+    assert(value.tag == 3 && value.value_type_id == return_type(m, index));
+    assert(value.payload_type == enum_type && value.variant == variant && value.bits == bits);
+    return;
+}
+function enum_values(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("enum E { Empty, Code(u32) } function empty(): E { return E::Empty; } function code(): E { return E::Code(17); }\n", 1250)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let a: runner::Value = runner::run0(m, 0)?;
+    let b: runner::Value = runner::run0(m, 1)?;
+    assert(a.tag == 1 && a.value_type_id == return_type(m, 0) && a.variant == 0 && a.bits == 0);
+    assert(b.tag == 1 && b.value_type_id == a.value_type_id && b.variant == 1 && b.bits == 17);
+    assert(m.functions[0].insts[0].op == 176 && m.functions[0].insts[0].b == a.value_type_id && m.functions[0].insts[0].c == 0 && m.functions[0].insts[0].value == 0);
+    return;
+}
+// 保持其他指令不变，逐项篡改枚举标签与载荷。
+function enum_validation(): void!AllocError {
+    var result: mir::MirResult = runner::accepted("enum E { Empty, Code(u32) } function f(x: u32, flag: bool): E { @drop(flag); return E::Code(x); }\n", 1257)?;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    var i: u32 = 0;
+    while i < @len(result.module.functions[0].insts) as u32 && result.module.functions[0].insts[i].op != 176 { i = i + 1; }
+    assert(i < @len(result.module.functions[0].insts) as u32);
+    let original: mir::MirInst = result.module.functions[0].insts[i];
+    result.module.functions[0].insts[i].c = 2; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].c = 4294967295u32; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i] = original;
+    let def: u32 = result.module.enums.items[0].def;
+    result.module.enums.items[0].def = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.enums.items[0].def = def;
+    result.module.functions[0].insts[i].value = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i] = original;
+    result.module.functions[0].insts[i].value = result.module.functions[0].params[1] as u64; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i] = original;
+    result.module.functions[0].insts[i].c = 0; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 0; assert(mir_verify::verify_module(&result.module:Read)?);
+    // 使用合法枚举指令骨架模拟固有错误枚举，不依赖源码构造该错误。
+    let value_type_id: u32 = original.value_type_id;
+    let entry: typecheck::TypeEntry = result.module.types.entries[value_type_id - 1];
+    result.module.types.entries[value_type_id - 1].kind = 1;
+    result.module.types.entries[value_type_id - 1].builtin = 4108;
+    assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].c = 1; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].c = 0;
+    result.module.functions[0].insts[i].value = original.value; assert(!mir_verify::verify_module(&result.module:Read)?);
+    result.module.functions[0].insts[i].value = 0; assert(mir_verify::verify_module(&result.module:Read)?);
+    result.module.types.entries[value_type_id - 1] = entry;
+    return;
+}
+function scalar_carrier(): void!AllocError {
+    let src: &[u8] = "enum E { Skip, Bad(u32) } function choose(x: u32): u32!E { if x == 0 { return E::Skip; } if x == 1 { return E::Bad(17); } return x + 3; }\n";
+    let m_result: mir::MirResult = runner::accepted(src, 1251)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let other_result: mir::MirResult = runner::accepted(src, 1251)?;
+    let other: &mir::MirModule:Read = &other_result.module:Read;
+    runner::same_module(m, other);
+    let error: u32 = only_error(m, 0);
+    failure(m, 0, runner::run1(m, 0, 0)?, error, 0, 0);
+    failure(m, 0, runner::run1(m, 0, 1)?, error, 1, 17);
+    success(m, 0, runner::run1(m, 0, 2)?, 5);
+    return;
+}
+function void_carrier(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("enum E { Bad } function stop(ok: bool): void!E { if !ok { return E::Bad; } return; } function chain(ok: bool): void!E { stop(ok)?; return; }\n", 1252)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let error: u32 = only_error(m, 0);
+    success(m, 0, runner::run1(m, 0, 1)?, 0);
+    success(m, 1, runner::run1(m, 1, 1)?, 0);
+    failure(m, 0, runner::run1(m, 0, 0)?, error, 0, 0);
+    failure(m, 1, runner::run1(m, 1, 0)?, error, 0, 0);
+    return;
+}
+function question_paths(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("enum E { Bad } foreign args_len(index: u32): u32; function base(x: u32): u32!E { if x == 0 { return E::Bad; } return x; } function chain(x: u32): u32!E { let a: u32 = base(x)?; let b: u32 = base(a + 1)?; return args_len(b + 1); }\n", 1253)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    var args: runner::Value[] = [];
+    @push(args, runner::scalar(runner::type_for(m, 4099), 2))?;
+    var state: runner::Execution = runner::execution_new();
+    let ok: runner::Value = runner::execute(m, 1, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    success(m, 1, ok, 4);
+    assert(state.foreign_calls == 1 && state.trace == 4);
+    args[0].bits = 0; state = runner::execution_new();
+    let err: runner::Value = runner::execute(m, 1, &args[0..@len(args)]:Read, &state:ReadWrite, 0)?;
+    failure(m, 1, err, only_error(m, 0), 0, 0);
+    assert(state.foreign_calls == 0 && state.trace == 0);
+    return;
+}
+function error_subset(): void!AllocError {
+    let m_result: mir::MirResult = runner::accepted("enum A { Bad(u32) } enum B { Bad } function base(x: u32): u32!A { if x == 0 { return A::Bad(37); } return x; } function outer(x: u32): u32!(A | B) { let n: u32 = base(x)?; if n == 7 { return B::Bad; } return n + 1; } function other(): u32!B { return B::Bad; }\n", 1254)?;
+    let m: &mir::MirModule:Read = &m_result.module:Read;
+    let a: u32 = only_error(m, 0);
+    let b: u32 = only_error(m, 2);
+    assert(a != b);
+    failure(m, 1, runner::run1(m, 1, 0)?, a, 0, 37);
+    failure(m, 1, runner::run1(m, 1, 7)?, b, 0, 0);
+    success(m, 1, runner::run1(m, 1, 2)?, 3);
+    return;
+}
+function aggregate_carriers(): void!AllocError {
+    let result: mir::MirResult = runner::accepted("struct P { x: u32 } enum E { Bad } function f(): P!E { return P { x: 1 }; }\n", 1255)?;
+    let m: &mir::MirModule:Read = &result.module:Read;
+    assert(mir_verify::verify_module(m)? && @len(m.functions) == 1);
+    let carrier: u32 = return_type(m, 0);
+    let entry: typecheck::TypeEntry = m.types.entries[carrier - 1];
+    assert(entry.kind == 9 && m.types.entries[entry.success - 1].kind == 2);
+    var i: u32 = 0;
+    while i < @len(m.functions[0].insts) as u32 && m.functions[0].insts[i].op != 160 { i = i + 1; }
+    assert(i < @len(m.functions[0].insts) as u32);
+    let injected: mir::MirInst = m.functions[0].insts[i];
+    assert(injected.value_type_id == carrier && injected.b != 0 && injected.c == entry.elem);
+    assert(m.functions[0].locals[injected.b - 1].value_type_id == entry.success);
+    // 这里只验证聚合载荷的 MIR，运行器不模拟该枚举的字节布局。
+    let error_result: mir::MirResult = runner::accepted("struct P { x: u32 } enum E { Bad(P) } function f(x: u32): u32!E { return E::Bad(P { x: x }); }\n", 1256)?;
+    let error_module: &mir::MirModule:Read = &error_result.module:Read;
+    assert(mir_verify::verify_module(error_module)? && @len(error_module.functions) == 1);
+    let f: &mir::MirFunction:Read = &error_module.functions[0]:Read;
+    let count: u32 = @len(f.insts) as u32;
+    var record_index: u32 = count;
+    var enum_index: u32 = count;
+    var error_index: u32 = count;
+    var j: u32 = 0;
+    while j < count {
+        let op: u8 = f.insts[j].op;
+        if op == 96 { record_index = j; }
+        elseif op == 176 { enum_index = j; }
+        elseif op == 161 { error_index = j; }
+        j = j + 1;
+    }
+    assert(record_index < enum_index && enum_index < error_index && error_index < count);
+    let record: mir::MirInst = f.insts[record_index];
+    let tag: mir::MirInst = f.insts[enum_index];
+    let err: mir::MirInst = f.insts[error_index];
+    let enum_type: u32 = only_error(error_module, 0);
+    let err_type: u32 = return_type(error_module, 0);
+    assert(record.a != 0 && record.args_count == 1 && error_module.types.entries[record.value_type_id - 1].kind == 2);
+    assert(tag.a != 0 && tag.b == enum_type && tag.value_type_id == enum_type && tag.c == 0 && tag.value == record.a as u64);
+    assert(err.b == tag.a && err.value_type_id == err_type && err.c == error_module.types.entries[err_type - 1].success);
+    return;
+}
+function main(): void {
+    enum_values()?; enum_validation()?; scalar_carrier()?; void_carrier()?;
+    question_paths()?; error_subset()?; aggregate_carriers()?;
+    return;
+}

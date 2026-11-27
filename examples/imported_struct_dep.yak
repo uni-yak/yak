@@ -1,0 +1,11 @@
+// 导入结构体样例的依赖单元：导出 Pair 结构与按值构造/求和函数。
+// 根单元通过 .iface 的字段签名与布局摘要获得字段类型和偏移。
+export struct Pair { a: u32, b: u32, c: u32 }
+
+export function make(x: u32): Pair {
+    return Pair { a: x, b: x + 1u32, c: x + 2u32 };
+}
+
+export function sum(p: Pair): u32 {
+    return p.a + p.b + p.c;
+}

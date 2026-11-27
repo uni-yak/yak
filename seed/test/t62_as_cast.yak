@@ -1,0 +1,12 @@
+// t62: as 类型转换assert（真实assert）
+foreign assert(cond: bool): void;
+
+function main(): void {
+    let big: u64 = 300;
+    let small: u8 = big as u8;
+    assert(small == 44);
+    let pos: i32 = -1 as i32;
+    let back: u32 = pos as u32;
+    assert(back == 4294967295);
+    return;
+}

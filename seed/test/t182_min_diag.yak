@@ -1,0 +1,23 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// expected_stdout: 错误 E4002 @ off=3
+// expected_stdout: 错误 E4003 @ off=3
+// expected_stdout: 警告 E4003 @ off=8
+// expected_stdout: 错误 E4002 @ off=9
+// expected_stdout: 信息 E4003 @ off=10
+// expected_stdout: 构建失败：3 个错误
+import types; import diag;
+foreign assert(cond: bool): void;
+function main(): void {
+    var d: diag::DiagBuffer = diag::diagbuf_new();
+    // 以逆序加入诊断，分别覆盖源偏移和同偏移的错误码排序。
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4002), severity: 0, span: types::Span { file: 1, offset: 9, length: 1 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4003), severity: 0, span: types::Span { file: 1, offset: 3, length: 1 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4002), severity: 0, span: types::Span { file: 1, offset: 3, length: 1 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4003), severity: 2, span: types::Span { file: 1, offset: 10, length: 1 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    diag::diagbuf_emit(&d:ReadWrite, diag::Diag { code: types::error_code(4003), severity: 1, span: types::Span { file: 1, offset: 8, length: 1 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    assert(diag::diagbuf_count(&d) == 5);
+    diag::diagbuf_sort(&d:ReadWrite);
+    diag::diagbuf_print_terminal(&d)?;
+}

@@ -1,0 +1,6 @@
+// t50: break 在循环外（应 trap）
+// expected_trap: break outside loop
+function main(): void {
+    break;
+    return;
+}

@@ -1,0 +1,2 @@
+// expected_trap: escaping reference
+function main(): void { var x: i64 = 0; var r: &i64 = &x; { let y: i64 = 1; r = &y; } }

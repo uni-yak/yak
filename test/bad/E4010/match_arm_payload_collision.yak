@@ -1,0 +1,17 @@
+// expected_code: E4010
+// spec: spec/lang/name.md N-10
+// 触发：直接臂体内的局部与模式的载荷绑定重名。
+foreign assert(cond: bool): void;
+
+enum E { Empty, Code(u32) }
+
+function main(): void {
+    let e: E = E::Code(41u32);
+    match e {
+        Empty => {},
+        Code(value) => {
+            assert(value == 41u32);
+            let value: u32 = 7u32;
+        }
+    }
+}

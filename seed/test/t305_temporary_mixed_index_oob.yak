@@ -1,0 +1,4 @@
+// expected_trap: index out of bounds
+struct Item { data: u32[] }
+function items(): Item[] { return [Item { data: [1u32] }]; }
+function main(): void { let value: u32 = items()[0u32].data[1u32]; @drop(value); }

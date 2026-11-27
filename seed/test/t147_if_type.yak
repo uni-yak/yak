@@ -1,0 +1,2 @@
+// expected_trap: if condition must be bool
+function main(): void { if 1 { return; } }

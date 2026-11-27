@@ -1,0 +1,2 @@
+// expected_trap: invalid escape
+function main(): void { let s: &[u8] = "\q"; }

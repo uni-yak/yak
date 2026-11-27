@@ -1,0 +1,23 @@
+// 可错载体与 `?` 传播：160/161 构造、162 分派与臂载荷装载产出真实机器码。
+// 验收方式：链接后运行，成功路径必须打印 "ok" 并以退出码 41 结束。
+foreign write(data: &[u8]): void;
+foreign exit(code: u8): void;
+
+enum E { Bad }
+
+function base(x: u32): u32!E {
+    if x == 0u32 { return E::Bad; }
+    return x;
+}
+
+function show(x: u32): void!E {
+    let n: u32 = base(x)?;
+    write("ok");
+    exit(n as u8);
+    return;
+}
+
+function main(): void {
+    show(41u32);
+    return;
+}

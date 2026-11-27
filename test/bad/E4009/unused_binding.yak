@@ -1,0 +1,4 @@
+// expected_code: E4009
+// spec: spec/lang/name.md N-9
+// 触发：局部绑定在离开作用域前从未被引用。
+function main(): void { let unused: u8 = 1u8; return; }

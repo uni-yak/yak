@@ -1,0 +1,32 @@
+import c0_clone_shapes;
+foreign assert(condition: bool): void;
+
+export function observe_clone(mode: u8): u32!AllocError {
+    if mode == 2u8 {
+        let inactive: c0_clone_shapes::Choice = c0_clone_shapes::Choice::Empty;
+        let copied: c0_clone_shapes::Choice = @clone(inactive)?;
+        match copied {
+            Empty => { return 42u32; },
+            _ => { return 0u32; }
+        }
+    }
+    let source: c0_clone_shapes::Choice = c0_clone_shapes::build();
+    let cloned: c0_clone_shapes::Choice = @clone(source)?;
+    if mode == 3u8 {
+        match cloned {
+            Empty => { return 0u32; },
+            _ => { return 42u32; }
+        }
+    }
+    match cloned {
+        Bundle(batch) => {
+            assert(batch.stamp == 42u8 && batch.rows[0][0][0] == 11u8);
+            assert(batch.rows[0][1][0] == 12u8 && batch.rows[1][0][0] == 13u8);
+            assert(batch.tail[0] == 14u8);
+            return 42u32;
+        },
+        _ => { return 0u32; }
+    }
+}
+
+function main(): void { return; }

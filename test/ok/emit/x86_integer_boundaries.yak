@@ -1,0 +1,38 @@
+// expected_exit: 0
+// spec: spec/target/x86.md 3.1
+foreign assert(condition: bool): void;
+
+function product8(a: u8, b: u8): u8 { return a * b; }
+function product16(a: u16, b: u16): u16 { return a * b; }
+function product32(a: u32, b: u32): u32 { return a * b; }
+function product64(a: u64, b: u64): u64 { return a * b; }
+function unsigned32(a: u32, b: u32, quotient: u32, remainder: u32): void {
+    assert(a / b == quotient);
+    assert(a % b == remainder);
+}
+function unsigned64(a: u64, b: u64, quotient: u64, remainder: u64): void {
+    assert(a / b == quotient);
+    assert(a % b == remainder);
+}
+
+function main(): void {
+    assert(product8(17, 15) == 255);
+    assert(product16(257, 255) == 65535);
+    assert(product32(65537, 65535) == 4294967295);
+    assert(product64(4294967297, 4294967295) == 18446744073709551615);
+    assert(product64(18446744073709551615, 1) == 18446744073709551615);
+    assert(product64(1, 18446744073709551615) == 18446744073709551615);
+    assert(product64(9223372036854775808, 0) == 0);
+    unsigned32(4294967295, 2, 2147483647, 1);
+    unsigned32(4294967295, 4294967294, 1, 1);
+    unsigned64(18446744073709551615, 1, 18446744073709551615, 0);
+    unsigned64(18446744073709551615, 2, 9223372036854775807, 1);
+    unsigned64(18446744073709551615, 3, 6148914691236517205, 0);
+    unsigned64(18446744073709551615, 9223372036854775807, 2, 1);
+    unsigned64(9223372036854775808, 9223372036854775807, 1, 1);
+    unsigned64(9223372036854775808, 9223372036854775808, 1, 0);
+    unsigned64(18446744073709551615, 9223372036854775808, 1, 9223372036854775807);
+    unsigned64(9223372036854775807, 9223372036854775808, 0, 9223372036854775807);
+    unsigned64(0, 18446744073709551615, 0, 0);
+    return;
+}

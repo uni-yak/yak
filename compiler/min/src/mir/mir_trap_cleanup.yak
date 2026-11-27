@@ -1,0 +1,613 @@
+// 构造当前帧逐陷阱点的拥有值清理链。
+import types;
+import typecheck;
+import mir;
+import mir_builder;
+
+// 陷阱清理使用正常边上的拥有值状态。0 已不拥有，1 仍拥有，2 合流前驱不一致。
+struct TrapFlow {
+    columns: u32[], locals: u32[], aliases: u32[],
+    first_slot: u32, slot_kinds: u8[],
+    state: u8[], entries: u8[], known: bool[], queued: bool[], work: u32[],
+    flags: u32[], changes: u32[], changed_cols: u32[], ends: u32[],
+    live_count: u32, wide_count: u32, tracking: bool, widened: bool,
+}
+
+function trap_set(flow: &TrapFlow:ReadWrite, local: u32, state: u8): void!AllocError {
+    if local == 0 { return; }
+    let column: u32 = flow.columns[local - 1];
+    if column != 0 {
+        let idx: u32 = column - 1;
+        let old: u8 = flow.state[idx];
+        if old != state {
+            if flow.tracking && flow.flags[idx] != 0 && flow.changes[idx] == 0 {
+                flow.changes[idx] = 1;
+                @push(flow.changed_cols, idx)?;
+            }
+            if old == 0 { flow.live_count = flow.live_count + 1; }
+            elseif state == 0 { flow.live_count = flow.live_count - 1; }
+            if old == 2 { flow.wide_count = flow.wide_count - 1; }
+            elseif state == 2 { flow.wide_count = flow.wide_count + 1; }
+            flow.state[idx] = state;
+        }
+    }
+    return;
+}
+
+function trap_take(flow: &TrapFlow:ReadWrite, local: u32): void!AllocError {
+    if local == 0 { return; }
+    let alias: u32 = flow.aliases[local - 1];
+    if alias != 0 { trap_set(flow, alias, 0)?; }
+    else { trap_set(flow, local, 0)?; }
+    return;
+}
+
+// 跨帧失败时已交接按值实参，调用者不再拥有；尚未产生调用结果，也未接收 out。
+function trap_call_handoff(ctx: &mir::MirFunction:Read, flow: &TrapFlow:ReadWrite, ins: mir::MirInst): void!AllocError {
+    if !mir::is_checked_call(ins.op) { return; }
+    var i: u32 = 0;
+    while i < ins.args_count {
+        let arg: u32 = ctx.args[ins.args_start + i];
+        if ctx.locals[arg - 1].kind != 3 { trap_take(flow, arg)?; }
+        i = i + 1;
+    }
+    return;
+}
+
+// 读取产生借用的按位值；可变绑定的载入仅在按值消费时使其原绑定失效。
+// 其余拥有结果在整值交接时失效，不因窥读、取址、长度查询而失效。
+function trap_transfer(ctx: &mir::MirFunction:Read, flow: &TrapFlow:ReadWrite, tt: &typecheck::TypeTable:Read, ins: mir::MirInst): void!AllocError {
+    let op: u8 = ins.op;
+    // 标量/位/比较/转换/取址/借用/载入指令不消费也不产生拥有型或聚合槽列，直接跳过。
+    if op == 80 || op == 82 || op == 83 || op == 1 || op == 2 || op == 3 || op == 5
+        || (op >= 16 && op <= 64) || (op >= 128 && op <= 130) { return; }
+    if op == 112 || op == 115 || op == 160 || op == 161 { trap_take(flow, ins.b)?; }
+    elseif op == 81 || op == 178 || op == 209 { trap_take(flow, ins.c)?; }
+    elseif op == 176 { trap_take(flow, ins.value as u32)?; }
+    if op == 210 { trap_take(flow, ins.b)?; }
+    if op == 81 || op == 209 { trap_set(flow, ins.b, 1)?; }
+    if mir::hands_off_args(op) {
+        var i: u32 = 0;
+        while i < ins.args_count {
+            let arg: u32 = ctx.args[ins.args_start + i];
+            if ctx.locals[arg - 1].kind != 3 { trap_take(flow, arg)?; }
+            elseif ins.a == 0 || tt.entries[ins.value_type_id - 1].kind != 9 { trap_set(flow, arg, 1)?; }
+            i = i + 1;
+        }
+    }
+    if op != 208 && ins.a != 0 { trap_set(flow, ins.a, 1)?; }
+    return;
+}
+
+function trap_join(flow: &TrapFlow:ReadWrite, dest: u32): void!AllocError {
+    let width: u32 = @len(flow.locals) as u32;
+    let start: u32 = dest * width;
+    let known: bool = flow.known[dest];
+    var changed: bool = !known;
+    var i: u32 = 0;
+    while i < width {
+        let state: u8 = flow.state[i];
+        let at: u32 = start + i;
+        if !known { flow.entries[at] = state; }
+        elseif flow.entries[at] != state && flow.entries[at] != 2 {
+            flow.entries[at] = 2;
+            flow.widened = true;
+            changed = true;
+        }
+        i = i + 1;
+    }
+    flow.known[dest] = true;
+    if changed && !flow.queued[dest] {
+        @push(flow.work, dest)?;
+        flow.queued[dest] = true;
+    }
+    return;
+}
+
+function trap_enter(ctx: &mir::MirFunction:Read, flow: &TrapFlow:ReadWrite, block: u32): void!AllocError {
+    let width: u32 = @len(flow.locals) as u32;
+    let base: u32 = block * width;
+    var live: u32 = 0;
+    var wide: u32 = 0;
+    var i: u32 = 0;
+    while i < width {
+        let s: u8 = flow.entries[base + i];
+        flow.state[i] = s;
+        if s != 0 {
+            live = live + 1;
+            if s == 2 { wide = wide + 1; }
+        }
+        i = i + 1;
+    }
+    flow.live_count = live;
+    flow.wide_count = wide;
+    trap_set(flow, ctx.blocks[block].payload, 1)?;
+    return;
+}
+
+// 调用成功边才接收可错调用的输出。错误边保留调用前的空槽。
+function trap_success_slots(ctx: &mir::MirFunction:Read, flow: &TrapFlow:ReadWrite, block: u32, carrier: u32): void!AllocError {
+    if ctx.blocks[block].inst_count == 0 { return; }
+    let last: mir::MirInst = ctx.insts[ctx.blocks[block].inst_start + ctx.blocks[block].inst_count - 1];
+    if !mir::is_slot_call(last.op) || last.a != carrier { return; }
+    var i: u32 = 0;
+    while i < last.args_count {
+        let arg: u32 = ctx.args[last.args_start + i];
+        if ctx.locals[arg - 1].kind == 3 { trap_set(flow, arg, 1)?; }
+        i = i + 1;
+    }
+    return;
+}
+
+function trap_propagate(ctx: &mir::MirFunction:Read, flow: &TrapFlow:ReadWrite, block: u32): void!AllocError {
+    let end: mir::MirTerminator = ctx.blocks[block].terminator;
+    if end.op == 192 || end.op == 193 { trap_join(flow, end.b)?; }
+    if end.op == 193 { trap_join(flow, end.c)?; }
+    if end.op == 162 {
+        trap_take(flow, end.a)?;
+        trap_join(flow, end.c)?;
+        trap_success_slots(ctx, flow, block, end.a)?;
+        trap_join(flow, end.b)?;
+    }
+    if end.op == 177 {
+        trap_take(flow, end.a)?;
+        var arm: u32 = 0;
+        while arm < end.c { trap_join(flow, ctx.arms[end.b + arm].block as u32)?; arm = arm + 1; }
+    }
+    return;
+}
+
+function append_cleanup(insts: &mir::MirInst[]:ReadWrite, locations: &types::Span[]:ReadWrite, track: bool, ins: mir::MirInst, span: types::Span): void!AllocError {
+    @push(*insts, ins)?;
+    if track { @push(*locations, span)?; }
+    return;
+}
+
+function cleanup_inst(op: u8, a: u32, b: u32, c: u32, ty: u32, value: u64): mir::MirInst {
+    return mir::MirInst { op: op, a: a, b: b, c: c, value_type_id: ty, value: value, args_start: 0, args_count: 0, trap: 0, view_ends: 0, opens_view_slot: false };
+}
+
+function cleanup_local(ctx: &mir::MirFunction:ReadWrite, ty: u32, kind: u8): u32!AllocError {
+    let id: u32 = @len(ctx.locals) as u32 + 1;
+    @push(ctx.locals, mir::MirLocal { id: id, value_type_id: ty, kind: kind, state: 0 })?;
+    return id;
+}
+
+function emit_flag(insts: &mir::MirInst[]:ReadWrite, locations: &types::Span[]:ReadWrite, track: bool, flag: u32, ty: u32, no: u32, state: u8, span: types::Span): void!AllocError {
+    var value: u32 = no;
+    if state == 1 { value = no + 1; }
+    append_cleanup(insts, locations, track, cleanup_inst(81, 0, flag, value, ty, 0), span)?;
+    return;
+}
+
+function emit_flag_changes(insts: &mir::MirInst[]:ReadWrite, locations: &types::Span[]:ReadWrite, track: bool, flow: &TrapFlow:ReadWrite, ty: u32, no: u32, span: types::Span): void!AllocError {
+    let count: u32 = @len(flow.changed_cols) as u32;
+    if count == 0 { return; }
+    if count == 1 {
+        let k: u32 = flow.changed_cols[0];
+        emit_flag(insts, locations, track, flow.flags[k], ty, no, flow.state[k], span)?;
+        flow.changes[k] = 0;
+        flow.changed_cols = [];
+        return;
+    }
+    // 多列变更时按列序号升序发射，与全表扫描次序保持逐字节一致。
+    var i: u32 = 1;
+    while i < count {
+        let key: u32 = flow.changed_cols[i];
+        var j: u32 = i;
+        while j > 0 && flow.changed_cols[j - 1] > key {
+            flow.changed_cols[j] = flow.changed_cols[j - 1];
+            j = j - 1;
+        }
+        flow.changed_cols[j] = key;
+        i = i + 1;
+    }
+    i = 0;
+    while i < count {
+        let k: u32 = flow.changed_cols[i];
+        if flow.changes[k] != 0 {
+            emit_flag(insts, locations, track, flow.flags[k], ty, no, flow.state[k], span)?;
+            flow.changes[k] = 0;
+        }
+        i = i + 1;
+    }
+    flow.changed_cols = [];
+    return;
+}
+
+// 尚未合流的值保持普通析构；只有真正需要条件析构的整值才分配存活槽。
+function find_cleanup_flags(ctx: &mir::MirFunction:Read, flow: &TrapFlow:ReadWrite, tt: &typecheck::TypeTable:Read): void!AllocError {
+    var b: u32 = 0;
+    while b < @len(ctx.blocks) as u32 {
+        if !flow.known[b] { b = b + 1; continue; }
+        trap_enter(ctx, flow, b)?;
+        let start: u32 = ctx.blocks[b].inst_start;
+        var j: u32 = 0;
+        while j < ctx.blocks[b].inst_count {
+            let ins: mir::MirInst = ctx.insts[start + j];
+            if mir::has_trap_edge(ins.op) {
+                trap_call_handoff(ctx, flow, ins)?;
+                if flow.wide_count != 0 {
+                    var rem: u32 = flow.wide_count;
+                    var k: u32 = 0;
+                    while k < @len(flow.locals) as u32 && rem != 0 {
+                        if flow.state[k] == 2 {
+                            if ctx.locals[flow.locals[k] - 1].kind != 3 { flow.flags[k] = 1; }
+                            rem = rem - 1;
+                        }
+                        k = k + 1;
+                    }
+                }
+            } elseif ins.op == 115 {
+                let col: u32 = flow.columns[ins.b - 1];
+                if col != 0 && flow.state[col - 1] == 2 && ctx.locals[ins.b - 1].kind != 3 { flow.flags[col - 1] = 1; }
+            }
+            trap_transfer(ctx, flow, tt, ins)?;
+            j = j + 1;
+        }
+        if flow.wide_count != 0 && mir::terminates_process(ctx.blocks[b].terminator.op) {
+            var rem: u32 = flow.wide_count;
+            var k: u32 = 0;
+            while k < @len(flow.locals) as u32 && rem != 0 {
+                if flow.state[k] == 2 {
+                    if ctx.locals[flow.locals[k] - 1].kind != 3 { flow.flags[k] = 1; }
+                    rem = rem - 1;
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    return;
+}
+
+// 先逆序析构普通局部，再逆序回滚调用方满槽。输出形参由后续步骤补入。
+// 结果为 0 表示槽状态冲突，1 表示成功，2 表示还需回滚输出形参。
+function append_trap_drops(flow: &TrapFlow:Read, insts: &mir::MirInst[]:ReadWrite, locations: &types::Span[]:ReadWrite, track: bool, span: types::Span): u8!AllocError {
+    if flow.live_count == 0 { return 1; }
+    var remaining: u32 = flow.live_count;
+    var k: u32 = @len(flow.locals) as u32;
+    var caller_end: u32 = 0;
+    var result: u8 = 1;
+    while k != 0 && remaining != 0 {
+        k = k - 1;
+        let state: u8 = flow.state[k];
+        if state == 0 { continue; }
+        remaining = remaining - 1;
+        let local: u32 = flow.locals[k];
+        if k >= flow.first_slot {
+            let kind: u8 = flow.slot_kinds[k - flow.first_slot];
+            if kind != 0 {
+                if state == 2 { return 0; }
+                if kind == 2 { result = 2; }
+                elseif caller_end == 0 { caller_end = k + 1; }
+                continue;
+            }
+        }
+        var flag: u32 = 0;
+        if state == 2 { flag = flow.flags[k]; }
+        if track { append_cleanup(insts, locations, true, cleanup_inst(115, 0, local, flag, 0, 0), span)?; }
+        else { @push(*insts, cleanup_inst(115, 0, local, flag, 0, 0))?; }
+    }
+    while caller_end > flow.first_slot {
+        caller_end = caller_end - 1;
+        if flow.state[caller_end] != 1 { continue; }
+        if flow.slot_kinds[caller_end - flow.first_slot] == 1 {
+            let local: u32 = flow.locals[caller_end];
+            if track { append_cleanup(insts, locations, true, cleanup_inst(115, 0, local, 0, 0, 0), span)?; }
+            else { @push(*insts, cleanup_inst(115, 0, local, 0, 0, 0))?; }
+        }
+    }
+    return result;
+}
+
+// 清理块只追加析构及终止指令；正常块中的位点索引保持不变。
+function append_trap_leaf(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, flow: &TrapFlow:Read, spans: &types::Span[]:ReadWrite, site: u32, span: types::Span): bool!AllocError {
+    let first: u32 = @len(ctx.insts) as u32;
+    let result: u8 = append_trap_drops(flow, &ctx.insts:ReadWrite, spans, build.track_spans, span)?;
+    if result == 0 { mir_builder::reject(build, 6, span); return false; }
+    let count: u32 = @len(ctx.insts) as u32 - first;
+    if count != 0 || result == 2 {
+        if @len(ctx.blocks) >= 65536u64 { mir_builder::reject(build, 5, span); return false; }
+        let target: u32 = @len(ctx.blocks) as u32;
+        let reason: u32 = mir::trap_reason(ctx.insts[site].op);
+        @push(ctx.blocks, mir::MirBlock { id: target as u16, inst_start: first, inst_count: count, payload: 0, entry_view_ends: 0,
+            terminator: mir::MirTerminator { op: 195, a: reason, b: 0, c: 0 } })?;
+        ctx.insts[site].trap = target + 1;
+    }
+    return true;
+}
+
+function append_direct_traps(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, flow: &TrapFlow:ReadWrite, spans: &types::Span[]:ReadWrite, tt: &typecheck::TypeTable:Read, blocks: u32): bool!AllocError {
+    if !ctx.has_trap_target { return true; }
+    var b: u32 = 0;
+    while b < blocks {
+        if !flow.known[b] { b = b + 1; continue; }
+        trap_enter(ctx, flow, b)?;
+        var site: u32 = ctx.blocks[b].inst_start;
+        let limit: u32 = flow.ends[b];
+        while site < limit {
+            let ins: mir::MirInst = ctx.insts[site];
+            if mir::has_trap_edge(ins.op) {
+                trap_call_handoff(ctx, flow, ins)?;
+                var span: types::Span = build.span;
+                if build.track_spans { span = (*spans)[site]; }
+                if !append_trap_leaf(ctx, build, flow, spans, site, span)? { return false; }
+            }
+            trap_transfer(ctx, flow, tt, ins)?;
+            site = site + 1;
+        }
+        b = b + 1;
+    }
+    return true;
+}
+
+// 返回 0 表示局部或状态表溢出，1 表示成功且无覆盖析构，2 表示存在覆盖析构。
+function init_cleanup_flow(ctx: &mir::MirFunction:Read, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, flow: &TrapFlow:ReadWrite): u8!AllocError {
+    var i: u32 = 0;
+    let local_count: u32 = @len(ctx.locals) as u32;
+    while i < local_count {
+        let local: mir::MirLocal = ctx.locals[i];
+        let id: u32 = local.value_type_id;
+        // MIR 补入的 u64 地址是 Copy；它不一定已出现在类型检查表中。
+        if id == build.ptr_ty {
+            @push(flow.columns, 0u32)?;
+            @push(flow.aliases, 0u32)?;
+            i = i + 1;
+            continue;
+        }
+        if !mir::valid_type(&tc.types:Read, id) { return 0; }
+        var kind: u8 = build.cleanup_types[id - 1];
+        if kind == 0 {
+            kind = 1;
+            if !mir_builder::mir_copy_type(tc, id, build.copy_order) { kind = 2; }
+            build.cleanup_types[id - 1] = kind;
+        }
+        var column: u32 = 0;
+        if (local.kind == 3 && !mir::is_scalar(&tc.types:Read, id)) || (local.kind != 3 && kind == 2) {
+            // 仅在存在聚合槽的函数中，为首个槽之后的列记录清理类别。
+            var slot_kind: u8 = 0;
+            if local.kind == 3 {
+                if flow.first_slot == 4294967295u32 { flow.first_slot = @len(flow.locals) as u32; }
+                slot_kind = 1;
+                if local.state == 11 { slot_kind = 2; }
+            }
+            if flow.first_slot != 4294967295u32 { @push(flow.slot_kinds, slot_kind)?; }
+            @push(flow.locals, i + 1)?;
+            @push(flow.state, 0u8)?;
+            @push(flow.flags, 0u32)?;
+            @push(flow.changes, 0u32)?;
+            column = @len(flow.locals) as u32;
+        }
+        @push(flow.columns, column)?;
+        @push(flow.aliases, 0u32)?;
+        i = i + 1;
+    }
+    if @len(flow.locals) == 0 { return 1; }
+    var has_overwrite: bool = false;
+    i = 0;
+    while i < @len(ctx.insts) as u32 {
+        let ins: mir::MirInst = ctx.insts[i];
+        if ins.op == 80 && ctx.locals[ins.b - 1].kind == 2 { flow.aliases[ins.a - 1] = ins.b; }
+        if ins.op == 115 && ins.value == 1 { has_overwrite = true; }
+        i = i + 1;
+    }
+    let blocks: u32 = @len(ctx.blocks) as u32;
+    let width: u32 = @len(flow.locals) as u32;
+    if (blocks as u64) * (width as u64) > 4294967295u64 { return 0; }
+    i = 0;
+    while i < blocks {
+        @push(flow.known, false)?;
+        @push(flow.queued, false)?;
+        @push(flow.ends, ctx.blocks[i].inst_start + ctx.blocks[i].inst_count)?;
+        var k: u32 = 0;
+        while k < width { @push(flow.entries, 0u8)?; k = k + 1; }
+        i = i + 1;
+    }
+    if has_overwrite { return 2; }
+    return 1;
+}
+
+function solve_cleanup_liveness(ctx: &mir::MirFunction:Read, tc: &typecheck::TypeCheckResult:Read, flow: &TrapFlow:ReadWrite): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(ctx.params) as u32 {
+        let param: u32 = ctx.params[i];
+        if ctx.locals[param - 1].kind != 3 { trap_set(flow, param, 1)?; }
+        i = i + 1;
+    }
+    trap_join(flow, ctx.entry as u32)?;
+    var next: u32 = 0;
+    while next < @len(flow.work) as u32 {
+        let block: u32 = flow.work[next];
+        flow.queued[block] = false;
+        trap_enter(ctx, flow, block)?;
+        let start: u32 = ctx.blocks[block].inst_start;
+        var j: u32 = 0;
+        while j < ctx.blocks[block].inst_count {
+            trap_transfer(ctx, flow, &tc.types:Read, ctx.insts[start + j])?;
+            j = j + 1;
+        }
+        trap_propagate(ctx, flow, block)?;
+        next = next + 1;
+    }
+    // 入口从确定状态起步；只有正常边合流可能引入条件所有者。
+    if flow.widened { find_cleanup_flags(ctx, flow, &tc.types:Read)?; }
+    return;
+}
+
+function rewrite_cleanup_blocks(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, flow: &TrapFlow:ReadWrite, spans: &types::Span[]:Read, blocks: u32, width: u32, no: u32, insts: &mir::MirInst[]:ReadWrite, locations: &types::Span[]:ReadWrite, sites: &u32[]:ReadWrite): bool!AllocError {
+    var i: u32 = 0;
+    while i < blocks {
+        let start: u32 = ctx.blocks[i].inst_start;
+        let count: u32 = ctx.blocks[i].inst_count;
+        ctx.blocks[i].inst_start = @len(*insts) as u32;
+        if !flow.known[i] {
+            if count != 0 { return false; }
+            i = i + 1;
+            continue;
+        }
+        trap_enter(ctx, flow, i)?;
+        if no != 0 {
+            if i == ctx.entry as u32 {
+                append_cleanup(insts, locations, build.track_spans, cleanup_inst(2, no, 0, 0, build.bool_ty, 0), build.span)?;
+                append_cleanup(insts, locations, build.track_spans, cleanup_inst(2, no + 1, 0, 0, build.bool_ty, 1), build.span)?;
+                var k: u32 = 0;
+                while k < width {
+                    if flow.flags[k] != 0 {
+                        var initial: u8 = 0;
+                        var p: u32 = 0;
+                        while p < @len(ctx.params) as u32 {
+                            if ctx.params[p] == flow.locals[k] { initial = 1; break; }
+                            p = p + 1;
+                        }
+                        emit_flag(insts, locations, build.track_spans, flow.flags[k], build.bool_ty, no, initial, build.span)?;
+                    }
+                    k = k + 1;
+                }
+            }
+            let payload: u32 = ctx.blocks[i].payload;
+            if payload != 0 {
+                let column: u32 = flow.columns[payload - 1];
+                if column != 0 && flow.flags[column - 1] != 0 { emit_flag(insts, locations, build.track_spans, flow.flags[column - 1], build.bool_ty, no, 1, build.span)?; }
+            }
+        }
+        var j: u32 = 0;
+        while j < count {
+            var ins: mir::MirInst = ctx.insts[start + j];
+            var span: types::Span = build.span;
+            if build.track_spans { span = (*spans)[start + j]; }
+            var keep: bool = true;
+            if ins.op == 115 {
+                let column: u32 = flow.columns[ins.b - 1];
+                if column != 0 && ctx.locals[ins.b - 1].kind != 3 && flow.aliases[ins.b - 1] == 0 {
+                    if flow.state[column - 1] == 2 { ins.c = flow.flags[column - 1]; }
+                    // 投影载入后的无条件析构不属于普通整值状态。
+                    if flow.state[column - 1] == 0 && ins.value == 1 { keep = false; }
+                }
+                ins.value = 0;
+            }
+            flow.tracking = no != 0;
+            trap_transfer(ctx, flow, &tc.types:Read, ins)?;
+            let call_pair: bool = mir::is_slot_call(ins.op) && ctx.blocks[i].terminator.op == 162 && j + 1 == count && ins.a == ctx.blocks[i].terminator.a;
+            if no != 0 && call_pair {
+                let dest: u32 = flow.columns[ins.a - 1];
+                if dest != 0 && flow.changes[dest - 1] != 0 { return false; }
+                emit_flag_changes(insts, locations, build.track_spans, flow, build.bool_ty, no, span)?;
+            }
+            if keep {
+                // 载体调用前可能插入活性标记写入，清理边必须指向实际追加的调用。
+                if mir::has_trap_edge(ins.op) { @push(*sites, @len(*insts) as u32)?; }
+                append_cleanup(insts, locations, build.track_spans, ins, span)?;
+            } elseif ins.view_ends != 0 {
+                // 删除空析构时，词法结束点仍落在原先的同一程序位置。
+                let at: u32 = @len(*insts) as u32;
+                let in_block: bool = at > ctx.blocks[i].inst_start;
+                var prior: u32 = ctx.blocks[i].entry_view_ends;
+                if in_block { prior = (*insts)[at - 1].view_ends; }
+                var tail: u32 = ins.view_ends - 1;
+                while ctx.view_ends[tail].next != 0 { tail = ctx.view_ends[tail].next - 1; }
+                ctx.view_ends[tail].next = prior;
+                if in_block { (*insts)[at - 1].view_ends = ins.view_ends; }
+                else { ctx.blocks[i].entry_view_ends = ins.view_ends; }
+            }
+            if no != 0 && !call_pair { emit_flag_changes(insts, locations, build.track_spans, flow, build.bool_ty, no, span)?; }
+            flow.tracking = false;
+            j = j + 1;
+        }
+        let end: mir::MirTerminator = ctx.blocks[i].terminator;
+        if no != 0 && (end.op == 162 || end.op == 177) {
+            let col: u32 = flow.columns[end.a - 1];
+            if col != 0 && flow.flags[col - 1] != 0 {
+                if end.op == 162 { return false; }
+                emit_flag(insts, locations, build.track_spans, flow.flags[col - 1], build.bool_ty, no, 0, build.span)?;
+            }
+        }
+        if mir::terminates_process(end.op) {
+            let result: u8 = append_trap_drops(&*flow:Read, insts, locations, build.track_spans, build.span)?;
+            if result == 0 { mir_builder::reject(build, 6, build.span); return false; }
+        }
+        ctx.blocks[i].inst_count = @len(*insts) as u32 - ctx.blocks[i].inst_start;
+        i = i + 1;
+    }
+    return true;
+}
+
+// 原指令顺序中的陷阱位点与重排后的索引一一对应。用原块入口状态重算边上析构。
+function append_rewritten_traps(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, flow: &TrapFlow:ReadWrite, spans: &types::Span[]:Read, blocks: u32, insts: &mir::MirInst[]:ReadWrite, locations: &types::Span[]:ReadWrite, sites: &[u32]): bool!AllocError {
+    var at: u32 = 0;
+    var i: u32 = 0;
+    var original: u32 = 0;
+    while i < blocks {
+        if !flow.known[i] { i = i + 1; continue; }
+        trap_enter(ctx, flow, i)?;
+        let limit: u32 = flow.ends[i];
+        while original < limit {
+            let ins: mir::MirInst = ctx.insts[original];
+            if mir::has_trap_edge(ins.op) {
+                trap_call_handoff(ctx, flow, ins)?;
+                let first: u32 = @len(*insts) as u32;
+                var span: types::Span = build.span;
+                if build.track_spans { span = (*spans)[original]; }
+                let result: u8 = append_trap_drops(&*flow:Read, insts, locations, build.track_spans, span)?;
+                if result == 0 { mir_builder::reject(build, 6, span); return false; }
+                if first != @len(*insts) as u32 || result == 2 {
+                    if @len(ctx.blocks) >= 65536u64 { mir_builder::reject(build, 5, span); return false; }
+                    let target: u32 = @len(ctx.blocks) as u32;
+                    let reason: u32 = mir::trap_reason(ins.op);
+                    @push(ctx.blocks, mir::MirBlock { id: target as u16, inst_start: first, inst_count: @len(*insts) as u32 - first, payload: 0, entry_view_ends: 0,
+                        terminator: mir::MirTerminator { op: 195, a: reason, b: 0, c: 0 } })?;
+                    (*insts)[sites[at]].trap = target + 1;
+                }
+                at = at + 1;
+            }
+            trap_transfer(ctx, flow, &tc.types:Read, ins)?;
+            original = original + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export function insert_trap_cleanups(ctx: &mir::MirFunction:ReadWrite, build: &mir_builder::Builder:ReadWrite, tc: &typecheck::TypeCheckResult:Read, spans: &types::Span[]:ReadWrite): bool!AllocError {
+    // 没有陷阱或普通析构位点时，不需要计算存活状态。槽位验证仍单独执行。
+    var terminal_trap: bool = false;
+    var b: u32 = 0;
+    while b < @len(ctx.blocks) as u32 {
+        if mir::terminates_process(ctx.blocks[b].terminator.op) && (!ctx.has_trap_target || b != ctx.trap_target as u32) { terminal_trap = true; break; }
+        b = b + 1;
+    }
+    if !ctx.has_trap_target && !build.has_drop && !terminal_trap { return true; }
+    var flow: TrapFlow = TrapFlow { columns: [], locals: [], aliases: [], first_slot: 4294967295u32, slot_kinds: [], state: [], entries: [], known: [], queued: [], work: [], flags: [], changes: [], changed_cols: [], ends: [], live_count: 0, wide_count: 0, tracking: false, widened: false };
+    let init_status: u8 = init_cleanup_flow(&*ctx:Read, build, tc, &flow:ReadWrite)?;
+    if init_status == 0 { return false; }
+    if @len(flow.locals) == 0 { return true; }
+    let has_overwrite: bool = init_status == 2;
+    let blocks: u32 = @len(ctx.blocks) as u32;
+    let width: u32 = @len(flow.locals) as u32;
+    solve_cleanup_liveness(&*ctx:Read, tc, &flow:ReadWrite)?;
+    var no: u32 = 0;
+    var i: u32 = 0;
+    while i < width {
+        if flow.flags[i] != 0 {
+            if no == 0 {
+                if @len(ctx.locals) > 4294967293u64 || build.bool_ty == 0 { return false; }
+                no = cleanup_local(ctx, build.bool_ty, 1)?;
+                let yes: u32 = cleanup_local(ctx, build.bool_ty, 1)?;
+                @drop(yes);
+            }
+            if @len(ctx.locals) >= 4294967295u64 { return false; }
+            flow.flags[i] = cleanup_local(ctx, build.bool_ty, 2)?;
+        }
+        i = i + 1;
+    }
+    // 没有条件标记与待核对的覆盖析构时，不重新分配并复制普通指令。
+    if no == 0 && !has_overwrite && !terminal_trap { return append_direct_traps(ctx, build, &flow:ReadWrite, spans, &tc.types:Read, blocks)?; }
+    var insts: mir::MirInst[] = [];
+    var locations: types::Span[] = [];
+    var sites: u32[] = [];
+    if !rewrite_cleanup_blocks(ctx, build, tc, &flow:ReadWrite, &*spans:Read, blocks, width, no, &insts:ReadWrite, &locations:ReadWrite, &sites:ReadWrite)? { return false; }
+    if !append_rewritten_traps(ctx, build, tc, &flow:ReadWrite, &*spans:Read, blocks, &insts:ReadWrite, &locations:ReadWrite, &sites[0..@len(sites)]:Read)? { return false; }
+    ctx.insts = @move(insts);
+    *spans = @move(locations);
+    return true;
+}

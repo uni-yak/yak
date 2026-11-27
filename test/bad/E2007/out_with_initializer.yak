@@ -1,0 +1,4 @@
+// expected_code: E2007
+// spec: spec/lang/parse.md P-7
+// 触发：输出槽声明时不得自带初始化器。
+function main(): void { out x: i32 = 1; return; }

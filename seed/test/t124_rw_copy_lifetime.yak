@@ -1,0 +1,2 @@
+// expected_trap: exclusively borrowed
+function main(): void { var x: i64 = 0; let r: &i64:ReadWrite = &x:ReadWrite; { let q: &i64:ReadWrite = r; } let y: i64 = x; }

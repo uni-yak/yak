@@ -1,0 +1,178 @@
+// 将同一快照的已排序诊断编码成标准 LSP 通知，不读取或改写源码。
+import buf;
+import types;
+import diag;
+import positions;
+
+const OUTPUT_LIMIT: u32 = 16;
+const SCAN_LIMIT: u32 = 64;
+
+// 正文和发布状态分离；裁剪、不可定位均须由服务明确报告。
+export struct Publication { body: buf::ByteBuf, omitted: bool }
+
+function natural(body: &buf::ByteBuf:ReadWrite, value: u32): void!AllocError {
+    var scale: u32 = 1;
+    while value / scale >= 10u32 { scale = scale * 10u32; }
+    while scale != 0u32 {
+        let digit: u8 = ((value / scale) % 10u32) as u8;
+        buf::buf_push_u8(body, 48u8 + digit)?;
+        scale = scale / 10u32;
+    }
+    return;
+}
+
+function integer(body: &buf::ByteBuf:ReadWrite, value: i32): void!AllocError {
+    if value < 0i32 {
+        buf::buf_push_u8(body, 45u8)?;
+        natural(body, (0i64 - (value as i64)) as u32)?;
+    } else { natural(body, value as u32)?; }
+    return;
+}
+
+// URI 来自已解码并验证的文档存储，不能包含 ASCII 控制字节。
+function quoted_uri(body: &buf::ByteBuf:ReadWrite, uri: &[u8]): void!AllocError {
+    buf::buf_push_u8(body, 34u8)?;
+    var at: u32 = 0;
+    while (at as u64) < @len(uri) {
+        let byte: u8 = uri[at];
+        if byte == 34u8 || byte == 92u8 { buf::buf_push_u8(body, 92u8)?; }
+        buf::buf_push_u8(body, byte)?;
+        at = at + 1u32;
+    }
+    buf::buf_push_u8(body, 34u8)?;
+    return;
+}
+
+function coordinate(body: &buf::ByteBuf:ReadWrite, point: positions::Position): void!AllocError {
+    buf::buf_push_bytes(body, "{\"line\":")?;
+    natural(body, point.line)?;
+    buf::buf_push_bytes(body, ",\"character\":")?;
+    natural(body, point.character)?;
+    buf::buf_push_u8(body, 125u8)?;
+    return;
+}
+
+function diagnostic(body: &buf::ByteBuf:ReadWrite, r: positions::Range, code: u16, severity: u8): void!AllocError {
+    buf::buf_push_bytes(body, "{\"range\":{\"start\":")?;
+    coordinate(body, r.start)?;
+    buf::buf_push_bytes(body, ",\"end\":")?;
+    coordinate(body, r.end)?;
+    buf::buf_push_bytes(body, "},\"severity\":")?;
+    natural(body, (severity as u32) + 1u32)?;
+    buf::buf_push_bytes(body, ",\"source\":\"yak\",\"code\":\"E")?;
+    natural(body, code as u32)?;
+    buf::buf_push_bytes(body, "\",\"message\":\"Yak ")?;
+    let segment: u16 = code / 1000u16;
+    if segment == 1u16 { buf::buf_push_bytes(body, "词法诊断")?; }
+    elseif segment == 2u16 { buf::buf_push_bytes(body, "解析诊断")?; }
+    elseif segment == 3u16 { buf::buf_push_bytes(body, "基础子集诊断")?; }
+    elseif segment == 4u16 { buf::buf_push_bytes(body, "名称诊断")?; }
+    elseif segment == 5u16 { buf::buf_push_bytes(body, "类型或布局诊断")?; }
+    elseif segment == 6u16 { buf::buf_push_bytes(body, "所有权诊断")?; }
+    else { buf::buf_push_bytes(body, "诊断")?; }
+    buf::buf_push_bytes(body, " E")?;
+    natural(body, code as u32)?;
+    buf::buf_push_bytes(body, "\"}")?;
+    return;
+}
+
+function start(body: &buf::ByteBuf:ReadWrite, uri: &[u8], version: i32, include_version: bool): void!AllocError {
+    buf::buf_push_bytes(body, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":")?;
+    quoted_uri(body, uri)?;
+    if include_version {
+        buf::buf_push_bytes(body, ",\"version\":")?;
+        integer(body, version)?;
+    }
+    buf::buf_push_bytes(body, ",\"diagnostics\":[")?;
+    return;
+}
+
+export function clear(uri: &[u8]): buf::ByteBuf!AllocError {
+    var body: buf::ByteBuf = buf::buf_new();
+    start(&body:ReadWrite, uri, 0i32, false)?;
+    buf::buf_push_bytes(&body:ReadWrite, "]}}")?;
+    return body;
+}
+
+// 只消费调用方当前版本的前端诊断，最多查看排序后的前 64 条。
+export function encode(uri: &[u8], version: i32, include_version: bool, index: &positions::Index:Read,
+    src: &[u8], file: u16, diags: &diag::DiagBuffer:Read): Publication!AllocError {
+    var body: buf::ByteBuf = buf::buf_new();
+    start(&body:ReadWrite, uri, version, include_version)?;
+    var sent: u32 = 0;
+    var at: u32 = 0;
+    while at < diags.count && at < SCAN_LIMIT && sent < OUTPUT_LIMIT {
+        let d: diag::Diag = diags.diags[at];
+        let span: types::Span = d.span;
+        if d.unit == 0u16 && d.severity <= 2u8 {
+            let located: positions::RangeResult = positions::span_range(index, src, span.file, file, span.offset, span.length);
+            if located.valid {
+                if sent != 0u32 { buf::buf_push_u8(&body:ReadWrite, 44u8)?; }
+                let code: types::ErrorCode = d.code;
+                diagnostic(&body:ReadWrite, located.range, code.raw, d.severity)?;
+                sent = sent + 1u32;
+            }
+        }
+        at = at + 1u32;
+    }
+    buf::buf_push_bytes(&body:ReadWrite, "]}}")?;
+    return Publication { body: @move(body), omitted: sent != diags.count };
+}
+
+// 状态消息不插入 URI、用户源码或宿主细节；随下一帧文档诊断使用。
+export function status_message(reason: u8): buf::ByteBuf!AllocError {
+    var body: buf::ByteBuf = buf::buf_new();
+    buf::buf_push_bytes(&body:ReadWrite, "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"type\":2,\"message\":\"")?;
+    if reason == 1u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 缺少可信依赖，诊断分析不完整")?; }
+    elseif reason == 2u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 有诊断无法定位或超出发布上限")?; }
+    elseif reason == 3u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 源码超出候选分析字节上限，未执行前端")?; }
+    elseif reason == 5u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 前端诊断收集超出上限，分析不完整")?; }
+    elseif reason == 6u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 源码解析深度超出上限，分析不完整")?; }
+    elseif reason == 7u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 表达式树深度超出上限，分析不完整")?; }
+    elseif reason == 8u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 按值类型链深度超出上限，分析不完整")?; }
+    elseif reason == 9u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 源码 token 数量超出上限，分析不完整")?; }
+    elseif reason == 10u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 源码名称长度超出上限，分析不完整")?; }
+    elseif reason == 11u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: Copy 分类的类型图展开超出上限，分析不完整")?; }
+    elseif reason == 12u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: Write 槽位检查走访超出上限，分析不完整")?; }
+    elseif reason == 13u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 所有权循环回放超出上限，分析不完整")?; }
+    elseif reason == 14u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 所有权位置表复制超出上限，分析不完整")?; }
+    elseif reason == 15u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 切片借用合流超出上限，分析不完整")?; }
+    elseif reason == 16u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 切片借用快照复制超出上限，分析不完整")?; }
+    elseif reason == 17u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 切片借用作用域过滤超出上限，分析不完整")?; }
+    elseif reason == 18u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 切片借用赋值超出上限，分析不完整")?; }
+    elseif reason == 19u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 借用冲突查询超出上限，分析不完整")?; }
+    elseif reason == 20u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 所有权位置表合流超出上限，分析不完整")?; }
+    elseif reason == 21u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 所有权位置表查找超出上限，分析不完整")?; }
+    elseif reason == 22u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 所有权位置离块清理超出上限，分析不完整")?; }
+    elseif reason == 23u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 输出槽位跳转超出上限，分析不完整")?; }
+    elseif reason == 24u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 切片借用跳转超出上限，分析不完整")?; }
+    elseif reason == 25u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 名称查找超出上限，分析不完整")?; }
+    elseif reason == 26u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 声明预留超出上限，分析不完整")?; }
+    elseif reason == 27u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 本地枚举成员查找超出上限，分析不完整")?; }
+    elseif reason == 28u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 引用输出整理超出上限，分析不完整")?; }
+    elseif reason == 29u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 按值类型布局预检超出上限，分析不完整")?; }
+    elseif reason == 30u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 正式类型布局超出上限，分析不完整")?; }
+    elseif reason == 31u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 声明类型驻留超出上限，分析不完整")?; }
+    elseif reason == 32u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 常量初始化式查找超出上限，分析不完整")?; }
+    elseif reason == 33u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 常量可物化检查超出上限，分析不完整")?; }
+    elseif reason == 34u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 正式常量折叠超出上限，分析不完整")?; }
+    elseif reason == 35u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 整数诊断试算超出上限，分析不完整")?; }
+    elseif reason == 36u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 整数诊断外围扫描超出上限，分析不完整")?; }
+    elseif reason == 37u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 纯整数形态判定超出上限，分析不完整")?; }
+    elseif reason == 38u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 数组元素推断扫描超出上限，分析不完整")?; }
+    elseif reason == 39u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 本地构造器字段检查超出上限，分析不完整")?; }
+    elseif reason == 40u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 匹配臂检查扫描超出上限，分析不完整")?; }
+    elseif reason == 41u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 匹配模式路径判重超出上限，分析不完整")?; }
+    elseif reason == 42u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 解析错误恢复跳过 token 超出上限，分析不完整")?; }
+    elseif reason == 43u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: out 实参引用扫描超出上限，分析不完整")?; }
+    elseif reason == 44u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 本地字段投影扫描超出上限，分析不完整")?; }
+    elseif reason == 45u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 本地等值比较扫描超出上限，分析不完整")?; }
+    elseif reason == 46u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 常量与整数诊断快照复制超出上限，分析不完整")?; }
+    elseif reason == 47u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 函数体类型驻留超出上限，分析不完整")?; }
+    elseif reason == 48u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 词法名称驻留超出上限，分析不完整")?; }
+    elseif reason == 49u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 可信分析上下文超出预算，分析不完整")?; }
+    elseif reason == 50u8 { buf::buf_push_bytes(&body:ReadWrite, "Yak: 文档分析总工作量超出上限，分析不完整")?; }
+    else { buf::buf_push_bytes(&body:ReadWrite, "Yak: 文档同步超出预算，保留原快照")?; }
+    buf::buf_push_bytes(&body:ReadWrite, "\"}}")?;
+    return body;
+}

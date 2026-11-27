@@ -1,0 +1,51 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+foreign exit(code: u8): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function verify(): void!AllocError {
+    // 非零栈槽取址仍使用 RBP，两个相同寄存器的 ×1 形态不重排。
+    var code: pe::Code = pe::code_new();
+    pe::lea_rbp(&code:ReadWrite, pe::rax(), 1)?;
+    assert(pe::code_len(&code:Read) == 4 && code.bytes[2] == 0x45);
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    // 保留两个内存方向、相同寄存器和有区别的 ×2 索引。
+    let controls: [u8; 25] = [0x4a, 0x8b, 0x44, 0x2d, 0, 0x49, 0x8b, 0x44, 0x2d, 0,
+        0x48, 0x8d, 0x44, 0x2d, 0, 0x4b, 0x8d, 0x44, 0x2d, 0, 0x49, 0x8d, 0x44, 0x6d, 0];
+    encoding(&controls[0..25]:Read, 0)?;
+    // 即使方向倒序，能缩短的位移仍报 E7103，未读完整则报 E7101。
+    let long_form: [u8; 8] = [0x49, 0x8d, 0x84, 0x2d, 0x7f, 0, 0, 0];
+    encoding(&long_form[0..8]:Read, 7103)?;
+    encoding(&long_form[0..7]:Read, 7101)?;
+    // 两个方向编码等长，保留 RBP 为基址。
+    let wide_forms: [u8; 10] = [0x4a, 0x8d, 0x44, 0x2d, 0x00,
+        0x49, 0x8d, 0x44, 0x2d, 0x00];
+    encoding(&wide_forms[0..5]:Read, 0)?;
+    encoding(&wide_forms[5..10]:Read, 7102)?;
+    let dword_forms: [u8; 16] = [0x46, 0x8d, 0x84, 0x2d, 0x7f, 0xff, 0xff, 0xff,
+        0x45, 0x8d, 0x84, 0x2d, 0x7f, 0xff, 0xff, 0xff];
+    encoding(&dword_forms[0..8]:Read, 0)?;
+    encoding(&dword_forms[8..16]:Read, 7102)?;
+    let word_forms: [u8; 12] = [0x66, 0x42, 0x8d, 0x44, 0x2d, 0x80,
+        0x66, 0x41, 0x8d, 0x44, 0x2d, 0x80];
+    encoding(&word_forms[0..6]:Read, 0)?;
+    encoding(&word_forms[6..12]:Read, 7102)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let status: void!AllocError = verify();
+    @drop(status);
+    assert(false);
+    return;
+}

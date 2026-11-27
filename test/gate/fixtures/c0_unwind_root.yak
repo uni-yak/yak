@@ -1,0 +1,57 @@
+import c0_unwind_leaf;
+foreign assert(condition: bool): void;
+
+function through_ref(callback: &function(&u8): void, depth: &u8): void {
+    let middle: u8[] = [89u8];
+    callback(depth);
+    assert(middle[0u64] == 89u8);
+}
+
+function through_import(mode: u8): void!c0_unwind_leaf::Failure {
+    out earlier: c0_unwind_leaf::Payload;
+    c0_unwind_leaf::fill(out earlier);
+    let outer: u8[] = [90u8];
+    var input: u8[] = [82u8];
+    out output: c0_unwind_leaf::Payload;
+    c0_unwind_leaf::fail(mode, @move(input), out output)?;
+    let result: c0_unwind_leaf::Payload = @move(output);
+    let retained: c0_unwind_leaf::Payload = @move(earlier);
+    assert(result.bytes[0u64] == 81u8 && retained.bytes[0u64] == 88u8 && outer[0u64] == 90u8);
+    return;
+}
+
+// 只有一条正常分支把 input 交给可错调用，合流后仍须按活性处理。
+function conditional_handoff(take: bool, mode: u8): void!c0_unwind_leaf::Failure {
+    let outer: u8[] = [90u8];
+    var input: u8[] = [82u8];
+    if take {
+        out output: c0_unwind_leaf::Payload;
+        c0_unwind_leaf::fail(mode, @move(input), out output)?;
+        let result: c0_unwind_leaf::Payload = @move(output);
+        assert(result.bytes[0u64] == 81u8);
+    }
+    assert(outer[0u64] == 90u8);
+    return;
+}
+
+export function exercise(mode: u8): void {
+    if mode >= 9u8 {
+        var leaf_mode: u8 = 0u8;
+        if mode == 11u8 { leaf_mode = 7u8; }
+        let result: void!c0_unwind_leaf::Failure = conditional_handoff(mode != 10u8, leaf_mode);
+        @drop(result);
+        return;
+    }
+    if mode == 4u8 {
+        let outer: u8[] = [90u8];
+        let callback: &function(&u8): void = &c0_unwind_leaf::callback;
+        let depth: u8 = 2u8;
+        through_ref(callback, &depth);
+        assert(outer[0u64] == 90u8);
+        return;
+    }
+    let result: void!c0_unwind_leaf::Failure = through_import(mode);
+    @drop(result);
+}
+
+function main(): void { exercise(7u8); }

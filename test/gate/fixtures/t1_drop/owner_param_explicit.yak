@@ -1,0 +1,16 @@
+// 按值 owning 形参显式析构：被调方释放一次，调用方局部在返回后释放。
+function consume(v: u32[]): void {
+    @drop(v);
+    return;
+}
+
+function outer(): void!AllocError {
+    var keep: u32[] = [];
+    @push(keep, 73u32)?;
+    var e: u32[] = [];
+    @push(e, 71u32)?;
+    consume(@move(e));
+    return;
+}
+
+function main(): void { outer(); return; }

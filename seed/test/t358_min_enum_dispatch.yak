@@ -1,0 +1,104 @@
+// 定向验证 match 降级为 enum_dispatch：臂表升序覆盖全变体、解释器按 tag 分派。
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: runner=mir_runner.yak
+import mir;
+import runner;
+foreign assert(cond: bool): void;
+
+// 情形一：三变体全覆盖，臂表按 VariantId 升序，解释器按实际 tag 选中对应臂。
+function exhaustive_arms(): void!AllocError {
+    let src: &[u8] = "enum E { A, B, C }\nfunction pick(): u32 {\n    let x: E = E::B;\n    var r: u32 = 0u32;\n    match x {\n        A => { r = 10u32; },\n        B => { r = 20u32; },\n        C => { r = 30u32; },\n    }\n    return r;\n}\n";
+    let m: mir::MirResult = runner::accepted(src, 9101)?;
+    assert(@len(m.module.functions) == 1);
+    let f: &mir::MirFunction:Read = &m.module.functions[0]:Read;
+    assert(runner::term_count(f, 177) == 1);
+    assert(@len(f.arms) == 3);
+    assert(f.arms[0].variant == 0 && f.arms[1].variant == 1 && f.arms[2].variant == 2);
+    runner::expect0(&m.module:Read, 0, 20)?;
+    return;
+}
+
+// 情形二：通配臂展开为剩余变体，仍保持升序且覆盖全集。
+function wildcard_expands(): void!AllocError {
+    let src: &[u8] = "enum E { A, B, C }\nfunction pick(): u32 {\n    let x: E = E::C;\n    var r: u32 = 0u32;\n    match x {\n        A => { r = 1u32; },\n        _ => { r = 9u32; },\n    }\n    return r;\n}\n";
+    let m: mir::MirResult = runner::accepted(src, 9102)?;
+    let f: &mir::MirFunction:Read = &m.module.functions[0]:Read;
+    assert(@len(f.arms) == 3);
+    assert(f.arms[0].variant == 0 && f.arms[1].variant == 1 && f.arms[2].variant == 2);
+    runner::expect0(&m.module:Read, 0, 9)?;
+    return;
+}
+
+// 情形三：两变体分别命中；同一源码两次编译的模块逐字段一致（含臂表）。
+function deterministic(): void!AllocError {
+    let src: &[u8] = "enum E { A, B }\nfunction pick(): u32 {\n    let x: E = E::A;\n    var r: u32 = 0u32;\n    match x {\n        A => { r = 7u32; },\n        B => { r = 8u32; },\n    }\n    return r;\n}\n";
+    let first: mir::MirResult = runner::accepted(src, 9103)?;
+    let second: mir::MirResult = runner::accepted(src, 9103)?;
+    runner::same_module(&first.module:Read, &second.module:Read);
+    runner::expect0(&first.module:Read, 0, 7)?;
+    return;
+}
+
+// 情形四：臂载荷绑定；有载荷变体写入臂块隐式局部，空载荷臂保持 0。
+function payload_binding(): void!AllocError {
+    let src: &[u8] = "enum E { Empty, Code(u32) }\nfunction with_payload(): u32 { let e: E = E::Code(41u32); var r: u32 = 0u32; match e { Empty => { r = 0u32; }, Code(v) => { r = v + 1u32; } } return r; }\nfunction without_payload(): u32 { let e: E = E::Empty; var r: u32 = 0u32; match e { Empty => { r = 5u32; }, Code(v) => { r = v; } } return r; }\n";
+    let m: mir::MirResult = runner::accepted(src, 9104)?;
+    let f: &mir::MirFunction:Read = &m.module.functions[0]:Read;
+    assert(f.blocks[f.arms[0].block].payload == 0);
+    assert(f.blocks[f.arms[1].block].payload != 0);
+    runner::expect0(&m.module:Read, 0, 42)?;
+    runner::expect0(&m.module:Read, 1, 5)?;
+    return;
+}
+
+function main(): void {
+    exhaustive_arms()?;
+    wildcard_expands()?;
+    deterministic()?;
+    payload_binding()?;
+    return;
+}

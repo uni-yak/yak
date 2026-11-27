@@ -1,0 +1,935 @@
+// 全量同步只修改内存；服务层负责生命周期路由和发布。
+import json;
+import json_string;
+import positions;
+import types;
+import utf8;
+
+const MAX_DOCUMENTS: u32 = 32;
+const MAX_TEXT: u32 = 4194304;
+const MAX_ACTIVE: u32 = 16777216;
+const MAX_URI: u32 = 4096;
+const NO_SLOT: u32 = 32;
+const MAX_CONTEXT: u64 = 4096;
+// 分析字节门禁独立于文档存储上限。
+const ANALYSIS_BYTES: u64 = 16384;
+
+export function analysis_size_allowed(size: u64): bool { return size <= ANALYSIS_BYTES; }
+
+export struct Ticket { slot: u32, generation: u64, version: i32, analysis_epoch: u64 }
+export struct Snapshot { version: i32, analysis_ready: bool, text: json_string::Decoded, index: positions::Index, definitions: types::DocumentDefinitions }
+// 状态：0 参数非法，1 无目标，2 已定位。外部结果的槽位指向本次宿主目标集合。
+export struct Definition { status: u8, slot: u32, external: bool, range: positions::Range }
+// 只接收可信构建目标校验器产生的索引；非零状态不参与查询。
+export struct TargetSymbol { name_start: u32, name_len: u32, kind: u8, export_id: u32 }
+export struct DefinitionTarget { status: u8, module: u8[], interface_digest: u8[], source_digest: u8[], uri: u8[], locations: positions::RangeResult[], names: u8[], symbols: TargetSymbol[] }
+export struct Slot { generation: u64, analysis_epoch: u64, context: u8[], uri: json_string::Decoded, snapshot: Snapshot }
+export struct Store { slots: Slot[], used: u32, active: u32, cap: u32, generation: u64, encoding: u8 }
+// 状态：0 无文档事件，1 待分析，2 已关闭，3 参数非法，4 状态冲突，5 超预算。
+// 仅状态 1 的票据可索引快照；状态 2 持有用于清空诊断的 URI。
+export struct Event { status: u8, ticket: Ticket, closed_uri: json_string::Decoded }
+struct Version { ok: bool, value: i32 }
+
+// 调用方可收紧活动文本预算，不可放宽服务上限。
+export function create(active_budget: u32): Store {
+    var cap: u32 = active_budget;
+    if cap > MAX_ACTIVE { cap = MAX_ACTIVE; }
+    return Store { slots: [], used: 0, active: 0, cap: cap, generation: 0, encoding: positions::enc_utf16() };
+}
+
+export function set_encoding(store: &Store:ReadWrite, encoding: u8): void {
+    if encoding <= positions::enc_utf32() { store.encoding = encoding; }
+    return;
+}
+
+function empty_value(): json_string::Decoded { return json_string::Decoded { ok: false, data: [] }; }
+
+function blank(): Slot {
+    return Slot { generation: 0, analysis_epoch: 0, context: [], uri: empty_value(), snapshot: Snapshot { version: 0, analysis_ready: false, text: empty_value(),
+        index: positions::Index { status: 1, encoding: positions::enc_utf16(), bytes: 0, lines: [], marks: [] }, definitions: types::empty_definitions() } };
+}
+
+function outcome(status: u8): Event {
+    return Event { status: status, ticket: Ticket { slot: 0, generation: 0, version: 0, analysis_epoch: 0 }, closed_uri: empty_value() };
+}
+
+export function no_event(): Event { return outcome(0u8); }
+
+function letter(b: u8): bool {
+    return (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+function digit(b: u8): bool { return b >= 48u8 && b <= 57u8; }
+
+function hex(b: u8): bool { return digit(b) || (b >= 65u8 && b <= 70u8) || (b >= 97u8 && b <= 102u8); }
+
+export function valid_uri(uri: &[u8]): bool {
+    if @len(uri) > MAX_URI as u64 { return false; }
+    let n: u32 = @len(uri) as u32;
+    if n < 3u32 || !letter(uri[0]) { return false; }
+    var at: u32 = 1;
+    while at < n && uri[at] != 58u8 {
+        let b: u8 = uri[at];
+        if !letter(b) && !digit(b) && b != 43u8 && b != 46u8 && b != 45u8 { return false; }
+        at = at + 1u32;
+    }
+    if at >= n - 1u32 { return false; }
+    at = at + 1u32;
+    while at < n {
+        let b: u8 = uri[at];
+        if b <= 32u8 || b == 127u8 { return false; }
+        if b == 37u8 {
+            if n - at < 3u32 || !hex(uri[at + 1u32]) || !hex(uri[at + 2u32]) { return false; }
+            at = at + 3u32;
+        } else { at = at + 1u32; }
+    }
+    return true;
+}
+
+function equal_bytes(left: &[u8], right: &[u8]): bool {
+    let size: u32 = @len(left) as u32;
+    if (@len(right) as u32) != size { return false; }
+    var at: u32 = 0;
+    while at < size {
+        if left[at] != right[at] { return false; }
+        at = at + 1u32;
+    }
+    return true;
+}
+
+function locate(store: &Store:Read, uri: &[u8]): u32 {
+    let n: u32 = @len(store.slots) as u32;
+    var i: u32 = 0;
+    while i < n {
+        if store.slots[i].generation != 0u64 {
+            let size: u64 = @len(store.slots[i].uri.data);
+            if equal_bytes(uri, &store.slots[i].uri.data[0..size]:Read) { return i; }
+        }
+        i = i + 1u32;
+    }
+    return NO_SLOT;
+}
+
+function uri_is_open(store: &Store:Read, uri: &[u8]): bool { return locate(store, uri) != NO_SLOT; }
+
+function symbol_bytes_order(a: &[u8], b: &[u8]): i32 {
+    var at: u32 = 0;
+    while at < @len(a) as u32 && at < @len(b) as u32 {
+        if a[at] < b[at] { return -1i32; }
+        if a[at] > b[at] { return 1i32; }
+        at = at + 1u32;
+    }
+    if @len(a) < @len(b) { return -1i32; }
+    if @len(a) > @len(b) { return 1i32; }
+    return 0i32;
+}
+
+export function symbol_utf8(text: &[u8]): bool {
+    var at: u32 = 0;
+    while at < @len(text) as u32 {
+        let scalar: utf8::Scalar = utf8::decode(text, at);
+        if scalar.width == 0u32 { return false; }
+        at = at + scalar.width;
+    }
+    return true;
+}
+
+// 协议能力要求非空范围全部已验证，且每个模块和 URI 唯一。
+export function complete_symbol_scope(targets: &[DefinitionTarget]:Read): bool {
+    if @len(targets) == 0u64 || @len(targets) > 32u64 { return false; }
+    var i: u32 = 0;
+    while i < @len(targets) as u32 {
+        let target: &DefinitionTarget:Read = &targets[i]:Read;
+        if target.status != 0u8 { return false; }
+        var j: u32 = 0;
+        while j < i {
+            let other: &DefinitionTarget:Read = &targets[j]:Read;
+            if equal_bytes(&target.uri[0..@len(target.uri)]:Read, &other.uri[0..@len(other.uri)]:Read) ||
+                equal_bytes(&target.module[0..@len(target.module)]:Read, &other.module[0..@len(other.module)]:Read) { return false; }
+            j = j + 1u32;
+        }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+// 命中只引用本次输入集合；调用方不能换一组目标后再解释下标。
+export struct SymbolHit { target: u32, symbol: u32 }
+// 0 在可用授权范围内成功，1 查询非法，2 超预算，3 授权目标存在歧义。
+export struct SymbolResult { status: u8, covered: u32, shadowed: u32, hits: SymbolHit[] }
+
+function no_symbols(status: u8): SymbolResult { return SymbolResult { status: status, covered: 0, shadowed: 0, hits: [] }; }
+
+function folded(byte: u8): u8 {
+    if byte >= 65u8 && byte <= 90u8 { return byte + 32u8; }
+    return byte;
+}
+
+// 匹配子序列；大小写转换限于 ASCII，非 ASCII 按完整 UTF-8 标量精确匹配。
+function symbol_matches(name: &[u8], query: &[u8]): bool {
+    var at: u32 = 0;
+    var q: u32 = 0;
+    while at < @len(name) as u32 && q < @len(query) as u32 {
+        let a: utf8::Scalar = utf8::decode(name, at);
+        let b: utf8::Scalar = utf8::decode(query, q);
+        if a.width == 0u32 || b.width == 0u32 { return false; }
+        if a.width == 1u32 && b.width == 1u32 {
+            if folded(name[at]) == folded(query[q]) { q = q + 1u32; }
+        } elseif a.width == b.width && symbol_bytes_order(&name[at..at + a.width]:Read, &query[q..q + b.width]:Read) == 0 {
+            q = q + b.width;
+        }
+        at = at + a.width;
+    }
+    return q == @len(query) as u32;
+}
+
+export function symbols(store: &Store:Read, targets: &[DefinitionTarget]:Read, query: &[u8]): SymbolResult!AllocError {
+    if @len(targets) > 32u64 || @len(query) > 256u64 { return no_symbols(2u8); }
+    if !symbol_utf8(query) { return no_symbols(1u8); }
+    var order: u32[] = [];
+    var i: u32 = 0;
+    while i < @len(targets) as u32 {
+        let target: &DefinitionTarget:Read = &targets[i]:Read;
+        if target.status == 0u8 {
+            let uri: &[u8] = &target.uri[0..@len(target.uri)]:Read;
+            let name: &[u8] = &target.module[0..@len(target.module)]:Read;
+            var insert_at: u32 = @len(order) as u32;
+            var j: u32 = 0;
+            while j < @len(order) as u32 {
+                let other: &DefinitionTarget:Read = &targets[order[j]]:Read;
+                let cmp: i32 = symbol_bytes_order(uri, &other.uri[0..@len(other.uri)]:Read);
+                if cmp == 0 || symbol_bytes_order(name, &other.module[0..@len(other.module)]:Read) == 0 { return no_symbols(3u8); }
+                if cmp < 0 && j < insert_at { insert_at = j; }
+                j = j + 1u32;
+            }
+            @push(order, i)?;
+            j = @len(order) as u32 - 1u32;
+            while j > insert_at { order[j] = order[j - 1u32]; j = j - 1u32; }
+            order[insert_at] = i;
+        }
+        i = i + 1u32;
+    }
+    var hits: SymbolHit[] = [];
+    var shadowed: u32 = 0;
+    i = 0u32;
+    while i < @len(order) as u32 {
+        let target: &DefinitionTarget:Read = &targets[order[i]]:Read;
+        if uri_is_open(store, &target.uri[0..@len(target.uri)]:Read) { shadowed = shadowed + 1u32; }
+        else {
+            var j: u32 = 0;
+            while j < @len(target.symbols) as u32 {
+                let row: TargetSymbol = target.symbols[j];
+                if symbol_matches(&target.names[row.name_start..row.name_start + row.name_len]:Read, query) {
+                    if @len(hits) == 512u64 { return no_symbols(2u8); }
+                    @push(hits, SymbolHit { target: order[i], symbol: j })?;
+                }
+                j = j + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+    return SymbolResult { status: 0, covered: @len(order) as u32 - shadowed, shadowed: shadowed, hits: @move(hits) };
+}
+
+// 把临时切片限在查找中，提交时可移动 URI 的拥有值。
+function validated_slot(store: &Store:Read, uri: &json_string::Decoded:Read): u32 {
+    let bytes: &[u8] = &uri.data[0..@len(uri.data)]:Read;
+    if !valid_uri(bytes) { return NO_SLOT + 1u32; }
+    return locate(store, bytes);
+}
+
+function free_slot(store: &Store:Read): u32 {
+    let n: u32 = @len(store.slots) as u32;
+    var i: u32 = 0;
+    while i < n && store.slots[i].generation != 0u64 { i = i + 1u32; }
+    return i;
+}
+
+export function is_current(store: &Store:Read, ticket: Ticket): bool {
+    if ticket.generation == 0u64 || (ticket.slot as u64) >= @len(store.slots) { return false; }
+    return store.slots[ticket.slot].generation == ticket.generation && store.slots[ticket.slot].snapshot.version == ticket.version &&
+        store.slots[ticket.slot].analysis_epoch == ticket.analysis_epoch;
+}
+
+export function current_ticket(store: &Store:Read, slot: u32): Ticket {
+    if (slot as u64) >= @len(store.slots) || store.slots[slot].generation == 0u64 {
+        return Ticket { slot: slot, generation: 0, version: 0, analysis_epoch: 0 };
+    }
+    return Ticket { slot: slot, generation: store.slots[slot].generation,
+        version: store.slots[slot].snapshot.version, analysis_epoch: store.slots[slot].analysis_epoch };
+}
+
+function analysis_event(store: &Store:Read, slot: u32): Event {
+    return Event { status: 1, ticket: current_ticket(store, slot), closed_uri: empty_value() };
+}
+
+function same_context(slot: &Slot:Read, context: &[u8]): bool {
+    return equal_bytes(context, &slot.context[0..@len(slot.context)]:Read);
+}
+
+// 宿主使用经验证的内容身份；重复登记不产生分析事件，变化时先移除旧查询结果。
+export function set_analysis_context(store: &Store:ReadWrite, ticket: Ticket, context: &[u8]): Event!AllocError {
+    if !is_current(&*store:Read, ticket) { return outcome(4u8); }
+    if @len(context) > MAX_CONTEXT { return outcome(5u8); }
+    let slot: u32 = ticket.slot;
+    if same_context(&store.slots[slot]:Read, context) { return outcome(0u8); }
+    if ticket.analysis_epoch == 18446744073709551615u64 { return outcome(5u8); }
+    var saved: u8[] = [];
+    var i: u64 = 0;
+    while i < @len(context) { @push(saved, context[i])?; i = i + 1u64; }
+    store.slots[slot].context = @move(saved);
+    store.slots[slot].analysis_epoch = ticket.analysis_epoch + 1u64;
+    store.slots[slot].snapshot.definitions = types::empty_definitions();
+    store.slots[slot].snapshot.analysis_ready = false;
+    return analysis_event(&*store:Read, slot);
+}
+
+export function has_analysis(store: &Store:Read, ticket: Ticket): bool {
+    return is_current(store, ticket) && store.slots[ticket.slot].snapshot.analysis_ready;
+}
+
+export function commit_definitions(store: &Store:ReadWrite, ticket: Ticket, definitions: types::DocumentDefinitions): bool {
+    if !is_current(&*store:Read, ticket) { return false; }
+    store.slots[ticket.slot].snapshot.definitions = @move(definitions);
+    store.slots[ticket.slot].snapshot.analysis_ready = true;
+    return true;
+}
+
+function version_at(src: &[u8], node: json::Node): Version {
+    let bad: Version = Version { ok: false, value: 0 };
+    if !json::is_number(node.kind) { return bad; }
+    var at: u32 = node.start;
+    let negative: bool = src[at] == 45u8;
+    var max: u32 = 2147483647;
+    if negative { at = at + 1u32; max = max + 1u32; }
+    var n: u32 = 0;
+    while at < node.end {
+        let b: u8 = src[at];
+        if !digit(b) { return bad; }
+        let d: u32 = (b - 48u8) as u32;
+        if n > (max - d) / 10u32 { return bad; }
+        n = n * 10u32 + d;
+        at = at + 1u32;
+    }
+    if negative { return Version { ok: true, value: (0i64 - (n as i64)) as i32 }; }
+    return Version { ok: true, value: n as i32 };
+}
+
+export struct QueryPosition { status: u8, slot: u32, offset: u32 }
+export struct Hover { status: u8, slot: u32, text_at: u32, text_length: u32, range: positions::Range }
+
+function empty_range(): positions::Range {
+    let zero: positions::Position = positions::Position { line: 0, character: 0 };
+    return positions::Range { start: zero, end: zero };
+}
+
+function no_query(status: u8): QueryPosition { return QueryPosition { status: status, slot: 0, offset: 0 }; }
+
+// 无位置参数的查询同样只允许访问已打开且通过 URI 校验的文档。
+export function query_slot(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32): u32!AllocError {
+    let item: json::Member = json::member(doc, src, params, "textDocument");
+    if item.status != 1u8 { return NO_SLOT + 1u32; }
+    let uri_field: json::Member = json::member(doc, src, item.id, "uri");
+    if uri_field.status != 1u8 { return NO_SLOT + 1u32; }
+    let tok: json::Node = doc.nodes[uri_field.id];
+    if !json::is_string(tok.kind) { return NO_SLOT + 1u32; }
+    let uri: json_string::Decoded = json_string::decode(src, tok.start, tok.end, MAX_URI)?;
+    if !uri.ok { return NO_SLOT + 1u32; }
+    return validated_slot(store, &uri:Read);
+}
+
+// 定位类查询共用已打开文档和协商编码的坐标校验。
+export function query_position(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32): QueryPosition!AllocError {
+    let position: json::Member = json::member(doc, src, params, "position");
+    if position.status != 1u8 { return no_query(0u8); }
+    let row: json::Member = json::member(doc, src, position.id, "line");
+    let column: json::Member = json::member(doc, src, position.id, "character");
+    if row.status != 1u8 || column.status != 1u8 { return no_query(0u8); }
+    let line: Version = version_at(src, doc.nodes[row.id]);
+    let character: Version = version_at(src, doc.nodes[column.id]);
+    if !line.ok || line.value < 0i32 || !character.ok || character.value < 0i32 { return no_query(0u8); }
+    let slot: u32 = query_slot(store, doc, src, params)?;
+    if slot > NO_SLOT { return no_query(0u8); }
+    if slot == NO_SLOT { return no_query(1u8); }
+    let snap: &Snapshot:Read = &store.slots[slot].snapshot:Read;
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let offset: positions::OffsetResult = positions::to_offset(&snap.index:Read, text, line.value as u32, character.value as u32);
+    if !offset.valid { return no_query(1u8); }
+    return QueryPosition { status: 2, slot: slot, offset: offset.offset };
+}
+
+export struct DocumentSymbol { kind: u8, range: positions::Range, selection: positions::Range, offset: u32, length: u32 }
+export struct FoldingRange { first: u32, last: u32 }
+export struct Structure { status: u8, slot: u32, symbols: DocumentSymbol[], folds: FoldingRange[] }
+
+function no_structure(status: u8): Structure { return Structure { status: status, slot: 0, symbols: [], folds: [] }; }
+
+export function structure(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32, symbols: bool): Structure!AllocError {
+    let slot: u32 = query_slot(store, doc, src, params)?;
+    if slot > NO_SLOT { return no_structure(0u8); }
+    if slot == NO_SLOT { return no_structure(1u8); }
+    let snap: &Snapshot:Read = &store.slots[slot].snapshot:Read;
+    if !snap.definitions.structure_ready { return no_structure(1u8); }
+    let file: u16 = (slot + 1u32) as u16;
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    var result: Structure = Structure { status: 2, slot: slot, symbols: [], folds: [] };
+    var i: u32 = 0;
+    if symbols {
+        while i < @len(snap.definitions.symbols) as u32 {
+            let symbol: types::DocumentSymbolSpan = snap.definitions.symbols[i];
+            let name: types::Span = symbol.selection;
+            if symbol.end <= symbol.start || name.length == 0u32 || name.offset < symbol.start || name.offset > symbol.end || name.length > symbol.end - name.offset { return no_structure(1u8); }
+            let outer: positions::RangeResult = positions::span_range(&snap.index:Read, text, file, file, symbol.start, symbol.end - symbol.start);
+            let inner: positions::RangeResult = positions::span_range(&snap.index:Read, text, name.file, file, name.offset, name.length);
+            if !outer.valid || !inner.valid || inner.range.start.line != inner.range.end.line { return no_structure(1u8); }
+            @push(result.symbols, DocumentSymbol { kind: symbol.kind, range: outer.range, selection: inner.range, offset: name.offset, length: name.length })?;
+            i = i + 1u32;
+        }
+    } else {
+        var previous: FoldingRange = FoldingRange { first: 0, last: 0 };
+        while i < @len(snap.definitions.folds) as u32 {
+            let fold: types::DocumentFoldSpan = snap.definitions.folds[i];
+            if fold.end < fold.start { return no_structure(1u8); }
+            let mapped: positions::RangeResult = positions::span_range(&snap.index:Read, text, file, file, fold.start, fold.end - fold.start);
+            if !mapped.valid { return no_structure(1u8); }
+            let first: u32 = mapped.range.start.line;
+            let end: u32 = mapped.range.end.line;
+            // 按行折叠保留闭括号所在行，同一行投影重合时只保留一次。
+            if end > first + 1u32 {
+                let row: FoldingRange = FoldingRange { first: first, last: end - 1u32 };
+                if @len(result.folds) == 0u64 || row.first != previous.first || row.last != previous.last { @push(result.folds, row)?; }
+                previous = row;
+            }
+            i = i + 1u32;
+        }
+    }
+    return result;
+}
+
+export struct SemanticTokens { status: u8, data: u32[] }
+
+function no_semantic(status: u8): SemanticTokens { return SemanticTokens { status: status, data: [] }; }
+
+export function semantic_tokens(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32): SemanticTokens!AllocError {
+    let slot: u32 = query_slot(store, doc, src, params)?;
+    if slot > NO_SLOT { return no_semantic(0u8); }
+    if slot == NO_SLOT { return no_semantic(1u8); }
+    let snap: &Snapshot:Read = &store.slots[slot].snapshot:Read;
+    if !snap.definitions.semantic_ready { return no_semantic(1u8); }
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let file: u16 = (slot + 1u32) as u16;
+    var data: u32[] = [];
+    var row: u32 = 0;
+    var col: u32 = 0;
+    var end: u32 = 0;
+    var i: u32 = 0;
+    while i < @len(snap.definitions.semantic_tokens) as u32 {
+        let token: types::SemanticToken = snap.definitions.semantic_tokens[i];
+        let mapped: positions::RangeResult = positions::span_range(&snap.index:Read, text, file, file, token.offset, token.length);
+        let span: positions::Range = mapped.range;
+        if !mapped.valid || span.start.line != span.end.line || span.start.line < row || span.end.character <= span.start.character || token.offset < end || token.kind > 3u8 {
+            return no_semantic(1u8);
+        }
+        var delta_col: u32 = span.start.character;
+        if span.start.line == row { delta_col = delta_col - col; }
+        @push(data, span.start.line - row)?;
+        @push(data, delta_col)?;
+        @push(data, span.end.character - span.start.character)?;
+        @push(data, token.kind as u32)?;
+        @push(data, 0u32)?;
+        row = span.start.line;
+        col = span.start.character;
+        end = token.offset + token.length;
+        i = i + 1u32;
+    }
+    return SemanticTokens { status: 2, data: data };
+}
+
+function no_definition(status: u8): Definition { return Definition { status: status, slot: 0, external: false, range: empty_range() }; }
+
+function target_identity(target: &DefinitionTarget:Read, module_name: &[u8], interface_digest: &[u8]): bool {
+    return target.status == 0u8 && @len(interface_digest) == 32u64 &&
+        equal_bytes(&target.module[0..@len(target.module)]:Read, module_name) &&
+        equal_bytes(&target.interface_digest[0..@len(target.interface_digest)]:Read, interface_digest);
+}
+
+export function target_location(target: &DefinitionTarget:Read, module_name: &[u8], interface_digest: &[u8], id: u32): positions::RangeResult {
+    if !target_identity(target, module_name, interface_digest) || id == 0u32 || id > @len(target.locations) as u32 {
+        return positions::RangeResult { valid: false, range: empty_range() };
+    }
+    return target.locations[id - 1u32];
+}
+
+// 同一身份或 URI 有多个现役候选时不猜；已打开缓冲不能回退到磁盘位置。
+function imported_definition(store: &Store:Read, at: QueryPosition, targets: &[DefinitionTarget]:Read): Definition {
+    if @len(targets) == 0u64 || @len(targets) > MAX_DOCUMENTS as u64 { return no_definition(1u8); }
+    let snap: &Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+    let use: types::ImportedDefinitionUse = types::imported_definition_at(&snap.definitions:Read, at.offset);
+    if use.length == 0u32 || use.interface_row == 0u32 || use.interface_row > @len(snap.definitions.imported_interfaces) as u32 { return no_definition(1u8); }
+    let identity: &types::ImportedInterface:Read = &snap.definitions.imported_interfaces[use.interface_row - 1u32]:Read;
+    let module_name: &[u8] = &identity.module[0..@len(identity.module)]:Read;
+    let digest: &[u8] = &identity.digest[0..@len(identity.digest)]:Read;
+    var selected: u32 = NO_SLOT;
+    var i: u32 = 0;
+    while i < @len(targets) as u32 {
+        if target_identity(&targets[i]:Read, module_name, digest) {
+            if selected != NO_SLOT { return no_definition(1u8); }
+            selected = i;
+        }
+        i = i + 1u32;
+    }
+    if selected == NO_SLOT { return no_definition(1u8); }
+    let target: &DefinitionTarget:Read = &targets[selected]:Read;
+    let uri: &[u8] = &target.uri[0..@len(target.uri)]:Read;
+    if !valid_uri(uri) || locate(store, uri) != NO_SLOT { return no_definition(1u8); }
+    i = 0u32;
+    while i < @len(targets) as u32 {
+        if i != selected && targets[i].status == 0u8 && equal_bytes(&targets[i].uri[0..@len(targets[i].uri)]:Read, uri) {
+            return no_definition(1u8);
+        }
+        i = i + 1u32;
+    }
+    let range: positions::RangeResult = target_location(target, module_name, digest, use.export_id);
+    if !range.valid { return no_definition(1u8); }
+    return Definition { status: 2, slot: selected, external: true, range: range.range };
+}
+
+// 目标集合只由宿主提供，请求中的 URI 只用于定位当前消费者文档。
+export function definition_with_targets(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32, targets: &[DefinitionTarget]:Read): Definition!AllocError {
+    let at: QueryPosition = query_position(store, doc, src, params)?;
+    if at.status != 2u8 { return no_definition(at.status); }
+    let snap: &Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+    if !snap.analysis_ready { return no_definition(1u8); }
+    let link: types::DefinitionLink = types::definition_at(&snap.definitions:Read, at.offset);
+    if link.target_length == 0u32 { return imported_definition(store, at, targets); }
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let file: u16 = (at.slot + 1u32) as u16;
+    let range: positions::RangeResult = positions::span_range(&snap.index:Read, text, file, file, link.target_offset, link.target_length);
+    if !range.valid { return no_definition(1u8); }
+    return Definition { status: 2, slot: at.slot, external: false, range: range.range };
+}
+
+export function definition(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32): Definition!AllocError {
+    let targets: DefinitionTarget[] = [];
+    return definition_with_targets(store, doc, src, params, &targets[0..0]:Read)?;
+}
+
+function no_hover(status: u8): Hover {
+    return Hover { status: status, slot: 0, text_at: 0, text_length: 0, range: empty_range() };
+}
+
+export function hover(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32): Hover!AllocError {
+    let at: QueryPosition = query_position(store, doc, src, params)?;
+    if at.status != 2u8 { return no_hover(at.status); }
+    let snap: &Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+    let link: types::HoverLink = types::hover_at(&snap.definitions:Read, at.offset);
+    if link.text_length == 0u32 || (link.text_at as u64) + (link.text_length as u64) > @len(snap.definitions.hover_text) { return no_hover(1u8); }
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let file: u16 = (at.slot + 1u32) as u16;
+    let range: positions::RangeResult = positions::span_range(&snap.index:Read, text, file, file, link.offset, link.length);
+    if !range.valid { return no_hover(1u8); }
+    return Hover { status: 2, slot: at.slot, text_at: link.text_at, text_length: link.text_length, range: range.range };
+}
+
+const MAX_COMPLETIONS: u32 = 32;
+
+// 候选的拼写分别引用同版文本或生成的关键字表。
+export struct CompletionItem { offset: u32, length: u32, kind: u8, hash_name: bool }
+export struct Completion { status: u8, slot: u32, incomplete: bool, items: CompletionItem[], range: positions::Range }
+struct Prefix { ok: bool, start: u32, end: u32, hash_name: bool }
+
+// token 之间只可能有空白和注释；不从注释内容取得名称前缀。
+function outside_comment(text: &[u8], start: u32, end: u32): bool {
+    var i: u32 = start;
+    var depth: u32 = 0;
+    var line: bool = false;
+    while i < end {
+        let byte: u8 = text[i];
+        if line {
+            if byte == 10u8 { line = false; }
+        } elseif byte == 47u8 && i + 1u32 < @len(text) as u32 {
+            let next: u8 = text[i + 1u32];
+            if next == 42u8 { depth = depth + 1u32; i = i + 1u32; }
+            elseif next == 47u8 && depth == 0u32 { line = true; i = i + 1u32; }
+        } elseif byte == 42u8 && depth != 0u32 && i + 1u32 < end && text[i + 1u32] == 47u8 {
+            depth = depth - 1u32;
+            i = i + 1u32;
+        }
+        i = i + 1u32;
+    }
+    return !line && depth == 0u32;
+}
+
+function completion_prefix(tokens: &[types::CompletionToken], text: &[u8], at: u32): Prefix {
+    let none: Prefix = Prefix { ok: false, start: 0, end: 0, hash_name: false };
+    var lo: u32 = 0;
+    var hi: u32 = @len(tokens) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        if tokens[mid].offset < at { lo = mid + 1u32; } else { hi = mid; }
+    }
+    var picked: u32 = lo;
+    if lo < @len(tokens) as u32 && tokens[lo].offset == at && tokens[lo].kind == 1u8 {
+        picked = lo;
+    } elseif lo != 0u32 {
+        let previous: types::CompletionToken = tokens[lo - 1u32];
+        let end: u32 = previous.offset + previous.length;
+        if end > at && previous.kind != 1u8 { return none; }
+        if end >= at && previous.kind == 1u8 { picked = lo - 1u32; }
+    }
+    var prefix: Prefix = Prefix { ok: true, start: at, end: at, hash_name: false };
+    if picked < @len(tokens) as u32 && tokens[picked].kind == 1u8 {
+        let word: types::CompletionToken = tokens[picked];
+        let end: u32 = word.offset + word.length;
+        if word.offset <= at && at <= end {
+            prefix.start = word.offset;
+            prefix.end = end;
+            prefix.hash_name = word.offset < at && text[word.offset] == 35u8;
+        }
+    }
+    var gap: u32 = 0;
+    if picked != 0u32 {
+        let previous: types::CompletionToken = tokens[picked - 1u32];
+        if previous.kind == 2u8 || previous.kind == 3u8 { return none; }
+        gap = previous.offset + previous.length;
+    }
+    if !outside_comment(text, gap, prefix.start) { return none; }
+    return prefix;
+}
+
+function starts_with(label: &[u8], text: &[u8], start: u32, end: u32): bool {
+    let n: u32 = end - start;
+    if n > @len(label) as u32 { return false; }
+    var i: u32 = 0;
+    while i < n {
+        if label[i] != text[start + i] { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+
+function prefix_matches(item: CompletionItem, text: &[u8], words: &[u8], prefix: Prefix, at: u32): bool {
+    let end: u32 = item.offset + item.length;
+    if item.kind == 14u8 { return !prefix.hash_name && starts_with(&words[item.offset..end]:Read, text, prefix.start, at); }
+    if prefix.hash_name != item.hash_name && (at != prefix.start || prefix.hash_name) { return false; }
+    var start: u32 = prefix.start;
+    if prefix.hash_name { start = start + 1u32; }
+    return starts_with(&text[item.offset..end]:Read, text, start, at);
+}
+
+function lexical_before(left: &[u8], right: &[u8]): bool {
+    var i: u32 = 0;
+    while i < @len(left) as u32 && i < @len(right) as u32 {
+        if left[i] != right[i] { return left[i] < right[i]; }
+        i = i + 1u32;
+    }
+    return @len(left) < @len(right);
+}
+
+function completion_before(a: CompletionItem, b: CompletionItem, text: &[u8], words: &[u8]): bool {
+    if a.hash_name != b.hash_name { return a.hash_name; }
+    let ae: u32 = a.offset + a.length;
+    let be: u32 = b.offset + b.length;
+    if a.kind == 14u8 {
+        if b.kind == 14u8 { return lexical_before(&words[a.offset..ae]:Read, &words[b.offset..be]:Read); }
+        return lexical_before(&words[a.offset..ae]:Read, &text[b.offset..be]:Read);
+    }
+    if b.kind == 14u8 { return lexical_before(&text[a.offset..ae]:Read, &words[b.offset..be]:Read); }
+    return lexical_before(&text[a.offset..ae]:Read, &text[b.offset..be]:Read);
+}
+
+function insert_completion(result: &Completion:ReadWrite, item: CompletionItem, text: &[u8], words: &[u8]): void!AllocError {
+    let count: u32 = @len(result.items) as u32;
+    var lo: u32 = 0;
+    var hi: u32 = count;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2u32;
+        if completion_before(item, result.items[mid], text, words) { hi = mid; }
+        else { lo = mid + 1u32; }
+    }
+    var i: u32 = count;
+    if count == MAX_COMPLETIONS {
+        result.incomplete = true;
+        if lo == count { return; }
+        i = i - 1u32;
+    } else { @push(result.items, item)?; }
+    while i > lo { result.items[i] = result.items[i - 1u32]; i = i - 1u32; }
+    result.items[lo] = item;
+    return;
+}
+
+function active_binding(index: &types::DocumentDefinitions:Read, group: types::CompletionGroup, at: u32): types::CompletionBinding {
+    var best: types::CompletionBinding = types::CompletionBinding { start: 0, end: 0, available: 0, rank: 0, kind: 0, hash_name: false };
+    var i: u32 = 0;
+    while i < group.count {
+        let candidate: types::CompletionBinding = index.completion_bindings[group.first + i];
+        if candidate.start <= at && at < candidate.end && (best.end == 0u32 || candidate.rank > best.rank) { best = candidate; }
+        i = i + 1u32;
+    }
+    return best;
+}
+
+function no_completion(status: u8): Completion {
+    return Completion { status: status, slot: 0, incomplete: false, items: [], range: empty_range() };
+}
+
+export function completion(store: &Store:Read, doc: &json::Document:Read, src: &[u8], params: u32): Completion!AllocError {
+    let at: QueryPosition = query_position(store, doc, src, params)?;
+    if at.status != 2u8 { return no_completion(at.status); }
+    let snap: &Snapshot:Read = &store.slots[at.slot].snapshot:Read;
+    let index: &types::DocumentDefinitions:Read = &snap.definitions:Read;
+    if @len(index.completion_keywords) == 0u64 { return no_completion(1u8); }
+    let text: &[u8] = &snap.text.data[0..@len(snap.text.data)]:Read;
+    let words: &[u8] = &index.completion_keywords[0..@len(index.completion_keywords)]:Read;
+    let prefix: Prefix = completion_prefix(&index.completion_tokens[0..@len(index.completion_tokens)]:Read, text, at.offset);
+    if !prefix.ok { return no_completion(1u8); }
+    let file: u16 = (at.slot + 1u32) as u16;
+    let mapped: positions::RangeResult = positions::span_range(&snap.index:Read, text, file, file, prefix.start, prefix.end - prefix.start);
+    if !mapped.valid { return no_completion(1u8); }
+    var result: Completion = Completion { status: 2, slot: at.slot, incomplete: false, items: [], range: mapped.range };
+    var start: u32 = 0;
+    var i: u32 = 0;
+    while i <= @len(words) as u32 {
+        if i == @len(words) as u32 || words[i] == 32u8 {
+            let item: CompletionItem = CompletionItem { offset: start, length: i - start, kind: 14, hash_name: false };
+            if prefix_matches(item, text, words, prefix, at.offset) { insert_completion(&result:ReadWrite, item, text, words)?; }
+            start = i + 1u32;
+        }
+        i = i + 1u32;
+    }
+    i = 0u32;
+    while i < @len(index.completion_groups) as u32 {
+        let group: types::CompletionGroup = index.completion_groups[i];
+        let binding: types::CompletionBinding = active_binding(index, group, at.offset);
+        if binding.kind != 0u8 && binding.available <= at.offset {
+            let item: CompletionItem = CompletionItem { offset: group.offset, length: group.length, kind: binding.kind, hash_name: binding.hash_name };
+            if prefix_matches(item, text, words, prefix, at.offset) { insert_completion(&result:ReadWrite, item, text, words)?; }
+        }
+        i = i + 1u32;
+    }
+    return result;
+}
+
+export struct RangeField { ok: bool, range: positions::Range }
+
+export function parse_range(doc: &json::Document:Read, src: &[u8], node_id: u32): RangeField {
+    let bad: RangeField = RangeField { ok: false, range: empty_range() };
+    if !json::is_object(doc.nodes[node_id].kind) { return bad; }
+    let s: json::Member = json::member(doc, src, node_id, "start");
+    let e: json::Member = json::member(doc, src, node_id, "end");
+    if s.status != 1u8 || e.status != 1u8 || !json::is_object(doc.nodes[s.id].kind) || !json::is_object(doc.nodes[e.id].kind) { return bad; }
+    let sl: json::Member = json::member(doc, src, s.id, "line");
+    let sc: json::Member = json::member(doc, src, s.id, "character");
+    let el: json::Member = json::member(doc, src, e.id, "line");
+    let ec: json::Member = json::member(doc, src, e.id, "character");
+    if sl.status != 1u8 || sc.status != 1u8 || el.status != 1u8 || ec.status != 1u8 { return bad; }
+    let vsl: Version = version_at(src, doc.nodes[sl.id]);
+    let vsc: Version = version_at(src, doc.nodes[sc.id]);
+    let vel: Version = version_at(src, doc.nodes[el.id]);
+    let vec: Version = version_at(src, doc.nodes[ec.id]);
+    if !vsl.ok || vsl.value < 0i32 || !vsc.ok || vsc.value < 0i32 || !vel.ok || vel.value < 0i32 || !vec.ok || vec.value < 0i32 { return bad; }
+    return RangeField {
+        ok: true,
+        range: positions::Range {
+            start: positions::Position { line: vsl.value as u32, character: vsc.value as u32 },
+            end: positions::Position { line: vel.value as u32, character: vec.value as u32 },
+        },
+    };
+}
+
+struct PatchOffsets { ok: bool, start: u32, end: u32 }
+
+function resolve_patch_span(index: &positions::Index:Read, buf: &[u8], r: positions::Range): PatchOffsets {
+    let s: positions::OffsetResult = positions::to_offset(index, buf, r.start.line, r.start.character);
+    let e: positions::OffsetResult = positions::to_offset(index, buf, r.end.line, r.end.character);
+    if !s.valid || !e.valid || s.offset > e.offset || (e.offset as u64) > @len(buf) {
+        return PatchOffsets { ok: false, start: 0, end: 0 };
+    }
+    return PatchOffsets { ok: true, start: s.offset, end: e.offset };
+}
+
+function copy_u8_vec(src: &[u8]): u8[]!AllocError {
+    var dst: u8[] = [];
+    var i: u32 = 0;
+    while i < @len(src) as u32 { @push(dst, src[i])?; i = i + 1u32; }
+    return @move(dst);
+}
+
+function splice_bytes(buf: &[u8], start: u32, end: u32, insert: &[u8]): u8[]!AllocError {
+    var dst: u8[] = [];
+    var i: u32 = 0;
+    while i < start { @push(dst, buf[i])?; i = i + 1u32; }
+    i = 0u32;
+    while i < @len(insert) as u32 { @push(dst, insert[i])?; i = i + 1u32; }
+    i = end;
+    while i < @len(buf) as u32 { @push(dst, buf[i])?; i = i + 1u32; }
+    return @move(dst);
+}
+
+// 变更同时支持单条全量替换与多条顺序增量 range 补丁；任一项非法或超限时均不修改目标快照。
+function apply_changes(target: &Snapshot:ReadWrite, version: i32, doc: &json::Document:Read, src: &[u8], params: u32, limit: u32, encoding: u8, incremental: bool): u8!AllocError {
+    let edits: json::Member = json::member(doc, src, params, "contentChanges");
+    if edits.status != 1u8 || !json::is_array(doc.nodes[edits.id].kind) { return 3u8; }
+    let first: u32 = edits.id + 1u32;
+    let arr_end: u32 = doc.nodes[edits.id].next;
+    if first >= arr_end { return 3u8; }
+
+    // 常见单条全量变更走零复制快路径。
+    if doc.nodes[first].next == arr_end && json::is_object(doc.nodes[first].kind) {
+        let rm0: json::Member = json::member(doc, src, first, "range");
+        let rl0: json::Member = json::member(doc, src, first, "rangeLength");
+        if rm0.status == 0u8 && rl0.status == 0u8 {
+            let tm0: json::Member = json::member(doc, src, first, "text");
+            if tm0.status != 1u8 || !json::is_string(doc.nodes[tm0.id].kind) { return 3u8; }
+            let tok0: json::Node = doc.nodes[tm0.id];
+            let dec0: json_string::Decoded = json_string::decode(src, tok0.start, tok0.end, limit)?;
+            if !dec0.ok { return 5u8; }
+            let len0: u64 = @len(dec0.data);
+            let idx0: positions::Index = positions::build_encoded(&dec0.data[0..len0]:Read, encoding)?;
+            if idx0.status != 0u8 { return 5u8; }
+            *target = Snapshot {
+                version: version,
+                analysis_ready: false,
+                text: @move(dec0),
+                index: @move(idx0),
+                definitions: types::empty_definitions(),
+            };
+            return 0u8;
+        }
+    }
+    if !incremental { return 3u8; }
+
+    // 事务式工作副本：全部增量/混合补丁校验通过后一次性提交。
+    var buf: u8[] = copy_u8_vec(&target.text.data[0..@len(target.text.data)]:Read)?;
+    var cur_index: positions::Index = positions::build_encoded(&buf[0..@len(buf)]:Read, encoding)?;
+    if cur_index.status != 0u8 { return 5u8; }
+
+    var child: u32 = first;
+    var count: u32 = 0;
+    while child < arr_end {
+        if count >= 256u32 { return 5u8; }
+        if !json::is_object(doc.nodes[child].kind) { return 3u8; }
+        let text_m: json::Member = json::member(doc, src, child, "text");
+        if text_m.status != 1u8 || !json::is_string(doc.nodes[text_m.id].kind) { return 3u8; }
+        let range_m: json::Member = json::member(doc, src, child, "range");
+        let rlen_m: json::Member = json::member(doc, src, child, "rangeLength");
+        if range_m.status > 1u8 || rlen_m.status > 1u8 { return 3u8; }
+        let text_tok: json::Node = doc.nodes[text_m.id];
+        let decoded: json_string::Decoded = json_string::decode(src, text_tok.start, text_tok.end, limit)?;
+        if !decoded.ok { return 5u8; }
+        if range_m.status == 0u8 {
+            if rlen_m.status != 0u8 { return 3u8; }
+            var next_buf: u8[] = copy_u8_vec(&decoded.data[0..@len(decoded.data)]:Read)?;
+            let next_idx: positions::Index = positions::build_encoded(&next_buf[0..@len(next_buf)]:Read, encoding)?;
+            if next_idx.status != 0u8 { return 5u8; }
+            buf = @move(next_buf);
+            cur_index = @move(next_idx);
+        } else {
+            if rlen_m.status == 1u8 {
+                let rlv: Version = version_at(src, doc.nodes[rlen_m.id]);
+                if !rlv.ok || rlv.value < 0i32 { return 3u8; }
+            }
+            let rf: RangeField = parse_range(doc, src, range_m.id);
+            if !rf.ok { return 3u8; }
+            let po: PatchOffsets = resolve_patch_span(&cur_index:Read, &buf[0..@len(buf)]:Read, rf.range);
+            if !po.ok { return 3u8; }
+            let cur_len: u64 = @len(buf);
+            let ins_len: u64 = @len(decoded.data);
+            let new_len: u64 = (po.start as u64) + ins_len + (cur_len - (po.end as u64));
+            if new_len > (limit as u64) { return 5u8; }
+            var next_buf: u8[] = splice_bytes(&buf[0..cur_len]:Read, po.start, po.end, &decoded.data[0..ins_len]:Read)?;
+            let next_idx: positions::Index = positions::build_encoded(&next_buf[0..@len(next_buf)]:Read, encoding)?;
+            if next_idx.status != 0u8 { return 5u8; }
+            buf = @move(next_buf);
+            cur_index = @move(next_idx);
+        }
+        count = count + 1u32;
+        child = doc.nodes[child].next;
+    }
+
+    *target = Snapshot {
+        version: version,
+        analysis_ready: false,
+        text: json_string::Decoded { ok: true, data: @move(buf) },
+        index: @move(cur_index),
+        definitions: types::empty_definitions(),
+    };
+    return 0u8;
+}
+
+// method 由运行态通知路由提供：1 打开、2 变更、3 关闭。
+// 全量入口仅接受唯一且没有 range 或 rangeLength 的变更元素。
+export function apply(store: &Store:ReadWrite, doc: &json::Document:Read, src: &[u8], params: u32, method: u8): Event!AllocError {
+    return apply_with_sync_mode(store, doc, src, params, method, false)?;
+}
+
+// 只有宣告增量同步的会话才允许顺序补丁；doc 和 params 必须来自同一份 src。
+export function apply_with_sync_mode(store: &Store:ReadWrite, doc: &json::Document:Read, src: &[u8], params: u32, method: u8, incremental: bool): Event!AllocError {
+    if method < 1u8 || method > 3u8 || doc.status != 0u8 { return outcome(3u8); }
+    let item: json::Member = json::member(doc, src, params, "textDocument");
+    if item.status != 1u8 || !json::is_object(doc.nodes[item.id].kind) { return outcome(3u8); }
+    let uri_field: json::Member = json::member(doc, src, item.id, "uri");
+    if uri_field.status != 1u8 || !json::is_string(doc.nodes[uri_field.id].kind) { return outcome(3u8); }
+    let uri_token: json::Node = doc.nodes[uri_field.id];
+    let uri: json_string::Decoded = json_string::decode(src, uri_token.start, uri_token.end, MAX_URI)?;
+    if !uri.ok { return outcome(5u8); }
+    let present: u32 = validated_slot(&*store:Read, &uri:Read);
+    if present > NO_SLOT { return outcome(3u8); }
+
+    if method == 3u8 {
+        if present == NO_SLOT { return outcome(4u8); }
+        store.used = store.used - (@len(store.slots[present].snapshot.text.data) as u32);
+        store.active = store.active - 1u32;
+        store.slots[present] = blank();
+        return Event { status: 2, ticket: Ticket { slot: 0, generation: 0, version: 0, analysis_epoch: 0 }, closed_uri: @move(uri) };
+    }
+
+    if method == 1u8 {
+        let language: json::Member = json::member(doc, src, item.id, "languageId");
+        if language.status != 1u8 || !json::is_string(doc.nodes[language.id].kind) { return outcome(3u8); }
+        let token: json::Node = doc.nodes[language.id];
+        if !json_string::equals(src, token.start, token.end, "yak") { return outcome(3u8); }
+    }
+    let version: json::Member = json::member(doc, src, item.id, "version");
+    if version.status != 1u8 { return outcome(3u8); }
+    let revision: Version = version_at(src, doc.nodes[version.id]);
+    if !revision.ok { return outcome(3u8); }
+
+    var slot: u32 = present;
+    var base: u32 = store.used;
+    if method == 1u8 {
+        let text_m: json::Member = json::member(doc, src, item.id, "text");
+        if text_m.status != 1u8 || !json::is_string(doc.nodes[text_m.id].kind) { return outcome(3u8); }
+        if present != NO_SLOT { return outcome(4u8); }
+        if store.active >= MAX_DOCUMENTS || store.generation == 18446744073709551615u64 { return outcome(5u8); }
+        slot = free_slot(&*store:Read);
+        var limit: u32 = store.cap - base;
+        if limit > MAX_TEXT { limit = MAX_TEXT; }
+        let text_token: json::Node = doc.nodes[text_m.id];
+        let decoded: json_string::Decoded = json_string::decode(src, text_token.start, text_token.end, limit)?;
+        if !decoded.ok { return outcome(5u8); }
+        let bytes: u64 = @len(decoded.data);
+        let index: positions::Index = positions::build_encoded(&decoded.data[0..bytes]:Read, store.encoding)?;
+        if index.status != 0u8 { return outcome(5u8); }
+        let snapshot: Snapshot = Snapshot { version: revision.value, analysis_ready: false, text: @move(decoded), index: @move(index), definitions: types::empty_definitions() };
+        let generation: u64 = store.generation + 1u64;
+        let ready: Slot = Slot { generation: generation, analysis_epoch: 0, context: [], uri: @move(uri), snapshot: @move(snapshot) };
+        if (slot as u64) == @len(store.slots) { @push(store.slots, @move(ready))?; }
+        else { store.slots[slot] = @move(ready); }
+        store.generation = generation;
+        store.active = store.active + 1u32;
+        store.used = base + (bytes as u32);
+        return analysis_event(&*store:Read, slot);
+    }
+
+    if present == NO_SLOT || revision.value <= store.slots[slot].snapshot.version { return outcome(4u8); }
+    base = base - (@len(store.slots[slot].snapshot.text.data) as u32);
+    var limit: u32 = store.cap - base;
+    if limit > MAX_TEXT { limit = MAX_TEXT; }
+    let enc: u8 = store.encoding;
+    let status: u8 = apply_changes(&store.slots[slot].snapshot:ReadWrite, revision.value, doc, src, params, limit, enc, incremental)?;
+    if status != 0u8 { return outcome(status); }
+    let bytes: u64 = @len(store.slots[slot].snapshot.text.data);
+    store.used = base + (bytes as u32);
+    return analysis_event(&*store:Read, slot);
+}

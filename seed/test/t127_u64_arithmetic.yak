@@ -1,0 +1,2 @@
+foreign assert(cond: bool): void;
+function main(): void { let x: u64 = 18446744073709551615; assert(x / 2 == 9223372036854775807); assert(x % 2 == 1); assert(x > 9223372036854775807); }

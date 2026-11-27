@@ -1,0 +1,860 @@
+// yak64-v1 对象布局计算：标量、视图、数组、struct、enum、
+// ErrorSet、fallible 与 nullable；实现 layout.md 的确定性布局与拒绝形态。
+import types;
+import diag;
+import typecheck;
+
+const TK_VOID: u8 = 0;
+const TK_BUILTIN: u8 = 1;
+const TK_LOCAL: u8 = 2;
+const TK_IMPORTED: u8 = 3;
+const TK_REF: u8 = 4;
+const TK_SLICE: u8 = 5;
+const TK_DYN_ARRAY: u8 = 6;
+const TK_FIXED_ARRAY: u8 = 7;
+const TK_FN_REF: u8 = 8;
+const TK_FALLIBLE: u8 = 9;
+const TK_NULLABLE: u8 = 10;
+const TK_PLAIN_UNION: u8 = 12;
+const TK_TEXT: u8 = 13;
+const TK_TEXT_VIEW: u8 = 14;
+const TK_ERROR_SET: u8 = 11;
+const BUILTIN_ALLOC_ERROR: u16 = 4108;
+
+const LAYOUT_LY_1: u16 = 5501;
+const LAYOUT_LY_2: u16 = 5502;
+const LAYOUT_LY_3: u16 = 5503;
+const LAYOUT_LY_4: u16 = 5504;
+const LAYOUT_LY_9: u16 = 5509;
+const LAYOUT_LY_10: u16 = 5510;
+
+export struct LayoutInfo {
+    value_type_id: u32,
+    size: u64,
+    align: u8,
+    tag_size: u8,
+    payload_off: u64,
+    known: bool,
+    is_void: bool,
+}
+// 字段表与布局表同属一个单元；0 未检查，1 有序，2 无序。
+export struct LayoutTable { items: LayoutInfo[], states: u8[], field_order: u8 }
+export struct LayoutResult { table: LayoutTable }
+// 导入名义类型的布局摘要：dep 是消费方依赖编号，export_id 是导出方编号。
+// 直接依赖编号在前；经验证的传递名义类型摘要使用后缀编号。
+export struct ImportedLayout { dep: u16, export_id: u32, size: u64, align: u8 }
+export struct ImportedLayoutTable { items: ImportedLayout[] }
+// 文档预检与正式布局分别计费；普通编译借用同一不限额入口。
+// imported_order 仅用于非限额模式缓存导入摘要有序性：0 未检查，1 有序，2 无序。
+export struct ValueGraphBudget { limited: bool, remaining: u32, exhausted: bool, enum_ordered: bool, imported_order: u8 }
+function imported_layouts_ordered(imported: &ImportedLayoutTable:Read): bool {
+    let total: u32 = @len(imported.items) as u32;
+    var i: u32 = 1;
+    while i < total {
+        let prev: ImportedLayout = imported.items[i - 1];
+        let next: ImportedLayout = imported.items[i];
+        if prev.dep > next.dep || (prev.dep == next.dep && prev.export_id > next.export_id) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+function imported_layout_of_ordered(imported: &ImportedLayoutTable:Read, dep: u16, export_id: u32, ordered: bool): ImportedLayout {
+    let total: u32 = @len(imported.items) as u32;
+    if ordered {
+        var lo: u32 = 0;
+        var hi: u32 = total;
+        while lo < hi {
+            let mid: u32 = lo + (hi - lo) / 2;
+            let item: ImportedLayout = imported.items[mid];
+            if item.dep < dep || (item.dep == dep && item.export_id < export_id) { lo = mid + 1; }
+            elseif item.dep == dep && item.export_id == export_id { return item; }
+            else { hi = mid; }
+        }
+        return ImportedLayout { dep: 0, export_id: 0, size: 0, align: 0 };
+    }
+    var i: u32 = 0;
+    while i < total {
+        if imported.items[i].dep == dep && imported.items[i].export_id == export_id { return imported.items[i]; }
+        i = i + 1;
+    }
+    return ImportedLayout { dep: 0, export_id: 0, size: 0, align: 0 };
+}
+function imported_layout_of(imported: &ImportedLayoutTable:Read, dep: u16, export_id: u32, work: &ValueGraphBudget:ReadWrite): ImportedLayout {
+    if !work.limited {
+        if work.imported_order == 0 {
+            if imported_layouts_ordered(imported) { work.imported_order = 1; } else { work.imported_order = 2; }
+        }
+        return imported_layout_of_ordered(imported, dep, export_id, work.imported_order == 1);
+    }
+    var i: u32 = 0;
+    while i < @len(imported.items) as u32 {
+        if !charge_value_graph(work, 1u32) { return ImportedLayout { dep: 0, export_id: 0, size: 0, align: 0 }; }
+        if imported.items[i].dep == dep && imported.items[i].export_id == export_id { return imported.items[i]; }
+        i = i + 1;
+    }
+    return ImportedLayout { dep: 0, export_id: 0, size: 0, align: 0 };
+}
+
+function empty_layout(): LayoutInfo {
+    return LayoutInfo { value_type_id: 0, size: 0, align: 1, tag_size: 0, payload_off: 0, known: false, is_void: false };
+}
+function emit(diags: &diag::DiagBuffer:ReadWrite, code: u16): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: types::Span { file: 0, offset: 0, length: 0 }, unit: 0 , refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+function layout_of(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, table: &LayoutTable:ReadWrite, type_id: u32, work: &ValueGraphBudget:ReadWrite): LayoutInfo!AllocError {
+    if type_id == 0 || type_id > @len(type_table.entries) as u32 { return empty_layout(); }
+    if !charge_value_graph(work, 1u32) { return empty_layout(); }
+    let state: u8 = table.states[type_id - 1];
+    if state == 2 { return table.items[type_id - 1]; }
+    if state == 1 {
+        emit(diags, LAYOUT_LY_9)?;
+        return empty_layout();
+    }
+    table.states[type_id - 1] = 1;
+    let kind: u8 = type_table.entries[type_id - 1].kind;
+    var info: LayoutInfo = empty_layout();
+    info.value_type_id = type_id;
+    if kind == TK_VOID {
+        info.size = 0;
+        info.align = 1;
+        info.known = true;
+        info.is_void = true;
+    } elseif kind == TK_BUILTIN {
+        let builtin: u16 = type_table.entries[type_id - 1].builtin;
+        let align: u8 = types::builtin_align(builtin);
+        if align != 0 { info.size = align as u64; info.align = align; info.known = true; }
+        if builtin == BUILTIN_ALLOC_ERROR { info.tag_size = 1; }
+    } elseif kind == TK_REF || kind == TK_FN_REF {
+        info.size = 8;
+        info.align = 8;
+        info.known = true;
+    } elseif kind == TK_SLICE || kind == TK_TEXT_VIEW {
+        info.size = 16;
+        info.align = 8;
+        info.known = true;
+    } elseif kind == TK_DYN_ARRAY || kind == TK_TEXT {
+        // 数组头不依赖元素布局；元素合法性在整表布局完成后检查。
+        info.size = 24;
+        info.align = 8;
+        info.known = true;
+    } elseif kind == TK_FIXED_ARRAY {
+        let length: u64 = type_table.entries[type_id - 1].length;
+        let elem: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, type_table.entries[type_id - 1].elem, work)?;
+        if work.exhausted { return empty_layout(); }
+        if elem.known && elem.is_void { emit(diags, LAYOUT_LY_4)?; }
+        if length == 0 { emit(diags, LAYOUT_LY_2)?; info.known = false; }
+        elseif !elem.known || elem.is_void { info.known = false; }
+        else {
+            let stride: u64 = types::align_up(elem.size, elem.align);
+            if types::multiply_overflows(length, stride) { emit(diags, LAYOUT_LY_1)?; info.known = false; }
+            else { info.size = length * stride; info.align = elem.align; info.known = true; }
+        }
+    } elseif kind == TK_NULLABLE {
+        let elem: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, type_table.entries[type_id - 1].elem, work)?;
+        if work.exhausted { return empty_layout(); }
+        info = tagged_union(diags, 1, types::max_align(1, elem.align), elem.size)?;
+        if !elem.known { info.known = false; }
+    } elseif kind == TK_FALLIBLE {
+        let success_id: u32 = type_table.entries[type_id - 1].success;
+        let errorset_id: u32 = type_table.entries[type_id - 1].elem;
+        let success: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, success_id, work)?;
+        if work.exhausted { return empty_layout(); }
+        let errors: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, errorset_id, work)?;
+        if work.exhausted { return empty_layout(); }
+        info = tagged_union(diags, 1, types::max_align(success.align, errors.align), max_u64(success.size, errors.size))?;
+        if !success.known || !errors.known { info.known = false; }
+    } elseif kind == TK_ERROR_SET || kind == TK_PLAIN_UNION {
+        let count: u32 = type_table.entries[type_id - 1].members_count;
+        if count == 0 || count > 65536 || (kind == TK_PLAIN_UNION && count < 2) { emit(diags, LAYOUT_LY_3)?; info.known = false; }
+        elseif count == 1 {
+            if !charge_value_graph(work, 1u32) { return empty_layout(); }
+            let member: u32 = type_table.members[type_table.entries[type_id - 1].members_start];
+            info = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, member, work)?;
+            if work.exhausted { return empty_layout(); }
+        } else {
+            var tag_size: u8 = 1;
+            if count > 256 { tag_size = 2; }
+            var payload_align: u8 = 1;
+            var payload_size: u64 = 0;
+            var known: bool = true;
+            var i: u32 = 0;
+            while i < count {
+                if !charge_value_graph(work, 1u32) { return empty_layout(); }
+                let member: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, type_table.members[type_table.entries[type_id - 1].members_start + i], work)?;
+                if work.exhausted { return empty_layout(); }
+                if member.known {
+                    payload_align = types::max_align(payload_align, member.align);
+                    if member.size > payload_size { payload_size = member.size; }
+                } else { known = false; }
+                i = i + 1;
+            }
+            info = tagged_union(diags, tag_size, payload_align, payload_size)?;
+            if !known { info.known = false; }
+        }
+    } elseif kind == TK_LOCAL {
+        let def: u32 = type_table.entries[type_id - 1].def;
+        let enum_index: u32 = enum_find_limited(enums, work, def);
+        if work.exhausted { return empty_layout(); }
+        if enum_index != 0 {
+            info = layout_enum(type_table, fields, enums, imported, imported_enums, diags, table, enum_index, work)?;
+        } else {
+            info = layout_struct(type_table, fields, enums, imported, imported_enums, diags, table, def, work)?;
+        }
+    } elseif kind == TK_IMPORTED {
+        let dep: u16 = type_table.entries[type_id - 1].dep;
+        let export_id: u32 = type_table.entries[type_id - 1].export_id;
+        // 变体表命中表示导入枚举：按变体载荷推导 tag 与 payload，并与摘要交叉校验。
+        let variant: u32 = imported_enum_index(imported_enums, dep, export_id, work);
+        if work.exhausted { return empty_layout(); }
+        if variant != 0 {
+            info = layout_imported_enum(type_table, fields, enums, imported, imported_enums, diags, table, dep, export_id, work)?;
+        } else {
+            // 导入结构体按已载入接口的布局摘要取值；摘要缺失或无效时保持未知（失败关闭）。
+            let summary: ImportedLayout = imported_layout_of(imported, dep, export_id, work);
+            if work.exhausted { return empty_layout(); }
+            if summary.size > 0 && summary.align > 0 {
+                info.size = summary.size;
+                info.align = summary.align;
+                info.known = true;
+            } else { info.known = false; }
+        }
+    }
+    if work.exhausted { return empty_layout(); }
+    if info.known && info.size == 0 && !info.is_void {
+        emit(diags, LAYOUT_LY_2)?;
+        info.known = false;
+    }
+    info.value_type_id = type_id;
+    table.items[type_id - 1] = info;
+    table.states[type_id - 1] = 2;
+    return info;
+}
+function max_u64(left: u64, right: u64): u64 {
+    if left > right { return left; }
+    return right;
+}
+function tagged_union(diags: &diag::DiagBuffer:ReadWrite, tag_size: u8, payload_align: u8, payload_size: u64): LayoutInfo!AllocError {
+    let value: types::Measure = types::union_layout(tag_size, payload_align, payload_size);
+    if value.size == 0 { emit(diags, LAYOUT_LY_1)?; return empty_layout(); }
+    return LayoutInfo { value_type_id: 0, size: value.size, align: value.align, tag_size: tag_size, payload_off: value.payload_off, known: true, is_void: false };
+}
+export function value_graph_budget(limit: u32): ValueGraphBudget {
+    return ValueGraphBudget { limited: limit != 0u32, remaining: limit, exhausted: false, enum_ordered: false, imported_order: 0 };
+}
+// 文档声明检查按递增的定义编号产出唯一枚举行，无需复扫确认顺序。
+export function document_value_graph_budget(limit: u32): ValueGraphBudget {
+    return ValueGraphBudget { limited: limit != 0u32, remaining: limit, exhausted: false, enum_ordered: true, imported_order: 0 };
+}
+function charge_value_graph(work: &ValueGraphBudget:ReadWrite, steps: u32): bool {
+    if !work.limited { return true; }
+    if work.exhausted { return false; }
+    if steps > work.remaining { work.exhausted = true; return false; }
+    work.remaining = work.remaining - steps;
+    return true;
+}
+function enum_find_limited(enums: &typecheck::EnumTable:Read, work: &ValueGraphBudget:ReadWrite, def: u32): u32 {
+    let count: u32 = @len(enums.items) as u32;
+    if work.enum_ordered {
+        var lo: u32 = 0;
+        var hi: u32 = count;
+        while lo < hi {
+            if !charge_value_graph(work, 1u32) { return 0; }
+            let mid: u32 = lo + (hi - lo) / 2;
+            let key: u32 = enums.items[mid].def;
+            if key == def { return mid + 1; }
+            if key < def { lo = mid + 1; } else { hi = mid; }
+        }
+        return 0;
+    }
+    var i: u32 = 0;
+    while i < count {
+        if !charge_value_graph(work, 1u32) { return 0; }
+        if enums.items[i].def == def { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 仅对已验证按定义编号有序的字段表二分定位。
+function field_order_limited(fields: &typecheck::FieldTable:Read, work: &ValueGraphBudget:ReadWrite): u8 {
+    let count: u32 = @len(fields.items) as u32;
+    var i: u32 = 1;
+    while i < count {
+        if !charge_value_graph(work, 1u32) { return 0; }
+        if fields.items[i - 1].def > fields.items[i].def { return 2; }
+        i = i + 1;
+    }
+    return 1;
+}
+function field_order_of(fields: &typecheck::FieldTable:Read): u8 {
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    return field_order_limited(fields, &work:ReadWrite);
+}
+function field_start_limited(fields: &typecheck::FieldTable:Read, work: &ValueGraphBudget:ReadWrite, def: u32, order: u8): u32 {
+    if order != 1 { return 0; }
+    var lo: u32 = 0;
+    var hi: u32 = @len(fields.items) as u32;
+    while lo < hi {
+        if !charge_value_graph(work, 1u32) { return 0; }
+        let mid: u32 = lo + (hi - lo) / 2;
+        if fields.items[mid].def < def { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+function field_start(fields: &typecheck::FieldTable:Read, def: u32, order: u8): u32 {
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    return field_start_limited(fields, &work:ReadWrite, def, order);
+}
+
+export struct FieldRange { start: u32, end: u32 }
+
+// 有序表只返回目标定义的连续字段；无序表仍由调用方按原始声明序过滤。
+export function field_range(table: &LayoutTable:Read, fields: &typecheck::FieldTable:Read, def: u32): FieldRange {
+    let total: u32 = @len(fields.items) as u32;
+    if table.field_order != 1 { return FieldRange { start: 0, end: total }; }
+    let start: u32 = field_start(fields, def, table.field_order);
+    var end: u32 = start;
+    while end < total && fields.items[end].def == def { end = end + 1; }
+    return FieldRange { start: start, end: end };
+}
+
+function struct_field_count(fields: &typecheck::FieldTable:Read, def: u32, start: u32, order: u8, work: &ValueGraphBudget:ReadWrite): u32 {
+    var count: u32 = 0;
+    var i: u32 = start;
+    let total: u32 = @len(fields.items) as u32;
+    while i < total {
+        if !charge_value_graph(work, 1u32) { return 0; }
+        if order == 1 && fields.items[i].def != def { break; }
+        if fields.items[i].def == def { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+// 文档前端只核验本地按值图。缓存最长后缀，活动节点留给正式布局识别循环。
+struct ValueDepth { heights: u32[], active: bool[], field_order: u8 }
+
+function max_depth(left: u32, right: u32): u32 {
+    if left > right { return left; }
+    return right;
+}
+
+function value_depth(tt: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read,
+    enums: &typecheck::EnumTable:Read, marks: &ValueDepth:ReadWrite, work: &ValueGraphBudget:ReadWrite, id: u32, remaining: u32): u32 {
+    if id == 0u32 || id > @len(tt.entries) as u32 { return 0u32; }
+    if !charge_value_graph(work, 1u32) { return 0u32; }
+    let index: u32 = id - 1u32;
+    if marks.active[index] { return 0u32; }
+    if remaining == 0u32 { return 1u32; }
+    if marks.heights[index] != 0u32 { return marks.heights[index]; }
+    marks.active[index] = true;
+    let entry: typecheck::TypeEntry = tt.entries[index];
+    let next: u32 = remaining - 1u32;
+    var deepest: u32 = 0;
+    if entry.kind == TK_FIXED_ARRAY || entry.kind == TK_NULLABLE {
+        deepest = value_depth(tt, fields, enums, marks, work, entry.elem, next);
+    } elseif entry.kind == TK_FALLIBLE {
+        deepest = value_depth(tt, fields, enums, marks, work, entry.success, next);
+        if !work.exhausted && deepest <= next {
+            deepest = max_depth(deepest, value_depth(tt, fields, enums, marks, work, entry.elem, next));
+        }
+    } elseif (entry.kind == TK_ERROR_SET || entry.kind == TK_PLAIN_UNION) && entry.members_count <= 65536u32 {
+        var at: u32 = 0;
+        while at < entry.members_count && deepest <= next && !work.exhausted {
+            if !charge_value_graph(work, 1u32) { break; }
+            deepest = max_depth(deepest, value_depth(tt, fields, enums, marks, work, tt.members[entry.members_start + at], next));
+            at = at + 1u32;
+        }
+    } elseif entry.kind == TK_LOCAL {
+        let ei: u32 = enum_find_limited(enums, work, entry.def);
+        if work.exhausted { return 0u32; }
+        if ei != 0u32 {
+            var at: u32 = 0;
+            while at < @len(enums.items[ei - 1u32].payloads) as u32 && deepest <= next && !work.exhausted {
+                if !charge_value_graph(work, 1u32) { break; }
+                deepest = max_depth(deepest, value_depth(tt, fields, enums, marks, work, enums.items[ei - 1u32].payloads[at], next));
+                at = at + 1u32;
+            }
+        } else {
+            let order: u8 = marks.field_order;
+            var at: u32 = field_start_limited(fields, work, entry.def, order);
+            if work.exhausted { return 0u32; }
+            while at < @len(fields.items) as u32 && deepest <= next && !work.exhausted {
+                if !charge_value_graph(work, 1u32) { break; }
+                let field: typecheck::FieldType = fields.items[at];
+                if field.def == entry.def {
+                    deepest = max_depth(deepest, value_depth(tt, fields, enums, marks, work, field.type_id, next));
+                } elseif order == 1u8 { break; }
+                at = at + 1u32;
+            }
+        }
+    }
+    let height: u32 = deepest + 1u32;
+    marks.active[index] = false;
+    if !work.exhausted && height <= remaining { marks.heights[index] = height; }
+    return height;
+}
+
+// 叶算一层；引用、切片、函数引用和动态数组头不递归到元素。
+export function value_depth_limited(tt: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read,
+    enums: &typecheck::EnumTable:Read, limit: u32, work: &ValueGraphBudget:ReadWrite): bool!AllocError {
+    let count: u32 = @len(tt.entries) as u32;
+    if !charge_value_graph(work, count) { return false; }
+    let order: u8 = field_order_limited(fields, work);
+    if work.exhausted { return false; }
+    var marks: ValueDepth = ValueDepth { heights: [], active: [], field_order: order };
+    var i: u32 = 0;
+    while i < count {
+        @push(marks.heights, 0u32)?;
+        @push(marks.active, false)?;
+        i = i + 1u32;
+    }
+    i = 0;
+    while i < count {
+        let height: u32 = value_depth(tt, fields, enums, &marks:ReadWrite, work, i + 1u32, limit);
+        if work.exhausted || height > limit { return false; }
+        i = i + 1u32;
+    }
+    return true;
+}
+export function value_depth_within(tt: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read,
+    enums: &typecheck::EnumTable:Read, limit: u32): bool!AllocError {
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    return value_depth_limited(tt, fields, enums, limit, &work:ReadWrite)?;
+}
+
+function layout_struct(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, table: &LayoutTable:ReadWrite, def: u32, work: &ValueGraphBudget:ReadWrite): LayoutInfo!AllocError {
+    let start: u32 = field_start_limited(fields, work, def, table.field_order);
+    if work.exhausted { return empty_layout(); }
+    let count: u32 = struct_field_count(fields, def, start, table.field_order, work);
+    if work.exhausted { return empty_layout(); }
+    if count == 0 { emit(diags, LAYOUT_LY_2)?; return empty_layout(); }
+    if count > 65536 { emit(diags, LAYOUT_LY_10)?; return empty_layout(); }
+    var offset: u64 = 0;
+    var alignment: u8 = 1;
+    var known: bool = true;
+    var i: u32 = start;
+    let total: u32 = @len(fields.items) as u32;
+    while i < total {
+        if !charge_value_graph(work, 1u32) { return empty_layout(); }
+        if table.field_order == 1 && fields.items[i].def != def { break; }
+        if fields.items[i].def == def {
+            let field: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, fields.items[i].type_id, work)?;
+            if work.exhausted { return empty_layout(); }
+            if !field.known { known = false; }
+            elseif field.size == 0 { emit(diags, LAYOUT_LY_4)?; known = false; }
+            else {
+                offset = types::align_up(offset, field.align);
+                if types::add_overflows(offset, field.size) { emit(diags, LAYOUT_LY_1)?; known = false; }
+                else { offset = offset + field.size; }
+                alignment = types::max_align(alignment, field.align);
+            }
+        }
+        i = i + 1;
+    }
+    let size: u64 = types::align_up(offset, alignment);
+    if known && size == 0 { emit(diags, LAYOUT_LY_2)?; known = false; }
+    if types::alignment_overflows(offset, alignment) { emit(diags, LAYOUT_LY_1)?; known = false; }
+    var info: LayoutInfo = empty_layout();
+    info.size = size;
+    info.align = alignment;
+    info.known = known;
+    return info;
+}
+function layout_enum(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, table: &LayoutTable:ReadWrite, index: u32, work: &ValueGraphBudget:ReadWrite): LayoutInfo!AllocError {
+    let count: u32 = @len(enums.items[index - 1].payloads) as u32;
+    if count == 0 { emit(diags, LAYOUT_LY_2)?; return empty_layout(); }
+    if count > 65536 { emit(diags, LAYOUT_LY_3)?; return empty_layout(); }
+    var tag_size: u8 = 1;
+    if count > 256 { tag_size = 2; }
+    var payload_align: u8 = 1;
+    var payload_size: u64 = 0;
+    var known: bool = true;
+    var i: u32 = 0;
+    while i < count {
+        if !charge_value_graph(work, 1u32) { return empty_layout(); }
+        let payload: u32 = enums.items[index - 1].payloads[i];
+        if payload != 0 {
+            let info: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, payload, work)?;
+            if work.exhausted { return empty_layout(); }
+            if !info.known { known = false; }
+            elseif info.size == 0 { emit(diags, LAYOUT_LY_4)?; known = false; }
+            else {
+                payload_align = types::max_align(payload_align, info.align);
+                if info.size > payload_size { payload_size = info.size; }
+            }
+        }
+        i = i + 1;
+    }
+    var result: LayoutInfo = tagged_union(diags, tag_size, payload_align, payload_size)?;
+    if !known { result.known = false; }
+    return result;
+}
+// 导入枚举变体组是否存在；返回第一个变体条目的 1 基下标，0 表示不是枚举。
+function imported_enum_index(imported_enums: &typecheck::ImportedEnumTable:Read, dep: u16, export_id: u32, work: &ValueGraphBudget:ReadWrite): u32 {
+    var i: u32 = 0;
+    while i < @len(imported_enums.items) as u32 {
+        if !charge_value_graph(work, 1u32) { return 0; }
+        if imported_enums.items[i].dep == dep && imported_enums.items[i].export_id == export_id { return i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// 导入枚举布局：变体数与载荷尺寸来自消费方类型映射，tag 宽度按变体数，
+// payload 偏移按 tagged union 规则；摘要缺失或与推导不一致时保持未知。
+function layout_imported_enum(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, table: &LayoutTable:ReadWrite, dep: u16, export_id: u32, work: &ValueGraphBudget:ReadWrite): LayoutInfo!AllocError {
+    var count: u32 = 0;
+    var payload_align: u8 = 1;
+    var payload_size: u64 = 0;
+    var known: bool = true;
+    var i: u32 = 0;
+    while i < @len(imported_enums.items) as u32 {
+        if !charge_value_graph(work, 1u32) { return empty_layout(); }
+        let variant: &typecheck::ImportedEnumVariant:Read = &imported_enums.items[i]:Read;
+        if variant.dep == dep && variant.export_id == export_id {
+            count = count + 1;
+            if !variant.known { known = false; }
+            elseif variant.payload != 0 {
+                let payload: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, diags, table, variant.payload, work)?;
+                if work.exhausted { return empty_layout(); }
+                if !payload.known || payload.is_void || payload.size == 0 { known = false; }
+                else {
+                    payload_align = types::max_align(payload_align, payload.align);
+                    if payload.size > payload_size { payload_size = payload.size; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if count == 0 || count > 65536 { return empty_layout(); }
+    var tag_size: u8 = 1;
+    if count > 256 { tag_size = 2; }
+    if !known { return empty_layout(); }
+    let value: types::Measure = types::union_layout(tag_size, payload_align, payload_size);
+    if value.size == 0 { emit(diags, LAYOUT_LY_1)?; return empty_layout(); }
+    // 摘要必须与变体推导的尺寸/对齐一致；自相矛盾的接口事实按未知拒绝。
+    let summary: ImportedLayout = imported_layout_of(imported, dep, export_id, work);
+    if work.exhausted { return empty_layout(); }
+    if summary.size != value.size || summary.align != value.align { return empty_layout(); }
+    return LayoutInfo { value_type_id: 0, size: value.size, align: value.align, tag_size: tag_size, payload_off: value.payload_off, known: true, is_void: false };
+}
+// 导入结构体字段偏移：按已定型字段的尺寸/对齐序列累加（yak64-v1 规则）。
+// MIR 对导入类型做字段访问时使用；index 为 1 基字段序，越界或对齐非法返回 0xFFFFFFFF。
+export function imported_field_offset(sizes: &u64[]:Read, aligns: &u8[]:Read, index: u32): u64 {
+    if index == 0 || index > @len((*sizes)) as u32 || index > @len((*aligns)) as u32 { return 4294967295u64; }
+    var offset: u64 = 0;
+    var i: u32 = 0;
+    while i < index {
+        let a: u64 = (*aligns)[i] as u64;
+        // 合法对齐只有 1/2/4/8；其余按失败关闭处理。
+        if a != 1 && a != 2 && a != 4 && a != 8 { return 4294967295u64; }
+        offset = ((offset + a - 1) / a) * a;
+        if i + 1 == index { return offset; }
+        offset = offset + (*sizes)[i];
+        i = i + 1;
+    }
+    return 4294967295u64;
+}
+// 导入结构体总体布局：字段尺寸/对齐序列出后按 yak64-v1 求总尺寸与尾部对齐。
+// 与 imported_field_offset 配套使用；空表或非法对齐返回 0xFFFFFFFF（失败关闭）。
+export function imported_struct_size(sizes: &u64[]:Read, aligns: &u8[]:Read): u64 {
+    if @len((*sizes)) == 0 || @len((*sizes)) != @len((*aligns)) { return 4294967295u64; }
+    var offset: u64 = 0;
+    var max_align: u64 = 1;
+    var i: u32 = 0;
+    while i < @len((*sizes)) as u32 {
+        let a: u64 = (*aligns)[i] as u64;
+        if a != 1 && a != 2 && a != 4 && a != 8 { return 4294967295u64; }
+        if a > max_align { max_align = a; }
+        offset = ((offset + a - 1) / a) * a + (*sizes)[i];
+        i = i + 1;
+    }
+    return ((offset + max_align - 1) / max_align) * max_align;
+}
+// 导入结构体字段布局：offset 是按 yak64-v1 规则由字段尺寸/对齐累加得到的
+// 字段起点，field 为 1 基声明序，type 是消费方规范类型编号。
+// known=false 表示摘要缺失、字段类型未知或推导尺寸/对齐与摘要不一致，
+// 后端不得据此求字段地址，必须失败关闭。
+export struct ImportedFieldLayout {
+    dep: u16,
+    export_id: u32,
+    field: u32,
+    value_type_id: u32,
+    offset: u64,
+    size: u64,
+    align: u8,
+    known: bool,
+}
+export struct ImportedFieldLayoutTable { items: ImportedFieldLayout[] }
+// 只有已验证按（依赖编号，导出编号）排列的字段表才能二分及提前结束。
+export function imported_fields_ordered(fields: &ImportedFieldLayoutTable:Read): bool {
+    let total: u32 = @len(fields.items) as u32;
+    var i: u32 = 1;
+    while i < total {
+        let prev: ImportedFieldLayout = fields.items[i - 1];
+        let next: ImportedFieldLayout = fields.items[i];
+        if prev.dep > next.dep || (prev.dep == next.dep && prev.export_id > next.export_id) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+export function imported_fields_start(fields: &ImportedFieldLayoutTable:Read, dep: u16, export_id: u32, ordered: bool): u32 {
+    if !ordered { return 0; }
+    var lo: u32 = 0;
+    var hi: u32 = @len(fields.items) as u32;
+    while lo < hi {
+        let mid: u32 = lo + (hi - lo) / 2;
+        let item: ImportedFieldLayout = fields.items[mid];
+        if item.dep < dep || (item.dep == dep && item.export_id < export_id) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+// 把导入字段类型表组合成 (dep, export_id) → 字段偏移表。
+// 输入与 typecheck 产出的字段表同序；同一结构体的字段必须连续出现。
+// 摘要尺寸/对齐与字段推导不一致时整组标记未知，不输出部分可信的偏移。
+export function imported_field_layouts(fields: &typecheck::ImportedFieldTable:Read, table: &LayoutTable:Read, summaries: &ImportedLayoutTable:Read): ImportedFieldLayoutTable!AllocError {
+    let summaries_ordered: bool = imported_layouts_ordered(summaries);
+    var result_table: ImportedFieldLayoutTable = ImportedFieldLayoutTable { items: [] };
+    var i: u32 = 0;
+    while i < @len(fields.items) as u32 {
+        let group_dep: u16 = fields.items[i].dep;
+        let group_export: u32 = fields.items[i].export_id;
+        var sizes: u64[] = [];
+        var aligns: u8[] = [];
+        var field_types: u32[] = [];
+        var known: bool = true;
+        var j: u32 = i;
+        while j < @len(fields.items) as u32 && fields.items[j].dep == group_dep && fields.items[j].export_id == group_export {
+            let type_id: u32 = fields.items[j].value_type_id;
+            var size: u64 = 0;
+            var align: u8 = 0;
+            // 字段类型必须在已求值的布局表中是已知且非 void 的存储类型。
+            if type_id == 0 || type_id > @len(table.items) as u32 { known = false; }
+            elseif !table.items[type_id - 1].known || table.items[type_id - 1].is_void || table.items[type_id - 1].size == 0 { known = false; }
+            else {
+                size = table.items[type_id - 1].size;
+                align = table.items[type_id - 1].align;
+            }
+            @push(sizes, size)?;
+            @push(aligns, align)?;
+            @push(field_types, type_id)?;
+            j = j + 1;
+        }
+        let summary: ImportedLayout = imported_layout_of_ordered(summaries, group_dep, group_export, summaries_ordered);
+        if summary.size == 0 || summary.align == 0 { known = false; }
+        elseif known {
+            let total: u64 = imported_struct_size(&sizes:Read, &aligns:Read);
+            var max_align: u64 = 1;
+            var a: u32 = 0;
+            while a < @len(aligns) as u32 {
+                if aligns[a] as u64 > max_align { max_align = aligns[a] as u64; }
+                a = a + 1;
+            }
+            if total == 4294967295u64 || total != summary.size || max_align != summary.align as u64 { known = false; }
+        }
+        // 偏移在整组都可信时按单遍对齐累加计算，避免重复扫描前驱字段。
+        var offsets: u64[] = [];
+        var running_offset: u64 = 0;
+        var k: u32 = 0;
+        while k < @len(sizes) as u32 {
+            var offset: u64 = 4294967295u64;
+            if known {
+                let a: u64 = aligns[k] as u64;
+                if a == 1 || a == 2 || a == 4 || a == 8 {
+                    running_offset = ((running_offset + a - 1) / a) * a;
+                    offset = running_offset;
+                    running_offset = running_offset + sizes[k];
+                }
+            }
+            @push(offsets, offset)?;
+            k = k + 1;
+        }
+        k = 0;
+        while k < @len(sizes) as u32 {
+            @push(result_table.items, ImportedFieldLayout { dep: group_dep, export_id: group_export, field: k + 1, value_type_id: field_types[k], offset: offsets[k], size: sizes[k], align: aligns[k], known: known })?;
+            k = k + 1;
+        }
+        i = j;
+    }
+    return result_table;
+}
+// 有布局错误时整张表均不可供后续阶段使用，调用方须先检查诊断。
+// 兼容入口：不提供导入布局摘要，导入名义类型保持未知。
+export function layout_unit(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, diags: &diag::DiagBuffer:ReadWrite): LayoutResult!AllocError {
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    return layout_unit_limited(type_table, fields, enums, diags, &work:ReadWrite)?;
+}
+export function layout_unit_limited(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, work: &ValueGraphBudget:ReadWrite): LayoutResult!AllocError {
+    let no_imports: ImportedLayoutTable = ImportedLayoutTable { items: [] };
+    let no_imported_enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    return layout_unit_scoped(type_table, fields, enums, &no_imports:Read, &no_imported_enums:Read, diags, work)?;
+}
+// 带导入布局摘要与导入枚举变体表的入口：驱动把直接依赖的 .iface 事实传入，
+// 使导入名义类型的尺寸、对齐、枚举 tag 与 payload 均可求值。
+export function layout_unit_with_imports(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite): LayoutResult!AllocError {
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    return layout_unit_with_imports_limited(type_table, fields, enums, imported, imported_enums, diags, &work:ReadWrite)?;
+}
+export function layout_unit_with_imports_limited(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, work: &ValueGraphBudget:ReadWrite): LayoutResult!AllocError {
+    return layout_unit_scoped(type_table, fields, enums, imported, imported_enums, diags, work)?;
+}
+function layout_unit_scoped(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite, work: &ValueGraphBudget:ReadWrite): LayoutResult!AllocError {
+    var table: LayoutTable = LayoutTable { items: [], states: [], field_order: 0 };
+    let count: u32 = @len(type_table.entries) as u32;
+    if !charge_value_graph(work, count) { return LayoutResult { table: table }; }
+    table.field_order = field_order_limited(fields, work);
+    if work.exhausted { return LayoutResult { table: table }; }
+    if !work.limited {
+        // 源码枚举行按 DefId 追加；手工表仍支持非排序输入。
+        work.enum_ordered = true;
+        var row: u32 = 1;
+        while row < @len(enums.items) as u32 {
+            if enums.items[row - 1].def >= enums.items[row].def { work.enum_ordered = false; break; }
+            row = row + 1;
+        }
+    }
+    var i: u32 = 0;
+    while i < @len(type_table.entries) as u32 {
+        @push(table.items, empty_layout())?;
+        @push(table.states, 0)?;
+        i = i + 1;
+    }
+    i = 1;
+    while i <= @len(type_table.entries) as u32 {
+        layout_of(type_table, fields, enums, imported, imported_enums, diags, &table:ReadWrite, i, work)?;
+        if work.exhausted { return LayoutResult { table: table }; }
+        i = i + 1;
+    }
+    // 延后检查元素，避免把动态数组引入的间接递归误判为按值环。
+    if !charge_value_graph(work, count) { return LayoutResult { table: table }; }
+    i = 0;
+    while i < @len(type_table.entries) as u32 {
+        if type_table.entries[i].kind == TK_DYN_ARRAY {
+            let elem: u32 = type_table.entries[i].elem;
+            if elem > 0 && elem <= @len(table.items) as u32 {
+                if table.items[elem - 1].known && (table.items[elem - 1].is_void || table.items[elem - 1].size == 0) {
+                    if table.items[elem - 1].is_void { emit(diags, LAYOUT_LY_4)?; }
+                    emit(diags, LAYOUT_LY_2)?;
+                    table.items[i].known = false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return LayoutResult { table: table };
+}
+
+// 计算整张布局表并直接返回：供发射期按类型取尺寸，不再回读检查阶段状态。
+// 无导入摘要时导入名义类型保持未知。
+export function layout_table_for(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, diags: &diag::DiagBuffer:ReadWrite): LayoutTable!AllocError {
+    let no_imports: ImportedLayoutTable = ImportedLayoutTable { items: [] };
+    let no_imported_enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    return layout_table_with_imports(type_table, fields, enums, &no_imports:Read, &no_imported_enums:Read, diags)?;
+}
+// 带导入布局摘要与导入枚举变体表的整表入口：MIR 与 COFF 共用同一布局真源。
+export function layout_table_with_imports(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, diags: &diag::DiagBuffer:ReadWrite): LayoutTable!AllocError {
+    let result: LayoutResult = layout_unit_with_imports(type_table, fields, enums, imported, imported_enums, diags)?;
+    var table: LayoutTable = LayoutTable { items: [], states: [], field_order: 0 };
+    table.field_order = result.table.field_order;
+    var i: u32 = 0;
+    while i < @len(result.table.items) as u32 {
+        @push(table.items, result.table.items[i])?;
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(result.table.states) as u32 {
+        @push(table.states, result.table.states[i])?;
+        i = i + 1;
+    }
+    return table;
+}
+
+// 按布局偏移查找字段类型；偏移落在填充或字段内部时返回 0。
+export function field_type_at(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, def: u32, target: u64): u32!AllocError {
+    var table: LayoutTable = LayoutTable { items: [], states: [], field_order: 0 };
+    var t: u32 = 0;
+    while t < @len(type_table.entries) as u32 {
+        @push(table.items, empty_layout())?;
+        @push(table.states, 0)?;
+        t = t + 1;
+    }
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    var scratch: diag::DiagBuffer = diag::diagbuf_new();
+    let no_imports: ImportedLayoutTable = ImportedLayoutTable { items: [] };
+    let no_imported_enums: typecheck::ImportedEnumTable = typecheck::ImportedEnumTable { items: [] };
+    var offset: u64 = 0;
+    var i: u32 = 0;
+    while i < @len(fields.items) as u32 {
+        if fields.items[i].def == def {
+            let field: LayoutInfo = layout_of(type_table, fields, enums, &no_imports:Read, &no_imported_enums:Read, &scratch:ReadWrite, &table:ReadWrite, fields.items[i].type_id, &work:ReadWrite)?;
+            if !field.known || field.size == 0 { return 0; }
+            offset = types::align_up(offset, field.align);
+            if types::add_overflows(offset, field.size) { return 0; }
+            if offset == target { return fields.items[i].type_id; }
+            if offset > target { return 0; }
+            offset = offset + field.size;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 查询结构体第 index 个字段（按声明序、从 0 起）相对结构体起始的字节偏移。
+// 未知类型或越界返回 0xFFFFFFFF，调用方必须按拒绝处理，不能当成偏移 0 使用。
+// 算法与 layout_struct 完全一致：逐字段向上对齐后累加。
+export function field_byte_offset_with_imports(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, def: u32, index: u32): u64!AllocError {
+    var table: LayoutTable = LayoutTable { items: [], states: [], field_order: 0 };
+    return field_byte_offset_with_cache(type_table, fields, enums, imported, imported_enums, &table:ReadWrite, def, index)?;
+}
+
+// 缓存从空表开始，同一单元只登记一次类型槽；后续查询沿用已知布局。
+export function field_byte_offset_with_cache(type_table: &typecheck::TypeTable:Read, fields: &typecheck::FieldTable:Read, enums: &typecheck::EnumTable:Read, imported: &ImportedLayoutTable:Read, imported_enums: &typecheck::ImportedEnumTable:Read, table: &LayoutTable:ReadWrite, def: u32, index: u32): u64!AllocError {
+    var t: u32 = @len(table.items) as u32;
+    while t < @len(type_table.entries) as u32 {
+        @push(table.items, empty_layout())?;
+        @push(table.states, 0)?;
+        t = t + 1;
+    }
+    if table.field_order == 0 { table.field_order = field_order_of(fields); }
+    // 只求到目标字段为止；布局诊断由布局阶段统一报告。
+    var work: ValueGraphBudget = value_graph_budget(0u32);
+    var scratch: diag::DiagBuffer = diag::diagbuf_new();
+    var seen: u32 = 0;
+    let count: u32 = @len(fields.items) as u32;
+    var i: u32 = field_start(fields, def, table.field_order);
+    while i < count {
+        if table.field_order == 1 && fields.items[i].def != def { break; }
+        if fields.items[i].def == def {
+            let field: LayoutInfo = layout_of(type_table, fields, enums, imported, imported_enums, &scratch:ReadWrite, table, fields.items[i].type_id, &work:ReadWrite)?;
+            if !field.known { return 4294967295u64; }
+            if seen == index { break; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return field_byte_offset_from_table(&*table:Read, fields, def, index);
+}
+
+// 发射阶段复用既有布局表，避免再次推导或遗漏导入摘要。
+export function field_byte_offset_from_table(table: &LayoutTable:Read, fields: &typecheck::FieldTable:Read, def: u32, index: u32): u64 {
+    let none: u64 = 4294967295u64;
+    var offset: u64 = 0;
+    var seen: u32 = 0;
+    let count: u32 = @len(fields.items) as u32;
+    var i: u32 = field_start(fields, def, table.field_order);
+    while i < count {
+        if table.field_order == 1 && fields.items[i].def != def { break; }
+        if fields.items[i].def == def {
+            let id: u32 = fields.items[i].type_id;
+            if id == 0 || id > @len(table.items) as u32 { return none; }
+            let field: LayoutInfo = table.items[id - 1];
+            if !field.known || field.size == 0 { return none; }
+            offset = types::align_up(offset, field.align);
+            if types::add_overflows(offset, field.size) { return none; }
+            if seen == index { return offset; }
+            offset = offset + field.size;
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return none;
+}

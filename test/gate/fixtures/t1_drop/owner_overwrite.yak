@@ -1,0 +1,19 @@
+// 整值覆盖：var 重新赋值前逆序析构旧聚合值，再析构新值。
+struct Pair { left: u32[], right: u32[] }
+
+function overwrite(): void!AllocError {
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, 101u32)?;
+    @push(b, 102u32)?;
+    var p: Pair = Pair { left: @move(a), right: @move(b) };
+    var c: u32[] = [];
+    var d: u32[] = [];
+    @push(c, 103u32)?;
+    @push(d, 104u32)?;
+    p = Pair { left: @move(c), right: @move(d) };
+    @drop(p);
+    return;
+}
+
+function main(): void { overwrite(); return; }

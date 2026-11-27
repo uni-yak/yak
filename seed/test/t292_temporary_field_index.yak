@@ -1,0 +1,40 @@
+// mem_limit: 500000
+foreign assert(cond: bool): void;
+struct Inner { values: [u32; 2] }
+struct Outer { inner: Inner, data: u32[] }
+enum Failure { Bad }
+function make(ok: bool, calls: &u32:ReadWrite): Outer!Failure {
+    *calls = *calls + 1u32;
+    if !ok { return Failure::Bad; }
+    return Outer { inner: Inner { values: [11u32, 22u32] }, data: [1u32, 2u32] };
+}
+function index(ok: bool, calls: &u32:ReadWrite): u32!Failure {
+    assert(*calls > 0u32);
+    *calls = *calls + 1u32;
+    if !ok { return Failure::Bad; }
+    return 1u32;
+}
+function read(base_ok: bool, index_ok: bool, calls: &u32:ReadWrite): u32!Failure {
+    return (make(base_ok, calls)?).inner.values[index(index_ok, calls)?];
+}
+function recover(e: &Failure): u32 { return 99u32; }
+function ordered(calls: &u32:ReadWrite): u32 { assert(*calls == 1u32); return 0u32; }
+function order(calls: &u32:ReadWrite): u32!Failure { return (make(true, calls)?).inner.values[ordered(calls)]; }
+function main(): void {
+    var seen: u32 = 0;
+    assert(order(&seen:ReadWrite).catch(&recover) == 11u32);
+    assert(seen == 1u32);
+    let held: Outer = Outer { inner: Inner { values: [3u32, 4u32] }, data: [5u32] };
+    assert(held.inner.values[0u32] == 3u32);
+    assert((&held).inner.values[1u32] == 4u32);
+    var calls: u32 = 0;
+    assert(read(false, true, &calls:ReadWrite).catch(&recover) == 99u32);
+    assert(calls == 1u32);
+    var i: u32 = 0;
+    while i < 1000u32 {
+        assert(read(true, false, &calls:ReadWrite).catch(&recover) == 99u32);
+        assert(read(true, true, &calls:ReadWrite).catch(&recover) == 22u32);
+        i = i + 1u32;
+    }
+    assert(calls == 4001u32);
+}

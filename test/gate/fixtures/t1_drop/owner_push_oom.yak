@@ -1,0 +1,27 @@
+// @push 拥有元素时注入外层分配失败：失败只析构已接收的新元素；
+// 目标数组仍保留原有元素，并由错误完成路径正常析构一次。
+foreign write(data: &[u8]): void;
+
+struct Payload { data: u32[] }
+
+function trigger(): void!AllocError {
+    write("before-oom\n");
+    var base: u32[] = [];
+    @push(base, 50u32)?;
+    var first: Payload = Payload { data: @move(base) };
+    var items: Payload[] = [];
+    @push(items, @move(first))?;
+    var inner: u32[] = [];
+    @push(inner, 91u32)?;
+    var p: Payload = Payload { data: @move(inner) };
+    @push(items, @move(p))?;
+    write("after-oom\n");
+    return;
+}
+
+function outer(): void!AllocError {
+    trigger()?;
+    return;
+}
+
+function main(): void { outer(); return; }

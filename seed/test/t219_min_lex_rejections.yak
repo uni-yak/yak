@@ -1,0 +1,57 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+import lex;
+foreign assert(cond: bool): void;
+function rejects(src: &[u8], code: u16, offset: u32): void!AllocError {
+    let r: lex::LexResult = lex::lex_scan(src, 12)?;
+    assert(@len(r.tokens) == 0 && @len(r.diagnostics) == 1);
+    assert(r.diagnostics[0].code.raw == code);
+    assert(r.diagnostics[0].span.offset == offset && r.diagnostics[0].span.file == 12);
+    return;
+}
+function main(): void {
+    rejects("", 1018, 0)?;
+    rejects("a", 1018, 1)?;
+    rejects("a\n\n", 1018, 2)?;
+    rejects("a\rb\n", 1017, 1)?;
+    rejects("/// doc\n", 1002, 0)?;
+    rejects("/** doc */\n", 1002, 0)?;
+    rejects("/* open\n", 1019, 0)?;
+    rejects("# foo\n", 1016, 0)?;
+    rejects("#function\n", 1016, 0)?;
+    rejects("#_\n", 1016, 0)?;
+    rejects("@\n", 1011, 0)?;
+    rejects("@unknown\n", 1011, 0)?;
+    rejects("@size_of\n", 3008, 0)?;
+    rejects("null\n", 1008, 0)?;
+    rejects("loop\n", 3008, 0)?;
+    rejects("let a = $;\n", 1016, 8)?;
+    rejects("\"\\q\"\n", 1006, 1)?;
+    rejects("\"\\x41\"\n", 1006, 1)?;
+    rejects("\"\\u{}\"\n", 1006, 1)?;
+    rejects("\"\\u{D800}\"\n", 1006, 1)?;
+    rejects("\"\\u{110000}\"\n", 1006, 1)?;
+    rejects("\"\\u{0000000}\"\n", 1006, 1)?;
+    rejects("\"open\n", 1005, 5)?;
+    rejects("''\n", 1022, 0)?;
+    rejects("'ab'\n", 1022, 0)?;
+    rejects("0x\n", 1021, 0)?;
+    rejects("0b2\n", 1021, 0)?;
+    rejects("0o8\n", 1021, 0)?;
+    rejects("123abc\n", 1021, 3)?;
+    rejects("1u128\n", 1021, 1)?;
+    rejects("256u8\n", 1004, 0)?;
+    rejects("129i8\n", 1004, 0)?;
+    rejects("18446744073709551616\n", 1004, 0)?;
+    rejects("1.5\n", 1007, 0)?;
+    rejects("b\"x\"\n", 3008, 0)?;
+    rejects("r#\"x\"#\n", 3008, 0)?;
+    rejects("`x`\n", 3008, 0)?;
+    rejects("a?.b\n", 3008, 1)?;
+    rejects("a??b\n", 3008, 1)?;
+    rejects("1..=2\n", 3008, 1)?;
+}

@@ -1,0 +1,17 @@
+// t10: 嵌套函数调用 + assert
+foreign assert(cond: bool): void;
+
+function double(x: u32): u32 {
+    return x * 2;
+}
+
+function add(a: u32, b: u32): u32 {
+    return a + b;
+}
+
+function main(): void {
+    let r: u32 = add(double(3), double(4));
+    assert(r == 14);
+    assert(double(double(2)) == 8);
+    return;
+}

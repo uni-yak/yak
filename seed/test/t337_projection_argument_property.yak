@@ -1,0 +1,11 @@
+foreign assert(cond: bool): void;
+struct Item { data: u32[] }
+function read(value: &u64): u64 { return *value; }
+function index(count: &u32:ReadWrite): u32 { *count = *count + 1u32; return 0u32; }
+function main(): void {
+    let items: Item[] = [Item { data: [3u32, 4u32] }];
+    var count: u32 = 0u32;
+    assert(read(items[index(count)].data.len) == 2u64);
+    assert(count == 1u32);
+    assert(read(items[0u32].data.cap) >= 2u64);
+}

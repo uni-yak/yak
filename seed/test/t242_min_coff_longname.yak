@@ -1,0 +1,140 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: mir=../../compiler/min/src/mir/mir.yak
+// module: mir_borrow_flow=../../compiler/min/src/mir/mir_borrow_flow.yak
+// module: mir_place_flow=../../compiler/min/src/mir/mir_place_flow.yak
+// module: mir_verify_flow=../../compiler/min/src/mir/mir_verify_flow.yak
+// module: mir_verify=../../compiler/min/src/mir/mir_verify.yak
+// module: mir_verify_inst=../../compiler/min/src/mir/mir_verify_inst.yak
+// module: mir_no_alloc=../../compiler/min/src/mir/mir_no_alloc.yak
+// module: mir_lower_types=../../compiler/min/src/mir/mir_lower_types.yak
+// module: mir_materialize=../../compiler/min/src/mir/mir_materialize.yak
+// module: mir_builder=../../compiler/min/src/mir/mir_builder.yak
+// module: mir_lower_expr=../../compiler/min/src/mir/mir_lower_expr.yak
+// module: mir_lower_ops=../../compiler/min/src/mir/mir_lower_ops.yak
+// module: mir_trap_cleanup=../../compiler/min/src/mir/mir_trap_cleanup.yak
+// module: mir_lower_stmt=../../compiler/min/src/mir/mir_lower_stmt.yak
+// module: mir_lower=../../compiler/min/src/mir/mir_lower.yak
+// module: mir_lower_finalize=../../compiler/min/src/mir/mir_lower_finalize.yak
+import lex;
+import parse;
+import diag;
+import resolve_refs;
+import typecheck;
+import mir;
+foreign assert(cond: bool): void;
+foreign write(data: &[u8]): void;
+
+// module: runner=mir_runner.yak
+import runner;
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+// module: coff_code=../../compiler/min/src/emit/coff_code.yak
+// module: coff_state=../../compiler/min/src/emit/coff_state.yak
+// module: iface=../../compiler/min/src/check/iface.yak
+// module: coff_call=../../compiler/min/src/emit/coff_call.yak
+// module: coff_place=../../compiler/min/src/emit/coff_place.yak
+// module: coff_inst=../../compiler/min/src/emit/coff_inst.yak
+// module: coff_carrier=../../compiler/min/src/emit/coff_carrier.yak
+// module: coff_func=../../compiler/min/src/emit/coff_func.yak
+// module: coff_layout=../../compiler/min/src/emit/coff_layout.yak
+// module: coff=../../compiler/min/src/emit/coff.yak
+// module: coff_symbols=../../compiler/min/src/emit/coff_symbols.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+import coff_code;
+import coff;
+import coff_state;
+
+// 小端读 16 位与 32 位字段；符号表/字符串表断言只依赖原始字节。
+function u16_at(data: &u8[]:Read, at: u32): u16 {
+    return (data[at] as u16) | ((data[at + 1] as u16) << 8u16);
+}
+function u32_at(data: &u8[]:Read, at: u32): u32 {
+    return (data[at] as u32) | ((data[at + 1] as u32) << 8u32)
+        | ((data[at + 2] as u32) << 16u32) | ((data[at + 3] as u32) << 24u32);
+}
+function sample(): mir::MirResult!AllocError {
+    let source: &[u8] = "function add(a: u32, b: u32): u32 { return a + b; } function f(): u32 { return add(17, 5); }\n";
+    return runner::accepted(source, 1400)?;
+}
+// 长名符号表：DefId 1 为静态内部函数（STATIC），DefId 9 为未定义的外部服务（EXTERNAL、节号 0）。
+function long_links(): coff_state::LinkTable!AllocError {
+    var table: coff_state::LinkTable = coff_state::LinkTable { symbols: [] };
+    var entry: u8[] = [];
+    var e: u32 = 0;
+    let entry_text: &[u8] = "yak$entry";
+    while e < @len(entry_text) as u32 { @push(entry, entry_text[e])?; e = e + 1; }
+    @push(table.symbols, coff_state::LinkSymbol { def: 1u32, kind: 0u8, name: @move(entry) })?;
+    var service: u8[] = [];
+    let service_text: &[u8] = "yak_rt_write";
+    var s: u32 = 0;
+    while s < @len(service_text) as u32 { @push(service, service_text[s])?; s = s + 1; }
+    @push(table.symbols, coff_state::LinkSymbol { def: 9u32, kind: 1u8, name: @move(service) })?;
+    return table;
+}
+// 超过 8 字节的名字以「4 字节零 + 4 字节相对偏移」写入符号名，正文进入紧随符号表的字符串表。
+function long_name_string_table(): void!AllocError {
+    let result: mir::MirResult = sample()?;
+    let table: coff_state::LinkTable = long_links()?;
+    let res: coff::EmitResult = coff::emit_object(&result.module:Read, &table:Read, coff::profile_win64_pe())?;
+    assert(res.ok);
+    let sym_ptr: u32 = u32_at(&res.bytes.data:Read, 8);
+    let sym_count: u32 = u32_at(&res.bytes.data:Read, 12);
+    assert(sym_count == 2);
+    // 第一条符号：名字偏移 4、节号 1、类型 FUNCTION、存储类 STATIC。
+    assert(u32_at(&res.bytes.data:Read, sym_ptr) == 0);
+    assert(u32_at(&res.bytes.data:Read, sym_ptr + 4) == 4);
+    assert(u16_at(&res.bytes.data:Read, sym_ptr + 12) == 1);
+    assert(u16_at(&res.bytes.data:Read, sym_ptr + 14) == 32);
+    assert(res.bytes.data[sym_ptr + 16] == 3);
+    // 第二条符号：名字偏移 14（4 + 9 + 1）、节号 0、存储类 EXTERNAL。
+    let second: u32 = sym_ptr + 18;
+    assert(u32_at(&res.bytes.data:Read, second) == 0);
+    assert(u32_at(&res.bytes.data:Read, second + 4) == 14);
+    assert(u16_at(&res.bytes.data:Read, second + 12) == 0);
+    assert(u16_at(&res.bytes.data:Read, second + 14) == 32);
+    assert(res.bytes.data[second + 16] == 2);
+    // 字符串表紧随符号表：首 4 字节总长 4 + 10 + 13 = 27，正文按符号次序拼接。
+    let str_ptr: u32 = sym_ptr + sym_count * 18;
+    assert(u32_at(&res.bytes.data:Read, str_ptr) == 27);
+    let entry_text: &[u8] = "yak$entry";
+    var i: u32 = 0;
+    while i < @len(entry_text) as u32 { assert(res.bytes.data[str_ptr + 4 + i] == entry_text[i]); i = i + 1; }
+    assert(res.bytes.data[str_ptr + 13] == 0);
+    let service_text: &[u8] = "yak_rt_write";
+    var k: u32 = 0;
+    while k < @len(service_text) as u32 { assert(res.bytes.data[str_ptr + 14 + k] == service_text[k]); k = k + 1; }
+    assert(res.bytes.data[str_ptr + 26] == 0);
+    return;
+}
+
+function main(): void {
+    long_name_string_table()?;
+    return;
+}

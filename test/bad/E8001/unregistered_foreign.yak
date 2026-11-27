@@ -1,0 +1,8 @@
+// expected_code: E8001
+// spec: spec/lang/base.md 9.2 R-11、spec/lang/foreign.md F-1
+// 触发：调用未登记的外部服务。
+foreign delete(path: &[u8]): void;
+
+function main(): void {
+    delete("x");
+}

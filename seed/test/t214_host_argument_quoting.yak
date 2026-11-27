@@ -1,0 +1,18 @@
+// module: host=../../compiler/min/host/seed/host.yak
+// arg: a"b
+// arg: C:\path\
+// arg: a b
+// arg: 
+import host;
+foreign assert(cond: bool): void;
+function main(): void {
+    assert(host::arg_count() == 4);
+    let a: u8[] = host::arg_bytes(0)?;
+    let b: u8[] = host::arg_bytes(1)?;
+    let c: u8[] = host::arg_bytes(2)?;
+    let d: u8[] = host::arg_bytes(3)?;
+    assert(@len(a) == 3); assert(a[1] == 34);
+    assert(@len(b) == 8); assert(b[7] == 92);
+    assert(@len(c) == 3); assert(c[1] == 32);
+    assert(@len(d) == 0);
+}

@@ -1,0 +1,3 @@
+// expected_trap: view or carrier in storage position
+struct S { r: &i64, }
+function main(): void {  }

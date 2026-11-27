@@ -1,0 +1,7 @@
+// expected_code: E5007
+// expected_diagnostics: E5001 E5007
+// spec: spec/lang/const.md C-2
+// 触发：常量定长数组的元素数量少于声明长度。
+const Values: [u32; 2] = [1u32];
+function first(): u32 { return Values[0]; }
+function main(): void { return; }

@@ -1,0 +1,29 @@
+// 当前帧算术陷阱：标记之后取得局部并填满 Write 槽；
+// 动态零除触发陷阱时，私有清理块应释放 c，再按字段逆序回滚槽位载荷 b、a。
+foreign write(data: &[u8]): void;
+
+struct Payload { first: u32[], second: u32[] }
+
+function trap_arith(p: &Payload:Write, mode: u32): void!AllocError {
+    write("before-arith\n");
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, 31u32)?;
+    @push(b, 32u32)?;
+    *p = Payload { first: @move(a), second: @move(b) };
+    var c: u32[] = [];
+    @push(c, 33u32)?;
+    let zero: u32 = mode - mode;
+    let q: u32 = 100u32 / zero;
+    if q == 0u32 { return; }
+    @drop(c);
+    return;
+}
+
+function outer(): void!AllocError {
+    out p: Payload;
+    trap_arith(out p, 0u32)?;
+    return;
+}
+
+function main(): void { outer(); return; }

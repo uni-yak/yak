@@ -1,0 +1,6 @@
+// module: source=fixtures/read_argument.yak
+// expected_trap: reference referent type mismatch
+import source;
+struct Item { data: u32[] }
+function make(): Item { return Item { data: [7u32] }; }
+function main(): void { source::read(make()); }

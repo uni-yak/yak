@@ -1,0 +1,141 @@
+// 仅负责标准输入输出分帧；不解释正文，也不输出普通日志。
+foreign read(buf: &[u8]:ReadWrite): u32;
+foreign write(data: &[u8]): void;
+
+const HEADER_MAX: u32 = 8192;
+const BODY_MAX: u32 = 33554432;
+const INVALID_HEADER: u32 = 33554433;
+const END_OF_STREAM: u32 = 33554434;
+
+export function invalid_header(size: u32): bool { return size == INVALID_HEADER; }
+export function end_of_stream(size: u32): bool { return size == END_OF_STREAM; }
+
+function header_name_byte(byte: u8): bool {
+    return (byte >= 65u8 && byte <= 90u8) || (byte >= 97u8 && byte <= 122u8)
+        || (byte >= 48u8 && byte <= 57u8) || byte == 45u8;
+}
+
+function is_length_name(header: &[u8], from: u32, to: u32): bool {
+    let name: &[u8] = "content-length";
+    if to - from != (@len(name) as u32) { return false; }
+    var i: u32 = 0;
+    while i < to - from {
+        var byte: u8 = header[from + i];
+        if byte >= 65u8 && byte <= 90u8 { byte = byte + 32u8; }
+        if byte != name[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function horizontal_space(byte: u8): bool {
+    return byte == 32u8 || byte == 9u8;
+}
+
+function parse_length(header: &[u8], from: u32, to: u32): u32 {
+    var start: u32 = from;
+    var end: u32 = to;
+    while start < end && horizontal_space(header[start]) { start = start + 1; }
+    while start < end && horizontal_space(header[end - 1]) { end = end - 1; }
+    if start == end { return INVALID_HEADER; }
+    var size: u32 = 0;
+    while start < end {
+        let byte: u8 = header[start];
+        if byte < 48u8 || byte > 57u8 { return INVALID_HEADER; }
+        let digit: u32 = (byte - 48u8) as u32;
+        if size > (BODY_MAX - digit) / 10 { return INVALID_HEADER; }
+        size = size * 10 + digit;
+        start = start + 1;
+    }
+    return size;
+}
+
+// 成功返回正文长度；包含终结空行，不接受携带正文的头切片。
+export function parse_header(header: &[u8]): u32 {
+    let bytes: u64 = @len(header);
+    if bytes > (HEADER_MAX as u64) { return INVALID_HEADER; }
+    let count: u32 = bytes as u32;
+    var size: u32 = INVALID_HEADER;
+    var pos: u32 = 0;
+    while pos + 1 < count {
+        if header[pos] == 13u8 && header[pos + 1] == 10u8 {
+            if pos + 2 == count { return size; }
+            return INVALID_HEADER;
+        }
+        let name_start: u32 = pos;
+        while pos < count && header_name_byte(header[pos]) { pos = pos + 1; }
+        if pos == name_start || pos == count || header[pos] != 58u8 { return INVALID_HEADER; }
+        let length_field: bool = is_length_name(header, name_start, pos);
+        pos = pos + 1;
+        let value_start: u32 = pos;
+        while pos < count && header[pos] != 13u8 {
+            let byte: u8 = header[pos];
+            if byte != 9u8 && (byte < 32u8 || byte > 126u8) { return INVALID_HEADER; }
+            pos = pos + 1;
+        }
+        if pos + 1 >= count || header[pos + 1] != 10u8 { return INVALID_HEADER; }
+        if length_field {
+            if size != INVALID_HEADER { return INVALID_HEADER; }
+            size = parse_length(header, value_start, pos);
+            if size == INVALID_HEADER { return INVALID_HEADER; }
+        }
+        pos = pos + 2;
+    }
+    return INVALID_HEADER;
+}
+
+export function read_header(): u32!AllocError {
+    var header: u8[] = [];
+    var byte: [u8; 1] = [0u8];
+    var count: u32 = 0;
+    var tail: u32 = 0;
+    while count < HEADER_MAX {
+        if read(&byte[0..1]:ReadWrite) == 0 {
+            if count == 0 { return END_OF_STREAM; }
+            return INVALID_HEADER;
+        }
+        let next_byte: u8 = byte[0u64];
+        @push(header, next_byte)?;
+        count = count + 1;
+        tail = ((tail & 0x00ffffffu32) << 8u32) | (next_byte as u32);
+        if tail == 0x0d0a0d0au32 { return parse_header(&header[0..count]:Read); }
+    }
+    return INVALID_HEADER;
+}
+
+// 长度不匹配表示截断；空正文只有在请求长度为零时才算成功。
+export function read_body(size: u32): u8[]!AllocError {
+    var body: u8[] = [];
+    if size > BODY_MAX { return body; }
+    var pos: u32 = 0;
+    while pos < size {
+        @push(body, 0u8)?;
+        pos = pos + 1;
+    }
+    pos = 0;
+    while pos < size {
+        let got: u32 = read(&body[pos..size]:ReadWrite);
+        if got == 0 { return []; }
+        pos = pos + got;
+    }
+    return body;
+}
+
+export function write_frame(body: &[u8]): bool {
+    let bytes: u64 = @len(body);
+    if bytes > (BODY_MAX as u64) { return false; }
+    let size: u32 = bytes as u32;
+    var decimal: [u8; 8] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    var pos: u32 = 8;
+    var n: u32 = size;
+    while pos == 8 || n != 0 {
+        pos = pos - 1;
+        decimal[pos] = 48u8 + ((n % 10) as u8);
+        n = n / 10;
+    }
+    write("Content-Length: ");
+    write(&decimal[pos..8]:Read);
+    write("\r\n\r\n");
+    write(body);
+    return true;
+}

@@ -1,0 +1,26 @@
+// 正常路径对照：标记之后才填满 Write 槽，返回前显式释放 c；
+// 槽位载荷 b、a 只能在返回点回滚，不得早于标记输出。
+foreign write(data: &[u8]): void;
+
+struct Payload { first: u32[], second: u32[] }
+
+function trap_normal(p: &Payload:Write): void!AllocError {
+    var a: u32[] = [];
+    var b: u32[] = [];
+    @push(a, 51u32)?;
+    @push(b, 52u32)?;
+    write("normal-body\n");
+    var c: u32[] = [];
+    @push(c, 53u32)?;
+    *p = Payload { first: @move(a), second: @move(b) };
+    @drop(c);
+    return;
+}
+
+function outer(): void!AllocError {
+    out p: Payload;
+    trap_normal(out p)?;
+    return;
+}
+
+function main(): void { outer(); return; }

@@ -1,0 +1,8 @@
+// expected_trap: place has active Read borrows
+struct Item { value: u32, data: u32[] }
+function mutate(data: &Item[]:ReadWrite): u32 { return 0u32; }
+function main(): void {
+    var data: Item[] = [Item { value: 1u32, data: [2u32] }];
+    let value: u32 = (&data[0u32..1u32])[mutate(&data:ReadWrite)].value;
+    @drop(value);
+}

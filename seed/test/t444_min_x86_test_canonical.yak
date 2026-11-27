@@ -1,0 +1,35 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function encoding(bytes: &[u8], expected: u16): void!AllocError {
+    var code: pe::Code = pe::code_new();
+    pe::code_bytes(&code:ReadWrite, bytes)?;
+    assert(x86_validate::validate(&code:Read, 0)? == expected);
+    return;
+}
+
+function main(): void {
+    // 依次覆盖高字节寄存器、裸 REX 低字节寄存器、扩展寄存器和内存操作数。
+    let ordered: [u8; 11] = [0x84, 0xe0, 0x40, 0x84, 0xe0, 0x4c, 0x85, 0xca, 0x4c, 0x85, 0x08];
+    encoding(&ordered[0..11]:Read, 0)?;
+    let swapped: [u8; 8] = [0x84, 0xc4, 0x40, 0x84, 0xc4, 0x49, 0x85, 0xd1];
+    encoding(&swapped[0..2]:Read, 7102)?;
+    encoding(&swapped[2..5]:Read, 7102)?;
+    encoding(&swapped[5..8]:Read, 7102)?;
+    encoding(&swapped[5..7]:Read, 7101)?;
+
+    var code: pe::Code = pe::code_new();
+    pe::test_rr(&code:ReadWrite, 9, 2)?;
+    pe::test_rr(&code:ReadWrite, 2, 9)?;
+    assert(pe::code_len(&code:Read) == 6);
+    var i: u32 = 0;
+    while i < 3 {
+        assert(code.bytes[i] == ordered[5 + i] && code.bytes[3 + i] == ordered[5 + i]);
+        i = i + 1;
+    }
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    return;
+}

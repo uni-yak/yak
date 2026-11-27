@@ -1,0 +1,121 @@
+// module: buf=../../compiler/min/lib/buf.yak
+// module: hash=../../compiler/min/lib/hash.yak
+// module: hashmap=../../compiler/min/lib/hashmap.yak
+// module: types=../../compiler/min/lib/types.yak
+// module: lextables=../../compiler/min/src/lex/lextables.yak
+// module: lex=../../compiler/min/src/lex/lex.yak
+// module: ast=../../compiler/min/src/parse/ast.yak
+// module: parse_core=../../compiler/min/src/parse/parse_core.yak
+// module: type_parser=../../compiler/min/src/parse/type_parser.yak
+// module: position=../../compiler/min/src/parse/position.yak
+// module: parse_expr=../../compiler/min/src/parse/parse_expr.yak
+// module: parse=../../compiler/min/src/parse/parse.yak
+// module: parse_stmt=../../compiler/min/src/parse/parse_stmt.yak
+// module: diag=../../compiler/min/src/diag/diag.yak
+// module: resolve=../../compiler/min/src/check/resolve.yak
+// module: resolve_refs=../../compiler/min/src/check/resolve_refs.yak
+// module: resolve_scope=../../compiler/min/src/check/resolve_scope.yak
+// module: resolve_unit=../../compiler/min/src/check/resolve_unit.yak
+// module: typecheck=../../compiler/min/src/check/typecheck.yak
+// module: type_import=../../compiler/min/src/check/type_import.yak
+// module: type_display=../../compiler/min/src/check/type_display.yak
+// module: copy_facts=../../compiler/min/src/check/copy_facts.yak
+// module: typecheck_shape=../../compiler/min/src/check/typecheck_shape.yak
+// module: typecheck_body=../../compiler/min/src/check/typecheck_body.yak
+// module: typecheck_ops=../../compiler/min/src/check/typecheck_ops.yak
+// module: typecheck_driver=../../compiler/min/src/check/typecheck_driver.yak
+// module: typecheck_checks=../../compiler/min/src/check/typecheck_checks.yak
+// module: consteval=../../compiler/min/src/check/consteval.yak
+// module: layout=../../compiler/min/src/check/layout.yak
+// module: owner_write=../../compiler/min/src/check/owner_write.yak
+// module: owner_flow=../../compiler/min/src/check/owner_flow.yak
+// module: owner_expr=../../compiler/min/src/check/owner_expr.yak
+// module: owner_state=../../compiler/min/src/check/owner_state.yak
+// module: owner_block=../../compiler/min/src/check/owner_block.yak
+// module: owner_stmt=../../compiler/min/src/check/owner_stmt.yak
+// module: owner=../../compiler/min/src/check/owner.yak
+// module: desugar=../../compiler/min/src/desugar/desugar.yak
+// module: pipeline_index=../../compiler/min/src/check/pipeline_index.yak
+// module: pipeline=../../compiler/min/src/check/pipeline.yak
+// module: pipeline_stages=../../compiler/min/src/check/pipeline_stages.yak
+import buf;
+import lex;
+import diag;
+import pipeline;
+import consteval;
+import typecheck;
+import typecheck_driver;
+import typecheck_body;
+import typecheck_shape;
+import parse;
+import resolve_refs;
+import resolve_unit;
+foreign assert(cond: bool): void;
+
+// 首行命中、同名异定义、末行命中与未命中分别按读取行数累计。
+function small_steps(src: &[u8], steps: u32, document: bool): void!AllocError {
+    let lexed: lex::LexResult = lex::lex_scan(src, 119u16)?;
+    let parsed: parse::ParseResult = parse::parse_lexed(&lexed:Read, 119u16)?;
+    assert(@len(lexed.diagnostics) == 0 && @len(parsed.diagnostics) == 0);
+    var name_diags: diag::DiagBuffer = diag::diagbuf_new();
+    let deps: resolve_refs::DependencySet = resolve_refs::DependencySet { ifaces: [] };
+    let res: resolve_refs::Resolution = resolve_unit::resolve_unit(&parsed.file:Read, &parsed.pool:Read, &lexed.names:Read, &deps:Read, "", &name_diags:ReadWrite)?;
+    assert(name_diags.count == 0u32);
+    var limit: u32 = 1u32;
+    while limit <= steps + 1u32 {
+        var diags: diag::DiagBuffer = diag::diagbuf_new();
+        var intern: typecheck::InternBudget = typecheck::intern_budget(0u32);
+        var lookup: consteval::InitLookupBudget = consteval::init_lookup_budget(0u32);
+        var material: consteval::MaterialBudget = consteval::material_budget(0u32);
+        var fold: consteval::FoldBudget = consteval::fold_budget(0u32);
+        var probe: consteval::FoldBudget = consteval::fold_budget(0u32);
+        var scan: typecheck_driver::IntegerScanBudget = typecheck_driver::integer_scan_budget(0u32);
+        var shape: typecheck_shape::BodyInferenceBudget = typecheck_shape::body_inference_budget(0u32, 0u32, 0u32, 0u32, 0u32, limit, 0u32);
+        let checked: typecheck::TypeCheckResult = typecheck_driver::typecheck_unit_with_body_budget(&parsed.file:Read, &parsed.pool:Read, &res:Read, &diags:ReadWrite, &intern:ReadWrite, &lookup:ReadWrite, &material:ReadWrite, &fold:ReadWrite, &probe:ReadWrite, &scan:ReadWrite, &shape:ReadWrite, document)?;
+        assert(typecheck_shape::body_projection_exceeded(&shape:Read) == (limit < steps));
+        if limit < steps { assert(@len(checked.expr_types.items) == 0 && shape.projection_remaining == 0u32); }
+        else { assert(@len(checked.expr_types.items) == @len(parsed.pool.exprs) && shape.projection_remaining == limit - steps); }
+        limit = limit + 1u32;
+    }
+    return;
+}
+
+function boundary(over: bool, bad: bool): void!AllocError {
+    var text: buf::ByteBuf = buf::buf_new();
+    if bad { buf::buf_push_bytes(&text:ReadWrite, "function broken(): void { let n: bool = 1u32; if n { return; } }\n")?; }
+    buf::buf_push_bytes(&text:ReadWrite, "struct S { a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, a8: u32, a9: u32, a10: u32, a11: u32, a12: u32, a13: u32, a14: u32, a15: u32, a16: u32, a17: u32, a18: u32, a19: u32, a20: u32, a21: u32, a22: u32, a23: u32, a24: u32, a25: u32, a26: u32, a27: u32, a28: u32, a29: u32, a30: u32, a31: u32 }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function f(s: &S:Read): u32 { return s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31; }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function g(s: &S:Read): u32 { return s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31; }\n")?;
+    buf::buf_push_bytes(&text:ReadWrite, "function h(s: &S:Read): u32 { return s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + s.a31 + ")?;
+    if over { buf::buf_push_bytes(&text:ReadWrite, "s.a24; }\n")?; }
+    else { buf::buf_push_bytes(&text:ReadWrite, "s.a23; }\n")?; }
+    let src: &[u8] = &text.data[0..text.pos]:Read;
+    let doc: pipeline::DocumentAnalysis = pipeline::run_document_frontend(src, 120u16)?;
+    if over {
+        assert(pipeline::analysis_projection_exceeded(doc.status));
+        assert(doc.diagnostics.count == 0u32 && !doc.diagnostics.truncated);
+    } elseif bad {
+        assert(pipeline::analysis_rejected(doc.status));
+        assert(doc.diagnostics.count == 1u32 && doc.diagnostics.diags[0].code.raw == 5001u16);
+    } else { assert(pipeline::analysis_checked(doc.status) && doc.diagnostics.count == 0u32); }
+    var batch: diag::DiagBuffer = diag::diagbuf_new();
+    let ok: bool = pipeline::run_frontend(src, 120u16, &batch:ReadWrite)?;
+    assert(ok == !bad);
+    if bad { assert(batch.count == 1u32 && batch.diags[0].code.raw == 5001u16); }
+    else { assert(batch.count == 0u32); }
+    return;
+}
+
+function main(): void {
+    let hits: &[u8] = "struct S { a: u32, b: u32 } struct T { a: bool } function f(s: S): u32 { return s.a + s.b; } function g(t: &T:Read): bool { return t.a; }\n";
+    small_steps(hits, 6u32, false)?;
+    small_steps(hits, 15u32, true)?;
+    let missing: &[u8] = "struct S { a: u32, b: u32 } function f(s: &S:Read): u32 { return s.missing; }\n";
+    small_steps(missing, 2u32, false)?;
+    small_steps(missing, 5u32, true)?;
+    boundary(false, false)?;
+    boundary(false, true)?;
+    boundary(true, false)?;
+    boundary(true, true)?;
+    return;
+}

@@ -1,0 +1,63 @@
+// module: pe=../../compiler/min/src/emit/pe.yak
+// module: x86_validate=../../compiler/min/src/emit/x86_validate.yak
+import pe;
+import x86_validate;
+foreign assert(condition: bool): void;
+
+function main(): void {
+    // 模拟连续发射。函数从偏移 2 开始，后一条 RIP 取址已经本地回填。
+    var code: pe::Code = pe::code_new();
+    let bytes: [u8; 22] = [0x90, 0x90, 0xe8, 0, 0, 0, 0, 0x48, 0x8d, 0x05, 0, 0, 0, 0,
+        0x48, 0x8d, 0x15, 0x05, 0, 0, 0, 0xc3];
+    pe::code_bytes(&code:ReadWrite, &bytes[0..22]:Read)?;
+    let call: x86_validate::Rel32Site = x86_validate::Rel32Site { offset: 3, address: false };
+    let ref: x86_validate::Rel32Site = x86_validate::Rel32Site { offset: 10, address: true };
+    var sites: [x86_validate::Rel32Site; 2] = [call, ref];
+    assert(x86_validate::validate_relocated(&code:Read, 2, &sites[0..2]:Read)? == 0);
+    assert(x86_validate::validate(&code:Read, 2)? == 0);
+
+    sites[0] = x86_validate::Rel32Site { offset: 3, address: true };
+    assert(x86_validate::validate_relocated(&code:Read, 2, &sites[0..2]:Read)? == 8004);
+    sites[0] = call;
+    sites[1] = x86_validate::Rel32Site { offset: 11, address: true };
+    assert(x86_validate::validate_relocated(&code:Read, 2, &sites[0..2]:Read)? == 8004);
+    sites[1] = x86_validate::Rel32Site { offset: 22, address: true };
+    assert(x86_validate::validate_relocated(&code:Read, 2, &sites[0..2]:Read)? == 8004);
+    sites[1] = call;
+    assert(x86_validate::validate_relocated(&code:Read, 2, &sites[0..2]:Read)? == 8004);
+    sites[0] = ref;
+    assert(x86_validate::validate_relocated(&code:Read, 2, &sites[0..2]:Read)? == 8004);
+
+    code = pe::code_new();
+    let near_jump: [u8; 5] = [0xe9, 0, 0, 0, 0];
+    pe::code_bytes(&code:ReadWrite, &near_jump[0..5]:Read)?;
+    sites[0] = x86_validate::Rel32Site { offset: 1, address: false };
+    assert(x86_validate::validate(&code:Read, 0)? == 7103);
+    assert(x86_validate::validate_relocated(&code:Read, 0, &sites[0..1]:Read)? == 8004);
+    assert(x86_validate::validate_relocated(&code:Read, 1, &sites[0..1]:Read)? == 8004);
+
+    // 已定值分支不能跳进自身位移；错误链接站点优先按重定位失败处理。
+    code = pe::code_new();
+    let into_field: [u8; 5] = [0xe9, 0xfc, 0xff, 0xff, 0xff];
+    pe::code_bytes(&code:ReadWrite, &into_field[0..5]:Read)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 7101);
+    assert(x86_validate::validate_relocated(&code:Read, 0, &sites[0..1]:Read)? == 8004);
+
+    // 同一字节串，定值位移必须规范化；待链接位点则保留原加数。
+    code = pe::code_new();
+    let word_address: [u8; 7] = [0x66, 0x8d, 0x05, 0x80, 0, 1, 0];
+    pe::code_bytes(&code:ReadWrite, &word_address[0..7]:Read)?;
+    sites[0] = x86_validate::Rel32Site { offset: 3, address: true };
+    assert(x86_validate::validate(&code:Read, 0)? == 7102);
+    assert(x86_validate::validate_relocated(&code:Read, 0, &sites[0..1]:Read)? == 0);
+
+    code = pe::code_new();
+    pe::jmp_rm64(&code:ReadWrite, pe::rax())?;
+    let table: u32 = pe::code_len(&code:Read);
+    pe::code_u32(&code:ReadWrite, 0)?;
+    pe::mark_jump_table(&code:ReadWrite, table)?;
+    assert(x86_validate::validate(&code:Read, 0)? == 0);
+    sites[0] = x86_validate::Rel32Site { offset: table, address: true };
+    assert(x86_validate::validate_relocated(&code:Read, 0, &sites[0..1]:Read)? == 8004);
+    return;
+}
