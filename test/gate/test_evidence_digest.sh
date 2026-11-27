@@ -123,8 +123,9 @@ matrix_cmd='bash test/gate/t1_base_matrix.sh'
 strict_cmd="$matrix_cmd --require-complete"
 matrix_rows=('PASS  t1_fixture_first（隔离实配一）' 'PASS  t1_fixture_second（隔离实配二）'
     'PASS  t1_iface_bridge（ErrorSet 编码、依赖重映射和导入成员签名）'
-    'PASS  r_fixture_first（隔离拒绝一，E6004）' 'PASS  t1_transitive_ysm（传递名义格式 6、三类产物、原生退出 42）')
-matrix_summary='T1 base 矩阵：实配 3/3 通过，拒绝 1/1 通过，缺口 0 行，失败 0 行'
+    'PASS  r_fixture_first（隔离拒绝一，E6004）' 'PASS  t1_transitive_ysm（传递名义身份、直接依赖、普通产物不变、原生退出 42）'
+    'PASS  F-4 标准服务失败与跨帧资源回滚')
+matrix_summary='T1 base 矩阵：实配 4/4 通过，拒绝 1/1 通过，缺口 0 行，失败 0 行'
 matrix_done='T1 base 矩阵通过：base 子集无缺口'
 write_strict() {
     printf '%s\n' "$strict_cmd" > "$work/logs/base-matrix-strict.cmd"
@@ -421,20 +422,20 @@ check_release 普通矩阵冒充严格 2 "$strict_issue"
 write_strict
 printf '%s\n' "$matrix_summary" "$matrix_done" > "$strict_log"
 check_release 严格矩阵只有汇总 2 "$strict_issue"
-for summary in 'T1 base 矩阵：实配 3/3 通过，拒绝 1/1 通过，缺口 1 行，失败 0 行' \
-    'T1 base 矩阵：实配 2/3 通过，拒绝 1/1 通过，缺口 0 行，失败 0 行'; do
+for summary in 'T1 base 矩阵：实配 4/4 通过，拒绝 1/1 通过，缺口 1 行，失败 0 行' \
+    'T1 base 矩阵：实配 3/4 通过，拒绝 1/1 通过，缺口 0 行，失败 0 行'; do
     printf '%s\n' "${matrix_rows[@]}" "$summary" "$matrix_done" > "$strict_log"
     check_release 矩阵有缺口或断言未全通过 2 "$strict_issue"
 done
 write_strict
 printf '%s\n' "${matrix_rows[0]}" 'PASS  t1_fixture_first（同名实配，不同描述）' "${matrix_rows[@]:2}" "$matrix_summary" "$matrix_done" > "$strict_log"
 check_release 严格矩阵重复断言名 2 "$strict_issue"
-printf '%s\n' "${matrix_rows[@]:0:3}" 'PASS  r_fixture_first（缺少诊断码）' "${matrix_rows[4]}" "$matrix_summary" "$matrix_done" > "$strict_log"
+printf '%s\n' "${matrix_rows[@]:0:3}" 'PASS  r_fixture_first（缺少诊断码）' "${matrix_rows[@]:4}" "$matrix_summary" "$matrix_done" > "$strict_log"
 check_release 严格矩阵拒绝断言缺诊断码 2 "$strict_issue"
-printf '%s\n' "${matrix_rows[@]:0:4}" 'PASS  t1_transitive_ysm（传递名义格式 6、原生退出 42）' "$matrix_summary" "$matrix_done" > "$strict_log"
+printf '%s\n' "${matrix_rows[@]:0:4}" 'PASS  t1_transitive_ysm（传递名义身份、原生退出 42）' "${matrix_rows[5]}" "$matrix_summary" "$matrix_done" > "$strict_log"
 check_release 严格矩阵跨单元正例缺少产物断言 2 "$strict_issue"
-printf '%s\n' "${matrix_rows[@]:0:4}" 'PASS  r_transitive_ysm（YSM v4 直接依赖边界，E7026，无根产物）' \
-    'T1 base 矩阵：实配 2/2 通过，拒绝 2/2 通过，缺口 0 行，失败 0 行' "$matrix_done" > "$strict_log"
+printf '%s\n' "${matrix_rows[@]:0:4}" 'PASS  r_transitive_ysm（YSM v4 直接依赖边界，E7026，无根产物）' "${matrix_rows[5]}" \
+    'T1 base 矩阵：实配 3/3 通过，拒绝 2/2 通过，缺口 0 行，失败 0 行' "$matrix_done" > "$strict_log"
 check_release 严格矩阵旧格式拒绝不替代正例 2 "$strict_issue"
 printf '%s\n' "${matrix_rows[@]:0:2}" "${matrix_rows[@]:3}" "$matrix_summary" "$matrix_done" > "$strict_log"
 check_release 严格矩阵缺少接口桥断言 2 "$strict_issue"
