@@ -176,37 +176,34 @@ root_match=$(resolve_source "$identity") || exit 1
 root_name=${source_file##*/}
 root_name=${root_name%.yak}
 
-# 对账实际使用的 Bash、GNU 工具和 GCC 选择的链接器，版本漂移不进入构建。
+# 对账实际使用的 Bash、coreutils 与目标工具链最低版本门限，低于门限不进入构建。
 declare -A pins=()
 while read -r name equals version extra || [[ -n $name ]]; do
     version=${version%$'\r'}
     case $target:$name in
-        *:bash|*:coreutils|*:python|win-x64:binutils|win-x64:gcc|linux-x64:elf_binutils|linux-x64:elf_gcc)
+        *:bash|*:coreutils|*:uutils_coreutils|*:python|win-x64:binutils|win-x64:gcc|linux-x64:elf_binutils|linux-x64:elf_gcc)
             [[ $equals == = && -n $version && -z $extra && -z ${pins[$name]+x} ]] || fail "versions.lock 的 $name 条目无效"
             pins[$name]=$version ;;
     esac
 done < versions.lock
 pin() {
     local name=$1 actual=${2%$'\r'} wanted=${pins[$1]:-}
-    [[ -n $wanted ]] || fail "versions.lock 未锁定 $name"
-    [[ $actual == "$wanted" ]] || fail "$name 版本漂移：锁定 $wanted，实际 $actual"
+    [[ -n $wanted ]] || fail "versions.lock 未登记 $name 最低版本"
+    yak_version_ge "$actual" "$wanted" || fail "$name 版本漂移：要求 >= $wanted，实际 $actual"
 }
-gnu_pin() {
-    local version
-    version=$("$1" --version) || fail "无法读取 $1 版本"
-    version=${version%%$'\n'*}
-    [[ $version == *"(GNU $3) "* ]] || fail "$1 不是预期的 GNU $3"
-    pin "$2" "${version##*) }"
+coreutils_pin() {
+    local family version
+    read -r family version < <(yak_coreutils_version "$1") || fail "$1 不是受支持的 GNU 或 uutils coreutils"
+    if [[ $family == gnu ]]; then
+        pin coreutils "$version"
+    else
+        pin uutils_coreutils "$version"
+    fi
 }
-elf_binutils_pin() {
+binutils_pin() {
     local version
-    version=$("$1" --version) || fail "无法读取 ELF 工具 $1 的版本"
-    version=${version%%$'\n'*}
-    case $version in
-        "$2 (GNU Binutils) "*|"$2 (GNU Binutils for "*") "*) ;;
-        *) fail "$1 不是预期的 ELF $2" ;;
-    esac
-    pin elf_binutils "${version##*) }"
+    version=$(yak_binutils_version "$1" "${3:-}") || fail "$1 不是预期的 GNU Binutils${3:+（$3）}"
+    pin "$2" "$version"
 }
 # 正式编译器和扫描器都内嵌词法符号表，主编译器另有完整错误码表。
 error_table=""
@@ -226,17 +223,17 @@ if (( symbol_table )); then
     python tools/symgen/lex_tables.py --check || fail '符号表预检失败'
 fi
 pin bash "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}"
-gnu_pin sha256sum coreutils coreutils
+coreutils_pin sha256sum
 if [[ $target == linux-x64 ]]; then
     export YAK_ELF_AS="${YAK_ELF_AS:-as}" YAK_ELF_CC="${YAK_ELF_CC:-gcc}" YAK_ELF_LD="${YAK_ELF_LD:-ld}"
     machine=$("$YAK_ELF_CC" -dumpmachine) || fail '无法读取 ELF GCC 目标三元组'
     [[ $machine == x86_64-linux-gnu ]] || fail "ELF GCC 不是 x86_64-linux-gnu（实际 $machine）"
-    gcc_version=$("$YAK_ELF_CC" -dumpfullversion) || fail '无法读取 ELF GCC 版本'
+    gcc_version=$(yak_gcc_version "$YAK_ELF_CC" -dumpfullversion) || fail '无法读取 ELF GCC 版本'
     pin elf_gcc "$gcc_version"
-    elf_binutils_pin "$YAK_ELF_AS" 'GNU assembler'
+    binutils_pin "$YAK_ELF_AS" elf_binutils 'GNU assembler'
     as_selected=$("$YAK_ELF_CC" -m64 -print-prog-name=as) || fail '无法定位 ELF GCC 汇编器'
-    elf_binutils_pin "$as_selected" 'GNU assembler'
-    elf_binutils_pin "$YAK_ELF_LD" 'GNU ld'
+    binutils_pin "$as_selected" elf_binutils 'GNU assembler'
+    binutils_pin "$YAK_ELF_LD" elf_binutils 'GNU ld'
     python_version=$(python -c 'import sys; print(".".join(map(str, sys.version_info[:3])))') || fail '无法读取 Python 版本'
     pin python "$python_version"
     python -X utf8 -B tools/coff_sections.py --runtime-pe -- "$native_compiler" || fail 'ELF 构建的原生编译器不是有效的 Win64 产物'
@@ -244,10 +241,10 @@ if [[ $target == linux-x64 ]]; then
 else
     cc=$(yak_target_cc) || exit 1
     export YAK_TARGET_CC="$cc"
-    gcc_version=$("$cc" -dumpversion) || fail '无法读取目标 GCC 版本'
+    gcc_version=$(yak_gcc_version "$cc") || fail '无法读取目标 GCC 版本'
     pin gcc "$gcc_version"
     linker=$("$cc" -print-prog-name=ld) || fail '无法定位目标 GCC 链接器'
-    gnu_pin "${linker%$'\r'}" binutils Binutils
+    binutils_pin "${linker%$'\r'}" binutils
 fi
 if [[ -z $native_compiler ]]; then
     bin=$(yak_seed_path)

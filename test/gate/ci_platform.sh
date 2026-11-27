@@ -13,8 +13,8 @@ delivery=test/gate/tmp/ci-delivery
 mkdir -p -- "$evidence/logs"
 record() { bash test/gate/ci_record.sh "$evidence/logs" "$@"; }
 fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
-[[ ${RUNNER_ENVIRONMENT:-} == self-hosted && $(git rev-parse HEAD) == "$commit" ]] ||
-    fail '需要可信自托管运行器和指定提交'
+[[ $(git rev-parse HEAD) == "$commit" ]] ||
+    fail '当前检出提交与指定提交不符'
 record host -- uname -srvmo
 record bash-version -- bash --version
 record coreutils-version -- sha256sum --version

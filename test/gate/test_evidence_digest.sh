@@ -62,7 +62,7 @@ printf '取证摘要回归通过：固定摘要、缺失输入拒绝和矩阵锁
 
 # 以下是隔离的取证格式夹具，不执行编译，也不作为门禁发布证据。
 cp -- test/gate/evidence_preflight.sh test/gate/evidence_matrix.sh "$work/test/gate/"
-printf '%s\n' 'gcc = 16.2.0' 'binutils = 2.47.20260726' 'bash = 5.3.20' 'coreutils = 8.32' 'clang = 23.1.3' 'python = 3.12.3' > "$work/versions.lock"
+printf '%s\n' 'gcc = 13.0.0' 'binutils = 2.40' 'bash = 5.0.0' 'coreutils = 8.32' 'uutils_coreutils = 0.1.0' 'clang = 18.0.0' 'python = 3.12.0' > "$work/versions.lock"
 printf 'build\n' > "$work/compiler/min/build.sh"
 mkdir -p -- "$work/seed/out" "$work/runtime/out/win_x64" "$work/logs"
 printf '隔离 Seed 夹具\n' > "$work/seed/out/yak-seed.exe"
@@ -96,9 +96,9 @@ preflight_header='== T1 Linux 完整前置条件校验 =='
 host_done='Linux T1 宿主工具链校验通过：9 项；未校验 Seed 与运行时'
 preflight_done='Linux T1 前置条件满足：12 项全部通过'
 host_marks=('通过：目标编译器 x86_64-w64-mingw32-gcc（三元组 x86_64-w64-mingw32）'
-    '通过：目标 GCC 版本 16.2.0 与 versions.lock 一致' '通过：链接器 binutils 版本 2.47.20260726 与 versions.lock 一致'
-    '通过：bash 版本 5.3.20 与 versions.lock 一致' '通过：coreutils 版本 8.32 与 versions.lock 一致'
-    '通过：Clang 版本 23.1.3 与 versions.lock 一致' '通过：Python 版本 3.12.3 与 versions.lock 一致'
+    '通过：目标 GCC 版本 15.2.0 满足 versions.lock（>= 13.0.0）' '通过：链接器 binutils 版本 2.46 满足 versions.lock（>= 2.40）'
+    '通过：bash 版本 5.3.9 满足 versions.lock（>= 5.0.0）' '通过：coreutils 版本 9.0 满足 versions.lock（>= 8.32）'
+    '通过：Clang 版本 21.1.8 满足 versions.lock（>= 18.0.0）' '通过：Python 版本 3.14.4 满足 versions.lock（>= 3.12.0）'
     '通过：PE 运行器 /fixture/bin/wine 可用'
     '通过：交叉编译器产出 x86_64 COFF 对象')
 seed_run='通过：PE 运行器可解释执行冻结 Seed'
@@ -171,7 +171,7 @@ fetch_log="$work/logs/seed-fetch.log"
 fetch_line="通过：HTTPS 下载的冻结 Seed SHA-256 为 $seed_sum"
 verify_cmd='bash compiler/min/verify.sh'
 verify_log="$work/logs/verify.log"
-verify_marks=('ok：Python 版本 3.12.3'
+verify_marks=('ok：Python 版本 3.14.4'
     'ok：未发现提前出现的 yakc-full 实体' 'ok：T1 阶段实体边界回归通过'
     'ok：固定点与阶段切换边界校验通过' 'ok：固定点与阶段切换边界回归通过'
     'ok：规格审计通过' 'ok：词表可复现且与生成器一致'
@@ -341,17 +341,21 @@ cp -- "$work/preflight.good" "$preflight_log"
 printf '%s\n' "$host_header" '仓库根：/fixture/tree' '' "${host_marks[1]}" "${host_marks[0]}" "${host_marks[@]:2}" '' "$host_done" > "$host_log"
 check_release 宿主预检阶段乱序 2 "$host_issue"
 cp -- "$work/host.good" "$host_log"
-sed 's/目标 GCC 版本 16\.2\.0/目标 GCC 版本 13.3.0/' "$work/host.good" > "$host_log"
-check_release 宿主预检版本与锁不符 2 "$host_issue"
+sed 's/目标 GCC 版本 15\.2\.0/目标 GCC 版本 12.9.0/' "$work/host.good" > "$host_log"
+check_release 宿主预检版本低于门限 2 "$host_issue"
+sed 's/coreutils 版本 9\.0 满足 versions\.lock（>= 8\.32）/coreutils 版本 uutils 0.10.0 满足 versions.lock（>= uutils 0.1.0）/' "$work/host.good" > "$host_log"
+check_release 宿主预检兼容uutils 0 '归档的 9 项门禁记录全部为退出码 0。'
+sed 's/coreutils 版本 9\.0 满足 versions\.lock（>= 8\.32）/coreutils 版本 uutils 0.0.9 满足 versions.lock（>= uutils 0.1.0）/' "$work/host.good" > "$host_log"
+check_release 宿主预检uutils低于门限 2 "$host_issue"
 sed '/^通过：Clang 版本 /d' "$work/host.good" > "$host_log"
 check_release 宿主预检缺少Clang版本 2 "$host_issue"
-sed 's/Python 版本 3\.12\.3/Python 版本 3.14.4/' "$work/host.good" > "$host_log"
-check_release 宿主预检Python版本错配 2 "$host_issue"
+sed 's/Python 版本 3\.14\.4/Python 版本 3.11.9/' "$work/host.good" > "$host_log"
+check_release 宿主预检Python版本低于门限 2 "$host_issue"
 cp -- "$work/host.good" "$host_log"
-sed 's/Clang 版本 23\.1\.3/Clang 版本 22.1.2/' "$work/preflight.good" > "$preflight_log"
-check_release 完整预检Clang版本错配 2 "$preflight_issue"
+sed 's/Clang 版本 21\.1\.8/Clang 版本 17.9.0/' "$work/preflight.good" > "$preflight_log"
+check_release 完整预检Clang版本低于门限 2 "$preflight_issue"
 cp -- "$work/preflight.good" "$preflight_log"
-printf '%s\n' 'gcc = 16.2.0' >> "$work/versions.lock"
+printf '%s\n' 'gcc = 13.0.0' >> "$work/versions.lock"
 check_release 版本锁出现重复记录 2 "$host_issue"
 sed -i '$d' "$work/versions.lock"
 printf '\n' >> "$host_log"
@@ -475,13 +479,13 @@ for ((i = 0; i < ${#verify_marks[@]}; i++)); do
     printf '%s\n' "${verify_marks[@]:0:i}" "${verify_marks[@]:i+1}" "$verify_done" > "$verify_log"
     check_release "快速门禁缺少阶段 $i：${verify_marks[i]}" 2 "$verify_issue"
 done
-printf '%s\n' 'ok：Python 版本 3.12.4' "${verify_marks[@]:1}" "$verify_done" > "$verify_log"
-check_release 快速门禁使用错配的锁定版本 2 "$verify_issue"
-printf '%s\n' 'ok：Python 版本 3.12.4' "${verify_marks[@]}" "$verify_done" > "$verify_log"
+printf '%s\n' 'ok：Python 版本 3.11.9' "${verify_marks[@]:1}" "$verify_done" > "$verify_log"
+check_release 快速门禁使用低于门限的Python版本 2 "$verify_issue"
+printf '%s\n' 'ok：Python 版本 3.13.0' "${verify_marks[@]}" "$verify_done" > "$verify_log"
 check_release 快速门禁同时报告两种版本 2 "$verify_issue"
 write_verify
 cp -- "$work/versions.lock" "$work/versions.saved"
-printf '%s\n' 'python = 3.12.3' >> "$work/versions.lock"
+printf '%s\n' 'python = 3.12.0' >> "$work/versions.lock"
 check_release Python锁定条目重复 2 "$verify_issue"
 awk '$1 != "python"' "$work/versions.saved" > "$work/versions.lock"
 check_release Python锁定条目缺失 2 "$verify_issue"

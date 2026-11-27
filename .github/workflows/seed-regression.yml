@@ -19,23 +19,25 @@ concurrency:
 
 jobs:
   regression:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.YAK_WINDOWS_RUNNER != '')
-    runs-on: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
     timeout-minutes: 75
     env:
       MSYSTEM: UCRT64
       CHERE_INVOKING: '1'
       MSYS2_PATH_TYPE: inherit
     steps:
-      - name: 核对运行器
-        shell: pwsh
-        run: |
-          if ($env:RUNNER_ENVIRONMENT -ne 'self-hosted') {
-            throw '请配置 YAK_WINDOWS_RUNNER 指向预置锁定 UCRT64 工具链的 Windows runner'
-          }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: 准备 MSYS2 UCRT64 工具链
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        run: |
+          pacman --noconfirm -Sy --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang
+          command -v gcc clang as ld objdump
+          gcc --version | head -n 1
+          clang --version | head -n 1
+          ld --version | head -n 1
       - name: 在隔离源码中双编译器重建并回归
         shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
         run: |

@@ -90,30 +90,53 @@ fail() {
     exit 1
 }
 
+version_ge() {
+    local actual=${1%$'\r'} minimum=${2%$'\r'}
+    [[ $actual =~ ^[0-9]+(\.[0-9]+)*$ && $minimum =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+    local -a actual_parts=() minimum_parts=()
+    local index max_len a b
+    IFS=. read -r -a actual_parts <<< "$actual"
+    IFS=. read -r -a minimum_parts <<< "$minimum"
+    max_len=${#actual_parts[@]}
+    if (( ${#minimum_parts[@]} > max_len )); then max_len=${#minimum_parts[@]}; fi
+    for ((index = 0; index < max_len; index++)); do
+        a=$((10#${actual_parts[index]:-0}))
+        b=$((10#${minimum_parts[index]:-0}))
+        if (( a > b )); then return 0; fi
+        if (( a < b )); then return 1; fi
+    done
+    return 0
+}
+
 check_pin() {
     local tool="$1" actual="$2" name separator version extra pin=""
     while read -r name separator version extra || [ -n "$name" ]; do
         if [ "$name" = "$tool" ] && [ "$separator" = '=' ]; then
-            [ -z "$pin" ] && [ -n "$version" ] && [ -z "$extra" ] || fail "versions.lock 中 $tool 的锁定格式不正确"
+            [ -z "$pin" ] && [ -n "$version" ] && [ -z "$extra" ] || fail "versions.lock 中 $tool 的最低版本格式不正确"
             pin="${version%$'\r'}"
         fi
     done < ../versions.lock
-    [ -n "$pin" ] || fail "versions.lock 未钉死 $tool 版本"
-    [ "$pin" = "$actual" ] || fail "${3:-$tool} 版本漂移：锁定 $pin，实际 $actual（升级为重基线事件）"
+    [ -n "$pin" ] || fail "versions.lock 未登记 $tool 最低版本"
+    version_ge "$actual" "$pin" || fail "${3:-$tool} 版本漂移：要求 >= $pin，实际 $actual"
 }
 
 check_gnu() {
-    local tool="$1" pin="$2" family="$3" output
+    local tool="$1" pin="$2" family="$3" output version
     output=$("$tool" --version) || fail "无法读取 $tool 版本"
     output="${output%%$'\n'*}"
     output="${output%$'\r'}"
     case "$output" in
-        *"(GNU $family) "*) check_pin "$pin" "${output##*) }" "$tool" ;;
+        *"(GNU $family) "*|*"(GNU $family for "*") "*)
+            version="${output##*) }"
+            version="${version%% *}"
+            version="${version%%-*}"
+            check_pin "$pin" "$version" "$tool"
+            ;;
         *) fail "$tool 不是预期的 GNU $family：$output" ;;
     esac
 }
 
-# ── 2. 环境自检：核对锁定工具和编译器实际选择的链接工具 ──
+# ── 2. 环境自检：核对工具最低版本门限和编译器实际选择的链接工具 ──
 [ -r ../versions.lock ] || fail "无法读取 versions.lock"
 check_pin bash "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}"
 check_gnu sha256sum coreutils coreutils
@@ -121,7 +144,9 @@ check_gnu timeout coreutils coreutils
 GCC_VER=$(gcc -dumpversion) || fail "无法读取 gcc 版本"
 CLANG_VER=$(clang -dumpversion) || fail "无法读取 clang 版本"
 GCC_VER="${GCC_VER%$'\r'}"
+GCC_VER="${GCC_VER%%-*}"
 CLANG_VER="${CLANG_VER%$'\r'}"
+CLANG_VER="${CLANG_VER%%-*}"
 check_pin gcc "$GCC_VER"
 check_pin clang "$CLANG_VER"
 GCC_AS=$(gcc -print-prog-name=as) || fail "无法定位 gcc 汇编器"

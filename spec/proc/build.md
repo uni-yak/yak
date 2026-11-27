@@ -18,13 +18,13 @@
 
 2.1 环境变量：`LC_ALL=C`、`TZ=UTC`，在 shell profile 与构建脚本双处生效。
 
-2.2 工具版本以 [版本锁](../../versions.lock) 为准。构建和门禁按入口核对 Bash、GNU coreutils、Python 及各自使用的目标工具链。Seed 和 Windows 运行时的交叉复验另核对 Clang；Linux ELF 使用独立的 `elf_gcc` 与 `elf_binutils`。已锁定版本的升级视为重基线事件。
+2.2 工具最低版本门限以 [版本锁](../../versions.lock) 为准。构建和门禁按入口核对 Bash、coreutils（兼容 GNU coreutils 与 Ubuntu 宿主默认提供的 uutils coreutils）、Python 及各自使用的目标工具链，要求实际版本号按数字分段不低于登记的最低版本（`>=`），并在构建与 CI 回执中如实记录实际版本。Seed 和 Windows 运行时的交叉复验另核对 Clang；Linux ELF 使用独立的 `elf_gcc` 与 `elf_binutils`。最低门限的调整须经规格与回归门禁验证。
 
 2.3 构建不得依赖宿主指针、编译时间、绝对路径或未排序哈希遍历结果。
 
-2.4 T1 的 Windows x64 目标不随宿主变化。MSYS2 UCRT64 默认用 `gcc`，Linux 默认用 `x86_64-w64-mingw32-gcc`；可用 `YAK_TARGET_CC` 选定命令，目标三元组须为 `x86_64-w64-mingw32`，GCC 与其实际选择的 `ld` 均须匹配锁定版本。正式入口使用已安装的 `seed/out/yak-seed.exe`（包括显式路径指向同一文件）时，须在执行前对账 `seed/frozen.txt` 最后一条登记的 SHA-256；缺失、无效或不匹配一律失败。`YAK_SEED_BIN` 显式指定其他宿主可运行的 Seed 时，由调用方按所用宿主产物的冻结证据核对来源及摘要，不与 Windows 默认件摘要混用；相对路径从仓库根解析，不在 PATH 中查找。`YAK_RUNTIME_OBJ` 指向目标 COFF 运行时对象。Linux 执行冻结 PE Seed 或验证生成的目标程序时，须用 `YAK_PE_RUNNER` 指定可接收 EXE 路径与参数的命令。只链接不运行时不执行生成的目标程序，但仍须执行 Seed；若使用 Linux 原生 Seed，此时无需 PE 运行器。
+2.4 T1 的 Windows x64 目标不随宿主变化。MSYS2 UCRT64 默认用 `gcc`，Linux 默认用 `x86_64-w64-mingw32-gcc`；可用 `YAK_TARGET_CC` 选定命令，目标三元组须为 `x86_64-w64-mingw32`，GCC 与其实际选择的 `ld` 均须满足 `versions.lock` 最低版本门限。正式入口使用已安装的 `seed/out/yak-seed.exe`（包括显式路径指向同一文件）时，须在执行前对账 `seed/frozen.txt` 最后一条登记的 SHA-256；缺失、无效或不匹配一律失败。`YAK_SEED_BIN` 显式指定其他宿主可运行的 Seed 时，由调用方按所用宿主产物的冻结证据核对来源及摘要，不与 Windows 默认件摘要混用；相对路径从仓库根解析，不在 PATH 中查找。`YAK_RUNTIME_OBJ` 指向目标 COFF 运行时对象。Linux 执行冻结 PE Seed 或验证生成的目标程序时，须用 `YAK_PE_RUNNER` 指定可接收 EXE 路径与参数的命令。只链接不运行时不执行生成的目标程序，但仍须执行 Seed；若使用 Linux 原生 Seed，此时无需 PE 运行器。
 
-2.5 通用 base 根可在 Linux x86-64 宿主显式用 `bash compiler/min/build.sh ROOT --target linux-x64 --native-compiler EXE --native-scanner EXE [--module-root DIR]... [--out-dir DIR] [--audit-dir DIR]` 构建。调用方须核验 Win64 编译器与扫描器的来源和摘要，并设置只用于运行这两枚构建工具的 `YAK_PE_RUNNER`。ELF 仅使用源码运行时，不执行 Seed、不接受 `--require-frozen-seed` 或预制 `YAK_RUNTIME_OBJ`。`YAK_ELF_CC`、`YAK_ELF_AS`、`YAK_ELF_LD` 默认使用 `gcc`、`as`、`ld`；GCC 目标须为 `x86_64-linux-gnu`，GCC、独立 `as`、GCC 选出的 `as` 和 `ld` 须匹配 ELF 版本锁，Bash、coreutils、Python 使用共用锁。正式自举根 `compiler/min/src/main.yak` 和 `compiler/min/src/imports.yak` 仍只构建 Win64；独立 LSP 入口另遵守其发布约束。
+2.5 通用 base 根可在 Linux x86-64 宿主显式用 `bash compiler/min/build.sh ROOT --target linux-x64 --native-compiler EXE --native-scanner EXE [--module-root DIR]... [--out-dir DIR] [--audit-dir DIR]` 构建。调用方须核验 Win64 编译器与扫描器的来源和摘要，并设置只用于运行这两枚构建工具的 `YAK_PE_RUNNER`。ELF 仅使用源码运行时，不执行 Seed、不接受 `--require-frozen-seed` 或预制 `YAK_RUNTIME_OBJ`。`YAK_ELF_CC`、`YAK_ELF_AS`、`YAK_ELF_LD` 默认使用 `gcc`、`as`、`ld`；GCC 目标须为 `x86_64-linux-gnu`，GCC、独立 `as`、GCC 选出的 `as` 和 `ld` 须满足 ELF 最低版本门限，Bash、coreutils、Python 使用共用门限。正式自举根 `compiler/min/src/main.yak` 和 `compiler/min/src/imports.yak` 仍只构建 Win64；独立 LSP 入口另遵守其发布约束。
 
 ## 三、模块图与拓扑序
 

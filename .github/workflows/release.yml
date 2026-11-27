@@ -34,11 +34,11 @@ jobs:
       matrix:
         include:
           - target: linux-x64
-            image: ${{ vars.YAK_LINUX_RUNNER || 'ubuntu-26.04' }}
+            image: ubuntu-26.04
             code: ${{ vars.YAK_LINUX_CODE }}
             nvim: ${{ vars.YAK_LINUX_NVIM }}
           - target: win-x64
-            image: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
+            image: windows-2025
             code: ${{ vars.YAK_WINDOWS_CODE }}
             nvim: ${{ vars.YAK_WINDOWS_NVIM }}
     runs-on: ${{ matrix.image }}
@@ -89,14 +89,9 @@ jobs:
           REVIEW_REF: ${{ inputs.review_ref }}
           RELEASE_TAG: ${{ inputs.tag }}
           VERIFIED_RUN: ${{ inputs.verified_run }}
-          LINUX_RUNNER: ${{ vars.YAK_LINUX_RUNNER }}
-          WINDOWS_RUNNER: ${{ vars.YAK_WINDOWS_RUNNER }}
         run: |
           if [[ $MODE == verify ]]; then
             test -z "$RELEASE_TAG$VERIFIED_RUN" || { echo '错误：验收模式不接收发布标签或运行编号' >&2; exit 2; }
-            for name in LINUX_RUNNER WINDOWS_RUNNER; do
-              [[ -n ${!name} ]] || { echo "错误：缺少验收环境设置 $name" >&2; exit 2; }
-            done
             sha=$GITHUB_SHA
             if [[ -n $REVIEW_REF ]]; then
               [[ $REVIEW_REF =~ ^ci/verify/[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { echo '错误：审核分支名无效' >&2; exit 2; }

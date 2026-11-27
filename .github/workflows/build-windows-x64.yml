@@ -22,23 +22,43 @@ permissions:
 jobs:
   build:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.YAK_WINDOWS_RUNNER || 'windows-2025' }}
+    runs-on: windows-2025
     timeout-minutes: 90
     env:
       MSYSTEM: UCRT64
       CHERE_INVOKING: '1'
       MSYS2_PATH_TYPE: inherit
     steps:
-      - name: 核对运行器
-        shell: pwsh
-        run: |
-          if ($env:RUNNER_ENVIRONMENT -ne 'self-hosted') {
-            throw '请配置 YAK_WINDOWS_RUNNER 指向预置锁定 UCRT64 工具链的 Windows runner'
-          }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
+      - name: 准备 MSYS2 UCRT64 工具链
+        shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'
+        run: |
+          pacman --noconfirm -Sy --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang
+          command -v gcc clang as ld
+          gcc --version | head -n 1
+          clang --version | head -n 1
+      - name: 安装 Neovim 与 VS Code
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nvimZip = Join-Path $env:RUNNER_TEMP 'nvim-win64.zip'
+          Invoke-WebRequest -Uri 'https://github.com/neovim/neovim/releases/latest/download/nvim-win64.zip' -OutFile $nvimZip
+          $nvimStage = Join-Path $env:RUNNER_TEMP 'nvim-stage'
+          Expand-Archive -Path $nvimZip -DestinationPath $nvimStage -Force
+          $nvimRoot = Get-ChildItem -Path $nvimStage -Directory | Select-Object -First 1
+          $nvimDest = Join-Path $env:ProgramFiles 'Neovim'
+          if (Test-Path $nvimDest) { Remove-Item -Recurse -Force $nvimDest }
+          Move-Item -Path $nvimRoot.FullName -Destination $nvimDest
+          & "$nvimDest\bin\nvim.exe" --version | Select-Object -First 1
+
+          $codeSetup = Join-Path $env:RUNNER_TEMP 'vscode-setup.exe'
+          Invoke-WebRequest -Uri 'https://code.visualstudio.com/sha/download?build=stable&os=win32-x64' -OutFile $codeSetup
+          $proc = Start-Process -FilePath $codeSetup -ArgumentList '/VERYSILENT', '/NORESTART', '/MERGETASKS=!runcode' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "VS Code 安装失败，退出码 $($proc.ExitCode)" }
+          if (-not (Test-Path "$env:ProgramFiles\Microsoft VS Code\Code.exe")) { throw '找不到已安装的 Code.exe' }
       - name: 核对候选运行的来源
         if: inputs.commit == ''
         shell: 'C:/msys64/usr/bin/bash.exe --login -eo pipefail {0}'

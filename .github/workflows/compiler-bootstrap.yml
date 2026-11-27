@@ -13,16 +13,21 @@ permissions:
 jobs:
   bootstrap:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.YAK_LINUX_RUNNER || 'ubuntu-26.04' }}
+    runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
-      - name: 核对运行器
-        run: |
-          test "$RUNNER_ENVIRONMENT" = self-hosted || { echo '错误：请配置 YAK_LINUX_RUNNER 指向锁定的 Linux runner' >&2; exit 2; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
+      - name: 安装 MinGW 交叉工具链与 Wine
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 wine
+          x86_64-w64-mingw32-gcc --version | head -n 1
+          x86_64-w64-mingw32-ld --version | head -n 1
+          wine --version
       - name: 执行冷启动门禁和自举
         shell: bash
         env:

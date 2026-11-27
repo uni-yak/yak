@@ -27,6 +27,7 @@ while (( $# )); do
 done
 if (( native == 0 )); then args+=(--require-frozen-seed); fi
 
+source tools/target.sh
 # 预检在构建编译器和扫描器之前拒绝陈旧或缺失的错误码表。
 python_version=$(python -c 'import sys; print(".".join(map(str, sys.version_info[:3])))') || {
     printf '%s\n' '错误：无法读取 Python 版本' >&2; exit 1;
@@ -39,8 +40,8 @@ while read -r name equals version extra || [[ -n $name ]]; do
     fi
     python_pin=${version%$'\r'}
 done < versions.lock
-if [[ -z $python_pin || $python_version != "$python_pin" ]]; then
-    printf '错误：Python 版本漂移：锁定 %s，实际 %s\n' "$python_pin" "$python_version" >&2
+if [[ -z $python_pin ]] || ! yak_version_ge "$python_version" "$python_pin"; then
+    printf '错误：Python 版本漂移：要求 >= %s，实际 %s\n' "$python_pin" "$python_version" >&2
     exit 1
 fi
 python tools/error_codes.py --check --output compiler/min/src/diag/error_codes.yak

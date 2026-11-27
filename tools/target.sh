@@ -99,3 +99,78 @@ yak_pe_runner() {
 yak_run_pe() {
     if [[ -n ${YAK_PE_RUNNER:-} ]]; then "$YAK_PE_RUNNER" "$@"; else "$@"; fi
 }
+
+# 按数字分段比较版本：actual >= minimum 返回 0，其余（含非数字或空串）返回 1。
+yak_version_ge() {
+    local actual=${1%$'\r'} minimum=${2%$'\r'}
+    [[ $actual =~ ^[0-9]+(\.[0-9]+)*$ && $minimum =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+    local -a actual_parts=() minimum_parts=()
+    local index max_len a b
+    IFS=. read -r -a actual_parts <<< "$actual"
+    IFS=. read -r -a minimum_parts <<< "$minimum"
+    max_len=${#actual_parts[@]}
+    if (( ${#minimum_parts[@]} > max_len )); then max_len=${#minimum_parts[@]}; fi
+    for ((index = 0; index < max_len; index++)); do
+        a=$((10#${actual_parts[index]:-0}))
+        b=$((10#${minimum_parts[index]:-0}))
+        if (( a > b )); then return 0; fi
+        if (( a < b )); then return 1; fi
+    done
+    return 0
+}
+
+# 读取 coreutils 工具（如 sha256sum）的实现族与版本号，输出 "<族> <版本>"（gnu 或 uutils）。
+yak_coreutils_version() {
+    local output version
+    output=$("$1" --version 2>/dev/null) || return 1
+    output=${output%%$'\n'*}
+    output=${output%$'\r'}
+    case $output in
+        *'(GNU coreutils) '*)
+            version=${output##*) }
+            version=${version%% *}
+            version=${version%%-*}
+            printf 'gnu %s\n' "$version"
+            ;;
+        *'(uutils coreutils) '*)
+            version=${output##*) }
+            version=${version%% *}
+            version=${version%%-*}
+            printf 'uutils %s\n' "$version"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 读取 GNU Binutils 工具版本号，兼容 "(GNU Binutils) " 与 "(GNU Binutils for ...) "。
+yak_binutils_version() {
+    local output version prefix=${2:-}
+    output=$("$1" --version 2>/dev/null) || return 1
+    output=${output%%$'\n'*}
+    output=${output%$'\r'}
+    if [[ -n $prefix ]]; then
+        case $output in
+            "$prefix (GNU Binutils) "*|"$prefix (GNU Binutils for "*") "*) ;;
+            *) return 1 ;;
+        esac
+    else
+        case $output in
+            *'(GNU Binutils) '*|*'(GNU Binutils for '*') '*) ;;
+            *) return 1 ;;
+        esac
+    fi
+    version=${output##*) }
+    version=${version%% *}
+    version=${version%%-*}
+    printf '%s\n' "$version"
+}
+
+# 读取 GCC 版本号，兼容 Debian/Ubuntu MinGW 的 -posix / -win32 后缀。
+yak_gcc_version() {
+    local flag=${2:--dumpversion} output
+    output=$("$1" "$flag" 2>/dev/null) || return 1
+    output=${output%%$'\n'*}
+    output=${output%$'\r'}
+    output=${output%%-*}
+    printf '%s\n' "$output"
+}

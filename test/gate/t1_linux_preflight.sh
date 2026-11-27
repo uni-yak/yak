@@ -75,13 +75,13 @@ ok() {
     pass=$((pass + 1))
 }
 
-# 与正式入口相同：只接受唯一的「工具 = 版本」记录。
+# 与正式入口相同：只接受唯一的「工具 = 最低版本」记录。
 declare -A pins=()
 if [[ -r versions.lock ]]; then
     while read -r name equals version extra || [[ -n $name ]]; do
         version=${version%$'\r'}
         case $name in
-            bash|coreutils|binutils|gcc|clang|python)
+            bash|coreutils|uutils_coreutils|binutils|gcc|clang|python)
                 if [[ $equals == = && -n $version && -z $extra && -z ${pins[$name]+x} ]]; then
                     pins[$name]=$version
                 else
@@ -92,16 +92,6 @@ if [[ -r versions.lock ]]; then
 else
     block "无法读取 versions.lock"
 fi
-
-# 只接受正式入口识别的 GNU 工具版本行；异常时留空，由调用方报告。
-gnu_version() {
-    local output
-    output=$("$1" --version 2>/dev/null) || return 1
-    output=${output%%$'\n'*}
-    output=${output%$'\r'}
-    [[ $output == *"(GNU $2) "* ]] || return 1
-    printf '%s\n' "${output##*) }"
-}
 
 if [[ $host_only -eq 1 ]]; then
     echo "== T1 Linux 宿主工具链前置校验 =="
@@ -119,60 +109,76 @@ else
     block "目标编译器不可用或不满足三元组" "需要 x86_64-w64-mingw32-gcc，或用 YAK_TARGET_CC 指定"
 fi
 
-# 2. 版本钉死：build.sh 会逐项比对，任一不符都在创建工作区前退出 1。
+# 2. 最低版本门限：build.sh 会逐项比对，低于门限在创建工作区前退出 1。
 if [[ -n $cc ]]; then
-    gcc_actual=$("$cc" -dumpversion 2>/dev/null || true)
+    gcc_actual=$(yak_gcc_version "$cc" || true)
     gcc_wanted=${pins[gcc]:-}
-    if [[ -n $gcc_wanted && $gcc_actual == "$gcc_wanted" ]]; then
-        ok "目标 GCC 版本 $gcc_actual 与 versions.lock 一致"
+    if [[ -n $gcc_wanted ]] && yak_version_ge "$gcc_actual" "$gcc_wanted"; then
+        ok "目标 GCC 版本 $gcc_actual 满足 versions.lock（>= $gcc_wanted）"
     else
-        block "目标 GCC 版本不满足版本钉死" "versions.lock 锁定 ${gcc_wanted:-未登记}，实际 ${gcc_actual:-未知}"
+        block "目标 GCC 版本不满足最低门限" "versions.lock 要求 >= ${gcc_wanted:-未登记}，实际 ${gcc_actual:-未知}"
     fi
     if linker=$("$cc" -print-prog-name=ld 2>/dev/null) && [[ -n $linker ]]; then
         linker=${linker%$'\r'}
-        ld_actual=$(gnu_version "$linker" Binutils || true)
+        ld_actual=$(yak_binutils_version "$linker" || true)
         ld_wanted=${pins[binutils]:-}
-        if [[ -n $ld_wanted && $ld_actual == "$ld_wanted" ]]; then
-            ok "链接器 binutils 版本 $ld_actual 与 versions.lock 一致"
+        if [[ -n $ld_wanted ]] && yak_version_ge "$ld_actual" "$ld_wanted"; then
+            ok "链接器 binutils 版本 $ld_actual 满足 versions.lock（>= $ld_wanted）"
         else
-            block "链接器版本不满足版本钉死" "versions.lock 锁定 ${ld_wanted:-未登记}，实际 ${ld_actual:-未知}"
+            block "链接器版本不满足最低门限" "versions.lock 要求 >= ${ld_wanted:-未登记}，实际 ${ld_actual:-未知}"
         fi
     else
-        block "无法定位目标 GCC 的链接器" "build.sh 需要 ld 版本与 versions.lock 的 binutils 条目一致"
+        block "无法定位目标 GCC 的链接器" "build.sh 需要 ld 版本满足 versions.lock 的 binutils 门限"
     fi
 fi
 
 # 3. 构建脚本自身依赖的宿主工具版本。
 bash_actual="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}"
 bash_wanted=${pins[bash]:-}
-if [[ -n $bash_wanted && $bash_actual == "$bash_wanted" ]]; then
-    ok "bash 版本 $bash_actual 与 versions.lock 一致"
+if [[ -n $bash_wanted ]] && yak_version_ge "$bash_actual" "$bash_wanted"; then
+    ok "bash 版本 $bash_actual 满足 versions.lock（>= $bash_wanted）"
 else
-    block "bash 版本不满足版本钉死" "versions.lock 锁定 ${bash_wanted:-未登记}，实际 $bash_actual"
+    block "bash 版本不满足最低门限" "versions.lock 要求 >= ${bash_wanted:-未登记}，实际 $bash_actual"
 fi
-cu_actual=$(gnu_version sha256sum coreutils || true)
-cu_wanted=${pins[coreutils]:-}
-if [[ -n $cu_wanted && $cu_actual == "$cu_wanted" ]]; then
-    ok "coreutils 版本 $cu_actual 与 versions.lock 一致"
+cu_family=""
+cu_actual=""
+if read -r cu_family cu_actual < <(yak_coreutils_version sha256sum); then
+    if [[ $cu_family == gnu ]]; then
+        cu_wanted=${pins[coreutils]:-}
+        if [[ -n $cu_wanted ]] && yak_version_ge "$cu_actual" "$cu_wanted"; then
+            ok "coreutils 版本 $cu_actual 满足 versions.lock（>= $cu_wanted）"
+        else
+            block "coreutils 版本不满足最低门限" "versions.lock 要求 >= ${cu_wanted:-未登记}，实际 ${cu_actual:-未知}"
+        fi
+    else
+        cu_wanted=${pins[uutils_coreutils]:-}
+        if [[ -n $cu_wanted ]] && yak_version_ge "$cu_actual" "$cu_wanted"; then
+            ok "coreutils 版本 uutils $cu_actual 满足 versions.lock（>= uutils $cu_wanted）"
+        else
+            block "coreutils 版本不满足最低门限" "versions.lock 要求 >= uutils ${cu_wanted:-未登记}，实际 uutils ${cu_actual:-未知}"
+        fi
+    fi
 else
-    block "coreutils 版本不满足版本钉死" "versions.lock 锁定 ${cu_wanted:-未登记}，实际 ${cu_actual:-未知}"
+    block "coreutils 版本不满足最低门限" "versions.lock 要求 GNU >= ${pins[coreutils]:-未登记} 或 uutils >= ${pins[uutils_coreutils]:-未登记}，实际不可识别"
 fi
 
-# 4. 冷启动运行时构建和快速门禁使用的版本也须在取用 Seed 前满足锁定值。
+# 4. 冷启动运行时构建和快速门禁使用的版本也须在取用 Seed 前满足最低门限。
 clang_actual=$(clang -dumpversion 2>/dev/null || true)
+clang_actual=${clang_actual%$'\r'}
+clang_actual=${clang_actual%%-*}
 clang_wanted=${pins[clang]:-}
-if [[ -n $clang_wanted && $clang_actual == "$clang_wanted" ]]; then
-    ok "Clang 版本 $clang_actual 与 versions.lock 一致"
+if [[ -n $clang_wanted ]] && yak_version_ge "$clang_actual" "$clang_wanted"; then
+    ok "Clang 版本 $clang_actual 满足 versions.lock（>= $clang_wanted）"
 else
-    block "Clang 版本不满足版本钉死" "versions.lock 锁定 ${clang_wanted:-未登记}，实际 ${clang_actual:-不可用}"
+    block "Clang 版本不满足最低门限" "versions.lock 要求 >= ${clang_wanted:-未登记}，实际 ${clang_actual:-不可用}"
 fi
 if command -v -- python >/dev/null 2>&1; then
     python_actual=$(python -c 'import platform; print(platform.python_version())' 2>/dev/null || true)
     python_wanted=${pins[python]:-}
-    if [[ -n $python_wanted && $python_actual == "$python_wanted" ]]; then
-        ok "Python 版本 $python_actual 与 versions.lock 一致"
+    if [[ -n $python_wanted ]] && yak_version_ge "$python_actual" "$python_wanted"; then
+        ok "Python 版本 $python_actual 满足 versions.lock（>= $python_wanted）"
     else
-        block "Python 版本不满足版本钉死" "versions.lock 锁定 ${python_wanted:-未登记}，实际 ${python_actual:-不可用}"
+        block "Python 版本不满足最低门限" "versions.lock 要求 >= ${python_wanted:-未登记}，实际 ${python_actual:-不可用}"
     fi
 else
     block "缺少 python 命令" "verify.sh 以 python 名称调用工具；需安装并暴露该名称"

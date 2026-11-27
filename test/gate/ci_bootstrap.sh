@@ -6,8 +6,8 @@ export YAK_CI_RECORD_TIMING=1
 
 commit=$1
 run=$2
-[[ ${RUNNER_ENVIRONMENT:-} == self-hosted && $OSTYPE == linux* && $HOSTTYPE == x86_64 ]] || {
-    echo '错误：需要预置锁定工具链的 Linux x86-64 自托管运行器' >&2
+[[ $OSTYPE == linux* && $HOSTTYPE == x86_64 ]] || {
+    echo '错误：需要 Linux x86-64 运行器' >&2
     exit 2
 }
 root=$(pwd -P)

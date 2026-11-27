@@ -43,11 +43,11 @@ grep -Fq 'fixture: permission denied' "$work/denied.log"
 for tool in bash coreutils binutils gcc clang; do
     while IFS= read -r line; do
         case "$line" in
-            "$tool = "*) printf '%s = 0.0.0\n' "$tool" ;;
+            "$tool = "*) printf '%s = 999.0.0\n' "$tool" ;;
             *) printf '%s\n' "$line" ;;
         esac
     done < "$root/versions.lock" > "$work/versions.lock"
-    expect_failure "$tool" '版本漂移：锁定 0.0.0' bash "$work/seed/build.sh"
+    expect_failure "$tool" '版本漂移：要求 >= 999.0.0' bash "$work/seed/build.sh"
     [ ! -e "$work/seed/lock.dir" ]
 done
 printf '构建前置检查回归通过\n'

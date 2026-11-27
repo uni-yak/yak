@@ -6,11 +6,19 @@
 
 截至 2026-11-27：静态语料覆盖 214／214，完整性错误 0。已登记 106 个源码负例、4 组 Seed 宿主夹具、2 组运行期夹具、1 组原生接口夹具和 76 组工具夹具。运行回执与相应源码范围见 [证据](test/gate/EVIDENCE.md)。
 
-## P1 — 正式 Linux CI 发布归档与 Seed 退役（外部环境门禁）
+## P1 — 迁移至全 GitHub 托管 CI 并完成 T2 归档与 Seed 退役
 
-> 说明：仓库内全部非 P6 规格、门禁脚本、双目标验证与 CI 编排均已就绪并经本机 Windows 与局域网 Ubuntu x86-64 锁定工具链全量复验（含 `spec/` 77 份文档交叉审计清零、原冷启动与固定点候选工作流、`verify.sh` 含 `FP-4`/`SD-2`/`SD-3`、`t1_clean_gate.sh` 21/21、`t1_base_matrix.sh --require-complete` 39/39 实配 + 51/51 拒绝、`test_base_linux_build.sh`、`test_lsp_linux_build.sh`、Neovim 0.11.6 与 VS Code 1.148.0 真客户端、冻结 Seed 点火 `C0 → C1 → C2 → C3` 315 份审计产物逐字节一致与 `FP-3` 1,647 条唯一命中、同一 `C2v2` 候选 Win64 PE／Linux x86_64 ELF 131/131 原生对拍，详见[验收证据](test/gate/EVIDENCE.md#spec-全量交叉复检修补与-t2-ci-归档工作流落地2026-11-27)）。按 `spec/proc/fixpoint.md` 2.6 与 `spec/proc/seed.md` 3.1，以下仅余须在外部可信 `main` 远端与自托管 Linux CI runner 上触发执行的归档与退役动作：
+> 说明：仓库内全部非 P6 规格、门禁脚本、双目标验证、核心大文件/超长函数重构与基础 CI 编排均已就绪，并经本地锁定工具链全量复验及 GitHub `仓库检查通过` 全绿（详见[验收证据](test/gate/EVIDENCE.md#spec-全量交叉复检修补与-t2-ci-归档工作流落地2026-11-27)）。统一采用 GitHub 仓库托管 CI（`ubuntu-26.04` + `windows-2025`），不依赖自托管 runner：
 
-⬜  按 [GitHub Actions 说明](.github/WORKFLOW.md) 在可信 `main` 配置冻结 Seed 下载和匹配 `versions.lock` 的 Linux、Windows runner，运行 [完整验收](.github/workflows/release.yml) 归档冷启动、两遍相同的审计产物、同候选双目标原生矩阵、诊断原件及独立静态 `yak_lsp.elf`。从首轮回执检查各门禁耗时。正式 CI 归档审核后完成 `spec/audit.json` 冻结收口与 Seed 退役。
+⬜  去除自托管 runner 限制并适配 GitHub 托管环境：修订 `spec/proc/build.md`、`versions.lock` 版本校验策略与 `test/gate/{ci_bootstrap.sh,ci_platform.sh,t1_linux_preflight.sh}`，移除 `.github/workflows/{seed-regression,compiler-bootstrap,build-windows-x64,build-linux-x64,release}.yml` 中的 `self-hosted` / `YAK_*_RUNNER` 强校验；在托管 `ubuntu-26.04` 与 `windows-2025` 作业中补齐工具链与编辑器安装（`mingw-w64`、`wine`、`xvfb`、`nvim`、`code` 等），同步更新 `.github/WORKFLOW.md` 与 `.github/SETUP.md`。
+⬜  上传冻结 Seed Release 并跑通远端全链路验收：在同仓库创建 `seed-<SHA256>` Release 上传冻结 `seed/out/yak-seed.exe`，触发并验收 [Seed 解释器回归](.github/workflows/seed-regression.yml) 与 [发布与验收归档](.github/workflows/release.yml) 的 `verify` 完整验收流水线（冷启动、两遍一致审计产物、双目标 131/131 原生矩阵、诊断原件及独立静态 `yak_lsp.elf`）。
+⬜  完成 T2 收口与 Seed 退役：正式 CI 归档审核通过后完成 `spec/audit.json` 冻结收口、退役 `seed/out/yak-seed.exe`（`spec/proc/seed.md` 3.1），并通过 [发布与验收归档](.github/workflows/release.yml) 的 `draft` 模式产出首个预发布/正式版本草稿。
+
+## P2 — T2 退役 Seed 后的工具链原生化与基座治理（T2 → T3 过渡）
+
+⬜  Linux 原生自举编译器与去 Wine / 去 MinGW 化：T2 退役冻结 Seed 后，放开 `compiler/min/build.sh` 对 `main.yak` 与 `imports.yak` 的 `--target linux-x64` 限制（`compiler/min/host/stream/host.yak` 已仅依赖平台无关的 `read`／`write`／`exit`），复用已归档 `C2` 交叉产出原生静态 `main.elf` 与 `imports.elf`，在 Linux 原生完成 `ELF C2 == ELF C3` 固定点接力，使 Linux 构建、自举与分发彻底脱离 Wine 与 MinGW。
+⬜  控制流原语与 `foreign` I/O 边界整理：评估并将 `assert` 与 `exit` 从用户 `foreign` 服务集上移为语言级控制流原语 `@assert`／`@exit`（同步更新 `spec/lang/symbol.def`、`spec/lang/foreign.md`、`spec/lang/base.md`、`spec/ir/mir.md`、`spec/ir/ysm.md` 与 `no_alloc` 判定）；`read`／`write` 保留在 `foreign` ABI 层，不进入 `@` 语言原语闭集。
+⬜  大模块演进治理：T2 解除冻结 Seed 100M 步约束后，随 `yakc-full` 演进按需拆分 `compiler/min/src/emit/pe.yak`（分离纯 x86 编码原语与分支布局／ABI 帧辅助）及 `compiler/min/src/check/owner_state.yak`；若在 Seed 退役前需继续扩展 YSM 格式，优先拆离 `compiler/min/src/ysm/ysm_write.yak`（当前 C0 实测 97.0M 步）的编码段。
 
 ## P6 — full 层待办（T3–T4 能力生长与底层开发支持）
 
@@ -23,7 +31,7 @@
 ⬜  泛型单态化（`S-14`）：接入声明与调用语法、泛型名义类型及接口约束事实。复用 `monomorph::instantiate_signature`，生成实例函数体与 MIR，按声明、具体 TypeSig 和目标 profile 去重并生成规范摘要，同步验收 `AW-4`／`AL-4` 泛型 `TypeSig` 规范身份、摘要生成与跨单元同实例一致性，用完整源码复验 `SU-7`。
 ⬜  核心类型与运行时语义扩展：接入 `string`／`&string`（`S-12`）的 full 入口、受检 UTF-8 构造、生命周期、MIR 与 ABI；实现字节／原始／模板字面量、`f32`／`f64` 浮点算术与 ABI、用户自定义 `Drop`（含 `no_alloc` 静态校验），并随 `T?` 实现修复 seed 跨模块 `?.` 用当前模块查字段的问题。
 ⬜  顶层 `let`／`var`（`S-4`）：实现绑定解析和依赖收集，接入 `desugar::plan_initializers`，由模块初始化器执行排序结果；用完整源文件核对初始化顺序和 `E3006`。
-⬜  `pkg/` 标准库建设。
+⬜  `pkg/` 标准库建设：落地 `pkg/io`、`pkg/string`、`pkg/buf`、`pkg/alloc`、`pkg/math`；其中 `pkg/io` 以模块私有 `foreign read`／`foreign write` 加公开 `export function` 封装标准输入输出，并逐步迁移 `examples/` 改用标准库接口（替代手写 `foreign` 声明）。
 
 #### 2. 底层系统开发能力（T3 实现）
 

@@ -22,17 +22,24 @@ permissions:
 jobs:
   build:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.YAK_LINUX_RUNNER || 'ubuntu-26.04' }}
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
-      - name: 核对运行器
-        shell: bash
-        run: |
-          test "$RUNNER_ENVIRONMENT" = self-hosted || { echo '错误：请配置 YAK_LINUX_RUNNER 指向锁定的 Linux runner' >&2; exit 2; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
+      - name: 安装 Wine、Xvfb、Neovim 与 VS Code
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine xvfb dbus-x11 neovim
+          curl -fsSL 'https://code.visualstudio.com/sha/download?build=stable&os=linux-deb-x64' -o /tmp/vscode.deb
+          sudo apt-get install -y /tmp/vscode.deb
+          rm -f /tmp/vscode.deb
+          wine --version
+          nvim --version | head -n 1
+          test -x /usr/share/code/code
       - name: 核对候选运行的来源
         if: inputs.commit == ''
         shell: bash

@@ -1,19 +1,19 @@
 # Yak GitHub 仓库配置清单
 
-本清单用于将 `uni-yak/yak` 的 GitHub Actions、自托管运行器、分支与标签规则集配置就绪。完整工作流设计与变量脚本见 [WORKFLOW.md](WORKFLOW.md)。
+本清单用于将 `uni-yak/yak` 的 GitHub Actions、冻结 Seed Release、分支与标签规则集配置就绪。全部工作流统一运行在 GitHub 托管运行器（`ubuntu-26.04` / `windows-2025`），无需配置自托管 runner。完整工作流设计与变量脚本见 [WORKFLOW.md](WORKFLOW.md)。
 
 ---
 
-## 1. 准备自托管 Runner 与 Actions 仓库变量
+## 1. 准备冻结 Seed Release 与可选变量
 
-本仓库全部工作流仅使用内置 `github.token`，不需要配置额外的 PAT 或自定义 Secret。
+本仓库全部工作流仅使用内置 `github.token`，不需要配置额外的 PAT、自定义 Secret 或自托管运行器。
 
-1. 按 [versions.lock](../versions.lock) 准备隔离的 Linux x86-64 与 Windows x64（MSYS2 UCRT64）自托管 runner，并预置 Neovim、VS Code、Node/npm（Linux 另需 Wine、Xvfb、D-Bus）。
-2. 在 **Settings → Secrets and variables → Actions → Variables** 配置以下必填仓库变量（也可直接执行 [WORKFLOW.md](WORKFLOW.md#设置-actions-仓库变量) 中的 PowerShell 脚本）：
-   - `YAK_LINUX_RUNNER`、`YAK_WINDOWS_RUNNER`：受限的自托管 runner 标签
-   - `YAK_SEED_URL`：与 [seed/frozen.txt](../seed/frozen.txt) 末条 SHA-256 一致的冻结 Seed HTTPS 地址
-   - `YAK_LINUX_CODE`、`YAK_LINUX_NVIM`、`YAK_WINDOWS_CODE`、`YAK_WINDOWS_NVIM`：双平台编辑器可执行文件路径
-   - 可选：`YAK_CI_WINE`（默认 `wine`）、`YAK_LINUX_CASE_JOBS` / `YAK_WINDOWS_CASE_JOBS`（默认 `3`，范围 `1`–`8`）
+1. 将与 [seed/frozen.txt](../seed/frozen.txt) 末条 SHA-256 一致的 `seed/out/yak-seed.exe` 发布为同仓库 Release 附件（标签 `seed-<完整 SHA-256>`，附件名 `yak-seed.exe`）。
+2. 可选 Actions 仓库变量（**Settings → Secrets and variables → Actions → Variables**，默认可不配）：
+   - `YAK_SEED_URL`：冻结 Seed 的额外 HTTPS 镜像地址（未配置时自动从同仓库 Release 读取）
+   - `YAK_CI_WINE`：Linux 上运行 Win64 PE 工具的命令（默认 `wine`）
+   - `YAK_LINUX_CASE_JOBS` / `YAK_WINDOWS_CASE_JOBS`：单平台语料并发数（默认 `3`，范围 `1`–`8`）
+   - `YAK_LINUX_CODE`、`YAK_LINUX_NVIM`、`YAK_WINDOWS_CODE`、`YAK_WINDOWS_NVIM`：仅在覆盖编辑器默认安装路径时填写
 
 ---
 
@@ -45,6 +45,6 @@ git config core.hooksPath .githooks
 
 ## 4. 环境盘点与正式发布流程
 
-1. **环境盘点**：在 `main` 上手动触发 [发布与验收归档](workflows/release.yml)（`mode=probe`），确认双平台工具链与编辑器路径齐备。
+1. **环境盘点**：在 `main` 上手动触发 [发布与验收归档](workflows/release.yml)（`mode=probe`），确认 GitHub 托管双平台运行器基线环境。
 2. **完整验收**：在 `main` 上手动触发 `release.yml`（`mode=verify`；合入前验收可指定受保护 `review_ref: ci/verify/<名称>`），依次完成 `仓库检查` → `编译器冷启动与自举` → 并行 `Windows x64` / `Linux x86-64` 原生验收 → `对拍并归档双平台交付件`（生成 `release-ready` 归档与运行编号）。
 3. **创建受保护标签与草稿 Release**：在已验收提交上推送 `vX.Y.Z`（或 `vX.Y.Z-rc.N`）标签，再以 `mode=draft` 传入 `tag` 与 `verified_run` 生成待审核草稿 Release，复核 `SHA256SUMS` 与构建清单后在 GitHub Releases 页面公开发布。

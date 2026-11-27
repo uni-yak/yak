@@ -41,7 +41,7 @@ printf '%s\n' '// 仅用于验证陈旧表拒绝的附加字节' >> "$table"
 run_preflight stale 1 '错误码表陈旧'
 cp -- current.yak "$table"
 cp -- versions.lock current.lock
-printf '%s\n' 'python = 0.0.0' > versions.lock
+printf '%s\n' 'python = 999.0.0' > versions.lock
 run_preflight version 1 'Python 版本漂移'
 cp -- current.lock versions.lock
 run_preflight current 57 'error codes: reproducible and current'
@@ -65,7 +65,7 @@ cp -- current.yak "$table"
 printf '%s\n' '// 仅用于验证直接入口的陈旧表字节' >> "$table"
 run_direct direct-stale '错误码表陈旧'
 cp -- current.yak "$table"
-printf '%s\n' 'python = 0.0.0' > versions.lock
+printf '%s\n' 'python = 999.0.0' > versions.lock
 run_direct direct-version 'python 版本漂移'
 cp -- current.lock versions.lock
 run_direct direct-symbol-missing 'E7010 词法表与配置源不一致'

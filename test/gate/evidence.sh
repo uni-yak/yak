@@ -312,7 +312,7 @@ if [[ $release -eq 1 && $failed -eq 0 && -z $missing_records ]]; then
         verify_python=$version
     done < versions.lock || verify_ok=0
     [[ -n $verify_python ]] || verify_ok=0
-    verify_marks=("ok：Python 版本 $verify_python"
+    verify_marks=(
         'ok：未发现提前出现的 yakc-full 实体' 'ok：T1 阶段实体边界回归通过'
         'ok：固定点与阶段切换边界校验通过' 'ok：固定点与阶段切换边界回归通过'
         'ok：规格审计通过' 'ok：词表可复现且与生成器一致'
@@ -323,15 +323,25 @@ if [[ $release -eq 1 && $failed -eq 0 && -z $missing_records ]]; then
         'ok：取证回归通过' 'ok：Seed 诊断 JSONL 回归通过' 'ok：T1 入口用例通过'
         'yakc-min 快速门禁通过')
     verify_next=0
+    verify_py_seen=0
+    verify_py_re='^ok：Python 版本 ([0-9]+(\.[0-9]+)*)$'
     if ! while IFS= read -r line || [[ -n $line ]]; do
         if (( verify_next == ${#verify_marks[@]} )) ||
-            [[ $line == 'FAIL：'* || $line == 'yakc-min 快速门禁失败：'* ]] ||
-            [[ $line == 'ok：Python 版本 '* && $line != "${verify_marks[0]}" ]]; then
+            [[ $line == 'FAIL：'* || $line == 'yakc-min 快速门禁失败：'* ]]; then
             verify_ok=0
+        fi
+        if [[ $line == 'ok：Python 版本 '* ]]; then
+            if (( verify_py_seen != 0 || verify_next != 0 )) || [[ ! $line =~ $verify_py_re ]] ||
+                ! evidence_version_ge "${BASH_REMATCH[1]}" "$verify_python"; then
+                verify_ok=0
+            else
+                verify_py_seen=1
+            fi
+            continue
         fi
         for mark in "${verify_marks[@]}"; do
             [[ $line == "$mark" ]] || continue
-            if [[ $line == "${verify_marks[verify_next]:-}" ]]; then
+            if (( verify_py_seen == 1 )) && [[ $line == "${verify_marks[verify_next]:-}" ]]; then
                 verify_next=$((verify_next + 1))
             else
                 verify_ok=0
@@ -342,7 +352,7 @@ if [[ $release -eq 1 && $failed -eq 0 && -z $missing_records ]]; then
         verify_ok=0
     fi
     if ! cmp -s -- "$from_logs/verify.cmd" <(printf '%s\n' 'bash compiler/min/verify.sh') ||
-        [[ $verify_ok -ne 1 || $verify_next -ne ${#verify_marks[@]} ]]; then
+        [[ $verify_ok -ne 1 || $verify_py_seen -ne 1 || $verify_next -ne ${#verify_marks[@]} ]]; then
         release_issues+=("快速门禁未记录指定命令及按序完整且唯一的成功结论")
     fi
 

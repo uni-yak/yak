@@ -22,17 +22,23 @@ echo "仓库根：$root"
 
 echo "-- Python 门禁工具版本 --"
 python_version=$(python -c 'import platform; print(platform.python_version())')
+python_found=0
 while read -r name equals wanted extra || [ -n "$name" ]; do
     if [ "$name" = python ]; then
         wanted=${wanted%$'\r'}
-        if [ "$equals" != = ] || [ -z "$wanted" ] || [ -n "$extra" ] || [ "$python_version" != "$wanted" ]; then
-            bad "Python 版本漂移：锁定 $wanted，实际 $python_version"
+        if [ "$equals" != = ] || [ -z "$wanted" ] || [ -n "$extra" ] || ! yak_version_ge "$python_version" "$wanted"; then
+            bad "Python 版本漂移：要求 >= $wanted，实际 $python_version"
             exit 1
         fi
         ok "Python 版本 $python_version"
+        python_found=1
         break
     fi
 done < versions.lock
+if [ "$python_found" -ne 1 ]; then
+    bad "versions.lock 缺少 python 最低版本条目"
+    exit 1
+fi
 
 echo "-- T1 阶段实体边界（SD-1）--"
 if python test/gate/t1_stage_boundary.py; then

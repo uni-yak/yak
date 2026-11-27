@@ -40,22 +40,22 @@ while read -r name equals version extra || [[ -n $name ]]; do
 done < ../versions.lock
 pin_tool() {
     local name=$1 actual=${2%$'\r'} wanted=${pins[$1]:-}
-    [[ -n $wanted ]] || fail_toolchain "versions.lock 未锁定 $name"
-    [[ $actual == "$wanted" ]] || fail_toolchain "$name 版本漂移：锁定 $wanted，实际 $actual"
+    [[ -n $wanted ]] || fail_toolchain "versions.lock 未登记 $name 最低版本"
+    yak_version_ge "$actual" "$wanted" || fail_toolchain "$name 版本漂移：要求 >= $wanted，实际 $actual"
 }
 pin_tool bash "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}"
 gcc_target=$(yak_target_cc)
-gcc_version=$("$gcc_target" -dumpversion) || fail_toolchain '无法读取目标 GCC 版本'
+gcc_version=$(yak_gcc_version "$gcc_target") || fail_toolchain '无法读取目标 GCC 版本'
 pin_tool gcc "$gcc_version"
 clang_version=$(clang -dumpversion) || fail_toolchain '无法读取 Clang 版本'
+clang_version=${clang_version%$'\r'}
+clang_version=${clang_version%%-*}
 pin_tool clang "$clang_version"
 assembler=$("$gcc_target" -print-prog-name=as) || fail_toolchain '无法定位目标 GCC 汇编器'
 assembler=${assembler%$'\r'}
 [[ -n $assembler ]] || fail_toolchain '目标 GCC 未返回实际汇编器'
-assembler_banner=$("$assembler" --version) || fail_toolchain '无法读取目标 GCC 汇编器版本'
-assembler_banner=${assembler_banner%%$'\n'*}
-[[ $assembler_banner == *'(GNU Binutils) '* ]] || fail_toolchain '目标 GCC 汇编器不是 GNU Binutils'
-pin_tool binutils "${assembler_banner##*) }"
+assembler_version=$(yak_binutils_version "$assembler") || fail_toolchain '目标 GCC 汇编器不是 GNU Binutils 或无法读取版本'
+pin_tool binutils "$assembler_version"
 clang_flags=(-mno-incremental-linker-compatible)
 if [[ $OSTYPE == linux* ]]; then clang_flags+=(--target=x86_64-w64-windows-gnu); fi
 

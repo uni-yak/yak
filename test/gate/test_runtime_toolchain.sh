@@ -35,7 +35,7 @@ bash_version=${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}.${BASH_VERSINFO[2]}
 for tool in bash gcc clang binutils; do
     pins=([0]="$bash_version" [1]=16.2.0 [2]=23.1.3 [3]=2.47.20260726)
     case $tool in bash) index=0 ;; gcc) index=1 ;; clang) index=2 ;; binutils) index=3 ;; esac
-    pins[$index]=0.0.0
+    pins[$index]=999.0.0
     printf 'bash = %s\ngcc = %s\nclang = %s\nbinutils = %s\n' "${pins[@]}" > versions.lock
     rc=0
     bash runtime/build.sh --scratch work > "$tool.log" 2>&1 || rc=$?
