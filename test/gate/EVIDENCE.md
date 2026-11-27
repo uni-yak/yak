@@ -1836,6 +1836,22 @@ Win64 重定位夹具以真实 PE 中的 VA、RVA 与独立保留的语义加数
 - **T2 正式 Linux CI 归档工作流落地**：
   - 当时新增 `t2-linux.yml`，复用 `t1-linux.yml` 的可信 `main` runner 守卫，编排冷启动、固定点候选与平台定向门禁。这两条入口后来由[按平台拆分的工作流](../../.github/WORKFLOW.md)接续。
 
+### 全 GitHub 托管 CI 迁移与 `release.yml (mode=verify)` 全链路验收归档（2026-11-27）
+
+- **迁移与门禁修复**：
+  - 将 [spec/proc/build.md](../../spec/proc/build.md) 2.2/2.4/2.5 与 [versions.lock](../../versions.lock) 统一调整为最低版本门限（`>=`，兼容 Ubuntu 26.04 默认 `uutils coreutils` 及 Debian/Ubuntu MinGW 版本格式），并在全部工作流（`seed-regression.yml`、`compiler-bootstrap.yml`、`build-linux-x64.yml`、`build-windows-x64.yml`、`release.yml`）中移除 `self-hosted` / `YAK_*_RUNNER` 限制，统一运行在 GitHub 托管 `ubuntu-26.04` 与 `windows-2025` 上（提交 `c5e8d05`）。
+  - 在同仓库发布冻结 Seed 预发布附件 `seed-9abd162e2713748ffb62d471e39c5703abb733b607bb6431dccef1e7b9fe30ec`（`yak-seed.exe` SHA-256 与 `seed/frozen.txt` 末条一致）。
+  - 实测修复五处托管环境与既有门禁漂移：隔离 `WINEPREFIX` 并禁用 Wine `AeDebug` 事后调试器转储（`6af7d6a`）；同步 [evidence_matrix.sh](evidence_matrix.sh) 的 `F-4` 与 `t1_transitive_ysm` 断言文本（`ce6c2e2`）；改用 `ELECTRON_RUN_AS_NODE=1` 查询 VS Code CLI 版本、调整 `lsp-linux-boundary` 次序并为 Linux 作业补齐 MinGW 工具链（`0412aeb`、`56216e3`）；同步 [lsp_corpus_check.py](lsp_corpus_check.py) 的 P4 握手能力集、未注册屏障请求及 Linux 匿名内存汇总键（`e1c8fec`、`62220d6`）；启用 `/usr/lib/wine/wineserver -p` 消除短进程重连 `recvmsg` 竞态（`5296412`、`b4ce06d`）。
+- **云端 GitHub Actions 验收结果**：
+  - **Seed 解释器回归**（Run `45923700182`，`windows-2025` MSYS2 UCRT64，提交 `c5e8d05`）：`success`（6m48s，GCC/Clang 双编字节一致、478/478 回归交叉等价及端到端链接复现）。
+  - **发布与验收归档 `mode=verify`**（Run `45997051559`，提交 `62220d64e4d43d48f1905c87e39585e6dc478f69`，GitHub 托管 `ubuntu-26.04` + `windows-2025`）：**全作业通过**（`plan` 4s → `checks` 27s → `bootstrap` 11m59s → 并行 `linux` 4m16s / `windows` 7m54s → `assemble` 8s）。
+  - **正式归档 `release-ready` 摘要**：
+    - 共享 `C2 == C3` 候选摘要：`8f7d8b43c7679463a4b52014ce00d2eab07a7659b4913a43218d3e4d39d209fc`
+    - 双平台原生逐例对拍：`131 / 131` 通过（含真实 Neovim、真实 VS Code、`lsp-stress`、`lsp-corpus` 万行/百文件/16 MiB 压测与独立静态 `yak_lsp.elf` 二次清冷构建字节一致）
+    - `yak-windows-x64.zip` SHA-256：`f7ec79b36e0ca0cb974e52efe09605ed54c7df8db8037c4297f48a60e5ce40ee`
+    - `yak-lsp-linux-x86-64.tar.gz` SHA-256：`73a64f9a0c7e2688cd788116073deb98cef7f91cf1fee4ba33e2f2fa050821e7`
+    - `build-manifest.json` SHA-256：`bf3eb4edc2ba361f5e91c4e98092e3c3c033300830836a3ec46e2fa5c4403d48`
+
 ## 归档模板
 
 提交或在评审中粘贴证据时，用下列字段，缺项即视为证据不完整：

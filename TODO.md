@@ -6,13 +6,11 @@
 
 截至 2026-11-27：静态语料覆盖 214／214，完整性错误 0。已登记 106 个源码负例、4 组 Seed 宿主夹具、2 组运行期夹具、1 组原生接口夹具和 76 组工具夹具。运行回执与相应源码范围见 [证据](test/gate/EVIDENCE.md)。
 
-## P1 — 迁移至全 GitHub 托管 CI 并完成 T2 归档与 Seed 退役
+## P1 — 完成 T2 收口、Seed 退役与首个草稿发布
 
-> 说明：仓库内全部非 P6 规格、门禁脚本、双目标验证、核心大文件/超长函数重构与基础 CI 编排均已就绪，并经本地锁定工具链全量复验及 GitHub `仓库检查通过` 全绿（详见[验收证据](test/gate/EVIDENCE.md#spec-全量交叉复检修补与-t2-ci-归档工作流落地2026-11-27)）。统一采用 GitHub 仓库托管 CI（`ubuntu-26.04` + `windows-2025`），不依赖自托管 runner：
+> 说明：全 GitHub 托管 CI（`ubuntu-26.04` + `windows-2025`）与 `release.yml (mode=verify)` 全链路验收归档已全绿通过（Run `45997051559`，提交 `62220d6`，双平台 131/131 原生对拍一致，详见[验收证据](test/gate/EVIDENCE.md#全-github-托管-ci-迁移与-releaseyml-modeverify-全链路验收归档2026-11-27)）：
 
-⬜  去除自托管 runner 限制并适配 GitHub 托管环境：修订 `spec/proc/build.md`、`versions.lock` 版本校验策略与 `test/gate/{ci_bootstrap.sh,ci_platform.sh,t1_linux_preflight.sh}`，移除 `.github/workflows/{seed-regression,compiler-bootstrap,build-windows-x64,build-linux-x64,release}.yml` 中的 `self-hosted` / `YAK_*_RUNNER` 强校验；在托管 `ubuntu-26.04` 与 `windows-2025` 作业中补齐工具链与编辑器安装（`mingw-w64`、`wine`、`xvfb`、`nvim`、`code` 等），同步更新 `.github/WORKFLOW.md` 与 `.github/SETUP.md`。
-⬜  上传冻结 Seed Release 并跑通远端全链路验收：在同仓库创建 `seed-<SHA256>` Release 上传冻结 `seed/out/yak-seed.exe`，触发并验收 [Seed 解释器回归](.github/workflows/seed-regression.yml) 与 [发布与验收归档](.github/workflows/release.yml) 的 `verify` 完整验收流水线（冷启动、两遍一致审计产物、双目标 131/131 原生矩阵、诊断原件及独立静态 `yak_lsp.elf`）。
-⬜  完成 T2 收口与 Seed 退役：正式 CI 归档审核通过后完成 `spec/audit.json` 冻结收口、退役 `seed/out/yak-seed.exe`（`spec/proc/seed.md` 3.1），并通过 [发布与验收归档](.github/workflows/release.yml) 的 `draft` 模式产出首个预发布/正式版本草稿。
+⬜  完成 T2 收口与 Seed 退役：基于已通过的正式 CI 归档（Run `45997051559`），审核并完成 `spec/audit.json` 冻结收口、退役 `seed/out/yak-seed.exe`（`spec/proc/seed.md` 3.1），并通过 [发布与验收归档](.github/workflows/release.yml) 的 `draft` 模式产出首个预发布/正式版本草稿。
 
 ## P2 — T2 退役 Seed 后的工具链原生化与基座治理（T2 → T3 过渡）
 
