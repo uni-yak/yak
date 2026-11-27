@@ -28,6 +28,8 @@ record elf-as -- "${YAK_ELF_AS:-as}" --version
 record elf-ld -- "${YAK_ELF_LD:-ld}" --version
 record python-version -- python --version
 record verify-stage -- python test/gate/ci_bootstrap_stage.py verify "$stage" "$commit" "$run"
+record elf-object -- bash test/gate/test_elf_object.sh --verify-dir "$stage/elf-probes/object"
+record elf-call -- bash test/gate/test_elf_call.sh --verify-dir "$stage/elf-probes/call"
 
 source tools/target.sh
 declare -A pins=()

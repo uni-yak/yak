@@ -11,6 +11,8 @@ from ci_artifacts import digest, read_json, write_json
 
 WIN64_FILES = tuple(
     f"{stage}/out/{tool}.exe" for stage in ("c2", "c3") for tool in ("main", "imports")
+) + tuple(
+    f"elf-probes/{kind}/{name}.o" for kind in ("object", "call") for name in ("first", "second")
 ) + ("runtime.obj",)
 ELF_ROOTS = ("main", "imports")
 OBJ_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.o$")
