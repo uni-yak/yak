@@ -199,6 +199,165 @@ function positive_integer_max(builtin: u16): u64 {
     return 18446744073709551615u64;
 }
 
+// 闭区间试算只读已定型的表达式，不扩展基座常量初始器或其他诊断的求值范围。
+// 位值始终截到当前宽度；陷阱与不支持的表达式均为未知，不能证明外层加一溢出。
+function integer_width(builtin: u16): u64 {
+    if builtin == BUILTIN_U8 || builtin == BUILTIN_I8 { return 8; }
+    if builtin == BUILTIN_U16 || builtin == BUILTIN_I16 { return 16; }
+    if builtin == BUILTIN_U32 || builtin == BUILTIN_I32 { return 32; }
+    return 64;
+}
+
+function integer_mask(width: u64): u64 { return 18446744073709551615u64 >> (64u64 - width); }
+
+function integer_negative(bits: u64, width: u64): bool { return (bits & (1u64 << (width - 1))) != 0; }
+
+function extend_signed(bits: u64, width: u64): u64 {
+    if integer_negative(bits, width) { return bits | (18446744073709551615u64 ^ integer_mask(width)); }
+    return bits;
+}
+
+function integer_probe(known: bool, bits: u64): IntegerProbe { return IntegerProbe { done: true, known: known, bits: bits }; }
+
+function closed_integer_binary(op: u8, builtin: u16, left: u64, right: u64): IntegerProbe {
+    let width: u64 = integer_width(builtin);
+    let mask: u64 = integer_mask(width);
+    let signed: bool = builtin >= BUILTIN_I8;
+    let left_negative: bool = signed && integer_negative(left, width);
+    let right_negative: bool = signed && integer_negative(right, width);
+    var bits: u64 = 0;
+    if op == 11 || op == 12 {
+        if op == 11 { bits = @wrap_add(left, right) & mask; }
+        else { bits = @wrap_sub(left, right) & mask; }
+        if signed {
+            let result_negative: bool = integer_negative(bits, width);
+            if result_negative != left_negative && ((op == 11 && left_negative == right_negative) || (op == 12 && left_negative != right_negative)) { return integer_probe(false, 0); }
+        } elseif (op == 11 && left > mask - right) || (op == 12 && left < right) { return integer_probe(false, 0); }
+    } elseif op == 13 || op == 14 || op == 15 {
+        var a: u64 = left;
+        var b: u64 = right;
+        if left_negative { a = @wrap_sub(0u64, a) & mask; }
+        if right_negative { b = @wrap_sub(0u64, b) & mask; }
+        var negative: bool = left_negative != right_negative;
+        if op == 13 {
+            var limit: u64 = positive_integer_max(builtin);
+            if negative { limit = limit + 1; }
+            if b != 0 && a > limit / b { return integer_probe(false, 0); }
+            bits = a * b;
+        } else {
+            if b == 0 { return integer_probe(false, 0); }
+            if op == 14 {
+                if left_negative && right_negative && a == positive_integer_max(builtin) + 1 && b == 1 { return integer_probe(false, 0); }
+                bits = a / b;
+            } else {
+                bits = a % b;
+                negative = left_negative;
+            }
+        }
+        if negative { bits = @wrap_sub(0u64, bits) & mask; }
+    } elseif op == 7 || op == 8 {
+        if right >= width { return integer_probe(false, 0); }
+        if op == 7 { bits = (left << right) & mask; }
+        else {
+            bits = left >> right;
+            if left_negative { bits = bits | (mask ^ (mask >> right)); }
+        }
+    } elseif op == 19 { bits = left & right; }
+    elseif op == 20 { bits = left | right; }
+    elseif op == 21 { bits = left ^ right; }
+    else { return integer_probe(false, 0); }
+    return integer_probe(true, bits);
+}
+
+struct ClosedProbeFrame { expr: u32, stage: u8, left: u64 }
+
+// 显式栈按源码顺序处理操作数，无须让深表达式占用宿主调用栈。
+function probe_closed_upper(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:Read, expr_types: &typecheck::ExprTypeTable:Read, refs: &resolve_refs::RefTable:Read, input: &consteval::ConstInput:Read, consts: &consteval::ConstTable:ReadWrite, upper: u32, work: &consteval::FoldBudget:ReadWrite): IntegerProbe!AllocError {
+    var stack: ClosedProbeFrame[] = [];
+    var depth: u32 = 0;
+    var expr: u32 = upper;
+    var stage: u8 = 0;
+    var left: u64 = 0;
+    var bits: u64 = 0;
+    while true {
+        if work.limited && !consteval::charge_fold(work) { return integer_probe(false, 0); }
+        if expr >= @len(expr_types.items) as u32 || expr >= @len(pool.exprs) as u32 { return integer_probe(false, 0); }
+        let value_type_id: u32 = expr_types.items[expr];
+        if !typecheck::is_integer_type(tt, value_type_id) { return integer_probe(false, 0); }
+        let builtin: u16 = tt.entries[value_type_id - 1].builtin;
+        let node: ast::Expr = pool.exprs[expr];
+        let data: u32 = node.data as u32;
+        var child: u32 = expr;
+        if node.kind == 20 {
+            let binary: ast::BinaryExpr = pool.binaries[data];
+            if binary.left >= expr || binary.right >= expr || expr_types.items[binary.left] != value_type_id || expr_types.items[binary.right] != value_type_id { return integer_probe(false, 0); }
+            if stage == 0 { child = binary.left; }
+            elseif stage == 1 { left = bits; child = binary.right; }
+            else {
+                let result: IntegerProbe = closed_integer_binary(binary.op, builtin, left, bits);
+                if !result.known { return result; }
+                bits = result.bits;
+            }
+        } elseif node.kind == 28 {
+            let operand: u32 = pool.casts[data].operand;
+            if operand >= expr { return integer_probe(false, 0); }
+            let source: u32 = expr_types.items[operand];
+            if !typecheck::is_integer_type(tt, source) { return integer_probe(false, 0); }
+            if stage == 0 { child = operand; }
+            else {
+                let from: u16 = tt.entries[source - 1].builtin;
+                let source_width: u64 = integer_width(from);
+                let target_width: u64 = integer_width(builtin);
+                let negative: bool = from >= BUILTIN_I8 && integer_negative(bits, source_width);
+                if source_width > target_width && !negative && (bits >> target_width) != 0 { return integer_probe(false, 0); }
+                if negative { bits = extend_signed(bits, source_width); }
+                bits = bits & integer_mask(target_width);
+            }
+        } elseif node.kind == 21 {
+            let unary: ast::UnaryExpr = pool.unaries[data];
+            if unary.op != 12 || unary.operand >= expr || expr_types.items[unary.operand] != value_type_id { return integer_probe(false, 0); }
+            let width: u64 = integer_width(builtin);
+            let operand: ast::Expr = pool.exprs[unary.operand];
+            if operand.kind == 2 {
+                // 直接负字面量可写出有符号最小值，不等同于再次取负。
+                if operand.integer_suffix != 0 && typecheck::integer_suffix_builtin(operand.integer_suffix) != builtin { return integer_probe(false, 0); }
+                if (builtin < BUILTIN_I8 && operand.data != 0) || (builtin >= BUILTIN_I8 && operand.data > positive_integer_max(builtin) + 1) { return integer_probe(false, 0); }
+                bits = operand.data;
+            } elseif stage == 0 { child = unary.operand; }
+            elseif (builtin < BUILTIN_I8 && bits != 0) || (builtin >= BUILTIN_I8 && bits == (1u64 << (width - 1))) { return integer_probe(false, 0); }
+            if child == expr { bits = @wrap_sub(0u64, bits) & integer_mask(width); }
+        } elseif node.kind == 2 {
+            if node.integer_suffix != 0 && typecheck::integer_suffix_builtin(node.integer_suffix) != builtin { return integer_probe(false, 0); }
+            if node.data > positive_integer_max(builtin) { return integer_probe(false, 0); }
+            bits = node.data;
+        } elseif node.kind == 0 || node.kind == 25 {
+            // 只复用已有常量绑定；不调用函数，不求值运行期读取。
+            var value: u32 = 0;
+            if work.limited { value = consteval::try_integer_limited(consts, input, pool, refs, expr, value_type_id, work)?; }
+            else { value = consteval::try_integer(consts, input, pool, refs, expr, value_type_id)?; }
+            if value == 0 || consts.values[value - 1].kind != 1 { return integer_probe(false, 0); }
+            bits = consts.values[value - 1].bits;
+        } else { return integer_probe(false, 0); }
+        if child != expr {
+            let frame: ClosedProbeFrame = ClosedProbeFrame { expr: expr, stage: stage + 1u8, left: left };
+            if depth == @len(stack) as u32 { @push(stack, frame)?; }
+            else { stack[depth] = frame; }
+            depth = depth + 1;
+            expr = child;
+            stage = 0;
+            left = 0;
+        } else {
+            if depth == 0 { return integer_probe(true, bits); }
+            depth = depth - 1;
+            let frame: ClosedProbeFrame = stack[depth];
+            expr = frame.expr;
+            stage = frame.stage;
+            left = frame.left;
+        }
+    }
+    return integer_probe(false, 0);
+}
+
 // 仅诊断可证越界：动态容器长度未知时只检查负下标。
 function negative_integer(tt: &typecheck::TypeTable:Read, value_type_id: u32, bits: u64): bool {
     if !typecheck::is_integer_type(tt, value_type_id) { return false; }
@@ -257,12 +416,12 @@ function check_index_bounds(pool: &ast::AstPool:Read, tt: &typecheck::TypeTable:
             } else {
                 let bound_type: u32 = expr_types.items[range.inclusive_upper];
                 if typecheck::is_integer_type(tt, bound_type) {
-                    let upper: IntegerProbe = probe_integer(pool, tt, expr_types, refs, input, consts, cache, range.inclusive_upper, work)?;
+                    let upper: IntegerProbe = probe_closed_upper(pool, tt, expr_types, refs, input, consts, range.inclusive_upper, work)?;
                     if upper.known {
                         let builtin: u16 = tt.entries[bound_type - 1].builtin;
                         let max: u64 = positive_integer_max(builtin);
                         if upper.bits == max {
-                            // 只报告区间上界加一才产生的溢出，位置为原闭区间分隔符。
+                            // 只报告闭区间上界加一产生的溢出，位置保留原上界范围。
                             typecheck::emit(diags, types::error_code(3005), pool.exprs[range.high].span)?;
                             i = i + 1;
                             continue;

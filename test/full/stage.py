@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import struct
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ BAD = {
     'if_let_fallible': 3004, 'closed_range_u8_max': 3005, 'if_let_non_fallible': 3008,
 }
 BASE = Path('test/ok/flow/labeled_break.yak')
+DYNAMIC_RANGE = Path('test/full/ok/range_runtime.yak')
 OWNED = (
     Path('compiler/min/build.sh'), Path('compiler/min/lib'), Path('compiler/min/src'),
     Path('compiler/min/host/stream'), Path('compiler/full/build.sh'),
@@ -84,10 +86,127 @@ def compile_source(root, executable, target, name, source):
 
 def reject(proc, name, codes=None):
     require(proc.returncode == 1, f'{name}：预期诊断退出 1，实际 {proc.returncode}: {proc.stderr!r}')
-    rows = [json.loads(line) for line in frames(proc.stdout).get(b'diag', b'').splitlines()]
-    actual = [row['code'] for row in rows if row['severity'] == 'error']
+    outputs = frames(proc.stdout)
+    require(not proc.stderr and set(outputs) == {b'diag'},
+            f'{name}：拒绝只允许诊断帧，实际 {list(outputs)!r}，stderr={proc.stderr!r}')
+    raw = outputs[b'diag']
+    require(raw.endswith(b'\n') and b'\r' not in raw, f'{name}：预期 LF 结尾的 JSONL')
+    rows = [json.loads(line) for line in raw.splitlines()]
+    errors = [row for row in rows if row['severity'] == 'error']
+    actual = [row['code'] for row in errors]
     require(actual and (codes is None or actual == codes), f'{name}：预期 {codes}，实际 {actual}')
-    return actual
+    return errors
+
+
+def reject_at(root, executable, target, name, source, code, marker, length=None):
+    require(source.count(marker) == 1, f'{name}：诊断定位标记必须唯一：{marker!r}')
+    row, = reject(compile_source(root, executable, target, name, source), name, [code])
+    expected = {'off': source.index(marker), 'len': len(marker) if length is None else length}
+    require(row['unit'] == name and row['span'] == expected,
+            f"{name}：预期 E{code} 位置 {expected}，实际 {row!r}")
+    print(f'通过：{executable.stem} {name} E{code}，位置精确且无编译产物', flush=True)
+
+
+def closed_program(upper):
+    return (b'function main(): void { let arr: [u8; 4] = [1u8, 2u8, 3u8, 4u8]; '
+            b'let view: &[u8] = &arr[0u8..=' + upper + b']; @assert(@len(view) == 0u64); return; }\n')
+
+
+def regressions(root, target, minimum, full):
+    for name, upper in (
+        ('range_cast_sum', b'((255u16 as u8) + 0u8)'),
+        ('range_signed_max', b'((126i16 as i8) + 1i8)'),
+        ('range_wide_max', b'(18446744073709551614u64 + 1u64)'),
+    ):
+        reject_at(root, full, target, name, closed_program(upper), 3005, upper)
+
+    move_call = (b'function take(x: u8[]): void { @drop(x); return; } '
+                 b'function main(): void { var x: u8[] = []; take((x.move())); return; }\n')
+    reject_at(root, full, target, 'chain_grouped_move', move_call, 6201, b'(x.move())', 1)
+    prefixed_move = move_call.replace(b'x.move()', b'@move(x)')
+    reject_at(root, minimum, target, 'base_grouped_move', prefixed_move, 6201, b'(@move(x))', 1)
+
+    for name, statement, marker in (
+        ('chain_grouped_drop', b'(x.drop());', b'x.drop()'),
+        ('chain_drop_target', b'x.drop() = x;', b'x.drop()'),
+        ('chain_move_arity_target', b'x.move(1u8) = x;', b'x.move(1u8)'),
+    ):
+        source = b'function main(): void { var x: u8[] = []; ' + statement + b' return; }\n'
+        reject_at(root, full, target, name, source, 2001, marker)
+
+    batch = (b'function main(): void { let x: u8 = 0u8; let arr: [u8; 1] = [1u8]; '
+             b'@drop(x, arr[0]); return; }\n')
+    reject_at(root, full, target, 'batch_projection', batch, 6206, b'arr[0]')
+    repeat = b'function main(): void { var x: u8[] = []; @drop(x, x); return; }\n'
+    reject_at(root, full, target, 'batch_duplicate', repeat, 6003, b'x, x', 1)
+
+    def borrowed(statement):
+        return (b'function bad(r: &u8[]:ReadWrite): void { ' + statement +
+                b' return; } function main(): void { return; }\n')
+
+    base_drop = borrowed(b'@drop(*r);')
+    reject_at(root, minimum, target, 'base_borrowed_drop', base_drop, 6204, b'@drop')
+    reject_at(root, full, target, 'batch_borrowed_drop',
+              borrowed(b'let x: u8 = 0u8; @drop(x, *r);'), 6204, b'*r')
+    reject_at(root, full, target, 'chain_borrowed_drop', borrowed(b'(*r).drop();'), 6204, b'(*r).drop()')
+
+    for name, compiler, loop, jump in (
+        ('base_unknown_break', minimum, b'while true', b'break'),
+        ('base_unknown_continue', minimum, b'while true', b'continue'),
+        ('full_unknown_break', full, b'loop', b'break'),
+        ('full_unknown_continue', full, b'loop', b'continue'),
+    ):
+        source = b'function main(): void { outer: ' + loop + b' { ' + jump + b' missing; } return; }\n'
+        reject_at(root, compiler, target, name, source, 4002, jump)
+    unreachable = b'function main(): void { while true { return; break missing; } return; }\n'
+    reject_at(root, minimum, target, 'base_unreachable_label', unreachable, 4002, b'break')
+
+    # 括号隔开点号成员和调用时，候选必须保留基座对普通字段调用的诊断。
+    field = b'function main(): void { var x: u8[] = []; (x.drop)(); return; }\n'
+    base = compile_source(root, minimum, target, 'grouped_field', field)
+    candidate = compile_source(root, full, target, 'grouped_field', field)
+    reject(base, '基座括号字段调用')
+    reject(candidate, '候选括号字段调用')
+    require(base.stdout == candidate.stdout, '候选不能把括号字段调用改写为所有权动作')
+    print('通过：括号字段调用保留基座诊断', flush=True)
+
+
+def link_case(root, target, suffix, bash, env, relative):
+    name = Path(relative).stem
+    built = run(root, [bash, 'tools/link.sh', relative, '--no-run', '--target', target,
+                       '--native-compiler', f'tmp/build/yakc_full.{suffix}', '--out-dir', 'tmp/runs'], env=env)
+    success(built, f'链接 {name}')
+    return str(root / f'tmp/runs/{name}/{name}.{suffix}')
+
+
+def runtime_range(root, target, suffix, bash, env):
+    exe = link_case(root, target, suffix, bash, env, DYNAMIC_RANGE.as_posix())
+    proc = run(root, [exe], b'\x02')
+    success(proc, '运行时 u8 闭区间')
+    require(proc.stdout == b'before\nthree\nafter\n' and not proc.stderr, '正常上界输出不符')
+    # 只抑制宿主的崩溃对话框或转储，不改写子进程的退出状态。
+    if target == 'win-x64':
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        old = kernel.GetErrorMode()
+        kernel.SetErrorMode(old | 0x0002)
+        try:
+            proc = run(root, [exe], b'\xff')
+        finally:
+            kernel.SetErrorMode(old)
+        trap = proc.returncode & 0xffffffff == 0x80000003
+    else:
+        import resource
+        old = resource.getrlimit(resource.RLIMIT_CORE)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, old[1]))
+        try:
+            proc = run(root, [exe], b'\xff')
+        finally:
+            resource.setrlimit(resource.RLIMIT_CORE, old)
+        trap = proc.returncode == -signal.SIGTRAP
+    require(trap and proc.stdout == b'before\n' and not proc.stderr,
+            f'预期上界加一触发原生算术陷阱，实际 {proc.returncode} {proc.stdout!r} {proc.stderr!r}')
+    print('通过：同一运行产物按 u8 原宽度捕获上界加一溢出', flush=True)
 
 
 def probe(root, target, suffix, bash, env):
@@ -97,8 +216,13 @@ def probe(root, target, suffix, bash, env):
     full_scan = root / f'tmp/build/full_imports.{suffix}'
     for name, code in BAD.items():
         fixture = root / f'test/full/variants_bad/E{code}/{name}.yak'
-        reject(compile_source(root, full, target, name, fixture.read_bytes()), name, [code])
-        print(f'通过：{name} E{code}', flush=True)
+        source = fixture.read_bytes()
+        if name == 'closed_range_u8_max':
+            reject_at(root, full, target, name, source, code, b'255u8];', 5)
+        else:
+            reject(compile_source(root, full, target, name, source), name, [code])
+            print(f'通过：{name} E{code}', flush=True)
+    regressions(root, target, minimum, full)
     for name, stdout in OK.items():
         rel = f'test/full/ok/{name}.yak'
         source = (root / rel).read_bytes()
@@ -106,14 +230,14 @@ def probe(root, target, suffix, bash, env):
         success(scan, f'full 扫描 {name}')
         require(scan.stdout == b'', f'{name} 应独立且不导入其他模块')
         reject(compile_source(root, minimum, target, name, source), f'min 边界 {name}')
-        linked = run(root, [bash, 'tools/link.sh', rel, '--no-run', '--target', target,
-                            '--native-compiler', f'tmp/build/yakc_full.{suffix}', '--out-dir', 'tmp/runs'], env=env)
-        success(linked, f'链接 {name}')
-        executed = run(root, [str(root / f'tmp/runs/{name}/{name}.{suffix}')])
+        exe = link_case(root, target, suffix, bash, env, rel)
+        executed = run(root, [exe])
         success(executed, f'运行 {name}')
         require(executed.stdout.replace(b'\r\n', b'\n') == stdout,
                 f'{name}：预期 stdout={stdout!r}，实际 {executed.stdout!r}')
         print(f'通过：{name} 编译、链接、运行和 min 拒绝', flush=True)
+
+    runtime_range(root, target, suffix, bash, env)
 
     tuple_source = b'function main(): void { let t: (u8, u8) = (1u8, 2u8); return; }\n'
     for native in (minimum, full):
@@ -165,6 +289,7 @@ def main():
     print(f'首批候选独占目录：{root}', flush=True)
     exports = tuple(Path(f'test/full/ok/{name}.yak') for name in OK)
     exports += tuple(Path(f'test/full/variants_bad/E{code}/{name}.yak') for name, code in BAD.items())
+    exports += (DYNAMIC_RANGE,)
     inputs = tuple(p for p in OWNED if p != Path('tools/elf_headers.py') or suffix == 'elf')
     for path in inputs + exports:
         copy_source(path, root / path)

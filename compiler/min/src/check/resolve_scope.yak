@@ -503,7 +503,20 @@ function resolve_expr(tables: &resolve::ResolveTables:ReadWrite, work: &resolve:
     }
     return;
 }
-function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, block_id: u32, scope: u32): void!AllocError {
+// 只记当前函数的包围循环标签，不进入普通名称空间。
+struct LoopLabels { names: u32[] }
+
+function has_loop_label(labels: &LoopLabels:Read, work: &resolve::LookupBudget:ReadWrite, depth: u32, name: u32): bool {
+    var i: u32 = depth;
+    while i != 0 {
+        if !resolve::visit_lookup(work) { return false; }
+        i = i - 1;
+        if labels.names[i] == name { return true; }
+    }
+    return false;
+}
+
+function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, block_id: u32, scope: u32, labels: &LoopLabels:ReadWrite, label_depth: u32): void!AllocError {
     var index: u32 = 0;
     while index < @len(pool.blocks[block_id].stmts) as u32 {
         let stmt: ast::Stmt = pool.stmts[pool.blocks[block_id].stmts[index]];
@@ -522,6 +535,12 @@ function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve
             if local.init != 4294967295u32 { resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, local.init, false)?; if work.exhausted { return; } }
         } elseif stmt.kind == 10 {
             if stmt.data != 4294967295u32 { resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, stmt.data, false)?; if work.exhausted { return; } }
+        } elseif stmt.kind == 11 || stmt.kind == 12 {
+            if stmt.data != 0 {
+                let found: bool = has_loop_label(labels, work, label_depth, stmt.data);
+                if work.exhausted { return; }
+                if !found { resolve_refs::emit(diags, types::error_code(4002), stmt.span)?; }
+            }
         } elseif stmt.kind == 14 {
             let if_id: u32 = stmt.data;
             var branch: u32 = 0;
@@ -529,13 +548,13 @@ function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve
                 resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.ifs[if_id].branches[branch].condition, false)?;
                 if work.exhausted { return; }
                 let body_scope: u32 = tables.block_scope[pool.ifs[if_id].branches[branch].body];
-                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, pool.ifs[if_id].branches[branch].body, body_scope)?;
+                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, pool.ifs[if_id].branches[branch].body, body_scope, labels, label_depth)?;
                 if work.exhausted { return; }
                 branch = branch + 1;
             }
             let else_body: u32 = pool.ifs[if_id].else_body;
             if else_body < @len(pool.blocks) as u32 {
-                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, else_body, tables.block_scope[else_body])?;
+                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, else_body, tables.block_scope[else_body], labels, label_depth)?;
                 if work.exhausted { return; }
             }
         } elseif stmt.kind == 15 {
@@ -543,7 +562,14 @@ function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve
             resolve_expr(tables, work, refs, bridges, diags, pool, names, deps, imports, scope, pool.whiles[while_id].condition, false)?;
             if work.exhausted { return; }
             let body: u32 = pool.whiles[while_id].body;
-            resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body])?;
+            let label: u32 = pool.whiles[while_id].label;
+            var body_depth: u32 = label_depth;
+            if label != 0 {
+                if label_depth < @len(labels.names) as u32 { labels.names[label_depth] = label; }
+                else { @push(labels.names, label)?; }
+                body_depth = body_depth + 1u32;
+            }
+            resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body], labels, body_depth)?;
             if work.exhausted { return; }
         } elseif stmt.kind == 16 {
             let match_id: u32 = stmt.data;
@@ -564,7 +590,7 @@ function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve
                     }
                 }
                 let body: u32 = pool.matches[match_id].arms[arm].body;
-                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body])?;
+                resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body], labels, label_depth)?;
                 if work.exhausted { return; }
                 arm = arm + 1;
             }
@@ -583,6 +609,7 @@ function resolve_block(tables: &resolve::ResolveTables:ReadWrite, work: &resolve
     return;
 }
 export function resolve_items(tables: &resolve::ResolveTables:ReadWrite, work: &resolve::LookupBudget:ReadWrite, refs: &resolve_refs::RefTable:ReadWrite, bridges: &resolve_refs::BridgeTable:ReadWrite, diags: &diag::DiagBuffer:ReadWrite, pool: &ast::AstPool:Read, names: &lex::NameTable:Read, deps: &resolve_refs::DependencySet:Read, imports: &resolve_refs::ImportMap:Read, file: &ast::AstFile:Read): void!AllocError {
+    var labels: LoopLabels = LoopLabels { names: [] };
     var i: u32 = 0;
     while i < @len(file.items) as u32 {
         let item: ast::AstItem = file.items[i];
@@ -597,7 +624,7 @@ export function resolve_items(tables: &resolve::ResolveTables:ReadWrite, work: &
             resolve_type(tables, work, refs, bridges, diags, pool, names, deps, imports, 1, pool.functions[data].ret_type)?;
             if work.exhausted { return; }
             let body: u32 = pool.functions[data].body;
-            resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body])?;
+            resolve_block(tables, work, refs, bridges, diags, pool, names, deps, imports, body, tables.block_scope[body], &labels:ReadWrite, 0)?;
             if work.exhausted { return; }
         } elseif item.kind == 1 {
             var v: u32 = 0;

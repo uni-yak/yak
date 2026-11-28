@@ -139,7 +139,7 @@
 
 6.1 `if` / `elseif` / `else`：条件必须为 `bool`。`elseif` 为单关键字（非 `else if` 两词）。
 
-6.2 `while`：支持带标签 `break` / `continue`。`loop` 为 `while true` 的糖，登记于 `sugar.md`，base 期禁用。标签产生式见 `parse.md`。
+6.2 `while`：支持带标签 `break` / `continue`。`loop` 为 `while true` 的糖，登记于 `sugar.md`，base 期禁用。标签产生式见 [解析](parse.md)，目标解析见 [名字解析](name.md#六名字解析)。
 
 6.3 `match`：对 owning enum 值必须穷尽全部标签；允许 `_` 通配臂。`match` 消费 scrutinee：非 `Copy` enum 移动并使源 place 失效，`Copy` enum 先复制且源 place 保持有效。`match` 不作用于 `T!E`、`T?`、ErrorSet 或普通联合。含 payload 的标签可写一个绑定名，绑定时 payload 为 **move**（不可部分移动）；省略绑定名表示在该臂丢弃 active payload。无 payload 标签不得书写 payload 绑定。各臂可按各自标签独立选择是否绑定。base 不提供借用模式或部分解构。
 

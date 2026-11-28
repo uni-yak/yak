@@ -60,6 +60,22 @@ export function is_place_expr(pool: &ast::AstPool:Read, expr: u32): bool {
     }
     return false;
 }
+export function chained_action(pool: &ast::AstPool:Read, expr: u32): u8 {
+    if expr >= @len(pool.exprs) as u32 || pool.exprs[expr].kind != 22 { return 0; }
+    let call_id: u32 = pool.exprs[expr].data as u32;
+    if call_id >= @len(pool.calls) as u32 { return 0; }
+    return pool.calls[call_id].chain_action;
+}
+
+function action_name(p: &parse_core::Parser:Read, name: u32): u8 {
+    if name == 0 { return 0; }
+    if name == p.action_names[0] { return 1; }
+    if name == p.action_names[1] { return 2; }
+    if name == p.action_names[2] { return 3; }
+    if name == p.action_names[3] { return 4; }
+    return 0;
+}
+
 function binary_precedence(op: u8): u8 {
     if op == 6 { return 1; }
     if op == 5 { return 2; }
@@ -157,7 +173,7 @@ function parse_const_atom(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:
             parse_core::expect_op(p, 27)?;
             let call_id: u32 = @len(pool.calls) as u32;
             let span: types::Span = parse_core::span_range(p, start, p.pos);
-            @push(pool.calls, ast::CallExpr { callee: value, args: args, span: span, in_const: true })?;
+            @push(pool.calls, ast::CallExpr { callee: value, args: args, span: span, in_const: true, chain_action: 0, grouped: false })?;
             value = make_expr(pool, 22, span, call_id as u64)?;
         }
         while true {
@@ -267,6 +283,9 @@ function parse_atom(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWr
         parse_core::advance(p);
         let nested: u32 = parse_expr(p, pool, 1, true)?;
         parse_core::expect_op(p, 27)?;
+        if parse_core::action_syntax(p) && chained_action(pool, nested) != 0 {
+            pool.calls[pool.exprs[nested].data].grouped = true;
+        }
         return nested;
     }
     if parse_core::is_op(p, 5) {
@@ -379,8 +398,13 @@ function parse_postfix(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:Rea
     return value;
 }
 function parse_postfix_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, allow_ctor: bool): u32!AllocError {
+    let expr_start: u32 = p.pos;
     var value: u32 = parse_atom(p, pool, allow_ctor)?;
+    var next_action: u8 = 0;
     while true {
+        // 动作名必须直接接调用；先闭合括号或追加其他后缀时不能触发。
+        let action: u8 = next_action;
+        next_action = 0;
         if parse_core::is_op(p, 26) {
             if is_literal_expr(pool, value) { parse_core::fail(p, p.pos)?; }
             parse_core::advance(p);
@@ -388,8 +412,13 @@ function parse_postfix_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPo
             let start: u32 = p.pos;
             parse_core::expect_op(p, 27)?;
             let call_id: u32 = @len(pool.calls) as u32;
-            @push(pool.calls, ast::CallExpr { callee: value, args: args, span: parse_core::span_at(p, start), in_const: false })?;
-            value = make_expr(pool, 22, parse_core::span_at(p, start), call_id as u64)?;
+            var span: types::Span = parse_core::span_at(p, start);
+            if action != 0 {
+                span = parse_core::span_range(p, expr_start, p.pos);
+                if @len(args) != 0 { parse_core::fail_span(p, span, types::error_code(2001))?; }
+            }
+            @push(pool.calls, ast::CallExpr { callee: value, args: args, span: span, in_const: false, chain_action: action, grouped: false })?;
+            value = make_expr(pool, 22, span, call_id as u64)?;
         } elseif parse_core::is_op(p, 23) || parse_core::is_op(p, 35) {
             let start: u32 = p.pos;
             let optional: bool = parse_core::is_op(p, 35);
@@ -410,23 +439,26 @@ function parse_postfix_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPo
                 nullable_dispatch: nullable_dispatch, tag_name: name != 0 && name == p.tag_name,
                 payload_name: name != 0 && name == p.payload_name, span: parse_core::span_at(p, start) })?;
             value = make_expr(pool, 23, parse_core::span_at(p, start), member_id as u64)?;
+            if !optional && parse_core::action_syntax(p) { next_action = action_name(p, name); }
         } elseif parse_core::is_op(p, 30) {
             let start: u32 = p.pos;
             parse_core::advance(p);
             let low: u32 = parse_expr_bounded(p, pool, 1, true, true)?;
             if parse_core::is_op(p, 10) || parse_core::is_op(p, 34) {
                 let closed: bool = parse_core::is_op(p, 34);
-                let divider: types::Span = parse_core::span_at(p, p.pos);
                 parse_core::advance(p);
+                let high_start: u32 = p.pos;
                 var high: u32 = parse_expr(p, pool, 1, true)?;
+                let high_end: u32 = p.pos;
                 parse_core::expect_op(p, 31)?;
                 var inclusive_upper: u32 = 4294967295u32;
                 if closed {
                     inclusive_upper = high;
-                    let one: u32 = make_expr(pool, 2, divider, 1)?;
+                    let upper_span: types::Span = parse_core::span_range(p, high_start, high_end);
+                    let one: u32 = make_expr(pool, 2, upper_span, 1)?;
                     let sum: u32 = @len(pool.binaries) as u32;
-                    @push(pool.binaries, ast::BinaryExpr { left: high, right: one, op: 11, span: divider })?;
-                    high = make_expr(pool, 20, divider, sum as u64)?;
+                    @push(pool.binaries, ast::BinaryExpr { left: high, right: one, op: 11, span: upper_span })?;
+                    high = make_expr(pool, 20, upper_span, sum as u64)?;
                 }
                 let slice_id: u32 = @len(pool.slices) as u32;
                 @push(pool.slices, ast::SliceExpr { object: value, low: low, high: high, span: parse_core::span_at(p, start), inclusive_upper: inclusive_upper })?;

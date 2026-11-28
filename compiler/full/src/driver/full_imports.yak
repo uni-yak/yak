@@ -88,7 +88,7 @@ function scan(): void!AllocError {
     var parsed: parse::ParseResult = parse::parse_lexed_sugar(&lexed:Read, 0)?;
     emit_parse(&diags:ReadWrite, &parsed.diagnostics[0..@len(parsed.diagnostics)])?;
     if !diag::diagbuf_has_error(&diags:Read) {
-        let lowered_ok: bool = full_desugar::lower_stage1(&parsed:ReadWrite, &lexed.names:Read, &diags:ReadWrite)?;
+        let lowered_ok: bool = full_desugar::lower_stage1(&parsed:ReadWrite, &diags:ReadWrite)?;
         @drop(lowered_ok);
     }
     if diag::diagbuf_has_error(&diags:Read) {

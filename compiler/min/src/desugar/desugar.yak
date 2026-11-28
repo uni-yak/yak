@@ -10,7 +10,18 @@ function emit(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span):
     diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
     return;
 }
-function verify_nodes(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite, nullable: bool, union: bool, text: bool): bool!AllocError {
+// 闭区间只允许携带原上界索引；可执行形态必须是已有的基座受检加法。
+function lowered_closed_slice(pool: &ast::AstPool:Read, range: ast::SliceExpr): bool {
+    if range.high >= @len(pool.exprs) as u32 || range.inclusive_upper >= range.high { return false; }
+    let sum: ast::Expr = pool.exprs[range.high];
+    if sum.kind != 20 || sum.data >= @len(pool.binaries) { return false; }
+    let binary: ast::BinaryExpr = pool.binaries[sum.data];
+    if binary.op != 11 || binary.left != range.inclusive_upper || binary.right <= binary.left || binary.right >= range.high { return false; }
+    let one: ast::Expr = pool.exprs[binary.right];
+    return one.kind == 2 && one.integer_suffix == 0 && one.data == 1;
+}
+
+function verify_nodes(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite, nullable: bool, union: bool, text: bool, closed_slice: bool): bool!AllocError {
     var i: u32 = 0;
     while i < @len(pool.types) as u32 {
         let kind: u8 = pool.types[i].kind;
@@ -29,6 +40,10 @@ function verify_nodes(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags:
         elseif kind == 29 && (expr.data > 65535u64 || !lextables::builtin_is_base(expr.data as u16)) { emit(diags, 3003, expr.span)?; }
         elseif !nullable && kind == 20 && expr.data < @len(pool.binaries) && pool.binaries[expr.data].op == 36 { emit(diags, 3001, expr.span)?; }
         elseif !nullable && kind == 23 && expr.data < @len(pool.members) && pool.members[expr.data].optional { emit(diags, 3001, expr.span)?; }
+        elseif kind == 27 && expr.data < @len(pool.slices) {
+            let range: ast::SliceExpr = pool.slices[expr.data];
+            if range.inclusive_upper != 4294967295u32 && (!closed_slice || !lowered_closed_slice(pool, range)) { emit(diags, 3002, expr.span)?; }
+        }
         i = i + 1;
     }
     i = 0;
@@ -36,6 +51,11 @@ function verify_nodes(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags:
         let kind: u8 = pool.stmts[i].kind;
         // 局部声明为 1，其余 base 语句为 10 至 18；恢复时跳过的语句不进入池。
         if kind != 1 && (kind < 10 || kind > 18) { emit(diags, 3001, pool.stmts[i].span)?; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < @len(pool.calls) as u32 {
+        if pool.calls[i].chain_action != 0 || pool.calls[i].grouped { emit(diags, 3002, pool.calls[i].span)?; }
         i = i + 1;
     }
     var item: u32 = 0;
@@ -48,20 +68,25 @@ function verify_nodes(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags:
 }
 
 export function verify_base(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
-    return verify_nodes(file, pool, diags, false, false, false)?;
+    return verify_nodes(file, pool, diags, false, false, false, false)?;
+}
+
+// 只供首批待确认候选；除此以外仍按基座节点集合校验。
+export function verify_stage1_candidate(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    return verify_nodes(file, pool, diags, false, false, false, true)?;
 }
 
 // 可空节点保留到类型检查；仍对其他未登记的形态执行同一结构校验。
 export function verify_nullable_frontend(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
-    return verify_nodes(file, pool, diags, pool.option_syntax, false, false)?;
+    return verify_nodes(file, pool, diags, pool.option_syntax, false, false, false)?;
 }
 
 export function verify_union_frontend(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
-    return verify_nodes(file, pool, diags, pool.option_syntax, pool.union_syntax, false)?;
+    return verify_nodes(file, pool, diags, pool.option_syntax, pool.union_syntax, false, false)?;
 }
 
 export function verify_text_frontend(file: &ast::AstFile:Read, pool: &ast::AstPool:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
-    return verify_nodes(file, pool, diags, false, false, pool.text_syntax)?;
+    return verify_nodes(file, pool, diags, false, false, pool.text_syntax, false)?;
 }
 
 // 边由名称解析提供。两个端点都是当前模块内顶层绑定的顺序编号。

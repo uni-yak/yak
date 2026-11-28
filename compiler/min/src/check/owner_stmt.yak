@@ -145,8 +145,8 @@ export function check_drop_stmt(pool: &ast::AstPool:Read, refs: &resolve_refs::R
         }
         owner_state::consume_place(places, borrows, diags, work, root, PLACE_DROPPED, stmt_span)?;
     } else {
-        // 确定为值的表达式不是可析构的 place，仍需检查其内部求值。
-        if (kind == 21 && !owner_write::unary_is_deref(pool, stmt_data)) || (kind != 0 && kind != 25 && kind != 21 && kind != 23 && kind != 24 && kind != 27) { owner_state::emit(diags, types::error_code(6204), stmt_span)?; }
+        // 非绑定操作数（含借用解引用）不是 owning 整 place，仍需检查其内部求值。
+        if kind != 0 && kind != 25 { owner_state::emit(diags, types::error_code(6204), stmt_span)?; }
         owner_expr::check_expr_ownership(pool, refs, checked, tables, places, borrows, history, diags, returns, work, stmt_data, scope)?;
     }
     return;

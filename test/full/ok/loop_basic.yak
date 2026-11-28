@@ -39,7 +39,19 @@ function observe(): void!AllocError {
     return;
 }
 
+function nearest(): void {
+    var reached: bool = false;
+    same: loop {
+        same: loop { break same; }
+        reached = true;
+        break same;
+    }
+    @assert(reached);
+    return;
+}
+
 function main(): void {
+    nearest();
     observe();
     return;
 }

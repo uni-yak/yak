@@ -35,7 +35,7 @@ export function parse_input(source: &[u8], module_name: &[u8], jsonl_mode: bool,
     if @len(parsed.diagnostics) > 0 {
         driver_front::fail(diags, jsonl_mode, module_name)?;
     }
-    let lowered_ok: bool = full_desugar::lower_stage1(&parsed:ReadWrite, &lexed.names:Read, diags)?;
+    let lowered_ok: bool = full_desugar::lower_stage1(&parsed:ReadWrite, diags)?;
     if !lowered_ok {
         driver_front::fail(diags, jsonl_mode, module_name)?;
     }

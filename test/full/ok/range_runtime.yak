@@ -1,0 +1,20 @@
+// spec: spec/lang/closed-range.md
+// 同一二进制读取运行时上界，区分正常闭区间与 u8 加一上溢。
+foreign read(buf: &[u8]:ReadWrite): u32;
+foreign write(data: &[u8]): void;
+
+function take(buf: &[u8], high: u8): void {
+    let view: &[u8] = &buf[0u8..=high];
+    if @len(view) == 3u64 { write("three\n"); }
+    else { write("other\n"); }
+    return;
+}
+
+function main(): void {
+    var input: [u8; 1] = [0u8];
+    @assert(read(&input[0..1]:ReadWrite) == 1u32);
+    write("before\n");
+    take("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", input[0]);
+    write("after\n");
+    return;
+}

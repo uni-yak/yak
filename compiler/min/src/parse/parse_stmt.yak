@@ -324,17 +324,20 @@ export function parse_block(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPoo
     return value;
 }
 
-function parse_batch_drop(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, stmts: &u32[]:ReadWrite, first: u32): void!AllocError {
+struct DropOperand { expr: u32, span: types::Span }
+
+function parse_batch_drop(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, stmts: &u32[]:ReadWrite, first: DropOperand): void!AllocError {
     let enabled: bool = (p.syntax_profile & ALLOW_BATCH_DROP) != 0;
     if !enabled { fail_code(p, p.pos, types::error_code(3008))?; }
-    var args: u32[] = [];
+    var args: DropOperand[] = [];
     if enabled { @push(args, first)?; }
     while is_op(p, 32) {
         advance(p);
         if is_op(p, 27) { fail(p, p.pos)?; break; }
+        let start: u32 = p.pos;
         let arg: u32 = parse_expr::parse_expr(p, pool, 1, true)?;
         if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return; }
-        if enabled { @push(args, arg)?; }
+        if enabled { @push(args, DropOperand { expr: arg, span: parse_core::span_range(p, start, p.pos) })?; }
     }
     expect_op(p, 27)?;
     expect_op(p, 33)?;
@@ -342,9 +345,9 @@ function parse_batch_drop(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:
     var count: u32 = @len(args) as u32;
     while count > 0 {
         count = count - 1;
-        let arg: u32 = args[count];
+        let arg: DropOperand = args[count];
         let stmt: u32 = @len(pool.stmts) as u32;
-        @push(pool.stmts, ast::Stmt { kind: 18, span: pool.exprs[arg].span, data: arg })?;
+        @push(pool.stmts, ast::Stmt { kind: 18, span: arg.span, data: arg.expr })?;
         @push(*stmts, stmt)?;
     }
     return;
@@ -371,9 +374,11 @@ function parse_block_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool
             kind = 18;
             advance(p);
             expect_op(p, 26)?;
+            let arg_start: u32 = p.pos;
             data = parse_expr::parse_expr(p, pool, 1, true)?;
             if is_op(p, 32) {
-                parse_batch_drop(p, pool, &stmts:ReadWrite, data)?;
+                let first: DropOperand = DropOperand { expr: data, span: parse_core::span_range(p, arg_start, p.pos) };
+                parse_batch_drop(p, pool, &stmts:ReadWrite, first)?;
                 if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return 0u32; }
                 continue;
             }
@@ -422,9 +427,16 @@ function parse_block_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool
             data = continue_label;
             expect_op(p, 33)?;
         } elseif is_kind(p, 0) || is_kind(p, 1) || is_kind(p, 2) || is_kind(p, 3) || is_kind(p, 4) || is_kind(p, 5) || is_kind(p, 8) || is_kind(p, 15) || is_op(p, 11) || is_op(p, 12) || is_op(p, 13) || is_op(p, 18) || is_op(p, 19) || is_op(p, 26) || is_op(p, 30) || is_op(p, 5) {
+            let diagnostics_before_target: u64 = @len(p.diagnostics);
             let target: u32 = parse_expr::parse_expr(p, pool, 1, true)?;
             if is_op(p, 22) {
-                if !parse_expr::is_place_expr(pool, target) { fail_code(p, p.pos, types::error_code(2006))?; }
+                if !parse_expr::is_place_expr(pool, target) {
+                    // 值位置的链式析构先由候选脱糖按 P-1 拒绝；无效动作实参已在解析期报告。
+                    let action: u8 = parse_expr::chained_action(pool, target);
+                    if action == 0 || (action != 4 && @len(p.diagnostics) == diagnostics_before_target) {
+                        fail_code(p, p.pos, types::error_code(2006))?;
+                    }
+                }
                 advance(p);
                 let value: u32 = parse_expr::parse_expr(p, pool, 1, true)?;
                 let assign_id: u32 = @len(pool.assigns) as u32;

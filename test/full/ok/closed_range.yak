@@ -12,6 +12,8 @@ function run_ranges(): u32!AllocError {
     let single: &[u8] = &arr[2u64..=2u64];
     @assert(@len(single) == 1u64);
     @assert(single[0] == 7u8);
+    let empty: &[u8] = &arr[0..=-1];
+    @assert(@len(empty) == 0u64);
 
     var dyn: u8[] = [];
     @push(dyn, 10u8)?;

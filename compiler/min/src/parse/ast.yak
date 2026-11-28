@@ -30,7 +30,8 @@ export struct Expr { kind: u8, span: types::Span, data: u64, integer_suffix: u8 
 export struct UnaryExpr { operand: u32, op: u8, capability: u32, has_capability: bool, span: types::Span }
 export struct BinaryExpr { left: u32, right: u32, op: u8, span: types::Span }
 export struct CallArg { kind: u8, value: u32, span: types::Span }
-export struct CallExpr { callee: u32, args: CallArg[], span: types::Span, in_const: bool }
+// 链式动作与其外层括号仅供候选脱糖，进入基座检查前清除。
+export struct CallExpr { callee: u32, args: CallArg[], span: types::Span, in_const: bool, chain_action: u8, grouped: bool }
 // property 只记录拼写：1 为 len，2 为 cap。对象类型决定是否为内建属性。
 export struct MemberExpr { object: u32, name: u32, property: u8, recovery_name: bool, optional: bool, nullable_dispatch: bool, tag_name: bool, payload_name: bool, span: types::Span }
 export struct IndexExpr { object: u32, index: u32, span: types::Span }

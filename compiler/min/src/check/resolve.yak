@@ -41,7 +41,7 @@ export function visit_enum_lookup(work: &LookupBudget:ReadWrite): bool {
     work.enum_remaining = work.enum_remaining - 1u32;
     return true;
 }
-function visit_lookup(work: &LookupBudget:ReadWrite): bool {
+export function visit_lookup(work: &LookupBudget:ReadWrite): bool {
     if !work.limited { return true; }
     if work.remaining == 0u32 { work.exhausted = true; return false; }
     work.remaining = work.remaining - 1u32;

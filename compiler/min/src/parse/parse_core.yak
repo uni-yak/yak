@@ -17,13 +17,14 @@ import types;
 export struct ParseDiagnostic { code: types::ErrorCode, span: types::Span }
 // cap_* 保存本文件中出现的能力名 Read / Write / ReadWrite 的 NameId。
 // 未出现时为 0；is_capability 据此拒绝任何能力后缀。
-export struct Parser { tokens: lex::Token[], pos: u32, file: u16, diagnostics: ParseDiagnostic[], cap_read: u32, cap_write: u32, cap_readwrite: u32, float_f32: u32, float_f64: u32, len_name: u32, cap_name: u32, carrier_methods: [u32; 4], union_on_name: u32, tag_name: u32, payload_name: u32, string_name: u32, diagnostic_limit: u32, diagnostics_truncated: bool, depth_limit: u32, depth: u32, depth_exceeded: bool, match_path_remaining: u32, match_path_limited: bool, match_path_exceeded: bool, recovery_remaining: u32, recovery_limited: bool, recovery_exceeded: bool, syntax_profile: u8 }
+export struct Parser { tokens: lex::Token[], pos: u32, file: u16, diagnostics: ParseDiagnostic[], cap_read: u32, cap_write: u32, cap_readwrite: u32, float_f32: u32, float_f64: u32, len_name: u32, cap_name: u32, carrier_methods: [u32; 4], union_on_name: u32, tag_name: u32, payload_name: u32, string_name: u32, action_names: [u32; 4], diagnostic_limit: u32, diagnostics_truncated: bool, depth_limit: u32, depth: u32, depth_exceeded: bool, match_path_remaining: u32, match_path_limited: bool, match_path_exceeded: bool, recovery_remaining: u32, recovery_limited: bool, recovery_exceeded: bool, syntax_profile: u8 }
 
 export function option_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 4u8) != 0u8; }
 export function union_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 8u8) != 0u8; }
 export function text_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 16u8) != 0u8; }
 
 export function loop_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 32u8) != 0u8; }
+export function action_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 64u8) != 0u8; }
 
 // 超限后停止读取 token；上层只展开调用，不再生成恢复诊断。
 export function enter_depth(p: &Parser:ReadWrite): bool {

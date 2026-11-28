@@ -208,7 +208,7 @@ function push_import(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadW
 function parse_file_limited(tokens: &[lex::Token], names: &lex::NameTable:Read, file: u16, limit: u32, depth_limit: u32, match_path_limit: u32, recovery_limit: u32, syntax_profile: u8): ParseResult!AllocError {
     let methods: [u32; 4] = [parse_core::find_name(names, "then"), parse_core::find_name(names, "catch"),
         parse_core::find_name(names, "or"), parse_core::find_name(names, "unwrap")];
-    var p: parse_core::Parser = parse_core::Parser { tokens: [], pos: 0, file: file, diagnostics: [], cap_read: 0, cap_write: 0, cap_readwrite: 0, float_f32: 0, float_f64: 0, len_name: 0, cap_name: 0, carrier_methods: methods, union_on_name: 0, tag_name: 0, payload_name: 0, string_name: 0, diagnostic_limit: limit, diagnostics_truncated: false, depth_limit: depth_limit, depth: 0, depth_exceeded: false, match_path_remaining: match_path_limit, match_path_limited: match_path_limit != 0u32, match_path_exceeded: false, recovery_remaining: recovery_limit, recovery_limited: recovery_limit != 0u32, recovery_exceeded: false, syntax_profile: syntax_profile };
+    var p: parse_core::Parser = parse_core::Parser { tokens: [], pos: 0, file: file, diagnostics: [], cap_read: 0, cap_write: 0, cap_readwrite: 0, float_f32: 0, float_f64: 0, len_name: 0, cap_name: 0, carrier_methods: methods, union_on_name: 0, tag_name: 0, payload_name: 0, string_name: 0, action_names: [0u32, 0u32, 0u32, 0u32], diagnostic_limit: limit, diagnostics_truncated: false, depth_limit: depth_limit, depth: 0, depth_exceeded: false, match_path_remaining: match_path_limit, match_path_limited: match_path_limit != 0u32, match_path_exceeded: false, recovery_remaining: recovery_limit, recovery_limited: recovery_limit != 0u32, recovery_exceeded: false, syntax_profile: syntax_profile };
     p.cap_read = parse_core::find_name(names, "Read");
     p.cap_write = parse_core::find_name(names, "Write");
     p.cap_readwrite = parse_core::find_name(names, "ReadWrite");
@@ -217,6 +217,10 @@ function parse_file_limited(tokens: &[lex::Token], names: &lex::NameTable:Read, 
     p.len_name = parse_core::find_name(names, "len");
     p.cap_name = parse_core::find_name(names, "cap");
     p.string_name = parse_core::find_name(names, "string");
+    if parse_core::action_syntax(&p:Read) {
+        p.action_names = [parse_core::find_name(names, "move"), parse_core::find_name(names, "copy"),
+            parse_core::find_name(names, "clone"), parse_core::find_name(names, "drop")];
+    }
     let nullable: bool = parse_core::option_syntax(&p:Read);
     if nullable {
         p.union_on_name = parse_core::find_name(names, "on");
@@ -328,7 +332,7 @@ export function parse_lexed_text(lexed: &lex::LexResult:Read, file: u16): ParseR
     return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 16u8)?;
 }
 
-// 批量 @drop 和 loop 仅供 full 候选；if let 只保留到结构化拒绝。
+// 批量 @drop、loop 与链式动作仅供 full 候选；if let 只保留到结构化拒绝。
 export function parse_lexed_sugar(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
-    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 35u8)?;
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 99u8)?;
 }
