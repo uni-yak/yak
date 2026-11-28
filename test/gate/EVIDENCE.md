@@ -1898,6 +1898,18 @@ Win64 重定位夹具以真实 PE 中的 VA、RVA 与独立保留的语义加数
 - Windows x64：在 WSL 用 MinGW-w64 GCC 13-posix 交叉构建 PE（`main.exe` SHA-256 `eb6a775419bdffcd8369c45dce0b82c8e26c3b69f24e792dae0b1df3b2237f32`），错误签名目标诊断和无产物检查退出 0；Windows Python 3.14.8 原生执行 [标准流行为脚本](stdio_check.py)并通过同一 7 项，退出 0。这不是 Windows 原生工具链重建证据。
 - [full 候选专项入口](../full/run.sh)：在隔离快照以同代 ELF pair 构建候选，退出 0，13 组通过。四个正例逐一编译、链接、运行并核对 min 拒绝；六条负例逐项核对 `E2001` × 3、`E3004`、`E3005`、`E3008`；另核对 min/full 都拒绝 tuple、一个基座样本的扫描输出和 obj/iface 逐字节一致，以及批量 `@drop` 产物等于手写逆序且不同于正序。`yakc_full.elf` SHA-256 `5f4a4ba616efb8bfab839cefa2e0711e1b599239e5198f2ea8ca802b5bfd296f`，`full_imports.elf` 为 `97096380e127a398ec0b8630eeacc5d822429cbae5ca077c913e4364e5d824fa`。本地未执行 Windows full 专项；双目标结果由 [平台验收入口](ci_platform.sh)归档。
 
+## 可恢复标准流与首批 full 候选双平台 CI（2026-11-28）
+
+- 源码身份：`ce0e3c9cb6f7d4332ad22ba35248ad739d00c73c`，受保护审核引用 `ci/verify/stdio-full-stage1-shell`。[Run `46097516434`](https://github.com/uni-yak/yak/actions/runs/46097516434) 从 `main` 派发 [验收入口](../../.github/workflows/release.yml) 的 `mode=verify`，全链路通过，发布草稿作业未执行。
+- [首轮 `46094358343`](https://github.com/uni-yak/yak/actions/runs/46094358343) 的 Windows 候选专项误由 Windows Python 以裸名启动 `bash`，命中 WSL 启动器。修复后，[候选入口](../full/run.sh)传入当前原生 Bash 的绝对路径，[专项脚本](../full/stage.py)将其同时用于快照构建和链接，并只向相应子进程传递快照的运行时对象路径。未改变编译器、运行时或验收范围。
+- 原生目标与工具：Windows x64（`windows-2025`、MSYS2 UCRT64，Bash 5.3.20、GNU coreutils 9.0、GCC 16.2.0、binutils 2.47.20260726、Python 3.12.10）；Linux x86-64（`ubuntu-26.04`，Bash 5.3.9、uutils coreutils 0.10.0、GCC 15.2.0、binutils 2.46、Python 3.14.4）。
+- [自举入口](../../.github/workflows/compiler-bootstrap.yml)两个原生固定点作业均通过。两边 [平台验收](ci_platform.sh) 分别以同代 `C2` 编译器与扫描器运行 [标准流专项](test_stdio.sh) 和 [full 候选专项](../full/run.sh)，每项退出 0：每目标 7 个标准流原生行为用例及一个 `E8001` 签名负例，另有 13 组候选检查。回执见 [Windows 原始证据](https://github.com/uni-yak/yak/actions/runs/46097516434/artifacts/15244868882)／[Linux 原始证据](https://github.com/uni-yak/yak/actions/runs/46097516434/artifacts/15244952401) 的 `ci-platform-evidence/logs/{stdio,full-stage1}.{cmd,log,rc}`。
+- 双平台基座语料逐例对拍 **134／134**；新增专项单独存档，不计入该数字。共享候选 SHA-256 为 `c2dd37663cd34556dae3a7d729fd9ece93c22f774d1e386477a6298bd23a10ba`。下载 [最终验收归档](https://github.com/uni-yak/yak/actions/runs/46097516434/artifacts/15244773350)后，`sha256sum -c SHA256SUMS` 退出 0：
+  - `yak-linux-x86-64.tar.gz`：`0edeeaeabf5607ac34b20f2987522c60a42a56d92049632b500e51e266ef3cc6`
+  - `yak-windows-x64.zip`：`96c11141151b9a70949f0f4712ccc4305a7d19b41cc51df2a86d24b483b9f7c2`
+  - `build-manifest.json`：`f7df902bd0c51d27a4c6c8fc924c0d214bd38e0effadebbf6fcebc49480ef4bc`。
+- 该归档验收候选实现，不确认草案规格、不晋升 `yakc-full`，也不更新 T2 正式回执。
+
 ## 归档模板
 
 提交或在评审中粘贴证据时，用下列字段，缺项即视为证据不完整：
