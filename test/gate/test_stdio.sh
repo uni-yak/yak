@@ -19,11 +19,12 @@ fi
 mkdir -p -- test/gate/tmp
 work=$(mktemp -d test/gate/tmp/stdio.XXXXXXXX)
 export YAK_SEED_BIN="$PWD/$work/absent-seed.exe"
-for source in examples/echo.yak test/gate/fixtures/emptyio.yak; do
+for source in examples/echo.yak examples/lines.yak test/gate/fixtures/emptyio.yak; do
     bash tools/link.sh pkg/io/io.yak "$source" --target "$target" \
         --native-compiler "$compiler" --out-dir "$work/out" --no-run
 done
-python -X utf8 -B test/gate/stdio_check.py "$work/out/echo/echo.$suffix" "$work/out/emptyio/emptyio.$suffix"
+python -X utf8 -B test/gate/stdio_check.py "$work/out/echo/echo.$suffix" \
+    "$work/out/emptyio/emptyio.$suffix" "$work/out/lines/lines.$suffix"
 status=0
 bash tools/link.sh test/gate/fixtures/badio.yak --target "$target" \
     --native-compiler "$compiler" --out-dir "$work/out" --no-run --diag=jsonl || status=$?

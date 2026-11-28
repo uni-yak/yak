@@ -13,7 +13,7 @@
 | `t1_clean_gate.sh` | 构建只写登记位置、成功即清理、失败可回滚且可完全清理 | 同上 |
 | `t1_linux_preflight.sh` | Linux 宿主上 T1 构建入口的前置条件（目标三元组、版本钉死、PE 运行器、Seed 冻结和运行时对象）；`--host-only` 仅检查宿主工具链 | 0 通过 / 1 存在阻塞 / 2 环境或参数无效 / 3 并发 |
 | [t1_stage_boundary.py](t1_stage_boundary.py) | SD-1：有效 T2 收据前只允许 full 说明目录；始终拒绝默认 `out/` 内的 full 产物及归属标记 | 0 通过 / 1 越界 / 2 无法检查 |
-| [test_stdio.sh](test_stdio.sh) | 同一原生候选构建跨单元标准流夹具，覆盖正常和真实系统错误路径 | 0 通过 / 非零失败 |
+| [test_stdio.sh](test_stdio.sh) | 同一原生候选构建跨单元标准流夹具，覆盖二进制回显、跨块 LF 计数和真实系统错误路径 | 0 通过 / 非零失败 |
 | [full 专项](../full/run.sh) | 使用原生工具对构建隔离 full，验证脱糖、拒绝和 min 边界 | 0 通过 / 非零失败 |
 | `evidence.sh` | 生成可复现的取证报告（见 `EVIDENCE.md`） | 0 全通过 / 1 有失败记录 / 2 取证输入不可用 |
 | `test_evidence_digest.sh` | 隔离检查源摘要、矩阵锁回收，以及发布级输入对账、双模式矩阵明细与完整记录 | 0 通过 / 非零失败 |

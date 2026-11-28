@@ -24,7 +24,7 @@
 ⬜  泛型单态化（`S-14`）：接入声明与调用语法、泛型名义类型及接口约束事实。复用 `monomorph::instantiate_signature`，生成实例函数体与 MIR，按声明、具体 TypeSig 和目标 profile 去重并生成规范摘要，同步验收 `AW-4`／`AL-4` 泛型 `TypeSig` 规范身份、摘要生成与跨单元同实例一致性，用完整源码复验 `SU-7`。
 ⬜  核心类型与运行时语义扩展：接入 `string`／`&string`（`S-12`）的 full 入口、受检 UTF-8 构造、生命周期、MIR 与 ABI；实现字节／原始／模板字面量、`f32`／`f64` 浮点算术与 ABI、用户自定义 `Drop`（含 `no_alloc` 静态校验），并随 `T?` 实现修复 seed 跨模块 `?.` 用当前模块查字段的问题。
 ⬜  顶层 `let`／`var`（`S-4`）：实现绑定解析和依赖收集，接入 `desugar::plan_initializers`，由模块初始化器执行排序结果；用完整源文件核对初始化顺序和 `E3006`。
-⬜  `pkg/` 标准库建设：评审 [标准流接口](spec/lang/stdio.md) 的稳定性，按需将业务示例迁移至可恢复接口；保留最小兼容示例及其 ABI。随后推进 `pkg/buf`、`pkg/string`、`pkg/alloc`、`pkg/math`。
+⬜  `pkg/` 标准库建设：定稿前复核 [标准流接口](spec/lang/stdio.md) 的跨平台语义和 ABI 边界，保留最小兼容示例及其 ABI；随后推进 `pkg/buf`、`pkg/string`、`pkg/alloc`、`pkg/math`。
 
 #### 2. 底层系统开发能力（T3 实现）
 

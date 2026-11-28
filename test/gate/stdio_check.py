@@ -51,19 +51,24 @@ def open_pipe(binary):
 
 
 def main():
-    if len(sys.argv) != 3:
-        raise ValueError('用法：stdio_check.py echo emptyio')
-    echo, empty = (str(Path(path).resolve(strict=True)) for path in sys.argv[1:])
+    if len(sys.argv) != 4:
+        raise ValueError('用法：stdio_check.py echo emptyio lines')
+    echo, empty, lines = (str(Path(path).resolve(strict=True)) for path in sys.argv[1:])
     data = bytes(range(256)) * 17
     expect(run(echo, data=data), '逐字节回显', 0, data)
     expect(run(echo, data=b''), '空输入 EOF', 0)
     open_pipe(echo)
+    expect(run(lines, data=b''), '空输入计数', 0, b'0\n')
+    expect(run(lines, data=b'no\r-lf\x00'), '无 LF 输入计数', 0, b'0\n')
+    expect(run(lines, data=b'A\r\n\x00\nB' * 617 + b'C'), '跨缓冲且含二进制字节的 LF 计数', 0, b'1234\n')
     # 分别把管道的写端用作输入、读端用作输出；保留另一端来排除正常 EOF 或断管。
     fd_read, fd_write = os.pipe()
     with os.fdopen(fd_read, 'rb') as readable, os.fdopen(fd_write, 'wb') as writable:
         expect(run(echo, stdin=writable), '不可读的标准输入', 1)
         expect(run(echo, data=b'Z', stdout=readable), '不可写的标准输出', 2, None)
         expect(run(empty, stdin=writable, stdout=readable), '不可用句柄上的空切片', 0, None)
+        expect(run(lines, stdin=writable), '读失败不输出计数', 1)
+        expect(run(lines, data=b'Z\n', stdout=readable), '写计数失败', 2, None)
     fd_read, fd_write = os.pipe()
     os.close(fd_read)
     with os.fdopen(fd_write, 'wb') as broken:

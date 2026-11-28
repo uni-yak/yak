@@ -2,7 +2,7 @@
 
 ## 职责
 
-语言示例，面向展示与手工验证：[hello](hello.yak) 展示最小基座程序；[echo](echo.yak) 展示显式链接 [标准流模块](../pkg/io/README.md) 和处理 I/O 失败。两者的原生构建命令见 [快速开始](../README.md#快速开始)。
+语言示例，面向展示与手工验证：[hello](hello.yak) 展示最小兼容基座；[echo](echo.yak) 展示通过 [标准流模块](../pkg/io/README.md) 逐块转发输入；[lines](lines.yak) 仅在 EOF 后输出 LF 字节计数，末尾没有 LF 的片段不计。原生构建命令见 [快速开始](../README.md#快速开始)；构建 `lines` 时将回显示例的源文件替换为 [lines.yak](lines.yak)。
 
 ## 约定
 
