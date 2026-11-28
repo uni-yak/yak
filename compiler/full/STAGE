@@ -1,0 +1,4 @@
+stage: T3
+target: yakc-full
+base_compiler: yakc-min
+note: yakc-min 已归档 T2 固定点收据；yakc-full 基于已归档基座向 T3 首批语法糖待确认候选生长；不作为正式发布或确认收据。

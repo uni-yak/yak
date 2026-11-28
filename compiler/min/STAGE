@@ -9,5 +9,5 @@ products: out/<root>.exe / out/<root>.elf；可选审计目录保留各单元 .y
 entry: build.sh
 verify: verify.sh
 driver: src/main.yak
-ignition: 已完成 T2 固定点收敛（../../test/gate/t2_fixpoint_receipt.json）；yak-seed 已退役为归档审计证据（../../seed/）
-next: 推进 P2（Linux 原生自举编译器去 Wine/MinGW）与 T3 能力生长（../../TODO.md）
+ignition: 已完成 T2 固定点收敛（../../test/gate/t2_fixpoint_receipt.json）；被冻结的 yak-seed 仅保留用于 Windows 冷启动取证，不进入日常原生构建（../../seed/）
+next: 推进 T3 能力生长；Linux 静态 ELF 自举已全程原生执行（../../TODO.md）

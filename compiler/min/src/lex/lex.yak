@@ -11,6 +11,8 @@ const SCAN_OPTION: u8 = 4;
 const SCAN_UNION: u8 = 8;
 const SCAN_TEXT: u8 = 16;
 
+const SCAN_LOOP: u8 = 32;
+
 export struct Token {
     kind: u8,
     span: types::Span,
@@ -205,6 +207,10 @@ function scan_name(src: &[u8], start: u32, prefix: u8, file: u16, r: &LexResult:
     if prefix == 35 && (kw != 255 || reserved || wildcard) { fail(r, file, start, end - start, 1016)?; return end; }
     if reserved {
         if (profile & SCAN_UNION) != 0 && len == 2 && src[off] == 105 && src[off + 1] == 115 { emit(r, file, start, end, 7, 37, 0)?; return end; }
+        if (profile & SCAN_LOOP) != 0 && prefix == 0 && len == 4 && src[off] == 108 && src[off + 1] == 111 && src[off + 2] == 111 && src[off + 3] == 112 {
+            emit(r, file, start, end, 17, 0, 0)?;
+            return end;
+        }
         var code: u16 = 3008;
         if len == 4 && src[off] == 110 && src[off + 1] == 117 && src[off + 2] == 108 && src[off + 3] == 108 {
             if (profile & SCAN_OPTION) != 0 { emit(r, file, start, end, 15, 0, 0)?; return end; }
@@ -745,6 +751,11 @@ export function lex_scan_plain_union(src: &[u8], file: u16): LexResult!AllocErro
 
 export function lex_scan_text(src: &[u8], file: u16): LexResult!AllocError {
     return scan_source(src, file, 0, 0, 0, true, SCAN_TEXT)?;
+}
+
+// 仅由 full 的首批候选入口开启闭区间和 loop。
+export function lex_scan_full_sugar(src: &[u8], file: u16): LexResult!AllocError {
+    return scan_source(src, file, 0, 0, 0, true, SCAN_CLOSED_RANGES | SCAN_LOOP)?;
 }
 
 // 插值片段无需补写文件末尾换行。记号、错误与嵌套模板范围始终指向原文件。

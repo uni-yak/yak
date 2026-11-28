@@ -2,14 +2,12 @@
 
 ## 职责
 
-`yakc-full` 源码：组件划分与 `../../min/src/` 同构，便于逐组件迁移与差分对拍。
+T3 首批候选源码。候选前端将糖语法降级为基座 AST，再复用 min 的检查、MIR 和发射管线。正式能力以 [能力矩阵](../../../spec/index.md) 与 [语法基座](../../../spec/lang/base.md) 为准。
 
-## 结构
+## 结构与边界
 
-- 各组件目录在对应迁移阶段建立（`lex` / `parse` / `desugar` / `check` / `mir` / `emit` / `diag`）
-- `opt/` —— 优化遍（`min` 无此目录）
+- [driver](driver/README.md)：候选前端与编译、导入扫描入口。
+- [desugar](desugar/README.md)：仅候选启用的 AST 降级。
+- [opt](opt/README.md)：优化遍规划，本阶段不执行。
 
-## 约定
-
-- 迁移顺序按依赖：先非关键组件，检查器与代码生成最后。
-- 每迁移一个组件必须过差分对拍：同一输入下与 `min` 的诊断/产物语义一致。
+基座输入须与 min 产生相同的诊断或产物；候选验证见 [独立门禁](../../../test/full/README.md)。

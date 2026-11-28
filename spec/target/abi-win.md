@@ -93,7 +93,7 @@ yak$entry                                   // 根模块 main 的固定入口别
 
 6.2 foreign 服务链接符号由 `foreign.md` 登记的运行时名解析（如 `yak_rt_write`），不经 `yak$` 修饰。
 
-6.3 标准服务 `read`、`write`、`assert` 的 `call_service` 使用 `yak_rt_try_read`、`yak_rt_try_write`、`yak_rt_try_assert`。形参与对应标准服务一致。返回寄存器 `rax` 的全 1 位模式表示失败，其他返回值表示成功。`read` 成功时携带 `u32` 字节数。失败时清理当前帧，再回传服务失败。
+6.3 兼容服务 `read`、`write`、`assert` 的 `call_service` 使用 `yak_rt_try_read`、`yak_rt_try_write`、`yak_rt_try_assert`。形参与对应标准服务一致。返回寄存器 `rax` 的全 1 位模式表示失败，其他返回值表示成功。兼容 `read` 成功时携带 `u32` 字节数。失败时清理当前帧，再回传服务失败。状态服务 `stdio_read`、`stdio_write` 使用 `call_foreign`，`rax` 的值按 [foreign 3.6](../lang/foreign.md#三base-期服务集) 原样传给调用方。
 
 6.4 Yak 函数从 `r11` 返回完成状态，`0` 表示正常，`1` 表示算术或访问陷阱，`2` 表示标准服务失败，`256..511` 表示显式退出码 `status - 256`。正常返回值按 2.4、2.8 传递。`invoke_*` 在读取正常返回值或接收 `out` 前检查 `r11`，失败时先执行调用位点的清理。进入私有清理块后须在可能破坏 `r11` 的析构调用前保存该状态。普通 Win64 foreign 调用不使用该状态寄存器。
 

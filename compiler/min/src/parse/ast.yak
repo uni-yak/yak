@@ -19,6 +19,7 @@ export struct Block { stmts: u32[], span: types::Span }
 export struct IfBranch { condition: u32, body: u32, span: types::Span, reserved_binding: u32, binding_span: types::Span }
 export struct IfStmt { branches: IfBranch[], else_body: u32, span: types::Span }
 export struct WhileStmt { label: u32, condition: u32, body: u32, span: types::Span }
+export struct LoopStmt { label: u32, body: u32, span: types::Span }
 export struct MatchPattern { kind: u8, path: u32[], binding: u32, span: types::Span }
 export struct MatchArm { pattern: u32, body: u32, span: types::Span }
 export struct MatchStmt { scrutinee: u32, arms: MatchArm[], span: types::Span }
@@ -51,7 +52,7 @@ export struct Type { kind: u8, span: types::Span, data: u32 }
 export struct AstPool {
     items: AstItem[], functions: FnDecl[], enums: EnumDecl[], structs: StructDecl[],
     consts: ConstDecl[], foreigns: ForeignDecl[], imports: ImportDecl[],
-    blocks: Block[], ifs: IfStmt[], whiles: WhileStmt[], matches: MatchStmt[], patterns: MatchPattern[], assigns: AssignStmt[], stmts: Stmt[], exprs: Expr[], unaries: UnaryExpr[], binaries: BinaryExpr[], calls: CallExpr[], members: MemberExpr[], indices: IndexExpr[], slices: SliceExpr[], casts: CastExpr[], ctors: StructCtorExpr[], arrays: ArrayExpr[], paths: PathExpr[], type_paths: TypePath[], fixed_arrays: FixedArrayType[], refs: RefType[], fn_refs: FnType[], error_sets: ErrorSet[], fallibles: FallibleType[], types: Type[], locals: LocalDecl[],
+    blocks: Block[], ifs: IfStmt[], whiles: WhileStmt[], loops: LoopStmt[], matches: MatchStmt[], patterns: MatchPattern[], assigns: AssignStmt[], stmts: Stmt[], exprs: Expr[], unaries: UnaryExpr[], binaries: BinaryExpr[], calls: CallExpr[], members: MemberExpr[], indices: IndexExpr[], slices: SliceExpr[], casts: CastExpr[], ctors: StructCtorExpr[], arrays: ArrayExpr[], paths: PathExpr[], type_paths: TypePath[], fixed_arrays: FixedArrayType[], refs: RefType[], fn_refs: FnType[], error_sets: ErrorSet[], fallibles: FallibleType[], types: Type[], locals: LocalDecl[],
     statics: lex::StaticEntry[], static_bytes: u8[], plain_unions: PlainUnion[], option_syntax: bool, union_syntax: bool, text_syntax: bool,
 }
 

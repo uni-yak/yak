@@ -1,0 +1,9 @@
+// expected_code: E3005
+// spec: spec/lang/closed-range.md
+// 验证 SU-5：u8 闭区间上界为 255u8 时 +1 上溢，触发 E3005。
+function main(): void {
+    let arr: [u8; 4] = [1u8, 2u8, 3u8, 4u8];
+    let s: &[u8] = &arr[0u8..=255u8];
+    @drop(s);
+    return;
+}

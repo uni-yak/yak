@@ -250,7 +250,7 @@
 
 9.1 外部函数以 `foreign` 声明，调用约定见 `../target/abi-win.md` / `abi-linux.md`。
 
-9.2 base 期用户可声明的 `foreign` I/O 服务为 `read` 与 `write`（保留在外部 ABI 层，不进入 `@` 原语闭集）。进程退出与断言已上移为语言级控制流原语 `@exit(code: u8): void` 与 `@assert(cond: bool): void`（见 6.7）；原 `foreign exit` 与 `foreign assert` 仅作 T1 冻结 Seed 与存量夹具兼容保留。堆分配和释放属于运行时内部服务。签名、失败行为与种子宿主的单独登记见 [外部接口规格](foreign.md) 第三节。
+9.2 base 期用户可声明的 `foreign` I/O 服务由[外部接口规格](foreign.md)第三节登记（保留在外部 ABI 层，不进入 `@` 原语闭集）。进程退出与断言已上移为语言级控制流原语 `@exit(code: u8): void` 与 `@assert(cond: bool): void`（见 6.7）；原 `foreign exit` 与 `foreign assert` 仅作 T1 冻结 Seed 与存量夹具兼容保留。堆分配和释放属于运行时内部服务。签名、失败行为与种子宿主的单独登记见 [外部接口规格](foreign.md) 第三节。
 
 9.3 `Write` 不得传给外部边界；外部输出指针必须由独立的 `unsafe.md` / `foreign.md` 契约登记。
 

@@ -16,14 +16,15 @@
 
 #### 1. 高阶语法与类型驱动降级（T3 语法完整化）
 
-⬜  纯前端语法糖：实现 `loop`（`S-1`）、链式动作 `.move()`／`.clone()`／`.copy()`／`.drop()`（`S-8`）和 `tuple`（`S-11`）。在 full 入口接入 `..=`（`S-3`）、批量 `@drop`（`S-7`）及保留 `if let` 的类型诊断（`S-2`），并复验 `SU-3`–`SU-5`。
+⬜  首批语法糖正式评审：在 [待确认快照](spec/proc/status.md) 内补齐依赖、拒绝形态与完整门禁后，再登记实现态；候选验证由 [test/full](test/full/README.md) 承担。
+⬜  `tuple`（`S-11`）：确定跨单元 TypeSig 结构身份、布局与 owning 元素移动和逆序析构后，单独进入候选评审；在此之前维持拒绝。
 ⬜  两阶段降级管线与类型驱动降级：在类型检查后降级 `interface`／`impl` 静态分派与动态接口对象 `&Interface` 胖指针布局（`S-15`）、carrier 手动恢复 `.then()`／`.catch()`／`.or()`／`.unwrap()`（`S-9`）、实参前缀 `@clone`／`@copy`（`S-6`）、省略区间 `[a..]`（`S-13`）、`for` 迭代器循环（`S-16`）、无捕获匿名函数返回类型推导（`S-21`）、模板字符串插值（`S-24`），并补齐 `SU-8`。
 ⬜  普通联合（`S-20`）：接入 full 入口，完成完整的 `is` 流敏感收窄、跨单元 TypeSig 成员规范序、MIR 标记检查与载荷注入、活跃载荷移动和析构。显式前端已验证单元内归一化、布局及 `UN-1`–`UN-4`。
 ⬜  可空载体（`S-10`）：接入显式前端，补齐 `null`／present 注入、`??` 惰性回退、`?.` 字段与调用分派的 MIR 降级及 active payload 移动和析构。用完整源码复验 `OP-1`–`OP-4` 及载体的原生运行行为。
 ⬜  泛型单态化（`S-14`）：接入声明与调用语法、泛型名义类型及接口约束事实。复用 `monomorph::instantiate_signature`，生成实例函数体与 MIR，按声明、具体 TypeSig 和目标 profile 去重并生成规范摘要，同步验收 `AW-4`／`AL-4` 泛型 `TypeSig` 规范身份、摘要生成与跨单元同实例一致性，用完整源码复验 `SU-7`。
 ⬜  核心类型与运行时语义扩展：接入 `string`／`&string`（`S-12`）的 full 入口、受检 UTF-8 构造、生命周期、MIR 与 ABI；实现字节／原始／模板字面量、`f32`／`f64` 浮点算术与 ABI、用户自定义 `Drop`（含 `no_alloc` 静态校验），并随 `T?` 实现修复 seed 跨模块 `?.` 用当前模块查字段的问题。
 ⬜  顶层 `let`／`var`（`S-4`）：实现绑定解析和依赖收集，接入 `desugar::plan_initializers`，由模块初始化器执行排序结果；用完整源文件核对初始化顺序和 `E3006`。
-⬜  `pkg/` 标准库建设：落地 `pkg/io`、`pkg/string`、`pkg/buf`、`pkg/alloc`、`pkg/math`；其中 `pkg/io` 以模块私有 `foreign read`／`foreign write` 加公开 `export function` 封装标准输入输出，并逐步迁移 `examples/` 改用标准库接口（替代手写 `foreign` 声明）。
+⬜  `pkg/` 标准库建设：评审 [标准流接口](spec/lang/stdio.md) 的稳定性，按需将业务示例迁移至可恢复接口；保留最小兼容示例及其 ABI。随后推进 `pkg/buf`、`pkg/string`、`pkg/alloc`、`pkg/math`。
 
 #### 2. 底层系统开发能力（T3 实现）
 

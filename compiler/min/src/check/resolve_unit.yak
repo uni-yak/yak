@@ -85,6 +85,8 @@ function foreign_service_kind(names: &lex::NameTable:Read, name: u32): u8 {
     if foreign_name_equals(names, name, "assert") { return 2; }
     if foreign_name_equals(names, name, "read") { return 3; }
     if foreign_name_equals(names, name, "write") { return 4; }
+    if foreign_name_equals(names, name, "stdio_read") { return 6; }
+    if foreign_name_equals(names, name, "stdio_write") { return 7; }
     if foreign_name_equals(names, name, "args_count") { return 16; }
     if foreign_name_equals(names, name, "args_len") { return 17; }
     if foreign_name_equals(names, name, "args_read") { return 18; }
@@ -94,7 +96,7 @@ function foreign_service_kind(names: &lex::NameTable:Read, name: u32): u8 {
     return 0;
 }
 function foreign_param_count(kind: u8): u32 {
-    if kind == 1 || kind == 2 || kind == 3 || kind == 4 || kind == 17 || kind == 19 { return 1; }
+    if kind == 1 || kind == 2 || kind == 3 || kind == 4 || kind == 6 || kind == 7 || kind == 17 || kind == 19 { return 1; }
     if kind == 18 || kind == 21 { return 2; }
     if kind == 20 { return 3; }
     return 0;
@@ -103,8 +105,8 @@ function foreign_param_type(kind: u8, index: u32): u16 {
     if index == 0 {
         if kind == 1 { return foreign_byte; }
         if kind == 2 { return foreign_bool; }
-        if kind == 3 { return foreign_slice_read_write; }
-        if kind == 4 || kind == 19 || kind == 20 || kind == 21 { return foreign_slice_read; }
+        if kind == 3 || kind == 6 { return foreign_slice_read_write; }
+        if kind == 4 || kind == 7 || kind == 19 || kind == 20 || kind == 21 { return foreign_slice_read; }
         if kind == 17 || kind == 18 { return foreign_u32; }
     } elseif index == 1 {
         if kind == 18 { return foreign_slice_read_write; }
@@ -116,7 +118,7 @@ function foreign_param_type(kind: u8, index: u32): u16 {
 function foreign_return_type(kind: u8): u16 {
     if kind == 1 || kind == 2 || kind == 4 || kind == 21 { return builtin_void; }
     if kind == 3 || kind == 16 || kind == 17 || kind == 18 || kind == 20 { return foreign_u32; }
-    if kind == 19 { return foreign_u64; }
+    if kind == 6 || kind == 7 || kind == 19 { return foreign_u64; }
     return 0;
 }
 function foreign_builtin_matches(pool: &ast::AstPool:Read, refs: &resolve_refs::RefTable:Read, type_id: u32, builtin: u16): bool {

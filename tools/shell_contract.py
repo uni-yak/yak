@@ -37,6 +37,8 @@ PRODUCTION_ENTRIES = {
     "compiler/min/build.sh": "正式 T1 入口：模块图、编译与发布",
     "compiler/min/selfhost.sh": "自举入口：按模块名选择源根后调用 build.sh",
     "compiler/min/verify.sh": "快速门禁：规格审计、词表、契约与入口用例",
+    "compiler/full/build.sh": "隔离 full 候选入口：复用模块图、编译与链接",
+    "compiler/full/selfhost.sh": "隔离 full 候选构建：使用已构建的原生工具对",
     "seed/build.sh": "Seed 确定性构建与哈希冻结",
     "runtime/build.sh": "Windows x64 运行时对象确定性构建",
     "compiler/lsp/build.sh": "由正式编译入口产出的 Win64 诊断候选服务",

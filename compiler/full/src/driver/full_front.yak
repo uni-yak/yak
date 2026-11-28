@@ -1,0 +1,43 @@
+// full 第一阶段编译器前端封装：使用语法糖词法/解析配置后执行纯粹 AST→AST 降级，并复核 base 不变量。
+import diag;
+import driver_front;
+import full_desugar;
+import lex;
+import parse;
+import parse_core;
+
+function emit_lex(diags: &diag::DiagBuffer:ReadWrite, errors: &[lex::LexDiagnostic]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+
+function emit_parse(diags: &diag::DiagBuffer:ReadWrite, errors: &[parse_core::ParseDiagnostic]): void!AllocError {
+    var i: u32 = 0;
+    while i < @len(errors) as u32 {
+        diag::diagbuf_emit(diags, diag::Diag { code: errors[i].code, severity: 0, span: errors[i].span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+        i = i + 1;
+    }
+    return;
+}
+
+export function parse_input(source: &[u8], module_name: &[u8], jsonl_mode: bool, diags: &diag::DiagBuffer:ReadWrite): driver_front::ParsedUnit!AllocError {
+    var lexed: lex::LexResult = lex::lex_scan_full_sugar(source, 0)?;
+    emit_lex(diags, &lexed.diagnostics[0..@len(lexed.diagnostics)]:Read)?;
+    if @len(lexed.diagnostics) > 0 {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    var parsed: parse::ParseResult = parse::parse_lexed_sugar(&lexed:Read, 0)?;
+    emit_parse(diags, &parsed.diagnostics[0..@len(parsed.diagnostics)]:Read)?;
+    if @len(parsed.diagnostics) > 0 {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    let lowered_ok: bool = full_desugar::lower_stage1(&parsed:ReadWrite, &lexed.names:Read, diags)?;
+    if !lowered_ok {
+        driver_front::fail(diags, jsonl_mode, module_name)?;
+    }
+    return driver_front::ParsedUnit { lexed: @move(lexed), parsed: @move(parsed) };
+}

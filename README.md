@@ -23,13 +23,13 @@ function main(): void {
 }
 ```
 
-更多涵盖结构体、枚举与载荷匹配、动态数组、跨模块导入导出、错误传播与 ABI 布局的示例见 [examples/](examples/README.md)。
+更多示例见 [examples/](examples/README.md)。[跨模块回显](examples/echo.yak) 使用 [pkg/io](pkg/io/README.md) 候选接口，把短读、EOF 和 I/O 失败交由调用方区分；上面的最小示例保留旧 ABI。
 
 ## 目标平台与工具链
 
 | 维度 | 说明 |
 |:---|:---|
-| 构建宿主 | Windows（MSYS2 UCRT64）、Linux x86_64（配置 MinGW-w64 交叉工具链与 `YAK_PE_RUNNER`） |
+| 原生构建宿主 | Windows（MSYS2 UCRT64）与 Linux x86_64；Linux 原生路径不依赖 Wine 或 MinGW-w64 |
 | 产物目标一 | Windows x64 PE/COFF（T1 点火与自举目标，链接 `runtime/out/win_x64/runtime.obj`） |
 | 产物目标二 | Linux x86_64 静态 ELF64（T2 双目标验收与独立 `yak_lsp.elf` 交付目标，源码构建 Linux 运行时） |
 | 工具版本锁 | 全部宿主与目标工具版本统一锁定于 [versions.lock](versions.lock) |
@@ -44,9 +44,9 @@ function main(): void {
 | [seed/](seed/README.md) | 一次性 C 基座解释器 `yak-seed` 源码、回归测试与冻结记录 [seed/frozen.txt](seed/frozen.txt) |
 | [compiler/min/](compiler/min/README.md) | 用 Yak `base` 子集编写的最小自举编译器 `yakc-min`（词法、解析、检查、MIR、YSM、COFF/ELF 发射） |
 | [compiler/lsp/](compiler/lsp/) | 独立 Yak 语言服务 `yak_lsp`（Win64 PE 与 Linux 静态 ELF 构建入口） |
-| [compiler/full/](compiler/full/README.md) | 完整编译器 `yakc-full` 预留目录（T2 正式归档后由 `yakc-min` 生长） |
+| [compiler/full/](compiler/full/README.md) | `yakc-full` 首批待确认候选；不进入 `yakc-min` 默认构建与分发 |
 | [runtime/](runtime/README.md) | 无 GC 极简目标运行时（Windows Win32 桥与 Linux x86_64 syscall 桥） |
-| [pkg/](pkg/README.md) | Yak 标准库布局（T3 起建设） |
+| [pkg/](pkg/README.md) | Yak 标准库；首个标准流模块为 [pkg/io](pkg/io/README.md) |
 | [test/](test/README.md) | 正例语料 `ok/`、负例语料 `bad/`、过程门禁 `gate/`、性能基准 `perf/` 与单测 `unit/` |
 | [examples/](examples/README.md) | 可直接编译运行的 Yak 示例程序 |
 | [editors/](editors/vscode/README.md) | VS Code / CodeBuddy 扩展与网页语法高亮 |
@@ -55,49 +55,49 @@ function main(): void {
 
 ## 快速开始
 
-> 以下 Shell 命令在 **MSYS2 UCRT64** 或已按 [versions.lock](versions.lock) 配置好锁定工具链的 **Linux x86_64** 环境中执行（Linux 上执行 PE 需设置 `YAK_PE_RUNNER=wine`）。
+> 在配置 [versions.lock](versions.lock) 的宿主上，将同一候选归档中的原生编译器和扫描器放到 `tmp/bootstrap/`。冻结 Seed 仅用于 Windows 冷启动取证，日常构建不使用它；流程见 [GitHub Actions 说明](.github/WORKFLOW.md)。
 
-### 1. 准备 Seed 与运行时
+### 1. 构建当前源码与最小示例
+
+Windows（MSYS2 UCRT64）：
 
 ```bash
-# 校验或冻结构建 Seed（冷启动优先将可信冻结件放至 seed/out/yak-seed.exe 并与 seed/frozen.txt 对账）
-sha256sum seed/out/yak-seed.exe
-# 或在 MSYS2 UCRT64 从源码重新构建并验证 Seed：
-bash seed/build.sh
-
-# 从源码构建 Windows x64 运行时对象
 bash runtime/build.sh
+bash compiler/min/selfhost.sh --target win-x64 \
+  --native-compiler tmp/bootstrap/main.exe --native-scanner tmp/bootstrap/imports.exe \
+  --out-dir tmp/native
+bash compiler/min/build.sh examples/hello.yak --target win-x64 \
+  --native-compiler tmp/native/main.exe --native-scanner tmp/native/imports.exe \
+  --out-dir tmp/hello
 ```
 
-### 2. 编译并运行示例
+Linux x86_64（直接执行静态 ELF）：
 
 ```bash
-# 通过正式构建入口编译为 Win64 可执行文件
-bash compiler/min/build.sh examples/hello.yak
-
-# 或使用链接脚本直接编译并运行
-bash tools/link.sh examples/hello.yak
+bash compiler/min/selfhost.sh --target linux-x64 \
+  --native-compiler tmp/bootstrap/main.elf --native-scanner tmp/bootstrap/imports.elf \
+  --out-dir tmp/native
+bash compiler/min/build.sh examples/hello.yak --target linux-x64 \
+  --native-compiler tmp/native/main.elf --native-scanner tmp/native/imports.elf \
+  --out-dir tmp/hello
 ```
 
-在 Linux x86_64 上使用原生自举编译器对构建静态 ELF：
+### 2. 运行跨模块标准流示例
+
+用上一步从当前源码构建的编译器。以下为 Linux 命令；在 Windows 使用 `--target win-x64` 与 `main.exe`：
 
 ```bash
-# 构建通用 Yak 程序为静态 Linux x86_64 ELF
-YAK_PE_RUNNER=wine bash compiler/min/build.sh examples/hello.yak \
-  --target linux-x64 \
-  --native-compiler <C2/main.exe> \
-  --native-scanner <C2/imports.exe> \
-  --out-dir tmp/hello-elf
-
-# 构建独立静态 ELF 语言服务 yak_lsp.elf
-YAK_PE_RUNNER=wine bash compiler/lsp/build.sh \
-  --target linux-x64 \
-  --native-compiler <C2/main.exe> \
-  --native-scanner <C2/imports.exe> \
-  tmp/lsp-elf
+printf 'yak\n' | bash tools/link.sh pkg/io/io.yak examples/echo.yak \
+  --target linux-x64 --native-compiler tmp/native/main.elf --out-dir tmp/echo
 ```
+
+语言服务与 full 候选分别使用 [LSP 构建入口](compiler/lsp/README.md) 与 [候选验证入口](test/full/README.md)。
 
 ### 3. 运行验证门禁
+
+使用本轮编译器运行原生专项，例如 `bash test/gate/test_stdio.sh linux-x64 tmp/native/main.elf`；full 另走 [独立候选门禁](test/full/README.md)。
+
+下面是冷启动、基座矩阵与固定点取证入口，不是日常构建的前置步骤。按 [冷启动工作流](.github/WORKFLOW.md) 准备相应宿主与冻结 Seed。
 
 ```bash
 # yakc-min 快速门禁（规格审计、词表/错误码校验、契约单测、Shell 白名单、诊断 JSONL 与入口门禁）
@@ -116,9 +116,9 @@ bash test/gate/test_base_selfhost_candidate.sh --out-dir tmp/selfhost
 | 阶段 | 目标 | 当前状态 |
 |:---|:---|:---|
 | **T0** | 立项、首批规格、`yak-seed` 多编译器交叉构建与哈希冻结 | 已完成冻结基线（见 [seed/frozen.txt](seed/frozen.txt)） |
-| **T1** | `yak-seed` 解释执行 `yakc-min` 源码，产出 Win64 PE 并通过全套入口/矩阵/清理门禁 | 本机与 Ubuntu 锁定工具链全链路复验通过；待可信 `main` Linux CI 正式归档 |
-| **T2** | `yakc-min` 三遍自举收敛（`C2 == C3`）、Win64 PE 与 Linux x86_64 静态 ELF 双目标验收、独立 ELF `yak_lsp` 交付后退役 Seed | 本机 Windows + Ubuntu 实机完成 `C0→C3` 逐字节收敛、双目标 131/131 原生对拍与 Neovim/VS Code 真客户端验证；CI 归档工作流已就绪，待可信 `main` CI 归档与 Seed 退役 |
-| **T3** | `yakc-min` 生长为 `yakc-full`：高阶语法糖、联合/可空载体、泛型单态化、底层系统能力（`unsafe`/`@asm`/原子/布局扩展）与 `pkg/` 标准库 | 规格矩阵已登记，待 T2 正式收口后启动 |
+| **T1** | `yak-seed` 解释执行 `yakc-min` 源码，产出 Win64 PE 并通过全套入口/矩阵/清理门禁 | 阶段已通过；Windows 冷启动仍使用冻结 Seed |
+| **T2** | `yakc-min` 三遍自举收敛（`C2 == C3`）、Win64 PE 与 Linux x86_64 静态 ELF 双目标验收、独立 ELF `yak_lsp` 交付后退役 Seed | 可信 [T2 固定点收据](test/gate/t2_fixpoint_receipt.json) 已归档；后续 [原生双平台 CI](https://github.com/uni-yak/yak/actions/runs/46042555495) 通过 134/134 基座语料 |
+| **T3** | `yakc-min` 生长为 `yakc-full`：高阶语法糖、联合/可空载体、泛型单态化、底层系统能力（`unsafe`/`@asm`/原子/布局扩展）与 `pkg/` 标准库 | 开发中；首批语法糖有独立待确认候选，正式边界以 [能力矩阵](spec/index.md) 为准 |
 | **T4** | AOT 优化管线（`Y1`/`Y2`）、确定性寄存器分配、指令选择与更多架构目标 | 规格草案已登记 |
 
 详细验收回执见 [test/gate/EVIDENCE.md](test/gate/EVIDENCE.md)，全部未完成待办见 [TODO.md](TODO.md)。

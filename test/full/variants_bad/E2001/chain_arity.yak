@@ -1,0 +1,9 @@
+// expected_code: E2001
+// spec: spec/lang/chain-act.md
+// 链式所有权动作不接收显式实参。
+function main(): void {
+    let a: u8[] = [];
+    let b: u8[] = a.move(1u8);
+    @drop(b);
+    return;
+}

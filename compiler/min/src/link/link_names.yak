@@ -55,10 +55,12 @@ function service_symbol(kind: u8, checked: bool, sysv: bool): u8[]!AllocError {
     if kind == 2 { return copy_text("yak_rt_assert")?; }
     if kind == 3 { return copy_text("yak_rt_read")?; }
     if kind == 4 { return copy_text("yak_rt_write")?; }
+    if kind == 6 { return copy_text("yak_rt_stdio_read")?; }
+    if kind == 7 { return copy_text("yak_rt_stdio_write")?; }
     return [];
 }
 function service_known(kind: u8): bool {
-    return kind == 1 || kind == 2 || kind == 3 || kind == 4;
+    return (kind >= 1 && kind <= 4) || kind == 6 || kind == 7;
 }
 // 只有被调用指令实际引用的服务才需要外部符号；
 // 声明但未调用的 foreign 不产出未定义符号，避免链接器为死声明报错。

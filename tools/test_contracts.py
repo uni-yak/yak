@@ -31,10 +31,13 @@ class ContractGates(unittest.TestCase):
         self.assertFalse(self.root.is_relative_to(ROOT), f"沙箱不得落在仓库内：{self.root}")
         shutil.copytree(ROOT / "spec", self.root / "spec")
         shutil.copyfile(ROOT / "versions.lock", self.root / "versions.lock")
-        # 规格审计还要核查仓库内的门禁文档链接，夹具必须包含真实目标。
+        # 规格审计还要核查仓库内的门禁文档和候选语料链接，复制实际目标。
         gate_doc = Path("test/gate/README.md")
         (self.root / gate_doc.parent).mkdir(parents=True)
         shutil.copyfile(ROOT / gate_doc, self.root / gate_doc)
+        full_cases = Path("test/full")
+        shutil.copytree(ROOT / full_cases, self.root / full_cases,
+                        ignore=shutil.ignore_patterns("__pycache__"))
         self.audit = load("audit_spec_test", ROOT / "tools/audit_spec.py")
         self.audit.ROOT, self.audit.SPEC = self.root, self.root / "spec"
         self.generator = load("lex_tables_test", ROOT / "tools/symgen/lex_tables.py")

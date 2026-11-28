@@ -1,0 +1,7 @@
+// 标准流写服务返回 u64；旧返回宽度不得取得同名服务身份。
+foreign #stdio_write(data: &[u8]): u32;
+
+function main(): void {
+    @assert(stdio_write("x") == 0u32);
+    return;
+}

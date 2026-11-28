@@ -1,0 +1,17 @@
+// 标准流接口；系统失败由调用方检查，不经过兼容服务的陷阱边。
+foreign #stdio_read(buf: &[u8]:ReadWrite): u64;
+foreign #stdio_write(data: &[u8]): u64;
+
+export struct ReadResult { count: u32, ok: bool }
+
+export function #read(buf: &[u8]:ReadWrite): ReadResult {
+    let count: u64 = stdio_read(buf);
+    if count > 4294967295u64 {
+        return ReadResult { count: 0, ok: false };
+    }
+    return ReadResult { count: count as u32, ok: true };
+}
+
+export function #write(data: &[u8]): bool {
+    return stdio_write(data) == 0u64;
+}

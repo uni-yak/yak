@@ -41,6 +41,8 @@ jobs:
         run: |
           python tools/test_contracts.py
           python -m unittest tools.test_error_codes tools.test_shell_contract
+          python test/gate/t1_stage_boundary.py
+          python -m unittest discover -s test/gate -p test_t1_stage_boundary.py
           python test/gate/t2_stage_fixpoint_gate.py
           python -m unittest discover -s test/gate -p test_t2_stage_fixpoint_gate.py
           python test/gate/test_ci_artifacts.py

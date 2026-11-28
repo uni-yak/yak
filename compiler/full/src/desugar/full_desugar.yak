@@ -1,0 +1,145 @@
+// 首批候选纯语法糖：降级后只保留基座 AST 形态。
+import ast;
+import desugar;
+import diag;
+import lex;
+import parse;
+import types;
+
+function emit_diag(diags: &diag::DiagBuffer:ReadWrite, code: u16, span: types::Span): void!AllocError {
+    diag::diagbuf_emit(diags, diag::Diag { code: types::error_code(code), severity: 0, span: span, unit: 0, refs: diag::diag_refs_none(), args: diag::diag_args_none() })?;
+    return;
+}
+
+// S-1：loop { B } 与 label: loop { B } 原位降级为 while true { B }。
+function lower_loops(pool: &ast::AstPool:ReadWrite): void!AllocError {
+    var s: u32 = 0;
+    while s < @len(pool.stmts) as u32 {
+        if pool.stmts[s].kind == 19 {
+            let loop_id: u32 = pool.stmts[s].data;
+            if loop_id < @len(pool.loops) as u32 {
+                let lp: ast::LoopStmt = pool.loops[loop_id];
+                let true_expr: u32 = @len(pool.exprs) as u32;
+                @push(pool.exprs, ast::Expr { kind: 3, span: lp.span, data: 1u64, integer_suffix: 0 })?;
+                let while_id: u32 = @len(pool.whiles) as u32;
+                @push(pool.whiles, ast::WhileStmt { label: lp.label, condition: true_expr, body: lp.body, span: lp.span })?;
+                pool.stmts[s].kind = 15;
+                pool.stmts[s].data = while_id;
+            }
+        }
+        s = s + 1;
+    }
+    pool.loops = [];
+    return;
+}
+
+// 分类链式所有权调用：1=move 2=copy 3=clone 4=drop，其余返回 0。
+function classify_chained_action(pool: &ast::AstPool:Read, expr_id: u32, move_id: u32, clone_id: u32, copy_id: u32, drop_id: u32): u8 {
+    if expr_id >= @len(pool.exprs) as u32 || pool.exprs[expr_id].kind != 22 { return 0; }
+    let call_id: u32 = pool.exprs[expr_id].data as u32;
+    if call_id >= @len(pool.calls) as u32 { return 0; }
+    let callee: u32 = pool.calls[call_id].callee;
+    if callee >= @len(pool.exprs) as u32 || pool.exprs[callee].kind != 23 { return 0; }
+    let mem_id: u32 = pool.exprs[callee].data as u32;
+    if mem_id >= @len(pool.members) as u32 { return 0; }
+    let member: ast::MemberExpr = pool.members[mem_id];
+    if member.optional || member.name == 0 { return 0; }
+    if move_id != 0 && member.name == move_id { return 1; }
+    if copy_id != 0 && member.name == copy_id { return 2; }
+    if clone_id != 0 && member.name == clone_id { return 3; }
+    if drop_id != 0 && member.name == drop_id { return 4; }
+    return 0;
+}
+
+// S-8：把 e.move()/e.clone()/e.copy()/e.drop(); 降级为前缀原语或调用移动实参。
+function lower_chained_actions(pool: &ast::AstPool:ReadWrite, names: &lex::NameTable:Read, diags: &diag::DiagBuffer:ReadWrite): void!AllocError {
+    let move_id: u32 = lex::lookup_name(names, "move");
+    let clone_id: u32 = lex::lookup_name(names, "clone");
+    let copy_id: u32 = lex::lookup_name(names, "copy");
+    let drop_id: u32 = lex::lookup_name(names, "drop");
+    if move_id == 0 && clone_id == 0 && copy_id == 0 && drop_id == 0 { return; }
+
+    let orig_len: u32 = @len(pool.exprs) as u32;
+    var handled_drop: bool[] = [];
+    var is_chained_move: bool[] = [];
+    var idx: u32 = 0;
+    while idx < orig_len {
+        @push(handled_drop, false)?;
+        @push(is_chained_move, false)?;
+        idx = idx + 1;
+    }
+
+    var s: u32 = 0;
+    while s < @len(pool.stmts) as u32 {
+        if pool.stmts[s].kind == 13 {
+            let expr_id: u32 = pool.stmts[s].data;
+            if expr_id < orig_len && classify_chained_action(&*pool:Read, expr_id, move_id, clone_id, copy_id, drop_id) == 4 {
+                let call_id: u32 = pool.exprs[expr_id].data as u32;
+                if @len(pool.calls[call_id].args) != 0 {
+                    emit_diag(diags, 2001u16, pool.stmts[s].span)?;
+                } else {
+                    let mem_id: u32 = pool.exprs[pool.calls[call_id].callee].data as u32;
+                    let receiver: u32 = pool.members[mem_id].object;
+                    pool.stmts[s].kind = 18;
+                    pool.stmts[s].data = receiver;
+                }
+                handled_drop[expr_id] = true;
+            }
+        }
+        s = s + 1;
+    }
+
+    var e: u32 = 0;
+    while e < orig_len {
+        if pool.exprs[e].kind == 22 {
+            let call_id: u32 = pool.exprs[e].data as u32;
+            if call_id < @len(pool.calls) as u32 {
+                var a: u32 = 0;
+                while a < @len(pool.calls[call_id].args) as u32 {
+                    let arg: ast::CallArg = pool.calls[call_id].args[a];
+                    if arg.kind == 0 && arg.value < orig_len && is_chained_move[arg.value] {
+                        let inner_call: u32 = pool.exprs[arg.value].data as u32;
+                        if inner_call < @len(pool.calls) as u32 && @len(pool.calls[inner_call].args) == 1 {
+                            let inner_val: u32 = pool.calls[inner_call].args[0].value;
+                            pool.calls[call_id].args[a].kind = 2;
+                            pool.calls[call_id].args[a].value = inner_val;
+                        }
+                    }
+                    a = a + 1;
+                }
+            }
+        }
+        let act: u8 = classify_chained_action(&*pool:Read, e, move_id, clone_id, copy_id, drop_id);
+        if act == 4 && !handled_drop[e] {
+            emit_diag(diags, 2001u16, pool.exprs[e].span)?;
+        } elseif act == 1 || act == 2 || act == 3 {
+            let call_id: u32 = pool.exprs[e].data as u32;
+            if @len(pool.calls[call_id].args) != 0 {
+                emit_diag(diags, 2001u16, pool.exprs[e].span)?;
+            } else {
+                let callee_id: u32 = pool.calls[call_id].callee;
+                let mem_id: u32 = pool.exprs[callee_id].data as u32;
+                let obj: u32 = pool.members[mem_id].object;
+                var bid: u64 = 20481u64;
+                if act == 2 { bid = 20482u64; }
+                elseif act == 3 { bid = 20483u64; }
+                // 被调用的成员节点由该调用独占；原位改写以保留表达式池的后序。
+                pool.exprs[callee_id].kind = 29;
+                pool.exprs[callee_id].data = bid;
+                var new_args: ast::CallArg[] = [];
+                @push(new_args, ast::CallArg { kind: 0, value: obj, span: pool.exprs[obj].span })?;
+                pool.calls[call_id].args = @move(new_args);
+                if act == 1 { is_chained_move[e] = true; }
+            }
+        }
+        e = e + 1;
+    }
+    return;
+}
+
+export function lower_stage1(parsed: &parse::ParseResult:ReadWrite, names: &lex::NameTable:Read, diags: &diag::DiagBuffer:ReadWrite): bool!AllocError {
+    lower_loops(&parsed.pool:ReadWrite)?;
+    lower_chained_actions(&parsed.pool:ReadWrite, names, diags)?;
+    if diag::diagbuf_has_error(&*diags:Read) { return false; }
+    return desugar::verify_base(&parsed.file:Read, &parsed.pool:Read, diags)?;
+}

@@ -1,0 +1,12 @@
+// 空切片即使没有可用的宿主句柄也必须成功。
+import io;
+
+function #empty(): bool {
+    var data: [u8; 1] = [1u8];
+    let result: io::ReadResult = io::read(&data[0..0]:ReadWrite);
+    return result.ok && result.count == 0 && data[0u64] == 1u8 && io::write("");
+}
+
+function main(): void {
+    @assert(empty());
+}

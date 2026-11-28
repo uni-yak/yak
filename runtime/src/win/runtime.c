@@ -12,6 +12,7 @@ typedef unsigned long long u64;
 #define YAK_STD_ERROR (-12)
 #define YAK_ERROR_HANDLE_EOF 38u
 #define YAK_ERROR_BROKEN_PIPE 109u
+#define YAK_ERROR_MORE_DATA 234u
 
 // 陷阱退出码：与显式 foreign exit 的 0–255 值域分离，便于测试区分非正常完成。
 #define YAK_TRAP_CODE 70u
@@ -67,7 +68,19 @@ void start(void) {
     ExitProcess(0);
 }
 
-// 输入服务：读取至多 len 字节，返回实际字节数；0 表示输入结束。
+// 状态服务只等一次成功读取；短读与管道 EOF 都不是系统失败。
+u64 yak_rt_stdio_read(u8 *buffer, u64 len) {
+    if (len == 0) return 0;
+    const u32 want = (u32)(len > YAK_IO_CHUNK ? YAK_IO_CHUNK : len);
+    u32 got = 0;
+    if (ReadFile(GetStdHandle(YAK_STD_INPUT), buffer, want, &got, 0)) return got;
+    const u32 error = GetLastError();
+    if (error == YAK_ERROR_HANDLE_EOF || error == YAK_ERROR_BROKEN_PIPE) return 0;
+    if (error == YAK_ERROR_MORE_DATA && got != 0) return got;
+    return YAK_SERVICE_FAILED;
+}
+
+// 兼容入口保持分块读取与原有失败诊断。
 u64 yak_rt_try_read(u8 *buffer, u64 len) {
     void *handle = GetStdHandle(YAK_STD_INPUT);
     u64 total = 0;
@@ -93,25 +106,32 @@ u64 yak_rt_try_read(u8 *buffer, u64 len) {
     return total;
 }
 
-// 输出服务：写完整个切片；只有全部写完才报告成功。
-u64 yak_rt_try_write(const u8 *data, u64 len) {
+// 两个输出入口共用同一推进循环；只有兼容入口负责打印诊断。
+static u32 write_stdout(const u8 *data, u64 len) {
+    if (len == 0) return 0;
     void *handle = GetStdHandle(YAK_STD_OUTPUT);
     u64 total = 0;
     while (total < len) {
         u64 remain = len - total;
         u32 want = (u32)(remain > YAK_IO_CHUNK ? YAK_IO_CHUNK : remain);
         u32 wrote = 0;
-        if (!WriteFile(handle, data + total, want, &wrote, 0)) {
-            report_failure("yak: write failed\n", 18);
-            return YAK_SERVICE_FAILED;
-        }
-        if (wrote == 0) {
-            report_failure("yak: write stalled\n", 19);
-            return YAK_SERVICE_FAILED;
-        }
+        if (!WriteFile(handle, data + total, want, &wrote, 0)) return 1;
+        if (wrote == 0) return 2;
         total = total + wrote;
     }
     return 0;
+}
+
+u64 yak_rt_stdio_write(const u8 *data, u64 len) {
+    return write_stdout(data, len) == 0 ? 0 : YAK_SERVICE_FAILED;
+}
+
+u64 yak_rt_try_write(const u8 *data, u64 len) {
+    const u32 status = write_stdout(data, len);
+    if (status == 0) return 0;
+    if (status == 1) report_failure("yak: write failed\n", 18);
+    else report_failure("yak: write stalled\n", 19);
+    return YAK_SERVICE_FAILED;
 }
 
 // 退出服务：code 与宿主进程退出码真值一致。

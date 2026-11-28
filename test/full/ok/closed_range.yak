@@ -1,0 +1,36 @@
+// expected_exit: 0
+// expected_stdout: 24
+// expected_stdout:
+// spec: spec/lang/sugar.md S-3
+// 验证 S-3：定长数组与动态数组的闭区间切片 [a..=b]（含单元素边界）。
+foreign write(data: &[u8]): void;
+
+function run_ranges(): u32!AllocError {
+    let arr: [u8; 4] = [3u8, 5u8, 7u8, 9u8];
+    let s1: &[u8] = &arr[0u64..=3u64];
+    @assert(@len(s1) == 4u64);
+    let single: &[u8] = &arr[2u64..=2u64];
+    @assert(@len(single) == 1u64);
+    @assert(single[0] == 7u8);
+
+    var dyn: u8[] = [];
+    @push(dyn, 10u8)?;
+    @push(dyn, 14u8)?;
+    let high: u64 = dyn.len - 1u64;
+    let mid: &[u8] = &dyn[0u64..=high];
+    let sum: u32 = (mid[0] as u32) + (mid[1] as u32);
+    @assert(sum == 24u32);
+    return (s1[0] as u32) + (s1[1] as u32) + (s1[2] as u32) + (s1[3] as u32);
+}
+
+function observe(): void!AllocError {
+    let total: u32 = run_ranges()?;
+    @assert(total == 24u32);
+    write("24\n");
+    return;
+}
+
+function main(): void {
+    observe();
+    return;
+}

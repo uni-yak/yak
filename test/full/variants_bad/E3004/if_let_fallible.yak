@@ -1,0 +1,15 @@
+// expected_code: E3004
+// spec: spec/lang/sugar.md#s-2-if-let保留未激活
+// 验证 SU-4：可错载体的 if let 保留形态在类型阶段触发 E3004。
+enum Fail { Oops }
+
+function may_fail(): u32!Fail {
+    return 1u32;
+}
+
+function main(): void {
+    if let v = may_fail() {
+        @assert(v == 1u32);
+    }
+    return;
+}

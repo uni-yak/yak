@@ -1,0 +1,113 @@
+// yakc-full 编译器驱动：在保留 base 语义与发射管线的前提下启用 full 前端语法糖。
+import host;
+import host_args;
+import diag;
+import coff_symbols;
+import lex;
+import parse;
+import iface_load;
+import resolve_refs;
+import mir;
+import driver_deps;
+import driver_front;
+import driver_ir;
+import driver_emit;
+import full_front;
+
+foreign exit(code: u8): void;
+foreign write(data: &[u8]): void;
+
+function usage(): void {
+    write("用法：yakc_full --input src=<源文件> --output obj=<对象文件> --output iface=<接口文件> -- [--diag=jsonl] <源输入登记名> [<模块名> [<root|dep> [依赖接口登记名...]]]\n");
+    write("      位置参数 3 给出 --emit-ysm 时另产 .ysm，此时必须登记 --output ysm=<文件>，依赖登记名顺延到位置参数 4 之后。\n");
+    write("      --emit-ysm-only 只发射经过校验的审计产物。\n");
+    write("      --diag=jsonl 时诊断经宿主帧交由链接入口留存，不再写终端诊断文本。\n");
+    write("      --target=linux-x64 在诊断选项之后选择 ELF 与 System V，省略时使用 Win64。\n");
+    exit(2);
+}
+
+function run_compiler(): void!AllocError {
+    let packed_args: u8[] = host::load_args()?;
+    let args: &[u8] = &packed_args[0..@len(packed_args)]:Read;
+    let argc: u32 = host_args::count(args);
+    var jsonl_mode: bool = false;
+    var base: u32 = 0;
+    if argc > 0 {
+        let maybe_mode: u8[] = host_args::get(args, 0)?;
+        if coff_symbols::names_equal(&maybe_mode[0..@len(maybe_mode)]:Read, "--diag=jsonl") {
+            jsonl_mode = true;
+            base = 1;
+        }
+    }
+    var profile: u32 = 65537;
+    if argc > base {
+        let option: u8[] = host_args::get(args, base)?;
+        if coff_symbols::names_equal(&option[0..@len(option)]:Read, "--target=linux-x64") {
+            profile = 65538;
+            base = base + 1;
+        }
+    }
+    if argc == base { usage(); }
+    var is_root: bool = true;
+    if argc > base + 2 {
+        let role: u8[] = host_args::get(args, base + 2)?;
+        let bytes: &[u8] = &role[0..@len(role)]:Read;
+        is_root = coff_symbols::names_equal(bytes, "root");
+        if !is_root && !coff_symbols::names_equal(bytes, "dep") {
+            write("错误：单元角色必须是 root 或 dep\n");
+            exit(2);
+        }
+    }
+    var artifact_mode: u8 = 0;
+    var dep_first: u32 = base + 3;
+    if argc > base + 3 {
+        let marker: u8[] = host_args::get(args, base + 3)?;
+        let option: &[u8] = &marker[0..@len(marker)]:Read;
+        if coff_symbols::names_equal(option, "--emit-ysm") { artifact_mode = 1; }
+        elseif coff_symbols::names_equal(option, "--emit-ysm-only") { artifact_mode = 2; }
+        if artifact_mode != 0 { dep_first = base + 4; }
+    }
+    let input_name: u8[] = host_args::get(args, base)?;
+    let source: u8[] = host::input_bytes(&input_name[0..@len(input_name)]:Read)?;
+    var module_name: u8[] = [];
+    if argc > base + 1 {
+        module_name = host_args::get(args, base + 1)?;
+    } else {
+        @push(module_name, 109 as u8)?;
+        @push(module_name, 97 as u8)?;
+        @push(module_name, 105 as u8)?;
+        @push(module_name, 110 as u8)?;
+    }
+
+    var diags: diag::DiagBuffer = diag::diagbuf_new();
+    let name: &[u8] = &module_name[0..@len(module_name)]:Read;
+    let frontend: driver_front::ParsedUnit = full_front::parse_input(&source[0..@len(source)]:Read, name, jsonl_mode, &diags:ReadWrite)?;
+    let parsed: &parse::ParseResult:Read = &frontend.parsed:Read;
+    let lexed: &lex::LexResult:Read = &frontend.lexed:Read;
+    let names: &lex::NameTable:Read = &(*lexed).names:Read;
+    let loaded: driver_deps::Dependencies = driver_deps::load(args, argc, dep_first, &(*parsed).pool:Read, names, &diags:ReadWrite, jsonl_mode, profile)?;
+    if diag::diagbuf_has_error(&diags:Read) {
+        driver_front::fail(&diags:ReadWrite, jsonl_mode, name)?;
+    }
+    let analysis: driver_ir::UnitAnalysis = driver_ir::analyze(parsed, names, name, jsonl_mode, is_root, &loaded:Read, &diags:ReadWrite)?;
+    let direct_count: u32 = @len(loaded.order) as u32;
+    let assembly: &iface_load::DependencyAssembly:Read = &loaded.assembly:Read;
+    let deps: &resolve_refs::DependencySet:Read = &(*assembly).deps:Read;
+    let targets: &[u32]:Read = &(*assembly).targets[0..@len((*assembly).targets)]:Read;
+    let lowered: &mir::MirResult:Read = &analysis.lowered:Read;
+    let options: driver_emit::Options = driver_emit::Options { entry_def: analysis.entry_def, is_root: is_root,
+        artifact_mode: artifact_mode, jsonl: jsonl_mode, profile: profile };
+    driver_emit::emit(parsed, names, &analysis.resolution:Read, &analysis.checked:Read,
+        &analysis.layout_data:Read, &(*lowered).module:Read, name, &loaded.candidates[0..@len(loaded.candidates)]:Read,
+        &loaded.order[0..direct_count]:Read, targets, &(*deps).ifaces[0..direct_count]:Read,
+        options, &diags:ReadWrite)?;
+    exit(0);
+    return;
+}
+
+function main(): void {
+    let failed: void!AllocError = run_compiler();
+    @drop(failed);
+    write("错误：full 编译器内存分配失败\n");
+    exit(1);
+}

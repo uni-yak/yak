@@ -102,7 +102,7 @@ yak$entry                                   // 根模块 main 的固定入口别
 - syscall ABI：`rax` 传入调用号并接收返回值，六个参数使用 `rdi rsi rdx r10 r8 r9`。失败时原始 `rax` 返回负错误号。`syscall` 改写 `rcx` 和 `r11`，运行时桥接须隔离这些改写，并按第三节恢复被调方保存寄存器。见 [x86-64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI/-/tree/master)。
 - `yak_rt_alloc` 把分配失败归一为零地址，由调用方产生 `AllocError`。`read`、`write`、`assert` 按 6.4 将失败交给本帧清理。
 
-6.4 `call_service` 使用 `yak_rt_try_read`、`yak_rt_try_write`、`yak_rt_try_assert`，参数沿用相应服务签名。返回 `rax` 的全 1 位模式表示失败，`read` 成功值是 `u32` 字节数。生成的失败边须先执行当前帧清理，再向调用方回传，见 [MIR](../ir/mir.md) 4.13。
+6.4 兼容服务的 `call_service` 使用带诊断的 `yak_rt_checked_read`、`yak_rt_checked_write`、`yak_rt_checked_assert`，参数沿用相应服务签名。返回 `rax` 的全 1 位模式表示失败，`read` 成功值是 `u32` 字节数。生成的失败边须先执行当前帧清理，再向调用方回传，见 [MIR](../ir/mir.md) 4.13。状态服务 `stdio_read`、`stdio_write` 使用 `call_foreign`，`rax` 的值按 [foreign 3.6](../lang/foreign.md#三base-期服务集) 原样传给调用方。
 
 6.5 Yak 内部调用使用 `r11` 回传完成状态，数值和跨帧清理规则与 [Win64 ABI](abi-win.md) 6.4 一致。`_start` 调用 `yak$entry` 后消费该状态，正常完成退出 0，标准服务失败退出 70，显式退出保留 `u8` 值，算术或访问陷阱在清理后触发 `int3`。普通 System V foreign 调用遵守本 ABI 的常规寄存器规则。
 

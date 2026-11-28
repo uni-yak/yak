@@ -1,0 +1,13 @@
+// 回显标准输入；读失败退出 1，写失败退出 2，正常 EOF 退出 0。
+import io;
+
+function main(): void {
+    var data: [u8; 16] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+                           0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    while true {
+        let result: io::ReadResult = io::read(&data[0..16]:ReadWrite);
+        if !result.ok { @exit(1u8); }
+        if result.count == 0 { return; }
+        if !io::write(&data[0..result.count as u64]:Read) { @exit(2u8); }
+    }
+}

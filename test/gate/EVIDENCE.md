@@ -1890,6 +1890,14 @@ Win64 重定位夹具以真实 PE 中的 VA、RVA 与独立保留的语义加数
     - `yak-windows-x64.zip`：`c39345b4a2c3374f6f4027fe35bedc8bf417e805b6f59a5dda7ec0baad3c23c5`（`main.exe` `5b5aef00716910c7dd2ffc5af14e79cb0b32eae20333779b6272ec60ac0861c3`、`imports.exe` `4e76a933d8f4ac4b8ad035faa28e409eca0691635df564185389f91e247baf16`、`yak_lsp.exe` `5a7963596a8e9ccd8ac60e22753bec9b3bdf8ddedf01da191ab169abb27febbe`）
     - `build-manifest.json`：`3e35d4457d9217f668c3854347b9677abda72946eb926704e74716c0488c0316`
 
+## 可恢复标准流与首批 full 待确认候选（2026-11-28，本地专项）
+
+- 源树：基线 `91c2d39d248a9c2648bdf6056364dd4e816e66e4` 加本节随附的工作树变更；点火输入为 Run `46042555495` 已归档同代目标编译器和导入扫描器。本节不替代可信 CI 全门禁，不迁移候选规格状态，也不改写 T2 回执。
+- Linux x86-64（WSL，Bash 5.2.21、GCC 14.2.0、binutils 2.42、Python 3.12.3）：[min 原生构建](../../compiler/min/selfhost.sh)退出 0，产出的 `main.elf` SHA-256 为 `d5e56c6e71b48cd8882f239d180593da3584b82d05dc6dd8e2ff6c93d4f8604f`，`imports.elf` 为 `f96a3db3eef36bb4a7a263f389eedfb6e1d3a5e75550ecb4c89de1c7f93047d9`。
+- [标准流专项入口](test_stdio.sh)：以该 ELF 编译器运行，退出 0。覆盖二进制回显、EOF、输入管道未关闭时的短读、无效读/写端、零长切片、断管（原生执行 7 项）；错误签名另核对 `E8001`、退出 1 且无可执行产物。用例核对 stdout、stderr 和退出状态，系统失败分支不陷阱、不打印运行时消息。
+- Windows x64：在 WSL 用 MinGW-w64 GCC 13-posix 交叉构建 PE（`main.exe` SHA-256 `eb6a775419bdffcd8369c45dce0b82c8e26c3b69f24e792dae0b1df3b2237f32`），错误签名目标诊断和无产物检查退出 0；Windows Python 3.14.8 原生执行 [标准流行为脚本](stdio_check.py)并通过同一 7 项，退出 0。这不是 Windows 原生工具链重建证据。
+- [full 候选专项入口](../full/run.sh)：在隔离快照以同代 ELF pair 构建候选，退出 0，13 组通过。四个正例逐一编译、链接、运行并核对 min 拒绝；六条负例逐项核对 `E2001` × 3、`E3004`、`E3005`、`E3008`；另核对 min/full 都拒绝 tuple、一个基座样本的扫描输出和 obj/iface 逐字节一致，以及批量 `@drop` 产物等于手写逆序且不同于正序。`yakc_full.elf` SHA-256 `5f4a4ba616efb8bfab839cefa2e0711e1b599239e5198f2ea8ca802b5bfd296f`，`full_imports.elf` 为 `97096380e127a398ec0b8630eeacc5d822429cbae5ca077c913e4364e5d824fa`。本地未执行 Windows full 专项；双目标结果由 [平台验收入口](ci_platform.sh)归档。
+
 ## 归档模板
 
 提交或在评审中粘贴证据时，用下列字段，缺项即视为证据不完整：

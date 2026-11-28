@@ -1,0 +1,45 @@
+// expected_exit: 0
+// expected_stdout: 10
+// expected_stdout:
+// spec: spec/lang/sugar.md S-1
+// 验证 S-1：无标签 loop 与带标签 outer: loop 的 break / continue 及 owning 清理。
+foreign write(data: &[u8]): void;
+
+function test_owned_loop(limit: u32): u32!AllocError {
+    var total: u32 = 0u32;
+    var i: u32 = 0u32;
+    outer: loop {
+        var scratch: u8[] = [];
+        @push(scratch, 1u8)?;
+        if i >= limit {
+            break outer;
+        }
+        var j: u32 = 0u32;
+        loop {
+            j = j + 1u32;
+            if j == 2u32 && i != 0u32 {
+                i = i + 1u32;
+                total = total + 2u32;
+                continue outer;
+            }
+            if j == 2u32 {
+                break;
+            }
+        }
+        i = i + 1u32;
+        total = total + 2u32;
+    }
+    return total;
+}
+
+function observe(): void!AllocError {
+    let total: u32 = test_owned_loop(5u32)?;
+    @assert(total == 10u32);
+    write("10\n");
+    return;
+}
+
+function main(): void {
+    observe();
+    return;
+}

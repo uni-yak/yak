@@ -1,0 +1,8 @@
+// expected_code: E2001
+// spec: spec/lang/chain-act.md
+// 语句位置的链式 drop 也不接收实参。
+function main(): void {
+    let a: u8[] = [];
+    a.drop(1u8);
+    return;
+}

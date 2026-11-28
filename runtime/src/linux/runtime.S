@@ -57,8 +57,10 @@ yak_rt_exit:
 .size yak_rt_exit, .-yak_rt_exit
 
 # 尝试入口不做最终终止，留给编译器生成的清理边；全一表示服务失败。
-.globl yak_rt_try_read
+.globl yak_rt_try_read, yak_rt_stdio_read
 .type yak_rt_try_read,@function
+.type yak_rt_stdio_read,@function
+yak_rt_stdio_read:
 yak_rt_try_read:
     testq %rsi, %rsi
     je .Lservice_ok
@@ -78,9 +80,12 @@ yak_rt_try_read:
     # 短读正常返回，不能等缓冲填满或对端关闭。
     ret
 .size yak_rt_try_read, .-yak_rt_try_read
+.size yak_rt_stdio_read, .-yak_rt_stdio_read
 
-.globl yak_rt_try_write
+.globl yak_rt_try_write, yak_rt_stdio_write
 .type yak_rt_try_write,@function
+.type yak_rt_stdio_write,@function
+yak_rt_stdio_write:
 yak_rt_try_write:
     testq %rsi, %rsi
     je .Lservice_ok
@@ -105,6 +110,7 @@ yak_rt_try_write:
     jne .Lwrite_next
     jmp .Lservice_ok
 .size yak_rt_try_write, .-yak_rt_try_write
+.size yak_rt_stdio_write, .-yak_rt_stdio_write
 
 .globl yak_rt_try_assert
 .type yak_rt_try_assert,@function

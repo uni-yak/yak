@@ -40,9 +40,9 @@ if [ "$python_found" -ne 1 ]; then
     exit 1
 fi
 
-echo "-- T1 阶段实体边界（SD-1）--"
+echo "-- 固定点前实体与默认输出边界（SD-1）--"
 if python test/gate/t1_stage_boundary.py; then
-    ok "未发现提前出现的 yakc-full 实体"
+    ok "未发现提前出现或越出隔离目录的 yakc-full 实体"
 else
     bad "T1 阶段实体边界检查失败"
     exit 1

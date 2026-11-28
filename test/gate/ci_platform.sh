@@ -101,6 +101,8 @@ if [[ $target == linux-x64 ]]; then
     record lsp-linux-boundary -- bash test/gate/test_lsp_linux_build.sh "$main" "$scanner" --verified-output "$server"
     record base-linux -- bash test/gate/test_base_linux_build.sh "$main" "$scanner"
 fi
+record stdio -- bash test/gate/test_stdio.sh "$target" "$main"
+record full-stage1 -- bash test/full/run.sh --target "$target" "${pair[@]}"
 record corpus -- bash test/gate/test_base_selfhost_candidate.sh --verify-run "$candidate" --platform "$target"
 record lsp-protocol -- python test/gate/lsp_p4_check.py "$exe"
 record lsp-neovim -- python test/gate/lsp_neovim_check.py "$exe" "$YAK_CI_NVIM"

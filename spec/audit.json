@@ -1,6 +1,6 @@
 {
   "structural_errors": [],
-  "documents": 63,
+  "documents": 68,
   "error_entries": 197,
   "explicit_code_aliases": 41,
   "missing_specs": [],
@@ -763,6 +763,36 @@
     {
       "spec": "lang/parse.md",
       "dependency": "lang/base.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/stdio.md",
+      "dependency": "lang/foreign.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/stdio.md",
+      "dependency": "lang/type/slice.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/stdio.md",
+      "dependency": "lang/type/struct.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/stdio.md",
+      "dependency": "lang/type/u32.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/stdio.md",
+      "dependency": "lang/type/bool.md",
+      "status": "草案"
+    },
+    {
+      "spec": "lang/stdio.md",
+      "dependency": "proc/gate.md",
       "status": "草案"
     },
     {

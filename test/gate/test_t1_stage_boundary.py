@@ -1,11 +1,14 @@
 """用隔离目录调用真实 SD-1 命令行，不生成可执行产物。"""
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+
+from t2_stage_fixpoint_gate import DEFAULT_RECEIPT_REL, REQUIRED_RECEIPT_FLAGS
 
 
 CHECK = Path(__file__).with_name("t1_stage_boundary.py").resolve()
@@ -19,6 +22,8 @@ class StageBoundary(unittest.TestCase):
         self.check = self.root / "test/gate" / CHECK.name
         self.check.parent.mkdir(parents=True)
         shutil.copyfile(CHECK, self.check)
+        helper = CHECK.with_name("t2_stage_fixpoint_gate.py")
+        shutil.copyfile(helper, self.check.with_name(helper.name))
 
     def put(self, path):
         entry = self.root / path
@@ -56,6 +61,22 @@ class StageBoundary(unittest.TestCase):
                 self.assert_rejected(path)
                 self.assertEqual(entry.read_bytes(), b"fixture\n")
                 entry.unlink()
+
+    def test_candidate_requires_valid_t2_receipt(self):
+        self.put("compiler/full/src/check.yak")
+        receipt = self.put(DEFAULT_RECEIPT_REL)
+        self.assert_rejected("compiler/full/src/check.yak")
+        full_receipt = dict.fromkeys(REQUIRED_RECEIPT_FLAGS, True)
+        full_receipt["c2_main_sha256"] = "0" * 64
+        receipt.write_text(json.dumps({**full_receipt, "ci_trusted": False}), encoding="utf-8")
+        self.assert_rejected("compiler/full/src/check.yak")
+        receipt.write_text(json.dumps(full_receipt), encoding="utf-8")
+        result = self.run_check()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        for path in ("out/yakc-full.exe", "out/yakc_full.elf", "out/full_imports.elf"):
+            self.put(path)
+            self.assert_rejected(path)
+            (self.root / path).unlink()
 
     def test_symlink_is_not_document_or_absence(self):
         name = "compiler/full/README.md"

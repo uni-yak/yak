@@ -23,6 +23,8 @@ export function option_syntax(p: &Parser:Read): bool { return (p.syntax_profile 
 export function union_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 8u8) != 0u8; }
 export function text_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 16u8) != 0u8; }
 
+export function loop_syntax(p: &Parser:Read): bool { return (p.syntax_profile & 32u8) != 0u8; }
+
 // 超限后停止读取 token；上层只展开调用，不再生成恢复诊断。
 export function enter_depth(p: &Parser:ReadWrite): bool {
     if p.depth_exceeded || p.match_path_exceeded || p.recovery_exceeded { return false; }
@@ -177,6 +179,7 @@ export function is_item_start(p: &Parser:Read): bool {
 }
 export function is_stmt_start(p: &Parser:Read): bool {
     if is_builtin(p, 20484) { return true; }
+    if loop_syntax(p) && is_kind(p, 17) { return true; }
     if !is_kind(p, 6) { return false; }
     let keyword: u8 = p.tokens[p.pos].payload as u8;
     return keyword == 1 || keyword == 2 || keyword == 3 || keyword == 4 || keyword == 7 || keyword == 8 || keyword == 9 || keyword == 10 || keyword == 11 || keyword == 19;

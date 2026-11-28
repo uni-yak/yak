@@ -23,11 +23,11 @@
 
 2.4 base 期 foreign 声明不支持泛型参数、可变参数或 `@callconv` / `@export_c` 注解（推迟至第七节 full 层）。
 
-2.5 `foreign #name` 是零分配声明契约（`base.md` 5.11），允许已登记的无增 I/O 服务 `read`、`write`、T1 兼容保留的 `exit`、`assert` 以及 `../proc/host.md` 的受限宿主服务；堆分配服务不得标 `#`。堆释放为运行时内部服务，不由用户声明。full 层任意 external foreign 的 `#` 需要独立 effect / provider 证明，当前未激活。
+2.5 `foreign #name` 是零分配声明契约（`base.md` 5.11），允许本规格第三节已登记的无增 I/O 服务、T1 兼容保留的 `exit`、`assert` 以及 `../proc/host.md` 的受限宿主服务；堆分配服务不得标 `#`。堆释放为运行时内部服务，不由用户声明。full 层任意 external foreign 的 `#` 需要独立 effect / provider 证明，当前未激活。
 
 ## 三、base 期服务集
 
-3.1 用户可声明的 foreign 服务（签名固定，`base.md` 9.2）：`read` 与 `write` 长期保留在 `foreign` ABI 层；进程退出与断言首选语言级控制流原语 `@exit`／`@assert`（`base.md` 6.7），下表中 `exit`／`assert` 的 `foreign` 签名仅作 T1 冻结 Seed 与存量夹具兼容保留。
+3.1 用户可声明的 foreign 服务（签名固定，`base.md` 9.2）：标准流保留在 `foreign` ABI 层。原生代码需要处理系统 I/O 错误时使用 3.6 的服务。下表的 `read`／`write` 是保留既有失败语义的兼容入口；`exit`／`assert` 仅作 T1 冻结 Seed 与存量夹具兼容保留，分别以 `@exit`／`@assert`（`base.md` 6.7）替代。
 
 | 服务 | 签名 | `no_alloc` | 失败 |
 |:---|:---|:---:|:---|
@@ -54,13 +54,25 @@
 
 3.5 断言语义的首选形态为语言级控制流原语 `@assert(cond: bool): void`（`base.md` 6.7），T1 兼容 `foreign assert` 保持同一语义：`cond` 为真时正常继续；为假即进入不正常完成路径，不得静默返回。`foreign assert` 的服务失败登记 `E9205`（`../proc/error.def`）；两者均无分配，可用于 `#` 函数。
 
+3.6 原生标准流状态服务（Win64 PE 与 Linux x86-64 ELF；冻结 Seed 不识别这些签名）：
+
+| 服务 | 签名 | `no_alloc` | `LinkId` 对应的运行时符号 | `u64` 返回值 |
+|:---|:---|:---:|:---|:---|
+| 标准输入 | `foreign #stdio_read(buf: &[u8]:ReadWrite): u64` | true | `yak_rt_stdio_read` | 成功为读取的字节数（至多 4294967295）；失败为全 1 |
+| 标准输出 | `foreign #stdio_write(data: &[u8]): u64` | true | `yak_rt_stdio_write` | 全部写入为 0；失败为全 1 |
+
+- `#` 可省略，不改变服务身份。调用为普通标量 foreign 调用，不生成服务异常边或诊断输出；不得因系统 I/O 失败中止进程。类型不匹配适用 F-1。
+- 空缓冲区不接触宿主并返回 0。非空输入允许短读，不等到缓冲区填满；没有更多数据时返回 0。输入管道的正常关闭等价于 EOF。Linux `EINTR` 在服务内重试；其他系统失败返回全 1，不把失败归一为 EOF。
+- 写入循环处理短写，零进展或系统错误返回全 1；失败前可能已经写出前缀，不回滚、不承诺可重试整次操作。Linux 写断管必须走失败返回，不因 `SIGPIPE` 终止。
+- 只支持进程的标准输入、标准输出，不暴露文件句柄、宿主错误号或点火期文件服务。面向用户的 Yak 接口见 [标准流规格](stdio.md)。
+
 ## 四、调用约定
 
 4.1 foreign 调用约定为目标平台 ABI（`base.md` 9.1）：Windows x64 见 `../target/abi-win.md`，System V 见 `../target/abi-linux.md`。
 
 4.2 调用方按 ABI 降级参数：`&[u8]` 降为 `(ptr, len)` 两参数；`&[u8]:ReadWrite` 同。
 
-4.3 foreign 调用为不正常完成路径的可能来源（`base.md` 10.3）；服务失败必须映射为陷阱，不得静默忽略。
+4.3 foreign 失败按服务登记处理；3.1 中登记为陷阱的失败属于不正常完成路径（`base.md` 10.3），3.6 的系统 I/O 失败仅按标量状态返回。
 
 ## 五、边界能力限制
 
@@ -100,7 +112,7 @@
 | F-1 | 使用未登记的 foreign 服务签名（见 `base.md` R-11 / `E8001`） |
 | F-2 | foreign 参数或返回类型为 owning / `&T:Write` / carrier / 函数静态引用 |
 | F-3 | 向 foreign 边界传递 `Write`（`base.md` 9.3） |
-| F-4 | foreign 服务失败未映射为陷阱 |
+| F-4 | 已登记为陷阱的 foreign 服务失败未映射为陷阱 |
 | F-5 | foreign 声明使用 `export` 前缀（`E9204`） |
 
 > F-2 / F-3 / F-4 / F-5 的 `ErrorCode` 登记于 `../proc/error.def` E92 段；F-1 复用 `E8001`。

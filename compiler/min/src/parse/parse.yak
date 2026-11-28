@@ -225,7 +225,7 @@ function parse_file_limited(tokens: &[lex::Token], names: &lex::NameTable:Read, 
     if parse_core::union_syntax(&p:Read) { p.payload_name = parse_core::find_name(names, "payload"); }
     var copy_index: u32 = 0;
     while copy_index < @len(tokens) as u32 { @push(p.tokens, tokens[copy_index])?; copy_index = copy_index + 1; }
-    var pool: ast::AstPool = ast::AstPool { items: [], functions: [], enums: [], structs: [], consts: [], foreigns: [], imports: [], blocks: [], ifs: [], whiles: [], matches: [], patterns: [], assigns: [], stmts: [], exprs: [], unaries: [], binaries: [], calls: [], members: [], indices: [], slices: [], casts: [], ctors: [], arrays: [], paths: [], type_paths: [], fixed_arrays: [], refs: [], fn_refs: [], error_sets: [], fallibles: [], types: [], locals: [], statics: [], static_bytes: [], plain_unions: [], option_syntax: nullable, union_syntax: parse_core::union_syntax(&p:Read), text_syntax: parse_core::text_syntax(&p:Read) };
+    var pool: ast::AstPool = ast::AstPool { items: [], functions: [], enums: [], structs: [], consts: [], foreigns: [], imports: [], blocks: [], ifs: [], whiles: [], loops: [], matches: [], patterns: [], assigns: [], stmts: [], exprs: [], unaries: [], binaries: [], calls: [], members: [], indices: [], slices: [], casts: [], ctors: [], arrays: [], paths: [], type_paths: [], fixed_arrays: [], refs: [], fn_refs: [], error_sets: [], fallibles: [], types: [], locals: [], statics: [], static_bytes: [], plain_unions: [], option_syntax: nullable, union_syntax: parse_core::union_syntax(&p:Read), text_syntax: parse_core::text_syntax(&p:Read) };
     var root: ast::AstFile = ast::AstFile { items: [], file: file };
     while p.pos < @len(p.tokens) as u32 && !is_kind(&p:Read, 9) {
         if !parse_core::is_item_start(&p:Read) {
@@ -326,4 +326,9 @@ export function parse_lexed_plain_union(lexed: &lex::LexResult:Read, file: u16):
 
 export function parse_lexed_text(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
     return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 16u8)?;
+}
+
+// 批量 @drop 和 loop 仅供 full 候选；if let 只保留到结构化拒绝。
+export function parse_lexed_sugar(lexed: &lex::LexResult:Read, file: u16): ParseResult!AllocError {
+    return parse_lexed_profile(lexed, file, 0u32, 0u32, 0u32, 0u32, 35u8)?;
 }

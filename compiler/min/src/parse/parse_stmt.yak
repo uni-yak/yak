@@ -72,6 +72,15 @@ function parse_while(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadW
     return id;
 }
 
+function parse_loop(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite, label: u32): u32!AllocError {
+    let start: u32 = p.pos;
+    advance(p);
+    let body: u32 = parse_block(p, pool)?;
+    let id: u32 = @len(pool.loops) as u32;
+    @push(pool.loops, ast::LoopStmt { label: label, body: body, span: span_at(p, start) })?;
+    return id;
+}
+
 function parse_pattern(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool:ReadWrite): u32!AllocError {
     let start: u32 = p.pos;
     var kind: u8 = 0;
@@ -376,11 +385,19 @@ function parse_block_inner(p: &parse_core::Parser:ReadWrite, pool: &ast::AstPool
         } elseif is_keyword(p, 7) {
             kind = 15;
             data = parse_while(p, pool, 0)?;
+        } elseif parse_core::loop_syntax(p) && is_kind(p, 17) {
+            kind = 19;
+            data = parse_loop(p, pool, 0)?;
         } elseif (is_kind(p, 0) || is_kind(p, 1)) && is_op_at(p, p.pos + 1, 24) && is_keyword_at(p, p.pos + 2, 7) {
             let label: u32 = take_ident(p)?;
             expect_op(p, 24)?;
             kind = 15;
             data = parse_while(p, pool, label)?;
+        } elseif parse_core::loop_syntax(p) && (is_kind(p, 0) || is_kind(p, 1)) && is_op_at(p, p.pos + 1, 24) && is_kind_at(p, p.pos + 2, 17) {
+            let label: u32 = take_ident(p)?;
+            expect_op(p, 24)?;
+            kind = 19;
+            data = parse_loop(p, pool, label)?;
         } elseif is_keyword(p, 11) {
             kind = 16;
             data = parse_match(p, pool)?;

@@ -21,14 +21,7 @@
 
 ### S-1 `loop`
 
-```text
-loop { B }
-  →  'loop_label: while true { B }
-```
-
-- `loop` 为 `while true` 的语法糖。
-- base 期禁用；full 期启用。
-- `break` / `continue` 可带 `loop_label` 跳出。
+独立待确认候选规则见 [loop](loop.md)。
 
 ### S-2 `if let`（保留，未激活）
 
@@ -38,14 +31,7 @@ loop { B }
 
 ### S-3 `..=` 闭区间
 
-```text
-a..=b
-  →  a..(b+1)
-```
-
-- 闭区间 `[a..=b]` 脱糖为半开区间 `[a..(b+1)]`。
-- 要求 `b+1` 不溢出；溢出为拒绝。
-- base 期禁用。
+独立待确认候选规则见 [闭区间切片](closed-range.md)。
 
 ## 三、绑定糖
 
@@ -79,28 +65,11 @@ f(@copy(e))
 
 ### S-7 批量 `@drop`
 
-```text
-@drop(a, b, c);
-  →  @drop(c); @drop(b); @drop(a);
-```
-
-- base 期只允许单个 `@drop(e)`（`base.md` 7.11）。
-- full 期允许批量；脱糖为逆序逐个 `@drop`。
-- 逆序与作用域析构一致（`base.md` 7.10）。
+独立待确认候选规则见 [批量析构](batch-drop.md)。
 
 ### S-8 链式动作（`.move()` / `.clone()` / `.copy()` / `.drop()`）
 
-- base 期不提供（`base.md` 11.2）。
-- full 期不引入方法语法（无 `method.md`）；链式动作脱糖为前缀调用：
-
-```text
-e.clone()
-  →  @clone(e)
-e.move()
-  →  @move(e)
-```
-
-- 方法接收者不触发自动解引用多层（`base.md` 7.12）。
+独立待确认候选规则见 [链式所有权动作](chain-act.md)。
 
 ## 五、恢复糖
 

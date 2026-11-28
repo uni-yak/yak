@@ -58,6 +58,10 @@
 | `lang/type/result.md` | base / full | 草案 | 未实现 | 未实现 | 表面 `T!E`、内部 `Fallible`、ErrorSet 与 `?` 传播 |
 | `lang/type/union.md` | full | 草案 | 不适用 | 未实现 | 普通 `A | B`；无 success/error 极性 |
 | `lang/type/option.md` | full | 草案 | 不适用 | 未实现 | `T?`、`?.`、`??` 与显式嵌套 |
+| `lang/loop.md` | full | 草案 | 不适用 | 未实现 | S-1，隔离候选；未激活 |
+| `lang/closed-range.md` | full | 草案 | 不适用 | 未实现 | S-3，隔离候选；未激活 |
+| `lang/batch-drop.md` | full | 草案 | 不适用 | 未实现 | S-7，隔离候选；未激活 |
+| `lang/chain-act.md` | full | 草案 | 不适用 | 未实现 | S-8，隔离候选；未激活 |
 | `lang/sugar.md:S-9` | full | 草案 | 不适用 | 未实现 | carrier 手动恢复与内部 dispatch |
 | `lang/sugar.md:S-10` | full | 草案 | 不适用 | 未实现 | `Nullable<T>` 载体降级 |
 | `lang/sugar.md:S-21` | full | 草案 | 不适用 | 未实现 | 无捕获匿名函数 `(params) => body`，产出 `&function(P): R` |
@@ -85,6 +89,7 @@
 |:---|:---|:---|:---|:---|:---|
 | `lang/module.md` | base / full | 草案 | 未实现 | 未实现 | 文件↔模块、DAG、import/export、`.iface` 编排 |
 | `lang/foreign.md` | base / full | 草案 | 未实现 | 未实现 | 外部函数声明、base 服务集、ABI 桥接、`LinkId` |
+| `lang/stdio.md` | base | 草案 | 未实现 | 未实现 | `pkg/io` 标准流接口候选；不纳入冻结 Seed |
 
 ## 语言核心规格矩阵
 

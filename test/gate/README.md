@@ -12,7 +12,9 @@
 | `t1_base_matrix.sh` | base 子集在 T1 上的实配能力与拒绝形态；未实现项按缺口计数，不计入通过 | 同上；默认报告缺口；`--require-complete` 有缺口返回 1 |
 | `t1_clean_gate.sh` | 构建只写登记位置、成功即清理、失败可回滚且可完全清理 | 同上 |
 | `t1_linux_preflight.sh` | Linux 宿主上 T1 构建入口的前置条件（目标三元组、版本钉死、PE 运行器、Seed 冻结和运行时对象）；`--host-only` 仅检查宿主工具链 | 0 通过 / 1 存在阻塞 / 2 环境或参数无效 / 3 并发 |
-| `t1_stage_boundary.py` | T1 组件边界（SD-1）：只允许 `compiler/full` 的三份已知说明和其目录；拒绝默认 `out/` 内的 full 可执行文件及归属标记。由 `compiler/min/verify.sh` 在构建前执行，不判断正式 T2 是否达成 | 0 通过 / 1 提前出现实体 / 2 无法检查 |
+| [t1_stage_boundary.py](t1_stage_boundary.py) | SD-1：有效 T2 收据前只允许 full 说明目录；始终拒绝默认 `out/` 内的 full 产物及归属标记 | 0 通过 / 1 越界 / 2 无法检查 |
+| [test_stdio.sh](test_stdio.sh) | 同一原生候选构建跨单元标准流夹具，覆盖正常和真实系统错误路径 | 0 通过 / 非零失败 |
+| [full 专项](../full/run.sh) | 使用原生工具对构建隔离 full，验证脱糖、拒绝和 min 边界 | 0 通过 / 非零失败 |
 | `evidence.sh` | 生成可复现的取证报告（见 `EVIDENCE.md`） | 0 全通过 / 1 有失败记录 / 2 取证输入不可用 |
 | `test_evidence_digest.sh` | 隔离检查源摘要、矩阵锁回收，以及发布级输入对账、双模式矩阵明细与完整记录 | 0 通过 / 非零失败 |
 | `ci_record.sh` | 把一条命令记成 `.cmd/.log/.rc` 三件套，供 `evidence.sh --from-logs` 汇总 | 被记录命令的真实退出码 / 2 记录失败 |

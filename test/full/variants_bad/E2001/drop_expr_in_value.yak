@@ -1,0 +1,9 @@
+// expected_code: E2001
+// spec: spec/lang/chain-act.md
+// 验证 S-8：.drop() 只能作独立语句，禁止放在值表达式位置。
+function main(): void {
+    let arr: u8[] = [];
+    let bad: u8[] = arr.drop();
+    @drop(bad);
+    return;
+}

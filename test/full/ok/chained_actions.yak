@@ -1,0 +1,57 @@
+// expected_exit: 0
+// expected_stdout: 33
+// expected_stdout:
+// spec: spec/lang/sugar.md S-8
+// 验证 S-8：链式所有权动作 .move() / .clone() / .copy() / .drop()，含调用传参、out 槽位转出与组合调用。
+foreign write(data: &[u8]): void;
+
+struct PairCopy { a: u32, b: u32 }
+
+function take_owned(arr: u8[]): u32 {
+    let first: u32 = arr[0] as u32;
+    let count: u32 = arr.len as u32;
+    return first + count;
+}
+
+function fill_slot(slot: &u8[]:Write): void!AllocError {
+    var buf: u8[] = [];
+    @push(buf, 20u8)?;
+    *slot = buf.move();
+    return;
+}
+
+function run_actions(): u32!AllocError {
+    var src: u8[] = [];
+    @push(src, 10u8)?;
+    let moved: u8[] = src.move();
+    let cloned: u8[] = moved.clone()?;
+    let n1: u32 = take_owned(moved.move());
+
+    out extracted: u8[];
+    fill_slot(out extracted)?;
+    let other: u8[] = extracted.move();
+    let other_clone: u8[] = other.clone()?;
+    let n2: u32 = (other_clone[0] as u32) + 11u32;
+    other.drop();
+    cloned.drop();
+
+    let pc: PairCopy = PairCopy { a: 1u32, b: 2u32 };
+    let pc2: PairCopy = pc.copy();
+    @assert(n1 == 11u32);
+    @assert(n2 == 31u32);
+    @assert(pc.a == pc2.a);
+    @assert(pc2.a + pc2.b == 3u32);
+    return n2 + pc2.b;
+}
+
+function observe(): void!AllocError {
+    let total: u32 = run_actions()?;
+    @assert(total == 33u32);
+    write("33\n");
+    return;
+}
+
+function main(): void {
+    observe();
+    return;
+}

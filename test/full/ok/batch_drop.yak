@@ -1,0 +1,29 @@
+// expected_exit: 0
+// expected_stdout: ok
+// expected_stdout:
+// spec: spec/lang/sugar.md S-7
+// 验证 S-7：批量 @drop(a, b, c) 析构多个动态数组；语句逆序另由 AST 用例验证。
+foreign write(data: &[u8]): void;
+
+function run_drops(): void!AllocError {
+    var a: u8[] = [];
+    var b: u8[] = [];
+    var c: u8[] = [];
+    @push(a, 1u8)?;
+    @push(b, 2u8)?;
+    @push(c, 3u8)?;
+    @drop(a, b, c);
+
+    return;
+}
+
+function observe(): void!AllocError {
+    run_drops()?;
+    write("ok\n");
+    return;
+}
+
+function main(): void {
+    observe();
+    return;
+}

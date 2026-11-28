@@ -29,11 +29,10 @@ gh release view "seed-$yakCiSeedSha" --repo $yakCiRepo --json tagName,assets
 gh variable list --repo $yakCiRepo
 ```
 
-可选覆盖变量（仅在需要非默认路径、Seed 镜像、Wine 命令或并发数时设置；并发数接受 1 到 8，默认 3）：
+可选覆盖变量（仅在需要 Seed 镜像或自定义并发数时设置；并发数接受 1 到 8，默认 3）：
 
 ```powershell
 gh variable set YAK_SEED_URL --repo uni-yak/yak --body $yakSeedMirrorUrl
-gh variable set YAK_CI_WINE --repo uni-yak/yak --body 'wine'
 gh variable set YAK_LINUX_CASE_JOBS --repo uni-yak/yak --body '3'
 gh variable set YAK_WINDOWS_CASE_JOBS --repo uni-yak/yak --body '3'
 ```
@@ -48,6 +47,8 @@ gh variable set YAK_WINDOWS_CASE_JOBS --repo uni-yak/yak --body '3'
 钩子在 Git 索引中需使用可执行模式 `100755`，供 Linux 检出后直接执行。
 
 PR 静态检查上限 8 分钟，同一引用的新提交取消旧检查。完整验收先核对配置，再做静态检查和一次自举。两个平台收到同一候选后并行，分别核对 C2/C3 的终端结果，并对候选额外校验 JSONL。普通用例默认每平台最多并发 3 个，共用构建锁的模块图用例按序执行。可用 `YAK_WINDOWS_CASE_JOBS` 与 `YAK_LINUX_CASE_JOBS` 按运行器容量配置 1 至 8 个。Linux LSP 的两次清冷构建用于字节比对，回滚专项复用首次构建产物作为对照。自举、Windows 和 Linux 作业分别设 180、90、120 分钟的初始超时。归档记录各门禁与各语料用例的耗时。
+
+两平台各用本轮原生 C2 执行 [标准流专项](../test/gate/test_stdio.sh) 与 [full 候选专项](../test/full/README.md)，单独记录回执，不将 full 候选编入发布包。
 
 平台失败后优先重跑失败作业，成功的自举候选仍可下载。单独复验某个平台时，可填写同提交的成功自举运行编号。草稿作业直接下载指定验收运行的资产，核对内容并续传同摘要的草稿包。
 
