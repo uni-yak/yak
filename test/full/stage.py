@@ -41,8 +41,8 @@ def copy_source(source, destination):
         shutil.copy2(source, destination)
 
 
-def run(root, args, data=None):
-    return subprocess.run(args, cwd=root, input=data, capture_output=True, timeout=120)
+def run(root, args, data=None, *, env=None):
+    return subprocess.run(args, cwd=root, input=data, env=env, capture_output=True, timeout=120)
 
 
 def success(proc, label):
@@ -90,7 +90,7 @@ def reject(proc, name, codes=None):
     return actual
 
 
-def probe(root, target, suffix):
+def probe(root, target, suffix, bash, env):
     minimum = root / f'tmp/bootstrap/main.{suffix}'
     min_scan = root / f'tmp/bootstrap/imports.{suffix}'
     full = root / f'tmp/build/yakc_full.{suffix}'
@@ -106,8 +106,8 @@ def probe(root, target, suffix):
         success(scan, f'full 扫描 {name}')
         require(scan.stdout == b'', f'{name} 应独立且不导入其他模块')
         reject(compile_source(root, minimum, target, name, source), f'min 边界 {name}')
-        linked = run(root, ['bash', 'tools/link.sh', rel, '--no-run', '--target', target,
-                            '--native-compiler', f'tmp/build/yakc_full.{suffix}', '--out-dir', 'tmp/runs'])
+        linked = run(root, [bash, 'tools/link.sh', rel, '--no-run', '--target', target,
+                            '--native-compiler', f'tmp/build/yakc_full.{suffix}', '--out-dir', 'tmp/runs'], env=env)
         success(linked, f'链接 {name}')
         executed = run(root, [str(root / f'tmp/runs/{name}/{name}.{suffix}')])
         success(executed, f'运行 {name}')
@@ -146,10 +146,14 @@ def probe(root, target, suffix):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bash-executable', required=True, type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--target', required=True, choices=('win-x64', 'linux-x64'))
     parser.add_argument('--native-compiler', required=True, type=Path)
     parser.add_argument('--native-scanner', required=True, type=Path)
     args = parser.parse_args()
+    require(args.bash_executable.is_absolute() and args.bash_executable.is_file(),
+            '候选入口须提供当前 Bash 的绝对可执行文件路径')
+    bash = str(args.bash_executable)
     target = args.target
     suffix = 'elf' if target == 'linux-x64' else 'exe'
     require((os.name == 'nt') == (suffix == 'exe'), '候选仅支持在原生目标宿主运行')
@@ -177,13 +181,12 @@ def main():
         runtime = Path(env.get('YAK_RUNTIME_OBJ') or 'runtime/out/win_x64/runtime.obj')
         copy_source(runtime, bootstrap / 'runtime.obj')
         env['YAK_RUNTIME_OBJ'] = 'tmp/bootstrap/runtime.obj'
-        os.environ['YAK_RUNTIME_OBJ'] = env['YAK_RUNTIME_OBJ']
-    subprocess.run(['bash', 'compiler/full/selfhost.sh', '--target', target,
+    subprocess.run([bash, 'compiler/full/selfhost.sh', '--target', target,
                     '--out-dir', 'tmp/build', '--audit-dir', 'tmp/audit',
                     '--native-compiler', f'tmp/bootstrap/main.{suffix}',
                     '--native-scanner', f'tmp/bootstrap/imports.{suffix}'],
                    cwd=root, env=env, check=True)
-    probe(root, target, suffix)
+    probe(root, target, suffix, bash, env)
     print('通过：首批 full 待确认候选定向验证', flush=True)
 
 
